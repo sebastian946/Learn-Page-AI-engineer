@@ -1,0 +1,21 @@
+## About this exam
+
+This exam checks whether you can make and defend the deployment decisions from Module 8. It has 18 questions and a 35-minute limit. You need **70%** to pass.
+
+It covers:
+
+- release strategies for prompt and model changes: blue/green, canary, shadow traffic and analysis-gated rollback;
+- Kubernetes for streaming LLM services: custom-metric autoscaling, KEDA, graceful shutdown and PodDisruptionBudgets;
+- self-hosted serving: GPU memory math, KV cache, quantization and the right scaling signals;
+- AI gateways: LiteLLM routing, fallbacks, budgets and compliance-aware routing;
+- Terraform and Bedrock: VPC endpoints, IAM least privilege, quotas, cross-region inference and Guardrails;
+- release management, reliability and compliance.
+
+Question types: single choice, multi-select, ordering, and code reading on Terraform, Kubernetes YAML, LiteLLM config and Argo Rollouts manifests.
+
+## How to prepare
+
+1. Re-read the "Common mistakes" section of each concept lesson. Many distractors come from there.
+2. Redo the KV cache calculation from lesson 3 for a different model shape without looking.
+3. Open your `llm-deploy-lab` repo and explain each manifest and config file out loud, line by line.
+4. For code questions, read the whole snippet before the options. Defaults and missing fields matter.

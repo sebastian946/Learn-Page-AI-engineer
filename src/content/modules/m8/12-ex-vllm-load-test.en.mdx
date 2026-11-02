@@ -1,0 +1,145 @@
+## Goal
+
+Turn lesson 3's numbers into your own measurements. You will serve a small open-weight model behind vLLM's OpenAI-compatible API, push it from 1 to 32 concurrent streams, and find the **knee**: the concurrency where time to first token (TTFT) starts climbing fast while total throughput stops growing. That knee is the number you would feed to an autoscaler and to `--max-num-seqs`.
+
+This exercise is optional because it needs either a GPU or patience:
+
+- **GPU path (recommended):** any single NVIDIA GPU with 8 GB or more, using the official `vllm/vllm-openai` image.
+- **CPU path:** vLLM has a CPU backend (follow the CPU installation guide in the vLLM docs). It is slow, but the curve shapes are still instructive. If vLLM CPU will not run on your machine, `llama.cpp`'s `llama-server` also exposes an OpenAI-compatible endpoint; use it and note that its metrics differ.
+- **Cloud path:** a single small GPU instance for an hour (for example an AWS `g6.xlarge`; check current pricing) and shut it down afterwards.
+
+Use a small instruction model with a permissive license, such as `Qwen/Qwen2.5-0.5B-Instruct` or `Qwen/Qwen2.5-1.5B-Instruct`. The goal is the method, not the model.
+
+Why not k6 from Module 5? k6 is great for request-level latency, but measuring TTFT and inter-token latency needs reading the SSE stream token by token. A short async Python client does that precisely.
+
+<AcceptanceCriteria>
+
+- [ ] vLLM serves a small model on `/v1/chat/completions` with pinned image version, `--max-model-len` and `--gpu-memory-utilization` set explicitly, and an API key required
+- [ ] A load script runs concurrency levels 1, 2, 4, 8, 16 and 32 with streaming requests and records, per level: p50 and p95 TTFT, mean inter-token latency, per-request output tokens per second and total output tokens per second
+- [ ] Every level uses the same prompt set (at least 20 distinct prompts) and the same `max_tokens`, and runs for at least 60 seconds or 50 requests
+- [ ] During each level, the script samples `/metrics` and records the peak `vllm:num_requests_waiting` and peak KV cache usage
+- [ ] Results are saved as CSV and plotted (TTFT p95 and total tokens per second versus concurrency)
+- [ ] The README states the knee, a recommended `--max-num-seqs`, and an autoscaling target (for example "scale out when waiting requests stay above 0 for 60 seconds"), with the reasoning
+- [ ] The README compares measured KV capacity with the lesson 3 back-of-envelope estimate for this model and GPU and explains any gap
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```bash
+# GPU path: serve a small model (pin a version you tested)
+docker run --rm --gpus all -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:v0.11.0 \
+  --model Qwen/Qwen2.5-0.5B-Instruct --served-model-name small \
+  --max-model-len 4096 --gpu-memory-utilization 0.85 \
+  --api-key "$VLLM_API_KEY"
+```
+
+```python
+# loadtest/stream_bench.py — measure TTFT and inter-token latency under concurrency
+import asyncio
+import json
+import os
+import random
+import statistics
+import time
+from dataclasses import dataclass
+
+import httpx
+
+URL = "http://localhost:8000/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.environ['VLLM_API_KEY']}"}
+
+@dataclass
+class Sample:
+    ttft: float
+    itl: float          # mean seconds between tokens after the first
+    tokens: int
+    duration: float
+
+async def one_request(client: httpx.AsyncClient, prompt: str) -> Sample:
+    body = {"model": "small", "stream": True, "max_tokens": 256, "temperature": 0.7,
+            "messages": [{"role": "user", "content": prompt}]}
+    start = time.perf_counter()
+    stamps: list[float] = []
+    async with client.stream("POST", URL, json=body, headers=HEADERS) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            delta = json.loads(line[6:])["choices"][0]["delta"].get("content")
+            if delta:
+                stamps.append(time.perf_counter())
+    end = time.perf_counter()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    return Sample(ttft=stamps[0] - start if stamps else end - start,
+                  itl=statistics.mean(gaps) if gaps else 0.0,
+                  tokens=len(stamps), duration=end - start)
+
+async def run_level(concurrency: int, prompts: list[str], total: int) -> list[Sample]:
+    sem = asyncio.Semaphore(concurrency)
+    async with httpx.AsyncClient(timeout=120) as client:
+        async def guarded() -> Sample:
+            async with sem:
+                return await one_request(client, random.choice(prompts))
+        return await asyncio.gather(*(guarded() for _ in range(total)))
+
+# TODO: loop over [1, 2, 4, 8, 16, 32], compute p50/p95 TTFT, mean ITL,
+#       total tokens / wall time, sample /metrics in a background task, write CSV
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Counting streamed chunks approximates tokens well enough for comparisons across levels, but for exact numbers request usage in the stream (`"stream_options": {"include_usage": true}`), which vLLM supports, and read the final chunk's `usage.completion_tokens`.</Hint>
+  <Hint>Total throughput is total output tokens divided by the wall-clock time of the whole level, not the sum of per-request rates. Run a short warm-up level first and discard it; the first requests after startup include CUDA graph capture and cache warm-up.</Hint>
+  <Hint>For `/metrics`, run a background task that fetches every second and parses lines starting with `vllm:num_requests_waiting` and the KV cache usage gauge (`vllm:kv_cache_usage_perc`, or `vllm:gpu_cache_usage_perc` on older versions). Keep the max per level. vLLM also logs the number of KV cache blocks at startup; multiply by the block size to get the token capacity it actually allocated.</Hint>
+  <Hint>Define the knee concretely, for example "the lowest concurrency where p95 TTFT is more than 2x the single-user value, or where total throughput grows less than 10% from the previous level". With a definition, your recommendation is reproducible instead of eyeballed. Bonus: register the server in your Module 8 gateway as `chat-private` and rerun one level through LiteLLM to measure the gateway's overhead.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  04-vllm-load-test/
+    serve.sh                # docker run command with pinned version and flags
+    loadtest/
+      stream_bench.py
+      prompts.jsonl         # 20+ prompts, mixed lengths
+      plot.py
+    results/
+      bench.csv
+      ttft_vs_concurrency.png
+      throughput_vs_concurrency.png
+      metrics_peaks.csv
+    README.md
+```
+
+README outline:
+
+1. Hardware, model, vLLM version and flags.
+2. Method: levels, prompts, `max_tokens`, duration, how TTFT and ITL are measured.
+3. Results table and the two plots.
+4. The knee, with your definition, and the recommended `--max-num-seqs` and autoscaling signal.
+5. Back-of-envelope vs measured KV capacity, and why they differ.
+6. What would change in production: bigger model, quantization, FP8 KV cache, prefix caching for shared system prompts.
+
+Suggested commits:
+
+- `feat(vllm): serve a small model with pinned version and explicit limits`
+- `feat(vllm): streaming benchmark measuring TTFT and inter-token latency`
+- `feat(vllm): sample server metrics during each level`
+- `docs(vllm): results, knee and autoscaling recommendation`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m8-12-review" title="Self-review" items={["The vLLM image version and every flag are recorded in serve.sh", "A warm-up run is excluded from the results", "Total throughput uses wall-clock time for the whole level", "I recorded peak waiting requests and KV usage for every level", "My knee has a written, numeric definition", "The autoscaling recommendation uses queue depth or TTFT, not GPU utilization", "I compared measured KV capacity with the lesson 3 estimate", "The cloud GPU instance (if any) is shut down"]} />

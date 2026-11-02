@@ -75,6 +75,12 @@ for (const id of moduleIds) {
           break
         }
       }
+      // Current Claude models reject sampling params (400). Catch the common single-line forms.
+      for (const line of source.split(/\r?\n/)) {
+        if (/(ChatAnthropic|claude-[a-z]+-\d)/.test(line) && /\b(temperature|top_p|top_k)\s*[=:]/.test(line)) {
+          err(`modules/${id}/${lesson.slug}.${locale}.mdx`, `sampling params are rejected by current Claude models: "${line.trim().slice(0, 70)}"`)
+        }
+      }
       ids[locale] = [...source.matchAll(/<Checklist\s+id="([^"]+)"/g)].map((m) => m[1]).sort()
       if (source.trim().split(/\s+/).length < 150 && lesson.type !== 'exam') warn(lw, `${locale} file looks short`)
     }

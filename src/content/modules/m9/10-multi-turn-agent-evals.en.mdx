@@ -93,7 +93,7 @@ async def simulate(bot, scenario: dict, max_turns: int = 12) -> dict:
     sim_view = [{"role": "user", "content": "Start the conversation with the support bot."}]
     cost, tool_calls, hit_cap = 0.0, [], False
     for _ in range(max_turns):
-        sim = await client.messages.create(model=SIM_MODEL, max_tokens=200,
+        sim = await client.messages.create(model=SIM_MODEL, max_tokens=2000,
                                            system=user_system(scenario), messages=sim_view)
         user_msg = sim.content[0].text.strip()
         if STOP in user_msg:

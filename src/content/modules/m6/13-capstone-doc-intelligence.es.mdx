@@ -1,6 +1,6 @@
-<ClientBrief company="Harborline Mutual" industry="Seguros / Reclamos de propiedad y accidentes" duration="5 días" />
+<ClientBrief company="Keystone Mutual" industry="Seguros / Reclamos de propiedad y accidentes" duration="5 días" />
 
-Eres un AI engineer contratado. Harborline Mutual quiere un pipeline que lea los documentos de reclamos, extraiga los campos que hoy los ajustadores escriben a mano y responda las preguntas de los ajustadores sobre un reclamo con citas. Su plataforma de datos es Databricks, gobernada por Unity Catalog. Si no tienes un workspace, construye el mismo sistema con el stack local descrito abajo: el brief, los requisitos y la rúbrica no cambian.
+Eres un AI engineer contratado. Keystone Mutual quiere un pipeline que lea los documentos de reclamos, extraiga los campos que hoy los ajustadores escriben a mano y responda las preguntas de los ajustadores sobre un reclamo con citas. Su plataforma de datos es Databricks, gobernada por Unity Catalog. Si no tienes un workspace, construye el mismo sistema con el stack local descrito abajo: el brief, los requisitos y la rúbrica no cambian.
 
 <Callout type="warning" title="Las APIs de Databricks evolucionan">
 
@@ -10,11 +10,11 @@ Vector Search, Model Serving, MLflow 3 y el Agent Framework cambian con frecuenc
 
 ## Contexto de la empresa
 
-Harborline Mutual es una aseguradora regional de propiedad y accidentes (ficticia) con unos 1,200 empleados y 400,000 pólizas activas de hogar y auto. Maneja aproximadamente 6,000 reclamos nuevos por mes. Cada reclamo llega como un paquete de PDFs: un **formulario de primer aviso de siniestro (FNOL)**, **reportes de campo del ajustador**, **presupuestos de reparación**, fotos con descripciones y el **documento de la póliza** correspondiente con sus endosos.
+Keystone Mutual es una aseguradora regional de propiedad y accidentes (ficticia) con unos 1,200 empleados y 400,000 pólizas activas de hogar y auto. Maneja aproximadamente 6,000 reclamos nuevos por mes. Cada reclamo llega como un paquete de PDFs: un **formulario de primer aviso de siniestro (FNOL)**, **reportes de campo del ajustador**, **presupuestos de reparación**, fotos con descripciones y el **documento de la póliza** correspondiente con sus endosos.
 
 Hoy, el personal de recepción abre cada PDF y escribe 15–20 campos en el sistema de reclamos. Toma 12–20 minutos por reclamo y los errores son comunes (número de póliza incorrecto, fecha del siniestro omitida). Cuando los ajustadores necesitan saber "¿esto está cubierto?", buscan a mano en PDFs de pólizas de 40 páginas.
 
-Harborline ya deposita los documentos en almacenamiento en la nube y opera su data warehouse en Databricks. Seguridad exige que los datos de reclamos permanezcan dentro de la plataforma gobernada, que el acceso sea auditable y que ningún dato personal se envíe a sistemas fuera de los endpoints aprobados.
+Keystone ya deposita los documentos en almacenamiento en la nube y opera su data warehouse en Databricks. Seguridad exige que los datos de reclamos permanezcan dentro de la plataforma gobernada, que el acceso sea auditable y que ningún dato personal se envíe a sistemas fuera de los endpoints aprobados.
 
 ## Stakeholders
 
@@ -104,7 +104,7 @@ Reducir el tiempo manual de recepción al menos un 60% prellenando los campos es
 
 ## Arquitectura sugerida
 
-<Diagram caption="Pipeline de inteligencia documental de Harborline" chart={`flowchart LR
+<Diagram caption="Pipeline de inteligencia documental de Keystone" chart={`flowchart LR
   subgraph Ingesta
     A["PDFs de reclamos"] --> B["Volume de UC raw_docs"]
     B --> C["Auto Loader a bronze_docs"]

@@ -1,0 +1,158 @@
+## Los evals offline envejecen. Producción los mantiene honestos.
+
+Tu golden set refleja las entradas que imaginaste el trimestre pasado. Producción te muestra las entradas que los usuarios realmente envían esta semana. El módulo 3 cubrió los evals online, el tracing y el monitoreo de drift. Esta lección cierra el ciclo: cómo las señales de producción se convierten en colas de revisión, cómo los hallazgos de la revisión se convierten en casos de regresión y cómo todo el ciclo impulsa el desarrollo. También cubre dos temas sobre los que siempre preguntan a un dueño senior de evals: los evals de seguridad y equidad, y cómo leer benchmarks públicos.
+
+Para un SDET, esto es el ciclo de vida de un defecto. Incidente en producción, triage, causa raíz, prueba de regresión que falla antes del fix y pasa después, agregada a la suite para siempre.
+
+## Señales de feedback
+
+**Feedback explícito**: pulgar arriba/abajo, calificaciones con estrellas, "reportar un problema", correcciones. Mucha señal por evento, pero escaso y sesgado: los usuarios que califican no son típicos y califican sobre todo cuando están encantados o enojados. Nunca leas la tasa de pulgares arriba como métrica de calidad por sí sola.
+
+**Feedback implícito**: comportamiento que sugiere calidad.
+
+| Señal | Lo que puede indicar |
+|---|---|
+| El usuario regenera o reformula la misma pregunta | La respuesta no acertó |
+| Borrador aceptado con poca distancia de edición vs muy editado | Calidad de un borrador generado (correo, resumen) |
+| Copia o clic en una cita | La respuesta fue útil o confiable |
+| Escalamiento a un humano, ticket reabierto | La tarea no se resolvió |
+| Sesión abandonada justo después de una respuesta | Posiblemente inútil, posiblemente resuelta; ambiguo |
+
+Las señales implícitas son proxies ruidosos. Calíbralas como a un juez: muestrea 100–200 sesiones, etiquétalas y verifica qué tan bien cada señal predice la etiqueta humana antes de ponerla en un dashboard.
+
+## Muestrear trazas para revisión
+
+No puedes revisarlo todo, y el muestreo aleatorio por sí solo desperdicia el tiempo de los revisores en éxitos fáciles. Usa **muestreo estratificado** con estratos como:
+
+- Un estrato **aleatorio base** (por ejemplo 1% del tráfico) para estimaciones de calidad sin sesgo.
+- **Feedback negativo**: todos o casi todos los pulgares abajo.
+- **Puntaje bajo del juez** o desacuerdo del jurado de jueces (lección 5).
+- **Valores atípicos**: costo alto, latencia alta, muchas tool calls, llegaron a un límite de pasos.
+- **Territorio nuevo**: entradas lejos de cualquier clúster del golden set (distancia de embeddings), idiomas nuevos, tenants nuevos.
+
+Los estratos dirigidos encuentran fallos rápido pero están sesgados por diseño. Si quieres una estimación de calidad global a partir de la muestra mixta, pondera cada ítem revisado por el inverso de su probabilidad de muestreo.
+
+```python
+import random
+from dataclasses import dataclass
+
+@dataclass
+class Trace:
+    id: str
+    thumbs_down: bool
+    judge_score: float      # 0-1, calibrated judge
+    cost_usd: float
+
+RATES = {"thumbs_down": 0.8, "low_judge": 0.3, "high_cost": 0.2, "random": 0.01}
+
+def stratum(t: Trace) -> str:
+    if t.thumbs_down:
+        return "thumbs_down"
+    if t.judge_score < 0.5:
+        return "low_judge"
+    if t.cost_usd > 0.10:
+        return "high_cost"
+    return "random"
+
+def sample_for_review(traces: list[Trace], seed: int = 1) -> list[tuple[Trace, float]]:
+    """Returns (trace, weight) pairs. Weight = 1 / sampling probability, for unbiased estimates."""
+    rng = random.Random(seed)
+    picked = []
+    for t in traces:
+        p = RATES[stratum(t)]
+        if rng.random() < p:
+            picked.append((t, 1.0 / p))
+    return picked
+
+def weighted_failure_rate(reviewed: list[tuple[bool, float]]) -> float:
+    """reviewed: (human_says_failure, weight) for each reviewed trace."""
+    total = sum(w for _, w in reviewed)
+    return sum(w for failed, w in reviewed if failed) / total
+```
+
+## Del fallo en producción al caso de regresión
+
+Trata cada fallo confirmado como un defecto:
+
+1. **Triage.** Severidad (un monto de dinero incorrecto es crítico; un tono torpe es menor) y categoría según tu taxonomía de errores: fallo de retrieval, razonamiento incorrecto, violación de política, mal uso de herramientas, formato, rechazo cuando debía responder, cita alucinada.
+2. **Causa raíz.** Prompt, retrieval, datos, modelo, herramienta o sistema upstream. El arreglo es distinto en cada caso.
+3. **Minimiza y anonimiza.** Quita los datos personales, reduce la conversación a los turnos que importan y conserva una instantánea del contexto recuperado para que el caso sea reproducible.
+4. **Agrégalo al set de regresión** con su procedencia: id de traza, fecha, severidad, categoría, issue vinculado. Márcalo como `source: production`.
+5. **Demuéstralo.** El nuevo caso debe fallar en la versión actual y pasar con el fix, exactamente como una prueba de regresión para un bug.
+6. **Sigue la taxonomía en el tiempo.** Una categoría que se reduce significa que tus arreglos funcionan. Una que crece te dice dónde invertir después.
+
+Hacer primero un **análisis de errores** abierto ayuda: lee 50–100 trazas fallidas, escribe una nota libre para cada una y luego agrupa las notas en categorías. La taxonomía que surge de tus propios datos le gana a cualquier lista genérica.
+
+## Dashboards de evals
+
+Un dashboard de evals útil responde "¿la calidad está bien, dónde no lo está y eso es real?":
+
+- Métricas principales por release con intervalos de confianza, no puntos sueltos.
+- Desglose por segmento (tenant, idioma, intención, tipo de documento).
+- Modelo juez y versión de la rúbrica anotados, para que los cambios de juez sean visibles (lección 5).
+- Calidad muestreada en producción (ponderada) junto a los puntajes offline; una brecha creciente significa que el golden set está desactualizado.
+- Costo por tarea exitosa y latencia p95 en la misma página, porque cada decisión de calidad también es una decisión de costo.
+- Tamaño del set de regresión y proporción proveniente de producción a lo largo del tiempo.
+
+## Evals de seguridad, sesgo y equidad
+
+La seguridad y la equidad son dimensiones de eval con sus propias suites, no ideas de último momento:
+
+- **Contenido dañino y cumplimiento de políticas**: un set de prompts categorizado (autolesiones, actividad ilegal, consejo médico o legal fuera de alcance) con el comportamiento esperado por categoría. El red-teaming del módulo 3 alimenta casos nuevos aquí.
+- **Sobre-rechazo**: solicitudes legítimas que parecen riesgosas ("¿cómo mato un proceso de Python?"). Un modelo que las rechaza está roto para los usuarios. Sigue la tasa de falsos rechazos junto a la tasa de cumplimiento dañino.
+- **Equidad contrafactual**: pruebas metamórficas (lección 8) que cambian nombres, géneros, nacionalidades o marcadores dialectales manteniendo todo lo demás constante. La decisión, el tono y la calidad no deberían cambiar. Reporta la tasa de cambio por atributo con CIs.
+- **Paridad de resultados entre segmentos**: compara calidad, tasa de rechazo y tasa de escalamiento entre idiomas o segmentos de clientes que puedas observar legítimamente. No infieras atributos protegidos de usuarios reales para construir estos cortes; usa entradas sintéticas contrafactuales.
+
+Documenta qué probaste y qué no. Un eval de equidad con huecos conocidos es mucho mejor que una garantía implícita.
+
+## Lectura de benchmarks
+
+Los proveedores y los leaderboards reportan puntajes en benchmarks públicos. Léelos con espíritu crítico:
+
+- **Qué miden.** MMLU es conocimiento de opción múltiple en 57 materias. Dice poco sobre si un modelo sigue tu esquema de extracción o tu política de reembolsos.
+- **Saturación.** Cuando todos los modelos top puntúan cerca del techo, las diferencias son ruido.
+- **Contaminación.** Los ítems de prueba públicos se filtran a los datos de entrenamiento con el tiempo. Un puntaje alto puede reflejar en parte memorización.
+- **Sensibilidad a la configuración.** El formato del prompt, el número de ejemplos few-shot, el chain-of-thought y la extracción de la respuesta mueven los puntajes. Dos números reportados con configuraciones distintas no son comparables.
+- **Leaderboards de preferencia.** Los votos humanos pareados (estilo Chatbot Arena) capturan preferencia general, incluidas preferencias de estilo y longitud, no tu tarea.
+
+Por eso necesitas **benchmarks privados**: tu distribución de tareas, tus segmentos, tus métricas, nunca publicados, versionados. Mantén un split **reservado y sellado** que nunca se use para ajustar prompts, y míralo solo para decisiones de release. Si no, sobreajustas los prompts al set de eval y la ley de Goodhart toma el control: la medida se vuelve el objetivo y deja de medir.
+
+## Desarrollo guiado por evals
+
+Junta todo y obtienes un flujo que se siente como TDD:
+
+1. Llega un fallo o un requisito nuevo. Escribe primero los casos de eval que lo capturan. Fallan (rojo).
+2. Cambia el prompt, el retrieval o el modelo hasta que pasen (verde), revisando el split de desarrollo completo en busca de regresiones.
+3. Refactoriza (acorta el prompt, recorta costo) mientras los evals siguen en verde.
+4. Antes del release, corre el split sellado y la comparación estadística de la lección 02.
+5. Después del release, el muestreo de producción encuentra el siguiente fallo. Repite.
+
+## Errores comunes
+
+- **Tratar la tasa de pulgares arriba como calidad.** Es escasa y sesgada.
+- **Revisar solo las trazas con pulgar abajo.** Nunca verás los fallos silenciosos.
+- **Estimar la calidad a partir de una muestra dirigida sin ponderaciones.**
+- **Agregar casos de producción sin minimizarlos ni anonimizarlos.** Tu set de regresión se convierte en un almacén de datos personales.
+- **Elegir modelos por los leaderboards públicos.** Úsalos para preseleccionar y luego decide con tu benchmark privado.
+- **Ajustar prompts sobre el split reservado.** Deja de ser un split reservado.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo conviertes el tráfico de producción en mejores evals?" level="senior">
+
+Muestreo trazas por estratos: una pequeña porción aleatoria para estimaciones sin sesgo, más estratos dirigidos para pulgares abajo, puntajes bajos del juez, desacuerdo del jurado, valores atípicos de costo y latencia, y entradas lejanas a mi golden set. Los revisores las etiquetan; pondero por el inverso de la probabilidad de muestreo cuando reporto la calidad global. Los fallos confirmados pasan por triage como defectos: severidad, categoría de error, causa raíz. Minimizo y anonimizo cada uno, lo agrego al set de regresión con su procedencia y exijo que falle antes del fix y pase después. Sigo las categorías de error en el tiempo y mantengo un split sellado que nunca se usa para ajustar.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Un proveedor dice que su nuevo modelo le gana al tuyo por 4 puntos en MMLU. ¿Deberías cambiar?" level="mid">
+
+No por esa razón. MMLU mide conocimiento amplio de opción múltiple, que no es mi tarea. Los puntajes dependen de la configuración, como el formato del prompt y el número de few-shots; el benchmark está cerca de la saturación y la contaminación es posible. Preseleccionaría el modelo, lo correría en nuestro benchmark privado con métricas específicas de la tarea, revisaría costo, latencia y riesgos por segmento, y usaría una comparación pareada con intervalos de confianza o una prueba de no inferioridad antes de decidir.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Hendrycks et al., "Measuring Massive Multitask Language Understanding" (MMLU): https://arxiv.org/abs/2009.03300
+- Liang et al., "Holistic Evaluation of Language Models" (HELM): https://arxiv.org/abs/2211.09110
+- OWASP Top 10 para aplicaciones LLM: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+- Scores y colas de anotación en Langfuse: https://langfuse.com/docs

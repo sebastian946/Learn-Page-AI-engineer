@@ -1,0 +1,176 @@
+## Two questions every regulated client asks
+
+When you pitch an LLM platform to a bank, insurer or hospital, two questions come early:
+
+1. **"What happens when it breaks?"** Provider outage, region outage, a bad release, a GPU shortage.
+2. **"What happens to our data?"** Where it goes, who sees it, how long it is kept, and how you prove it.
+
+This lesson gives you the architecture vocabulary to answer both. It is engineering guidance, not legal advice. Real compliance decisions belong to the client's legal, privacy and compliance teams; your job is to build a system that makes their requirements enforceable and auditable.
+
+## Failure modes specific to LLM platforms
+
+Module 5 covered graceful degradation inside one service. At platform level, list the failure modes and decide the response **before** they happen:
+
+| Failure | Typical signal | Response |
+|---|---|---|
+| Provider fully down | 5xx or connection errors across all models | Gateway fails over to the second provider or region |
+| Provider degraded | p95 TTFT triples, partial errors | Circuit breaker opens for that deployment, traffic shifts |
+| Quota exhausted | 429s with no outage | Shed low-priority traffic, queue batch work, request increase |
+| Your region down | Health checks fail from outside | DNS failover to the standby region |
+| Self-hosted GPU capacity unavailable | Pods pending, no GPU nodes | Queue PII workloads; never fail over PII to a public API |
+| Bad release | Canary gates fail | Automatic rollback (lesson 1) |
+| Gateway down | All AI features fail at once | Multi-replica, multi-AZ gateway; separate gateways per criticality tier |
+
+Notice the asymmetry in the GPU row. Availability and compliance can conflict. For some workloads, "unavailable for 20 minutes" is acceptable and "processed by an unapproved provider" is not. Write that down per workload; it is the most important line in your DR plan.
+
+## Multi-provider and multi-region
+
+LLM platforms have two independent redundancy axes:
+
+- **Model redundancy:** the same capability from two sources (Anthropic API and Bedrock, or Bedrock in two regions via cross-region inference, or two self-hosted replicas in different zones). The gateway (lesson 5) handles this with fallbacks and cooldowns.
+- **Platform redundancy:** your own components (gateway, app, vector store, conversation store, prompt registry) in a second region.
+
+For platform DR, use the standard AWS strategy names, ordered by cost and recovery time:
+
+| Strategy | Standby region runs | Typical RTO | Cost |
+|---|---|---|---|
+| Backup and restore | Nothing; IaC plus backups | Hours | Lowest |
+| Pilot light | Data replicated; compute off | Tens of minutes | Low |
+| Warm standby | Scaled-down full stack | Minutes | Medium |
+| Multi-site active-active | Full stack serving traffic | Near zero | Highest |
+
+**RTO** (recovery time objective) is how long you may be down. **RPO** (recovery point objective) is how much data you may lose. Decide them per component:
+
+- **Vector index:** often rebuildable from source documents. RPO can be large if you can re-embed in time; otherwise replicate (for example Aurora Global Database for pgvector, or snapshots copied cross-region).
+- **Conversation history and audit logs:** usually small RPO; replicate continuously.
+- **Gateway database** (keys, budgets, spend): must exist in the standby or nobody can authenticate after failover.
+- **Prompt registry and release manifests:** in git, so already replicated; make sure the standby can read them.
+- **Self-hosted model weights:** replicate to the standby region's storage ahead of time. Downloading 40 GB during an incident is not a plan.
+
+Then **test it**. You know this from QA: an untested DR plan is a hypothesis. Run game days: block the primary provider at the gateway, fail a region's health check, kill GPU nodes. Measure the actual RTO and write it in the runbook.
+
+## PII handling
+
+Start with **data classification**: public, internal, confidential, regulated (PII, PHI, payment data). Each workload and each model alias in the gateway gets a maximum classification it may process. Routing enforces it.
+
+Then apply, in order of preference:
+
+1. **Minimize.** Do not send what the model does not need. A claims summarizer may need the diagnosis code, not the member's name and address.
+2. **Pseudonymize.** Replace identifiers with placeholders before the call and restore them after. The model sees `[PERSON_1]`, the user sees the name.
+3. **Route to an approved processor.** Regulated data goes only to models approved for it: self-hosted, or a provider under the right agreement (for HIPAA in the US, a Business Associate Agreement covering that specific service).
+4. **Scan outputs.** Models can echo or hallucinate identifiers. Check responses before display and before logging.
+
+A small reversible pseudonymization step using Microsoft Presidio's analyzer:
+
+```python
+from dataclasses import dataclass, field
+
+from presidio_analyzer import AnalyzerEngine
+
+analyzer = AnalyzerEngine()
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "LOCATION", "DATE_TIME"]
+
+@dataclass
+class Pseudonymizer:
+    mapping: dict[str, str] = field(default_factory=dict)   # placeholder -> original
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def mask(self, text: str) -> str:
+        results = analyzer.analyze(text=text, entities=ENTITIES, language="en")
+        # Replace from the end so earlier offsets stay valid
+        for r in sorted(results, key=lambda r: r.start, reverse=True):
+            original = text[r.start:r.end]
+            existing = next((k for k, v in self.mapping.items() if v == original), None)
+            if existing is None:
+                self.counters[r.entity_type] = self.counters.get(r.entity_type, 0) + 1
+                existing = f"[{r.entity_type}_{self.counters[r.entity_type]}]"
+                self.mapping[existing] = original
+            text = text[:r.start] + existing + text[r.end:]
+        return text
+
+    def unmask(self, text: str) -> str:
+        for placeholder, original in self.mapping.items():
+            text = text.replace(placeholder, original)
+        return text
+
+# p = Pseudonymizer(); safe = p.mask(user_text); answer = p.unmask(call_llm(safe))
+```
+
+Presidio can return overlapping spans (a `LOCATION` inside a `PERSON`, for example). In production, drop overlaps first and keep the highest-scoring span, or the replacements can corrupt each other. Keep the mapping in memory for the request only. Detection is probabilistic: it misses things and flags false positives. Measure it like any classifier, with a labeled test set of your real document types, and treat it as one layer, not a guarantee.
+
+## Retention and deletion
+
+LLM systems copy data into more places than people expect. For each class of data, list every store and its retention:
+
+| Store | Contains user content? | Example retention |
+|---|---|---|
+| Application logs | Should not (log ids, not text) | 30 days |
+| Traces (Langfuse, OTel) | Often yes | 14–30 days, or masked |
+| Bedrock invocation logs | Yes | Only if justified; short, encrypted |
+| Response and semantic caches | Yes | Hours, keyed by tenant |
+| Vector store | Yes (document chunks) | Lifetime of source document |
+| Eval datasets | Possibly | Use synthetic or de-identified data |
+| Provider side | Depends on terms | Check data-use and retention terms; some offer zero-retention arrangements |
+
+A deletion request (for example under GDPR) must reach **all** of them, including caches, traces and eval datasets. If you cannot enumerate the stores, you cannot honor deletion. That enumeration is a deliverable, not a footnote.
+
+## Audit logs
+
+Auditors want to reconstruct who did what. For an LLM platform, an audit record per request typically includes:
+
+- request id, timestamp, tenant or team, end-user id (or a pseudonymous id);
+- gateway key alias, model alias and resolved model, release id (lesson 10);
+- data classification of the request and the route chosen;
+- guardrail outcomes (blocked, masked, passed);
+- token counts and cost;
+- **not** the raw prompt, unless policy requires it, and then in a separate, stricter store.
+
+Make audit logs **tamper-evident**: write them to a separate AWS account, enable S3 Object Lock or CloudTrail Lake, and restrict deletes. Keep CloudTrail on for every account for the control-plane side: who changed IAM, who moved a prompt alias, who edited a guardrail.
+
+## SOC 2 and HIPAA-minded architecture
+
+You do not need to be an auditor, but you should know which architecture choices produce evidence for common controls:
+
+| Control area | Architecture evidence |
+|---|---|
+| Access control | SSO for consoles, least-privilege IAM, gateway virtual keys per team, quarterly access reviews |
+| Encryption | TLS everywhere, KMS customer-managed keys for logs, caches and vector stores |
+| Change management | IaC in git, PR reviews, release manifests with eval reports, canary deploys |
+| Monitoring and incident response | Dashboards, alerts, runbooks, game-day records, post-incident reviews |
+| Vendor management | Provider security reports and agreements (DPA, BAA where applicable) on file |
+| Data retention and disposal | Retention table enforced by lifecycle rules, tested deletion procedure |
+
+Everything you built in this module is evidence: Terraform history, Rollout analysis results, gateway spend and access logs, release manifests.
+
+## Common mistakes
+
+- **One DR plan for all workloads.** PII workloads need a different failover path than public ones.
+- **Failover that was never tested.** RTO on paper is not RTO.
+- **Logging full prompts by default** in traces and invocation logs.
+- **Forgetting caches and eval datasets** in retention and deletion.
+- **Treating PII detection as perfect.** Measure recall on your data.
+- **Assuming a provider's compliance covers you.** A provider's SOC 2 report covers the provider; your configuration is your responsibility.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Design the failover strategy for an LLM platform that serves both PII-sensitive and general workloads." level="senior">
+
+I classify workloads first. General workloads use a gateway alias backed by two providers or two regions, with retries, cooldowns and automatic fallback; a provider outage costs seconds. PII workloads use an alias restricted to approved processors, for example self-hosted replicas in two zones plus a warm standby region. Their fallback is another approved replica or a durable queue, never a public API, and we accept short degradation in exchange.
+
+For the platform itself, I pick RTO and RPO per component: replicated conversation and audit stores, the gateway database in the standby, weights pre-staged, vector indexes either replicated or rebuildable within the RTO. DNS health checks drive regional failover. We run game days quarterly and record the measured RTO.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Name the stores">
+
+When asked about GDPR deletion or retention, list the stores: logs, traces, invocation logs, caches, vector store, eval datasets, provider side. Candidates who only say "we delete it from the database" lose points.
+
+</Callout>
+
+## Further reading
+
+- AWS whitepaper, Disaster Recovery of Workloads on AWS: https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-workloads-on-aws.html
+- Microsoft Presidio: https://microsoft.github.io/presidio/
+- AWS HIPAA eligible services reference: https://aws.amazon.com/compliance/hipaa-eligible-services-reference/
+- Amazon S3 Object Lock: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html
+- OWASP Top 10 for LLM Applications (sensitive information disclosure): https://owasp.org/www-project-top-10-for-large-language-model-applications/

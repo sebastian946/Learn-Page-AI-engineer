@@ -1,8 +1,8 @@
-<ClientBrief company="Harborline Freight" industry="Logistics / Third-party logistics (3PL)" duration="5 days" />
+<ClientBrief company="Tidewater Freight" industry="Logistics / Third-party logistics (3PL)" duration="5 days" />
 
 ## Company context
 
-Harborline Freight is a fictional mid-size third-party logistics company. It runs four warehouses in the US Midwest and East Coast and ships about 18,000 orders a day for 140 e-commerce brands. It does not own trucks. It books parcel and LTL capacity with six carriers and resells it to its clients.
+Tidewater Freight is a fictional mid-size third-party logistics company. It runs four warehouses in the US Midwest and East Coast and ships about 18,000 orders a day for 140 e-commerce brands. It does not own trucks. It books parcel and LTL capacity with six carriers and resells it to its clients.
 
 The customer operations team has 22 agents. They work a shared inbox and a ticketing system. Most of their day is repetitive: "Where is my order?", "Can you deliver on Friday instead?", "The box arrived damaged", "Please cancel this order before it ships", "What would it cost to ship this pallet to Denver?". Each request needs two to five lookups across the order management system (OMS), carrier APIs and the ticketing tool.
 
@@ -80,7 +80,7 @@ Automate the five most common request types so that at least 60% of inbound oper
 
 ## Suggested architecture
 
-<Diagram caption="Harborline operations agent: intake, LangGraph agent with guards and HITL, tools, logging and evals" chart={`flowchart LR
+<Diagram caption="Tidewater operations agent: intake, LangGraph agent with guards and HITL, tools, logging and evals" chart={`flowchart LR
   subgraph Intake
     M["Mailbox fixtures"] --> P["Parser and intent extractor"]
     Q["Order events queue"] --> P

@@ -1,0 +1,185 @@
+## La unidad de release de una funcionalidad LLM
+
+En un servicio normal, la unidad de release es la imagen del contenedor. En una funcionalidad LLM, el comportamiento depende de más cosas que el código:
+
+- templates de prompt y system prompts;
+- el id del modelo, y qué **snapshot** de ese modelo;
+- parámetros de generación: max tokens, stop sequences, y o bien parámetros de sampling (temperature, para modelos autoalojados o de otros proveedores) o bien el nivel de `effort` (los modelos Claude actuales rechazan los parámetros de sampling);
+- configuración de retrieval (modelo de embeddings, top-k, re-ranker, versión del chunking);
+- schemas de tools para agentes;
+- versión del guardrail;
+- la versión del dataset de evaluación con la que se validó el cambio.
+
+Cambia cualquiera y cambia el comportamiento. Si no puedes decir qué combinación produjo una respuesta dada el martes pasado, no puedes depurarla, auditarla ni revertirla. El Módulo 5 presentó feature flags y versiones de prompts. Esta lección las convierte en **gestión de releases**: un paquete inmutable y versionado que se evalúa, se promueve y se revierte como una unidad.
+
+## Un manifiesto de release
+
+El enfoque robusto más simple es un archivo de manifiesto en git. Fija todo y referencia la evidencia de evaluación.
+
+```yaml
+# releases/claims-summary/2026-10-28.1.yaml
+release: claims-summary@2026-10-28.1
+prompt:
+  registry: mlflow
+  name: claims-summary
+  version: 7
+model:
+  alias: chat-private               # gateway alias (lesson 5)
+  resolved: llama-3.1-8b-instruct-awq@sha256:4f2c...   # pinned weights digest
+params: { temperature: 0.1, max_tokens: 600 }
+retrieval: { embedding_model: text-embed-v3, index: claims-policies-v12, top_k: 6 }
+guardrail: { id: gr-claims, version: "4" }
+eval:
+  dataset: claims-golden@v9
+  report: s3://acme-evals/claims-summary/2026-10-28.1/report.json
+  thresholds: { faithfulness: 0.90, contract_valid: 0.99 }
+```
+
+Este release apunta a un modelo autoalojado, así que `temperature` es válido. Un manifiesto para un alias de Claude registraría `params: { effort: medium, max_tokens: 600 }`, porque los modelos Claude actuales devuelven un 400 ante parámetros de sampling.
+
+Cárgalo y verifícalo en la app al arrancar, y adjunta su id y su hash a cada trace:
+
+```python
+import hashlib
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+class EvalRef(BaseModel):
+    dataset: str
+    report: str
+    thresholds: dict[str, float]
+
+class ReleaseManifest(BaseModel):
+    release: str
+    prompt: dict[str, str | int]
+    model: dict[str, str]
+    params: dict[str, float | int]
+    retrieval: dict[str, str | int]
+    guardrail: dict[str, str]
+    eval: EvalRef
+    content_hash: str = Field(default="", exclude=True)
+
+def load_release(path: Path) -> ReleaseManifest:
+    raw = path.read_bytes()
+    manifest = ReleaseManifest.model_validate(yaml.safe_load(raw))
+    manifest.content_hash = hashlib.sha256(raw).hexdigest()[:12]
+    if "latest" in str(manifest.model.get("resolved", "")):
+        raise ValueError("Pin a model snapshot or digest, never 'latest'.")
+    return manifest
+
+# In tracing: span.set_attribute("release.id", m.release); span.set_attribute("release.hash", m.content_hash)
+```
+
+Ahora cada trace en Langfuse o en tu backend de OpenTelemetry responde "¿qué release produjo esto?". Esa es la base del análisis canary (lección 1), la respuesta a incidentes y las auditorías.
+
+## Registros: dónde viven las versiones
+
+| Registro | Bueno para | Cuidado con |
+|---|---|---|
+| **Git** (archivos de prompt + manifiestos) | Code review, diffs, gates de CI, el rastro de auditoría más simple | Cambiar un prompt requiere un deploy (a menudo es una ventaja, no un defecto) |
+| **MLflow Prompt Registry** | Prompts versionados con alias (`@staging`, `@production`), linaje hacia corridas de evaluación, encaja con equipos en Databricks (Módulo 6) | Los alias se mueven en runtime; tus herramientas de deploy no ven el cambio |
+| **Gestión de prompts de Langfuse / LangSmith** | Versiones de prompts con labels, vinculadas a traces, editables por no ingenieros | La misma advertencia de cambios en runtime; el control de acceso importa |
+| **MLflow Model Registry** (o un registro de digests de pesos) | Pesos autoalojados y adapters con fine-tuning, con versiones y alias | Artefactos grandes; haz mirror de los pesos a tu propio almacenamiento |
+
+Un patrón que funciona con el prompt registry de MLflow:
+
+```python
+import mlflow
+
+prompt = mlflow.genai.register_prompt(
+    name="claims-summary",
+    template=("You summarize insurance claims for adjusters.\n"
+              "Return JSON with keys summary, missing_documents, denial_risk.\n"
+              "Claim:\n{{claim_text}}"),
+    commit_message="Add missing_documents field; shorter summaries",
+    tags={"ticket": "AI-412"},
+)
+mlflow.genai.set_prompt_alias("claims-summary", alias="staging", version=prompt.version)
+
+# The app resolves the alias once at startup (and logs the resolved version)
+p = mlflow.genai.load_prompt("prompts:/claims-summary@production")
+text = p.format(claim_text="...")
+```
+
+Elijas el registro que elijas, sigue dos reglas. Primero, **las versiones son inmutables**: nunca edites la versión 7, crea la versión 8. Segundo, **resuelve los alias al arrancar o al publicar, y luego registra la versión concreta**. Un trace que dice `@production` no te dice nada un mes después.
+
+## Promoción entre entornos
+
+Promover significa mover el **mismo** release de dev a staging y a prod, nunca reconstruirlo por entorno. Es la regla "build once, deploy many" del CI/CD del Módulo 5, aplicada a prompts y modelos.
+
+1. **Dev:** el ingeniero crea la versión 8 del prompt y un manifiesto. CI corre la suite de evaluación offline (Módulo 3) y guarda el reporte.
+2. **Staging:** se despliega el manifiesto. Tests de integración y una evaluación más grande sobre datos de staging. Shadow traffic opcional.
+3. **Prod:** un PR de promoción mueve el alias `production` (o actualiza el manifiesto al que apunta el deployment de prod). El PR debe enlazar un reporte de evaluación aprobado. Rollout canary con gates automáticos (lección 1).
+
+Pon un chequeo de política en CI: una promoción falla si el reporte de evaluación del manifiesto falta, es más viejo que la versión del dataset o está por debajo de los umbrales que declara. Es la regla "nada sin probar en prod", vuelta mecánica.
+
+## Reproducibilidad, con honestidad
+
+Los LLMs no son deterministas, así que "reproducible" no significa salida idéntica. Significa:
+
+- puedes **reconstruir la configuración exacta** (manifiesto, versión del prompt, snapshot del modelo, parámetros);
+- volver a correr la suite de evaluación con esa configuración da **estadísticamente los mismos puntajes** dentro de una tolerancia;
+- cada respuesta de producción es **trazable** a esa configuración.
+
+Dos cosas rompen la reproducibilidad en silencio. Los alias flotantes de modelos en el proveedor (un alias que se mueve solo a un snapshot más nuevo) y los pesos autoalojados sin fijar (descargar "main" desde un model hub). Fija ids de snapshot y digests de pesos. Donde un proveedor ofrece solo un alias flotante, registra la fecha y vuelve a correr las evaluaciones cuando se mueva.
+
+## Rollback
+
+El rollback debe ser **una sola acción, practicada y rápida**:
+
+- Releases basados en imagen: redespliega la imagen anterior o aborta el Rollout.
+- Releases basados en alias: mueve el alias de vuelta a la versión anterior y luego reinicia la app o avísale que vuelva a resolverlo.
+
+Algunos cambios no se revierten limpiamente. Planifícalos antes del release:
+
+- **Cambios de schema de salida** consumidos aguas abajo. Si la versión 8 escribe un campo nuevo en la base de datos, la versión 7 debe tolerar leerlo. Usa cambios expand-then-contract, como en las migraciones de base de datos.
+- **Cambios de modelo de embeddings.** Un modelo de embeddings nuevo necesita reindexar el corpus. Corre los índices viejo y nuevo en paralelo y cambia las lecturas; no re-embebas en el mismo lugar.
+- **Cambios de tools de agentes** con efectos secundarios ya ejecutados. El rollback frena el daño nuevo; no deshace acciones.
+
+## Deprecar un modelo que el proveedor retira
+
+Los proveedores retiran versiones de modelos según un calendario publicado. Anthropic, OpenAI y AWS Bedrock publican páginas de deprecación y ciclo de vida; en Bedrock, los modelos pasan por estados como Active, Legacy y End-of-life. Los plazos de aviso varían según el proveedor y el modelo. Trata un aviso de retiro como un proyecto de migración planificado:
+
+1. **Inventario.** ¿Qué apps, equipos y alias usan el modelo? Los logs del gateway (lección 5) lo responden con una consulta. Sin gateway, estás haciendo grep en repos.
+2. **Elige candidatos.** Normalmente el sucesor recomendado por el proveedor más una alternativa.
+3. **Evalúa.** Corre el golden dataset de cada equipo contra los candidatos. Compara calidad, latencia, costo y longitud de salida. Espera ajustes de prompt.
+4. **Shadow y luego canary** con el proceso de release normal.
+5. **Cambia el alias** para cada consumidor y luego **quita el modelo viejo** de la configuración del gateway y de las listas permitidas de IAM para que nada pueda llamarlo por accidente.
+6. **Agéndalo.** Registra las fechas de retiro en el mismo lugar que los vencimientos de certificados. Enterarte por un 404 en producción es un incidente evitable.
+
+Los retiros de modelos de embeddings son los más caros: obligan a reindexar todo. Presupuesta cómputo y tiempo para eso.
+
+## Errores comunes
+
+- **Editar una versión de prompt en el lugar** desde la UI de un registro. El historial ahora miente.
+- **Registrar el alias en lugar de la versión resuelta.**
+- **Ids de modelo "latest" en configuraciones de producción.**
+- **Promover sin un reporte de evaluación adjunto**, o con un reporte de un dataset más viejo.
+- **Sin inventario de uso de modelos**, así un aviso de retiro se vuelve un simulacro de incendio.
+- **Asumir que el rollback es gratis** en cambios de schema, embeddings o con efectos secundarios.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo versionas y promueves cambios de prompt entre entornos?" level="mid">
+
+Trato el prompt como parte de un paquete de release: versión del prompt, snapshot del modelo, parámetros, configuración de retrieval y versión del guardrail, fijados en un manifiesto. Las versiones de prompts son inmutables en el registro (git o el prompt registry de MLflow), y la app resuelve los alias al arrancar y registra la versión concreta y el id del release en cada trace.
+
+La promoción mueve el mismo paquete de dev a staging y a prod. CI bloquea la promoción salvo que un reporte de evaluación sobre la versión actual del dataset cumpla los umbrales declarados, y el rollout en producción es un canary con rollback automático. Revertir significa mover el alias o redesplegar el paquete anterior, algo que ensayamos.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu proveedor anuncia que retirará el modelo detrás de tres productos internos en cuatro meses. ¿Qué haces?" level="senior">
+
+Primero, inventario: los logs del gateway me dicen qué equipos, keys y alias usan ese modelo y con qué volumen. Luego elijo un sucesor y una alternativa, y corro el golden dataset de cada producto contra ambos, comparando calidad, latencia, costo y formato de salida, ajustando prompts donde haga falta. Cada producto migra por el camino de release normal: shadow, canary con gates, cambio de alias. Fijo plazos internos bastante antes de la fecha de retiro, quito el modelo viejo de la configuración del gateway y de IAM cuando el tráfico llega a cero, y agrego las fechas de retiro a nuestro calendario de seguimiento para que el próximo sea rutina. Si hay un modelo de embeddings afectado, planifico primero una reindexación en paralelo porque es lo que más tarda.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- MLflow Prompt Registry: https://mlflow.org/docs/latest/genai/prompt-registry/
+- MLflow Model Registry: https://mlflow.org/docs/latest/ml/model-registry/
+- Gestión de prompts en Langfuse: https://langfuse.com/docs/prompts/get-started
+- Deprecaciones de modelos de Anthropic: https://docs.anthropic.com/en/docs/about-claude/model-deprecations
+- Ciclo de vida de modelos en Amazon Bedrock: https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle.html

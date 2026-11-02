@@ -1,0 +1,185 @@
+## The release unit of an LLM feature
+
+For a normal service, the release unit is the container image. For an LLM feature, behavior depends on more than code:
+
+- prompt templates and system prompts;
+- the model id, and which **snapshot** of that model;
+- generation parameters: max tokens, stop sequences, and either sampling parameters (temperature, for self-hosted or other providers' models) or the `effort` level (current Claude models reject sampling parameters);
+- retrieval config (embedding model, top-k, re-ranker, chunking version);
+- tool schemas for agents;
+- guardrail version;
+- the eval dataset version the change was validated on.
+
+Change any one and behavior changes. If you cannot say which combination produced a given answer last Tuesday, you cannot debug it, audit it or roll it back. Module 5 introduced feature flags and prompt versions. This lesson turns them into **release management**: one immutable, versioned bundle that is evaluated, promoted and rolled back as a unit.
+
+## A release manifest
+
+The simplest robust approach is a manifest file in git. It pins everything and references the eval evidence.
+
+```yaml
+# releases/claims-summary/2026-10-28.1.yaml
+release: claims-summary@2026-10-28.1
+prompt:
+  registry: mlflow
+  name: claims-summary
+  version: 7
+model:
+  alias: chat-private               # gateway alias (lesson 5)
+  resolved: llama-3.1-8b-instruct-awq@sha256:4f2c...   # pinned weights digest
+params: { temperature: 0.1, max_tokens: 600 }
+retrieval: { embedding_model: text-embed-v3, index: claims-policies-v12, top_k: 6 }
+guardrail: { id: gr-claims, version: "4" }
+eval:
+  dataset: claims-golden@v9
+  report: s3://acme-evals/claims-summary/2026-10-28.1/report.json
+  thresholds: { faithfulness: 0.90, contract_valid: 0.99 }
+```
+
+This release targets a self-hosted model, so `temperature` is valid. A manifest for a Claude alias would record `params: { effort: medium, max_tokens: 600 }` instead, because current Claude models return a 400 for sampling parameters.
+
+Load and verify it in the app at startup, and attach its id and hash to every trace:
+
+```python
+import hashlib
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+class EvalRef(BaseModel):
+    dataset: str
+    report: str
+    thresholds: dict[str, float]
+
+class ReleaseManifest(BaseModel):
+    release: str
+    prompt: dict[str, str | int]
+    model: dict[str, str]
+    params: dict[str, float | int]
+    retrieval: dict[str, str | int]
+    guardrail: dict[str, str]
+    eval: EvalRef
+    content_hash: str = Field(default="", exclude=True)
+
+def load_release(path: Path) -> ReleaseManifest:
+    raw = path.read_bytes()
+    manifest = ReleaseManifest.model_validate(yaml.safe_load(raw))
+    manifest.content_hash = hashlib.sha256(raw).hexdigest()[:12]
+    if "latest" in str(manifest.model.get("resolved", "")):
+        raise ValueError("Pin a model snapshot or digest, never 'latest'.")
+    return manifest
+
+# In tracing: span.set_attribute("release.id", m.release); span.set_attribute("release.hash", m.content_hash)
+```
+
+Now every trace in Langfuse or your OpenTelemetry backend answers "which release produced this?". That is the foundation for canary analysis (lesson 1), incident response and audits.
+
+## Registries: where versions live
+
+| Registry | Good for | Watch out for |
+|---|---|---|
+| **Git** (prompt files + manifests) | Code review, diffs, CI gates, simplest audit trail | Changing a prompt requires a deploy (often a feature, not a bug) |
+| **MLflow Prompt Registry** | Versioned prompts with aliases (`@staging`, `@production`), lineage to eval runs, fits Databricks shops (Module 6) | Aliases move at runtime; your deploy tooling does not see the change |
+| **Langfuse / LangSmith prompt management** | Prompt versions with labels, linked to traces, editable by non-engineers | Same runtime-change caveat; access control matters |
+| **MLflow Model Registry** (or a registry of weight digests) | Self-hosted weights and fine-tuned adapters with versions and aliases | Large artifacts; mirror weights to your own storage |
+
+A working pattern with MLflow's prompt registry:
+
+```python
+import mlflow
+
+prompt = mlflow.genai.register_prompt(
+    name="claims-summary",
+    template=("You summarize insurance claims for adjusters.\n"
+              "Return JSON with keys summary, missing_documents, denial_risk.\n"
+              "Claim:\n{{claim_text}}"),
+    commit_message="Add missing_documents field; shorter summaries",
+    tags={"ticket": "AI-412"},
+)
+mlflow.genai.set_prompt_alias("claims-summary", alias="staging", version=prompt.version)
+
+# The app resolves the alias once at startup (and logs the resolved version)
+p = mlflow.genai.load_prompt("prompts:/claims-summary@production")
+text = p.format(claim_text="...")
+```
+
+Whichever registry you choose, follow two rules. First, **versions are immutable**: never edit version 7, create version 8. Second, **resolve aliases at startup or release time, then log the concrete version**. A trace that says `@production` tells you nothing a month later.
+
+## Environment promotion
+
+Promotion means moving the **same** release from dev to staging to prod, never rebuilding it per environment. This is the "build once, deploy many" rule from Module 5's CI/CD, applied to prompts and models.
+
+1. **Dev:** engineer creates prompt version 8 and a manifest. CI runs the offline eval suite (Module 3) and stores the report.
+2. **Staging:** the manifest is deployed. Integration tests and a larger eval run on staging data. Optional shadow traffic.
+3. **Prod:** a promotion PR moves the `production` alias (or bumps the manifest the prod deployment points to). The PR must link a passing eval report. Canary rollout with automatic gates (lesson 1).
+
+Put a policy check in CI: a promotion fails if the manifest's eval report is missing, older than the dataset version, or below the thresholds it declares. That is the "no untested code in prod" rule, made mechanical.
+
+## Reproducibility, honestly
+
+LLMs are non-deterministic, so "reproducible" does not mean identical output. It means:
+
+- you can **reconstruct the exact configuration** (manifest, prompt version, model snapshot, params);
+- re-running the eval suite on that configuration gives **statistically the same scores** within a tolerance;
+- every production answer is **traceable** to that configuration.
+
+Two things quietly break reproducibility. Floating model aliases at the provider (an alias that silently moves to a newer snapshot) and unpinned self-hosted weights (pulling "main" from a model hub). Pin snapshot ids and weight digests. Where a provider offers only a floating alias, record the date and re-run evals when it moves.
+
+## Rollback
+
+Rollback must be **one action, practiced, and fast**:
+
+- Image-based releases: redeploy the previous image or abort the Rollout.
+- Alias-based releases: move the alias back to the previous version, then restart or signal the app to re-resolve.
+
+Some changes do not roll back cleanly. Plan for them before release:
+
+- **Output schema changes** consumed downstream. If version 8 writes a new field to the database, version 7 must tolerate reading it. Use expand-then-contract changes, like database migrations.
+- **Embedding model changes.** A new embedding model needs a re-indexed corpus. Run old and new indexes side by side and switch reads; do not re-embed in place.
+- **Agent tool changes** with side effects already executed. Rollback stops new damage; it does not undo actions.
+
+## Deprecating a model the provider retires
+
+Providers retire model versions on a published schedule. Anthropic, OpenAI and AWS Bedrock all publish deprecation and lifecycle pages; on Bedrock, models move through lifecycle states such as Active, Legacy and End-of-life. Notice periods vary by provider and model. Treat a retirement notice as a planned migration project:
+
+1. **Inventory.** Which apps, teams and aliases use the model? The gateway logs (lesson 5) answer this in one query. Without a gateway, you are grepping repos.
+2. **Choose candidates.** Usually the provider's recommended successor plus one alternative.
+3. **Evaluate.** Run each team's golden dataset against the candidates. Compare quality, latency, cost and output length. Expect prompt adjustments.
+4. **Shadow, then canary** through the normal release process.
+5. **Switch the alias** for each consumer, then **remove the old model** from the gateway config and IAM allow-lists so nothing can call it by accident.
+6. **Calendar it.** Track retirement dates in the same place as certificate expiries. Finding out from a 404 in production is an avoidable incident.
+
+Embedding model retirements are the most expensive: they force a full re-index. Budget compute and time for it.
+
+## Common mistakes
+
+- **Editing a prompt version in place** in a registry UI. History is now a lie.
+- **Logging the alias instead of the resolved version.**
+- **"latest" model ids in production configs.**
+- **Promoting without an attached eval report**, or with a report from an older dataset.
+- **No inventory of model usage**, so a retirement notice becomes a fire drill.
+- **Assuming rollback is free** for schema, embedding or side-effect changes.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you version and promote prompt changes across environments?" level="mid">
+
+I treat the prompt as part of a release bundle: prompt version, model snapshot, parameters, retrieval config and guardrail version, pinned in a manifest. Prompt versions are immutable in the registry (git or MLflow's prompt registry), and the app resolves aliases at startup and logs the concrete version and release id on every trace.
+
+Promotion moves the same bundle from dev to staging to prod. CI blocks promotion unless an eval report on the current dataset version meets the declared thresholds, and production rollout is a canary with automatic rollback. Rolling back means moving the alias or redeploying the previous bundle, which we rehearse.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your provider announces it will retire the model behind three internal products in four months. What do you do?" level="senior">
+
+First, inventory: gateway logs tell me which teams, keys and aliases use that model and at what volume. Then pick a successor and an alternative, and run each product's golden dataset against both, comparing quality, latency, cost and output format, adjusting prompts where needed. Each product migrates through the normal release path: shadow, canary with gates, alias switch. I set internal deadlines well before the retirement date, remove the old model from gateway config and IAM once traffic hits zero, and add retirement dates to our tracking calendar so the next one is routine. If an embedding model is affected, I plan a parallel re-index first because it is the long pole.
+
+</InterviewQuestion>
+
+## Further reading
+
+- MLflow Prompt Registry: https://mlflow.org/docs/latest/genai/prompt-registry/
+- MLflow Model Registry: https://mlflow.org/docs/latest/ml/model-registry/
+- Langfuse prompt management: https://langfuse.com/docs/prompts/get-started
+- Anthropic model deprecations: https://docs.anthropic.com/en/docs/about-claude/model-deprecations
+- Amazon Bedrock model lifecycle: https://docs.aws.amazon.com/bedrock/latest/userguide/model-lifecycle.html

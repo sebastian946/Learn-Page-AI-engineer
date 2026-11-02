@@ -1,0 +1,227 @@
+[
+  {
+    "id": "m1-iv-01",
+    "level": "mid",
+    "tags": [
+      "tokens",
+      "context-window",
+      "cost"
+    ],
+    "question": {
+      "en": "What is a token, and why should an engineer integrating LLMs care about token counts?",
+      "es": "¿Qué es un token y por qué debería importarle el conteo de tokens a un ingeniero que integra LLMs?"
+    },
+    "answer": {
+      "en": "A token is a sub-word unit from the model's vocabulary. Models read and write tokens, not characters, and tokenizers differ between model families.\n\nToken counts drive three things:\n\n- **Cost**: billing is per input and output token, and output tokens cost several times more.\n- **Latency**: input is processed in parallel, but output is generated token by token, so long answers are slow.\n- **Limits**: the context window, `max_tokens` and rate limits are all measured in tokens.\n\nIn practice I measure token distributions on real samples with the provider's counting endpoint, because JSON, code and non-English text tokenize worse than \"4 characters per token\" suggests. I set explicit context budgets per request and log `usage` on every call.",
+      "es": "Un token es una unidad de sub-palabra del vocabulario del modelo. Los modelos leen y escriben tokens, no caracteres, y los tokenizers difieren entre familias de modelos.\n\nEl conteo de tokens determina tres cosas:\n\n- **Costo**: se cobra por token de entrada y de salida, y los de salida cuestan varias veces más.\n- **Latencia**: la entrada se procesa en paralelo, pero la salida se genera token por token, así que las respuestas largas son lentas.\n- **Límites**: la ventana de contexto, `max_tokens` y los rate limits se miden en tokens.\n\nEn la práctica mido distribuciones de tokens sobre muestras reales con el endpoint de conteo del proveedor, porque el JSON, el código y el texto en otros idiomas se tokenizan peor de lo que sugiere \"4 caracteres por token\". Defino presupuestos de contexto explícitos por request y registro el `usage` en cada llamada."
+    }
+  },
+  {
+    "id": "m1-iv-02",
+    "level": "senior",
+    "tags": [
+      "sampling",
+      "testing",
+      "non-determinism"
+    ],
+    "question": {
+      "en": "A teammate says: \"Just set temperature to 0 and the tests will be deterministic.\" How do you respond?",
+      "es": "Un compañero dice: \"Pon temperature en 0 y los tests serán deterministas.\" ¿Cómo respondes?"
+    },
+    "answer": {
+      "en": "Two problems. First, temperature 0 does not guarantee identical outputs: provider-side batching, floating-point effects and model updates still introduce variation. Second, many current models no longer accept sampling parameters at all; current Claude models reject non-default temperature with a 400 and offer effort as the lever instead. So a shared client must treat sampling as an optional per-model capability.\n\nFor testing, I separate two layers. Plumbing (adapters, retries, parsing, routing) is tested deterministically with a fake provider and recorded responses. Model behavior is tested statistically: an eval set with property-based assertions (valid schema, label in allowed set, no PII) and pass-rate thresholds in CI. It is the same mindset as dealing with flaky tests: assert invariants and track rates, not exact strings.",
+      "es": "Hay dos problemas. Primero, temperature 0 no garantiza salidas idénticas: el batching del proveedor, los efectos de punto flotante y las actualizaciones de modelos siguen introduciendo variación. Segundo, muchos modelos actuales ya no aceptan parámetros de sampling; los modelos actuales de Claude rechazan temperature no predeterminado con un 400 y ofrecen effort como palanca. Así que un cliente compartido debe tratar el sampling como una capacidad opcional por modelo.\n\nPara testear, separo dos capas. La plomería (adaptadores, reintentos, parseo, enrutamiento) se testea de forma determinista con un proveedor falso y respuestas grabadas. El comportamiento del modelo se testea estadísticamente: un set de evals con aserciones basadas en propiedades (schema válido, etiqueta permitida, sin PII) y umbrales de tasa de aprobación en CI. Es la misma mentalidad que con los tests flaky: verificar invariantes y monitorear tasas, no strings exactos."
+    }
+  },
+  {
+    "id": "m1-iv-03",
+    "level": "mid",
+    "tags": [
+      "structured-output",
+      "pydantic",
+      "json-schema"
+    ],
+    "question": {
+      "en": "How do you get reliable structured data out of an LLM?",
+      "es": "¿Cómo obtienes datos estructurados confiables de un LLM?"
+    },
+    "answer": {
+      "en": "I define the contract once as a Pydantic v2 model and generate the JSON Schema from it with `model_json_schema()`. Where the provider supports it, I use schema-constrained decoding (Anthropic `output_config` format or `messages.parse`, OpenAI `response_format` with `json_schema` and strict mode), which guarantees the structure.\n\nThen I still validate with `model_validate_json`, because structure is not meaning: validators enforce formats, ranges and cross-field business rules. I make fields nullable or add an \"unknown\" value so the model is never forced to invent data. I check `stop_reason` for truncation or refusal before parsing. Failures go through a bounded repair loop that sends the validation errors back, and anything still invalid escalates to a fallback instead of flowing downstream.",
+      "es": "Defino el contrato una vez como un modelo Pydantic v2 y genero el JSON Schema con `model_json_schema()`. Donde el proveedor lo soporta, uso decodificación restringida por schema (formato en `output_config` o `messages.parse` de Anthropic, `response_format` con `json_schema` y modo strict en OpenAI), que garantiza la estructura.\n\nLuego igual valido con `model_validate_json`, porque estructura no es significado: los validadores aplican formatos, rangos y reglas de negocio entre campos. Hago campos nulos o agrego un valor \"unknown\" para que el modelo nunca tenga que inventar datos. Reviso `stop_reason` por truncamiento o rechazo antes de parsear. Las fallas pasan por un bucle de reparación acotado que devuelve los errores de validación, y lo que sigue siendo inválido escala a un fallback en lugar de seguir adelante."
+    }
+  },
+  {
+    "id": "m1-iv-04",
+    "level": "mid",
+    "tags": [
+      "tool-calling",
+      "function-calling",
+      "anthropic",
+      "openai"
+    ],
+    "question": {
+      "en": "Explain the tool calling message flow, and the main differences between Anthropic and OpenAI.",
+      "es": "Explica el flujo de mensajes del tool calling y las principales diferencias entre Anthropic y OpenAI."
+    },
+    "answer": {
+      "en": "The model never executes anything. I send messages plus tool definitions (name, description, JSON Schema). The model either answers or requests tools. My code validates the inputs, executes the tools, sends the results back linked by id, and calls the model again until it gives a final answer, with a step limit.\n\nDifferences:\n\n- Anthropic signals with `stop_reason: \"tool_use\"` and `tool_use` blocks whose `input` is already a dict; results go back as `tool_result` blocks with `tool_use_id`, all in one user turn, with `is_error` for failures.\n- OpenAI returns `message.tool_calls` with `arguments` as a JSON string to parse; each result is a separate `role: \"tool\"` message with `tool_call_id`.\n\nIn both, I append the full assistant turn before the results. A provider abstraction hides these shapes behind neutral `ToolCall` and `ToolResult` types.",
+      "es": "El modelo nunca ejecuta nada. Envío mensajes más definiciones de tools (nombre, descripción, JSON Schema). El modelo responde o solicita tools. Mi código valida los inputs, ejecuta las tools, devuelve los resultados vinculados por id y llama al modelo de nuevo hasta que da una respuesta final, con un límite de pasos.\n\nDiferencias:\n\n- Anthropic lo señala con `stop_reason: \"tool_use\"` y bloques `tool_use` cuyo `input` ya es un dict; los resultados vuelven como bloques `tool_result` con `tool_use_id`, todos en un turno de usuario, con `is_error` para las fallas.\n- OpenAI devuelve `message.tool_calls` con `arguments` como string JSON a parsear; cada resultado es un mensaje `role: \"tool\"` separado con `tool_call_id`.\n\nEn ambos, agrego el turno completo del asistente antes de los resultados. Una abstracción de proveedores oculta estas formas detrás de tipos neutrales `ToolCall` y `ToolResult`."
+    }
+  },
+  {
+    "id": "m1-iv-05",
+    "level": "senior",
+    "tags": [
+      "tool-calling",
+      "security",
+      "tool-design"
+    ],
+    "question": {
+      "en": "How do you design tools so that a model uses them correctly and safely?",
+      "es": "¿Cómo diseñas tools para que un modelo las use de forma correcta y segura?"
+    },
+    "answer": {
+      "en": "Correctness starts with a small, sharp tool set: each tool has one clear purpose, a description that says when to use it and when not to, and a strict schema generated from Pydantic. Results are compact and structured, so they don't flood the context.\n\nSafety assumes the model is an untrusted caller:\n\n- Validate inputs server-side and check authorization from the session, never from model-supplied ids alone.\n- Separate read and write tools; write tools get business limits, idempotency keys and confirmation or human approval above thresholds.\n- Treat tool results as untrusted content that may contain prompt injection; they can never change permissions.\n- Bound the loop with step limits, timeouts and token caps.\n- Log every call with arguments, latency and outcome, and include misuse and injection cases in the eval suite.",
+      "es": "La corrección empieza con un conjunto pequeño y preciso de tools: cada una tiene un propósito claro, una descripción que dice cuándo usarla y cuándo no, y un schema estricto generado desde Pydantic. Los resultados son compactos y estructurados para no inundar el contexto.\n\nLa seguridad asume que el modelo es un llamador no confiable:\n\n- Validar los inputs del lado del servidor y verificar la autorización desde la sesión, nunca solo con ids que da el modelo.\n- Separar tools de lectura y escritura; las de escritura llevan límites de negocio, idempotency keys y confirmación o aprobación humana por encima de umbrales.\n- Tratar los resultados de tools como contenido no confiable que puede contener prompt injection; nunca pueden cambiar permisos.\n- Acotar el bucle con límites de pasos, timeouts y topes de tokens.\n- Registrar cada llamada con argumentos, latencia y resultado, e incluir casos de mal uso e inyección en la suite de evals."
+    }
+  },
+  {
+    "id": "m1-iv-06",
+    "level": "mid",
+    "tags": [
+      "streaming",
+      "sse",
+      "timeouts"
+    ],
+    "question": {
+      "en": "Why stream LLM responses, and what does streaming change in your error handling?",
+      "es": "¿Por qué hacer streaming de respuestas LLM y qué cambia el streaming en tu manejo de errores?"
+    },
+    "answer": {
+      "en": "Streaming cuts perceived latency to the time to first token, avoids idle-connection timeouts on long generations, and lets me cancel generation (and billing) when the user leaves.\n\nIt changes error handling in four ways:\n\n- **Timeouts**: I need a time-to-first-token timeout and an idle timeout between chunks, not just a total request timeout.\n- **Mid-stream failures**: a stream can return 200 and fail later. Retrying is only safe before anything reached the user; after that I restart visibly or mark the answer incomplete.\n- **Partial data**: tool inputs arrive as `partial_json` fragments, parsed only after the block stops.\n- **Cancellation and usage**: client disconnects must cancel the upstream stream, and I record partial usage in a `finally` block because those tokens are billed.",
+      "es": "El streaming reduce la latencia percibida al tiempo al primer token, evita timeouts de conexiones inactivas en generaciones largas y me permite cancelar la generación (y la facturación) cuando el usuario se va.\n\nCambia el manejo de errores de cuatro formas:\n\n- **Timeouts**: necesito un timeout de tiempo al primer token y un timeout de inactividad entre chunks, no solo un timeout total.\n- **Fallas a mitad del stream**: un stream puede devolver 200 y fallar después. Reintentar solo es seguro antes de que algo llegue al usuario; después reinicio de forma visible o marco la respuesta como incompleta.\n- **Datos parciales**: los inputs de tools llegan como fragmentos `partial_json`, que se parsean solo cuando el bloque termina.\n- **Cancelación y usage**: las desconexiones del cliente deben cancelar el stream upstream, y registro el usage parcial en un bloque `finally` porque esos tokens se facturan."
+    }
+  },
+  {
+    "id": "m1-iv-07",
+    "level": "senior",
+    "tags": [
+      "prompt-versioning",
+      "system-prompt",
+      "release-management"
+    ],
+    "question": {
+      "en": "How do you version, test and roll out system prompt changes in production?",
+      "es": "¿Cómo versionas, testeas y despliegas cambios de system prompts en producción?"
+    },
+    "answer": {
+      "en": "I treat the system prompt as a software contract. Prompts live as files in the repo with front matter: id, semantic version, owner, target models and the schema version they produce, plus a changelog. Semver has contract meaning: adding a category or renaming a field is MAJOR, behavior changes with the same contract are MINOR, wording with no intended effect is PATCH.\n\nTesting is a pyramid: fast static checks (every label defined, examples validate against the Pydantic schema, no unrendered placeholders), then an eval suite on a golden dataset in CI that compares metrics with the current version and blocks regressions.\n\nProduction pins an exact version via config, and every call logs prompt id, version and a content hash. New versions go out in shadow mode or behind a percentage flag, with monitoring of repair, escalation and override rates, and one-line rollback.",
+      "es": "Trato el system prompt como un contrato de software. Los prompts viven como archivos en el repo con front matter: id, versión semántica, dueño, modelos objetivo y la versión del schema que producen, más un changelog. Semver tiene significado de contrato: agregar una categoría o renombrar un campo es MAJOR, cambios de comportamiento con el mismo contrato son MINOR, redacción sin efecto intencional es PATCH.\n\nEl testing es una pirámide: checks estáticos rápidos (cada etiqueta definida, ejemplos que validan contra el schema Pydantic, sin placeholders sin renderizar), luego una suite de evals sobre un golden dataset en CI que compara métricas con la versión actual y bloquea regresiones.\n\nProducción fija una versión exacta por configuración, y cada llamada registra id del prompt, versión y un hash del contenido. Las nuevas versiones salen en modo shadow o detrás de un flag por porcentaje, monitoreando tasas de reparación, escalamiento y corrección, con rollback de una línea."
+    }
+  },
+  {
+    "id": "m1-iv-08",
+    "level": "senior",
+    "tags": [
+      "provider-abstraction",
+      "architecture",
+      "bedrock"
+    ],
+    "question": {
+      "en": "Design a provider abstraction over Anthropic, OpenAI and Bedrock. What goes in it, and what do you deliberately leave out?",
+      "es": "Diseña una abstracción de proveedores sobre Anthropic, OpenAI y Bedrock. ¿Qué incluye y qué dejas fuera a propósito?"
+    },
+    "answer": {
+      "en": "Ports and adapters. The port is a protocol with `complete` and `stream` over my own types: request (logical model name, messages, tools, optional JSON schema, metadata), response (text, tool calls, normalized stop reason, usage, concrete model id, latency) and stream events. Each adapter maps requests, responses and errors; errors become a small hierarchy with a `retryable` flag. Model ids and capability flags (structured outputs, sampling, max output) live in config under logical names.\n\nAbove the adapters sits the client with cross-cutting policy: retries with jitter (SDK retries off), rate limiting, concurrency caps, timeouts, failover and cost logging.\n\nI deliberately avoid a lowest-common-denominator design: capabilities are flags, and there is a `provider_options` escape hatch for features like prompt caching. And I don't pretend models are interchangeable: every model in a fallback chain must pass the same eval.",
+      "es": "Puertos y adaptadores. El puerto es un protocolo con `complete` y `stream` sobre mis propios tipos: request (nombre lógico de modelo, mensajes, tools, JSON schema opcional, metadata), respuesta (texto, tool calls, stop reason normalizado, usage, id concreto del modelo, latencia) y eventos de stream. Cada adaptador mapea requests, respuestas y errores; los errores se convierten en una jerarquía pequeña con un flag `retryable`. Los ids de modelo y los flags de capacidad (structured outputs, sampling, salida máxima) viven en configuración bajo nombres lógicos.\n\nEncima de los adaptadores está el cliente con las políticas transversales: reintentos con jitter (reintentos del SDK desactivados), rate limiting, límites de concurrencia, timeouts, failover y registro de costos.\n\nEvito a propósito un diseño de mínimo común denominador: las capacidades son flags, y hay una válvula de escape `provider_options` para features como prompt caching. Y no finjo que los modelos son intercambiables: cada modelo de una cadena de fallback debe pasar el mismo eval."
+    }
+  },
+  {
+    "id": "m1-iv-09",
+    "level": "mid",
+    "tags": [
+      "retries",
+      "backoff",
+      "jitter",
+      "reliability"
+    ],
+    "question": {
+      "en": "Describe your retry policy for LLM API calls.",
+      "es": "Describe tu política de reintentos para llamadas a APIs de LLM."
+    },
+    "answer": {
+      "en": "First, classify errors. Retryable: 429, 5xx, provider overloaded (529 on Anthropic), timeouts and connection errors. Never retryable: 400, 401, 403, 404, because they are my bug or my credentials.\n\nThen backoff: exponential with full jitter, `uniform(0, min(cap, base * 2**attempt))`, so clients don't retry in synchronized waves. If the response includes `retry-after`, that is the minimum wait.\n\nBounds: a maximum number of attempts and a total deadline that matches the caller's SLO. A user-facing call cannot sleep 30 seconds.\n\nOne layer only: I disable SDK retries when my client owns them, to avoid multiplied calls. Every retry is logged with provider, status and delay. When retries are exhausted, I fail over to an evaluated alternative model or degrade gracefully. Side-effecting tools need idempotency keys before they can be retried.",
+      "es": "Primero, clasifico los errores. Reintentables: 429, 5xx, proveedor sobrecargado (529 en Anthropic), timeouts y errores de conexión. Nunca reintentables: 400, 401, 403, 404, porque son mi bug o mis credenciales.\n\nLuego el backoff: exponencial con full jitter, `uniform(0, min(cap, base * 2**attempt))`, para que los clientes no reintenten en olas sincronizadas. Si la respuesta incluye `retry-after`, esa es la espera mínima.\n\nLímites: un número máximo de intentos y una fecha límite total acorde al SLO de quien llama. Una llamada de cara al usuario no puede dormir 30 segundos.\n\nUna sola capa: desactivo los reintentos del SDK cuando mi cliente se encarga, para evitar llamadas multiplicadas. Cada reintento se registra con proveedor, status y espera. Cuando se agotan los reintentos, hago failover a un modelo alternativo evaluado o degrado elegantemente. Las tools con efectos secundarios necesitan idempotency keys antes de poder reintentarse."
+    }
+  },
+  {
+    "id": "m1-iv-10",
+    "level": "senior",
+    "tags": [
+      "rate-limits",
+      "token-bucket",
+      "capacity-planning"
+    ],
+    "question": {
+      "en": "Your service runs on 6 replicas sharing one provider quota and hits 429 storms at peak. How do you fix it?",
+      "es": "Tu servicio corre en 6 réplicas que comparten una cuota del proveedor y sufre tormentas de 429 en horas pico. ¿Cómo lo resuelves?"
+    },
+    "answer": {
+      "en": "First, find which budget is exhausted: requests, input tokens or output tokens per minute. The rate-limit headers and my usage logs tell me. Then shape traffic instead of reacting to 429s.\n\nEach replica currently assumes it owns the whole quota. Options: a shared limiter (a Redis-backed token bucket keyed by model, for requests and estimated input tokens), or a static split of the quota per replica with headroom. Within each replica, a semaphore caps concurrency so a burst cannot fire hundreds of calls.\n\nRetries must respect `retry-after` and use jitter, otherwise they amplify the storm. I would also prioritize: interactive traffic first, batch work through a queue that drains below the limit, or through the provider's batch API. Longer term: prompt caching and shorter outputs reduce token pressure, and I would ask for a higher tier with data from the usage dashboard.",
+      "es": "Primero, identifico qué presupuesto se agota: requests, tokens de entrada o tokens de salida por minuto. Me lo dicen los headers de rate limit y mis logs de usage. Luego doy forma al tráfico en lugar de reaccionar a los 429.\n\nHoy cada réplica asume que tiene toda la cuota. Opciones: un limitador compartido (un token bucket respaldado en Redis por modelo, para requests y tokens de entrada estimados), o una división estática de la cuota por réplica con margen. Dentro de cada réplica, un semáforo limita la concurrencia para que una ráfaga no dispare cientos de llamadas.\n\nLos reintentos deben respetar `retry-after` y usar jitter; si no, amplifican la tormenta. También priorizaría: primero el tráfico interactivo, y el trabajo batch por una cola que drene por debajo del límite, o por la batch API del proveedor. A largo plazo: prompt caching y salidas más cortas reducen la presión de tokens, y pediría un tier más alto con datos del dashboard de uso."
+    }
+  },
+  {
+    "id": "m1-iv-11",
+    "level": "mid",
+    "tags": [
+      "async",
+      "asyncio",
+      "concurrency",
+      "httpx"
+    ],
+    "question": {
+      "en": "How do you run thousands of LLM calls concurrently in Python without hurting the provider or yourself?",
+      "es": "¿Cómo ejecutas miles de llamadas LLM de forma concurrente en Python sin dañar al proveedor ni a ti mismo?"
+    },
+    "answer": {
+      "en": "Async Python, because the work is waiting, not computing. I create one SDK or `httpx.AsyncClient` and reuse it so connections are pooled. An `asyncio.Semaphore` caps calls in flight, sized from my rate limits and measured with a pilot; a token bucket caps throughput.\n\nEvery call gets an end-to-end deadline with `asyncio.timeout`, because httpx read timeouts are per chunk, not total. For independent batch items I use `gather(return_exceptions=True)` so one failure doesn't cancel the rest; for parts of one operation I use `TaskGroup`.\n\nI never call blocking libraries like `boto3` or `requests` directly in a coroutine; they go through `asyncio.to_thread`. I don't swallow `CancelledError`, I write results incrementally so the job is resumable, and I log usage and cost per call.",
+      "es": "Python async, porque el trabajo es esperar, no calcular. Creo un solo cliente del SDK o `httpx.AsyncClient` y lo reutilizo para que las conexiones se agrupen en un pool. Un `asyncio.Semaphore` limita las llamadas en vuelo, dimensionado según mis rate limits y medido con un piloto; un token bucket limita el throughput.\n\nCada llamada tiene una fecha límite de extremo a extremo con `asyncio.timeout`, porque los timeouts de lectura de httpx son por chunk, no totales. Para ítems independientes de un batch uso `gather(return_exceptions=True)` para que una falla no cancele el resto; para partes de una misma operación uso `TaskGroup`.\n\nNunca llamo librerías bloqueantes como `boto3` o `requests` directamente en una corrutina; pasan por `asyncio.to_thread`. No me trago `CancelledError`, escribo resultados de forma incremental para que el job sea reanudable, y registro usage y costo por llamada."
+    }
+  },
+  {
+    "id": "m1-iv-12",
+    "level": "mid",
+    "tags": [
+      "cost",
+      "observability",
+      "attribution"
+    ],
+    "question": {
+      "en": "How do you track and attribute LLM cost in production?",
+      "es": "¿Cómo monitoreas y atribuyes el costo de LLM en producción?"
+    },
+    "answer": {
+      "en": "Every call goes through one client that returns normalized usage: input, output, cache read and cache write tokens. Cost is computed with `Decimal` from a dated pricing config; prices are never hard-coded, and an unknown model raises an alert instead of costing $0. Thinking tokens are billed as output, so they are included.\n\nEach attempt emits a structured record: request id, feature, prompt version, tenant, provider, the concrete model used, attempt number, tokens, latency and cost. `feature` is mandatory in the client.\n\nFrom those records I report cost per 1k requests per feature, cost per successful task (including retries, repairs and escalations), overhead share and token percentiles per prompt version. I add daily budgets with alerts per feature and reconcile monthly against the provider invoice to catch missing token categories.",
+      "es": "Cada llamada pasa por un único cliente que devuelve usage normalizado: tokens de entrada, salida, lectura y escritura de caché. El costo se calcula con `Decimal` desde una configuración de precios fechada; los precios nunca se codifican, y un modelo desconocido levanta una alerta en lugar de costar $0. Los tokens de thinking se cobran como salida, así que están incluidos.\n\nCada intento emite un registro estructurado: id del request, feature, versión de prompt, tenant, proveedor, el modelo concreto usado, número de intento, tokens, latencia y costo. `feature` es obligatorio en el cliente.\n\nCon esos registros reporto costo por 1k requests por feature, costo por tarea exitosa (incluyendo reintentos, reparaciones y escalamientos), proporción de overhead y percentiles de tokens por versión de prompt. Agrego presupuestos diarios con alertas por feature y concilio mensualmente contra la factura del proveedor para detectar categorías de tokens faltantes."
+    }
+  },
+  {
+    "id": "m1-iv-13",
+    "level": "senior",
+    "tags": [
+      "model-cascade",
+      "confidence",
+      "calibration",
+      "fallback"
+    ],
+    "question": {
+      "en": "You classify support tickets with a cheap model and escalate uncertain ones to a stronger model. How do you decide what \"uncertain\" means?",
+      "es": "Clasificas tickets de soporte con un modelo barato y escalas los inciertos a un modelo más fuerte. ¿Cómo decides qué significa \"incierto\"?"
+    },
+    "answer": {
+      "en": "I don't trust self-reported confidence as-is: models are often overconfident. I combine calibrated confidence with hard signals.\n\nCalibration: on a labeled calibration set, I bucket predictions by stated confidence and measure actual accuracy per bucket. The threshold is the lowest confidence where accuracy meets the target. Then I sweep the threshold and plot escalation rate, cost per 1k and macro-F1, and pick the knee.\n\nHard signals escalate regardless of confidence: a validation repair was needed, or the category is high-risk (fraud, billing, safety). Those rules live in code, so a prompt change cannot weaken them. If the strong model is still below its threshold, or the tiers disagree on a high-risk label, the ticket goes to a human queue.\n\nI report results on a separate test set and monitor override rates in production, since calibration drifts.",
+      "es": "No confío en la confianza autodeclarada tal cual: los modelos suelen ser demasiado confiados. Combino confianza calibrada con señales duras.\n\nCalibración: en un set de calibración etiquetado, agrupo las predicciones por confianza declarada y mido la precisión real por grupo. El umbral es la confianza más baja donde la precisión alcanza la meta. Luego barro el umbral, grafico tasa de escalamiento, costo por 1k y macro-F1, y elijo el codo.\n\nLas señales duras escalan sin importar la confianza: se necesitó una reparación de validación, o la categoría es de alto riesgo (fraude, facturación, seguridad). Esas reglas viven en código, para que un cambio de prompt no pueda debilitarlas. Si el modelo fuerte sigue por debajo de su umbral, o los niveles discrepan en una etiqueta de alto riesgo, el ticket va a una cola humana.\n\nReporto resultados en un set de prueba separado y monitoreo las tasas de corrección en producción, porque la calibración deriva."
+    }
+  }
+]

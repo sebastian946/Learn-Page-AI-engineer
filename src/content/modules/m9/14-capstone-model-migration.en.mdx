@@ -1,0 +1,140 @@
+<ClientBrief company="Lexora" industry="Legal tech / Contract intelligence" duration="5 days" />
+
+## Company context
+
+Lexora is a fictional legal-tech SaaS company. Mid-size law firms and in-house legal teams upload commercial contracts, and Lexora's **Clause Extract** feature returns two things for each document:
+
+1. A structured record of **14 fields**: parties, effective date, term, renewal type (auto, manual, none), renewal notice days, termination for convenience (yes/no), termination notice days, governing law, liability cap (amount or multiple of fees), liability cap carve-outs, indemnification (mutual, one-way, none), confidentiality term, assignment restrictions, and payment terms.
+2. A **risk summary** of 3–5 sentences that flags unusual or one-sided terms for the reviewing lawyer.
+
+Clause Extract processes roughly 180,000 documents a month. It runs on a large, expensive model today (`BASELINE_MODEL` in config). Lawyers review every record before it reaches a client, and their corrections are logged. Model spend is now the largest line in the cost of goods sold, and the product team wants to move to a cheaper or newer model (`CANDIDATE_MODEL`, for example a smaller tier from the same provider or a model from another provider; read both from config and check current pricing at report time).
+
+Last year a prompt change shipped based on "it looked fine on 30 examples". It quietly broke liability-cap extraction for scanned leases. Two enterprise customers noticed before Lexora did. Nobody wants a repeat. You have been hired to produce a **decision-grade evaluation**: one that a lawyer, a CFO and a staff engineer will all accept.
+
+## Stakeholders
+
+| Stakeholder | Role | What they care about |
+|---|---|---|
+| Dana Okafor | VP Product | A clear go/no-go, the savings, and a rollout plan that protects key accounts |
+| Miguel Herrera | Senior counsel, Head of Legal Ops | Critical fields (liability cap, renewal, termination, indemnification) must not get worse; summaries must not invent risk or miss it |
+| Priya Nair | Finance partner | Cost per 1,000 documents, with assumptions she can audit |
+| Tomás Rivera | Staff ML engineer | Reproducible pipeline, honest statistics, a judge he can trust |
+| Grace Liu | Customer Success lead | Enterprise customers with many scanned leases and Spanish-language contracts |
+| Security and compliance | Data protection | Client documents are confidential; only the anonymized evaluation set may leave the production environment |
+
+## Business goal
+
+Decide, with quantified risk, whether Clause Extract can move to the candidate model. The target is to cut model cost per 1,000 documents by **at least 40%** without a meaningful quality loss, and to know exactly **where** the candidate is weaker so the rollout can avoid or mitigate those segments.
+
+## Functional requirements
+
+1. **Evaluation dataset.** 600 anonymized contracts from design partners who consented to evaluation use. 400 already have gold records derived from lawyer-corrected outputs; you label or adjudicate 200 more to fill segment gaps. Tag every document with segments: contract type (NDA, MSA, SaaS agreement, commercial lease), length (under 10 pages, 10–40, over 40), language (English, Spanish), source quality (native digital, scanned OCR).
+2. **Sample-size justification.** Before running anything, estimate from a pilot of 60 documents how many documents you need to test non-inferiority on overall field F1 and on critical-field recall. Explain the result in the report.
+3. **Task metrics for extraction.** Field-level precision, recall and F1 with versioned, unit-tested normalizers (dates, amounts, durations, jurisdictions). Critical fields reported separately. A wrong value counts as both a false positive and a false negative.
+4. **Human-labeled summary subset.** 150 documents, both models' summaries, labeled blind by two annotators (paralegals or, in your lab version, you plus one other person) on `accurate` (yes/no) and `risk_coverage` (anchored 1–4) using a versioned guideline. Adjudicate disagreements. Report Cohen's kappa and Krippendorff's alpha with CIs.
+5. **Calibrated judge.** A reference-guided judge jury (at least two providers, not only the candidate's family) for summary accuracy and risk coverage. Calibrate it against the adjudicated labels per segment. Use it to score all 600 documents, and correct the headline summary metrics with prediction-powered inference using the human-labeled subset.
+6. **Statistical comparison.** Paired comparisons per document: paired bootstrap CIs on the difference in field F1, critical-field recall and summary metrics; exact McNemar on document-level critical-field correctness. Non-inferiority margins agreed up front (see below). Holm correction across the primary hypotheses.
+7. **Robustness.** Metamorphic and perturbation checks on at least 100 documents: OCR-style noise, clause reordering, party-name swaps and currency format changes. Report violation rates for both models.
+8. **Cost and latency.** Per-document input and output tokens, cost (from current published prices, with the date), and latency p50/p95 measured at realistic concurrency. Cost per 1,000 documents and cost per *correct* critical-field record.
+9. **Segment risk analysis.** Every metric broken down by segment with CIs, plus a risk register: segments where the candidate is non-inferior, inconclusive or worse.
+10. **Go/no-go report.** A stakeholder-ready report with a decision of GO, CONDITIONAL GO (with named conditions and segments) or NO-GO, and a rollout and monitoring plan.
+
+## Non-functional requirements
+
+| Requirement | Target |
+|---|---|
+| Non-inferiority, overall field F1 | Lower bound of the 95% paired CI of (candidate minus baseline) above minus 1.5 points |
+| Non-inferiority, critical-field recall | Lower bound above minus 2.0 points, overall and in every segment with at least 60 documents |
+| Summary accuracy (PPI-corrected) | Lower bound above minus 3.0 points |
+| Cost | At least 40% lower cost per 1,000 documents than baseline |
+| Latency | p95 under 25 seconds per document at 10 concurrent requests |
+| Judge quality | Jury vs adjudicated gold kappa at least 0.6 overall and not more than 0.1 below human-human kappa in any reported segment |
+| Reproducibility | One command reproduces every number in the report from cached model outputs |
+| Data handling | Only the anonymized set is used; no client data in the repo; outputs cached locally and gitignored if they contain document text |
+
+## Out of scope
+
+- Changing the extraction schema or the product UI.
+- Fine-tuning any model.
+- Prompt optimization beyond one adaptation pass for the candidate (you may port the prompt to the candidate's best practices, but log the change; the same prompt version must be used for every reported run).
+- Production deployment. You deliver the evaluation, the decision and the rollout plan.
+
+## Deliverables
+
+1. Repository `model-migration-eval` with the pipeline, tests, guideline, rubric versions and cached results.
+2. `reports/DECISION.md`: the go/no-go report (structure below).
+3. `reports/EXEC_SUMMARY.md`: one page for Dana and Priya, no jargon.
+4. `reports/risk_register.csv`: segment, metric, estimate, CI, status, mitigation.
+5. `reports/rollout_plan.md`: shadow mode, canary by segment, rollback triggers, monitoring.
+6. A 10-minute walkthrough recording or slide outline (optional but recommended for interviews).
+
+`DECISION.md` structure: decision and conditions in the first 5 lines; what was compared (model ids, prompt versions, dates); dataset and segments; metrics and margins; results table with CIs; segment table; judge calibration; robustness; cost and latency; risks and mitigations; limitations; appendix with methods.
+
+## Acceptance criteria
+
+- Margins, primary metrics and the decision rule are committed **before** the first full run (a dated `PREREGISTRATION.md`).
+- Both models run on exactly the same 600 documents with the same prompt version; all analyses are paired.
+- Every reported metric has a 95% CI computed by resampling documents.
+- Human agreement, judge calibration and PPI correction are reported with their numbers, not just "validated".
+- At least one segment-level finding is explained with concrete examples (document ids and field diffs).
+- Cost per 1,000 documents shows token counts, prices used and their date.
+- The decision follows mechanically from the preregistered rules, and any judgment call is labeled as such.
+
+## Suggested architecture
+
+<Diagram caption="Model migration evaluation pipeline" chart={`flowchart LR
+  A["Anonymized contracts (600)"] --> B["Segment tagger"]
+  B --> C["Runner: baseline + candidate (cached, repeated)"]
+  C --> D["Extraction metrics (field F1, normalizers)"]
+  C --> E["Summary judge jury"]
+  H["Human labels (150, adjudicated)"] --> F["Judge calibration + PPI"]
+  E --> F
+  C --> G["Metamorphic + perturbation checks"]
+  C --> I["Cost and latency logger"]
+  D --> J["Paired statistics (bootstrap, McNemar, Holm)"]
+  F --> J
+  G --> J
+  I --> J
+  J --> K["Segment risk register"]
+  K --> L["DECISION.md + exec summary"]`} />
+
+## Evaluation rubric
+
+| Area | Weight | Excellent looks like |
+|---|---|---|
+| Eval design and preregistration | 15% | Clear decision, margins agreed up front, metrics mapped to business risk, sample size justified from a pilot |
+| Extraction metrics | 15% | Field-level metrics with tested normalizers, critical fields separate, support counts everywhere |
+| Human evaluation | 15% | Versioned guideline with borderline examples, blind double labeling, agreement with CIs, adjudication trail |
+| Judge quality | 15% | Multi-provider jury, calibration per segment, PPI-corrected headline, judge versions pinned |
+| Statistical rigor | 20% | Paired analyses, correct resampling unit, non-inferiority logic, multiple-comparison control, honest "inconclusive" calls |
+| Cost, latency and robustness | 10% | Reproducible cost model with dated prices, realistic latency test, metamorphic violation rates for both models |
+| Communication | 10% | Decision in five lines, segment risks a non-specialist can act on, rollout and rollback plan |
+
+## Suggested timeline
+
+**Day 1: design and data.** Write `PREREGISTRATION.md` with stakeholders' margins. Build the dataset loader, segment tags and normalizers with unit tests. Run the 60-document pilot on both models and compute the sample-size estimate.
+
+**Day 2: runs and extraction metrics.** Run both models on all documents with caching and 2 repeats on a 100-document subset for variance. Compute field metrics, critical-field recall and paired CIs. Record cost and latency.
+
+**Day 3: human labels and judge.** Finalize the guideline, collect double labels on 150 summaries, adjudicate, compute agreement. Build and calibrate the judge jury per segment. Score all summaries and apply PPI.
+
+**Day 4: robustness and segments.** Run metamorphic and perturbation checks. Build the segment table and risk register. Investigate the worst segment with concrete examples.
+
+**Day 5: decision and communication.** Apply the preregistered decision rule, write `DECISION.md`, the executive summary and the rollout plan. Do a dry run of the walkthrough.
+
+## Definition of Done
+
+<Checklist id="m9-14-dod" title="Definition of Done" items={["PREREGISTRATION.md with margins, primary metrics and decision rule is committed before the first full run", "Sample size is justified from a pilot and the discordant rate", "Both models ran on the same documents with the same prompt version; every comparison is paired", "Field-level metrics use versioned, unit-tested normalizers; critical fields are reported separately", "150 summaries were double-labeled blind and adjudicated; kappa and alpha are reported with CIs", "The judge jury uses at least two providers and is calibrated per segment against adjudicated labels", "Headline summary metrics are PPI-corrected", "Every metric has a 95% CI from resampling documents; Holm correction is applied to primary hypotheses", "Metamorphic and perturbation violation rates are reported for both models", "Cost per 1,000 documents shows tokens, prices and their date; p95 latency was measured under concurrency", "The risk register lists every segment as non-inferior, inconclusive or worse, with mitigations", "DECISION.md states GO, CONDITIONAL GO or NO-GO in the first five lines and follows the preregistered rule", "One command reproduces all numbers from cached outputs, and no client data is committed"]} />
+
+## How to present this in an interview
+
+Open with the decision and the money: "The candidate cuts model cost per 1,000 documents by roughly X% and is non-inferior on overall field F1, but on scanned leases its liability-cap recall is inconclusive, so we recommended a conditional go that keeps scanned leases on the baseline until we have more data." That sentence shows business framing, statistics and risk management at once.
+
+Then walk through the four ideas that make the evaluation decision-grade:
+
+1. **Preregistration.** Margins and the decision rule were agreed with the senior counsel and finance before any results existed. Nobody could move the goalposts.
+2. **Paired statistics and non-inferiority.** Same documents, per-document differences, CIs from resampling documents, and a margin instead of "is it significantly better?". Mention the sample-size estimate from the pilot.
+3. **Humans and judges.** Blind double labeling with measured agreement, a multi-provider jury calibrated per segment, and PPI to correct the judge's bias on the headline number. Mention self-preference bias as the reason the candidate's family could not judge alone.
+4. **Segments and robustness.** The average hid a weak segment. Metamorphic tests showed the candidate was more sensitive to OCR noise. That finding shaped the rollout.
+
+Expect follow-ups such as "what if the CI had crossed the margin overall?" (answer: inconclusive, collect more data or no-go, never "close enough"), "how did you choose the margin?" (from the cost of errors and the existing lawyer correction rate, agreed with stakeholders), and "how would you monitor after rollout?" (shadow mode, sampled production review with weights, segment dashboards, rollback triggers). Bring one concrete example of a field diff: interviewers remember specifics.

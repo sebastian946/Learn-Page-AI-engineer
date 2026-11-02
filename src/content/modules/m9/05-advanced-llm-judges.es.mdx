@@ -25,14 +25,16 @@ G-Eval (Liu et al., 2023) tiene dos ideas que vale la pena conservar:
 Un patrón relacionado es la **descomposición**: en lugar de un puntaje holístico, el juez extrae afirmaciones y verifica cada una (así funcionan por dentro las métricas de faithfulness de Ragas y DeepEval). Los juicios descompuestos son más fáciles de auditar, porque puedes señalar la afirmación exacta sin respaldo.
 
 ```python
+from typing import Literal
+
 import anthropic
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 client = anthropic.AsyncAnthropic()
 
 class JudgeOut(BaseModel):
     steps: list[str]
-    score: int = Field(ge=1, le=4)
+    score: Literal[1, 2, 3, 4]
 
 RUBRIC_V3 = """You grade the ACCURACY of a contract clause summary.
 Follow these evaluation steps in order and write one line per step:
@@ -44,25 +46,27 @@ Follow these evaluation steps in order and write one line per step:
    3 = all claims supported, one minor omission
    2 = one unsupported claim, or a key point missing
    1 = any contradicted claim (amounts, parties, dates, obligations)
-Return only JSON: {"steps": ["..."], "score": 1-4}"""
+Put one line per step in "steps", then the score."""
 
 async def judge_accuracy(model: str, clause: str, reference: str, candidate: str, samples: int = 3) -> float:
     scores: list[int] = []
     for _ in range(samples):
-        msg = await client.messages.create(
-            model=model,
-            max_tokens=800,
+        msg = await client.messages.parse(        # structured output, validated against JudgeOut
+            model=model,                            # pinned id; no temperature (Claude rejects it)
+            max_tokens=4000,
             system=RUBRIC_V3,
+            output_format=JudgeOut,
+            output_config={"effort": "medium"},     # fixed effort level, stored with the results
             messages=[{"role": "user", "content": (
                 f"<clause>\n{clause}\n</clause>\n<reference>\n{reference}\n</reference>\n"
                 f"<candidate>\n{candidate}\n</candidate>"
             )}],
         )
-        scores.append(JudgeOut.model_validate_json(msg.content[0].text).score)
+        scores.append(msg.parsed_output.score)
     return sum(scores) / len(scores)  # sampling average as a stand-in for probability weighting
 ```
 
-En producción, usa tool use o structured outputs en lugar de parsear texto libre, y guarda en caché por `(judge model, rubric hash, item id, sample index)`.
+`messages.parse` usa structured outputs, así que el veredicto siempre cumple el esquema; nunca fuerces una tool call para obtener JSON (el `tool_choice` forzado devuelve un 400 en los modelos Opus y Sonnet actuales). Tampoco hay `temperature`: los modelos Claude actuales rechazan los parámetros de muestreo, así que la varianza se controla con el id de modelo fijado, la rúbrica versionada, un nivel de effort fijo y las muestras repetidas. Guarda en caché por `(judge model, rubric hash, effort, item id, sample index)`.
 
 ## Ensambles de jueces (jurados)
 
@@ -128,7 +132,7 @@ Tu juez es una dependencia. Los proveedores lanzan versiones nuevas y retiran la
 
 Trata al juez como cualquier dependencia versionada con una prueba de contrato:
 
-1. **Fija un id de modelo exacto** y guárdalo, junto con el hash de la rúbrica y los parámetros de muestreo, con cada resultado.
+1. **Fija un id de modelo exacto** y guárdalo, junto con el hash de la rúbrica y el nivel de effort (más los parámetros de muestreo en jueces no Claude que los acepten), con cada resultado.
 2. Mantén un **set de calibración del juez** congelado (100–300 ítems etiquetados por humanos, repartidos entre segmentos).
 3. Cuando el modelo juez tenga que cambiar, corre el juez viejo y el nuevo sobre el set de calibración. Reporta el kappa de cada uno contra humanos y el kappa entre los dos jueces.
 4. Si el nuevo juez es aceptable, **vuelve a puntuar el baseline** con él antes de comparar cualquier corrida nueva. Nunca compares puntajes producidos por jueces distintos.

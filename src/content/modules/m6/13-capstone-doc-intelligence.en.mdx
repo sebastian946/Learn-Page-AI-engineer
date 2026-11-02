@@ -1,6 +1,6 @@
-<ClientBrief company="Harborline Mutual" industry="Insurance / Property & casualty claims" duration="5 days" />
+<ClientBrief company="Keystone Mutual" industry="Insurance / Property & casualty claims" duration="5 days" />
 
-You are a contract AI engineer. Harborline Mutual wants a pipeline that reads claim documents, extracts the fields adjusters type by hand today, and answers adjusters' questions about a claim with citations. Their data platform is Databricks, governed by Unity Catalog. If you do not have a workspace, build the same system on the local stack described below — the brief, the requirements and the rubric do not change.
+You are a contract AI engineer. Keystone Mutual wants a pipeline that reads claim documents, extracts the fields adjusters type by hand today, and answers adjusters' questions about a claim with citations. Their data platform is Databricks, governed by Unity Catalog. If you do not have a workspace, build the same system on the local stack described below — the brief, the requirements and the rubric do not change.
 
 <Callout type="warning" title="Databricks APIs evolve">
 
@@ -10,11 +10,11 @@ Vector Search, Model Serving, MLflow 3 and the Agent Framework change frequently
 
 ## Company context
 
-Harborline Mutual is a regional property and casualty insurer (fictional) with about 1,200 employees and 400,000 active homeowner and auto policies. It handles roughly 6,000 new claims per month. Each claim arrives as a bundle of PDFs: a **first notice of loss (FNOL) form**, **adjuster field reports**, **repair estimates**, photos with captions, and the relevant **policy document** with its endorsements.
+Keystone Mutual is a regional property and casualty insurer (fictional) with about 1,200 employees and 400,000 active homeowner and auto policies. It handles roughly 6,000 new claims per month. Each claim arrives as a bundle of PDFs: a **first notice of loss (FNOL) form**, **adjuster field reports**, **repair estimates**, photos with captions, and the relevant **policy document** with its endorsements.
 
 Today, intake staff open each PDF and type 15–20 fields into the claims system. It takes 12–20 minutes per claim and errors are common (wrong policy number, missed date of loss). When adjusters need to know "is this covered?", they search 40-page policy PDFs by hand.
 
-Harborline already lands documents in cloud storage and runs its data warehouse on Databricks. Security insists that claim data stays inside the governed platform, that access is auditable, and that no personal data is sent to systems outside approved endpoints.
+Keystone already lands documents in cloud storage and runs its data warehouse on Databricks. Security insists that claim data stays inside the governed platform, that access is auditable, and that no personal data is sent to systems outside approved endpoints.
 
 ## Stakeholders
 
@@ -104,7 +104,7 @@ Cut manual intake time by at least 60% by pre-filling structured claim fields fr
 
 ## Suggested architecture
 
-<Diagram caption="Harborline document intelligence pipeline" chart={`flowchart LR
+<Diagram caption="Keystone document intelligence pipeline" chart={`flowchart LR
   subgraph Ingest
     A["Claim PDFs"] --> B["UC Volume raw_docs"]
     B --> C["Auto Loader to bronze_docs"]

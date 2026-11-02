@@ -9,7 +9,7 @@ As an SDET you already think this way about flaky tests. One red run proves litt
 An eval score moves for two different reasons:
 
 1. **Sampling variance of the dataset.** Your 200 items are a sample of all possible inputs. A different 200 would give a different score. This is usually the bigger source.
-2. **Generation variance.** The same item gives different outputs across runs. Temperature 0 reduces it but does not remove it: batching, hardware and provider-side changes still cause variation. Judges add their own variance on top.
+2. **Generation variance.** The same item gives different outputs across runs. You usually cannot switch it off: current Claude models reject `temperature`, `top_p` and `top_k` (a 400 error), and even on providers or self-hosted models that accept `temperature=0`, batching, hardware and provider-side changes still cause variation. Judges add their own variance on top. Control it the way you control a flaky environment: pin the exact model id, version the prompt and rubric, fix the `output_config.effort` level (on Claude, effort is the cost/quality lever, not a variance knob), run each item `n` times and report confidence intervals.
 
 Measure both before you trust a gate. The cheapest experiment is an **A/A test**: run the same configuration twice and compare. If A vs A shows a 2-point "difference", any change smaller than that is noise. This is the eval version of running your suite ten times on an unchanged commit to measure the flake rate.
 
@@ -163,7 +163,7 @@ Also watch **segment fishing**. If the overall result is flat and you slice by 1
 - **Comparing two overlapping CIs and calling it a test.** Two separate intervals can overlap while the paired difference is clearly significant. Test the difference directly.
 - **Resampling runs or turns instead of items.** Intervals come out far too narrow.
 - **Peeking.** Checking the p-value after every 20 items and stopping when it dips under 0.05 inflates false positives. Fix `n` in advance or use a sequential method on purpose.
-- **Treating temperature 0 as deterministic.** Measure the A/A noise floor.
+- **Assuming outputs are deterministic** (or that a sampling parameter will make them so). Measure the A/A noise floor and sample each item several times.
 - **"No significant difference, so they are the same."** Without power or a non-inferiority margin, that conclusion is unsupported.
 - **Reporting p-values without effect sizes and intervals.**
 

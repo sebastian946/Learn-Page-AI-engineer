@@ -9,7 +9,7 @@ Como SDET ya piensas así sobre las pruebas flaky. Una corrida en rojo prueba po
 Un puntaje de eval se mueve por dos razones distintas:
 
 1. **Varianza de muestreo del dataset.** Tus 200 ítems son una muestra de todas las entradas posibles. Otros 200 darían otro puntaje. Esta suele ser la fuente más grande.
-2. **Varianza de generación.** El mismo ítem da salidas distintas entre corridas. Temperature 0 la reduce pero no la elimina: el batching, el hardware y los cambios del lado del proveedor siguen causando variación. Los jueces agregan su propia varianza encima.
+2. **Varianza de generación.** El mismo ítem da salidas distintas entre corridas. Normalmente no puedes apagarla: los modelos Claude actuales rechazan `temperature`, `top_p` y `top_k` (error 400), e incluso en proveedores o modelos self-hosted que aceptan `temperature=0`, el batching, el hardware y los cambios del lado del proveedor siguen causando variación. Los jueces agregan su propia varianza encima. Contrólala como controlas un entorno flaky: fija el id exacto del modelo, versiona el prompt y la rúbrica, fija el nivel de `output_config.effort` (en Claude, effort es la palanca de costo/calidad, no una perilla de varianza), corre cada ítem `n` veces y reporta intervalos de confianza.
 
 Mide ambas antes de confiar en un gate. El experimento más barato es una **prueba A/A**: corre la misma configuración dos veces y compara. Si A vs A muestra una "diferencia" de 2 puntos, cualquier cambio menor a eso es ruido. Es la versión eval de correr tu suite diez veces sobre un commit sin cambios para medir la tasa de flakiness.
 
@@ -163,7 +163,7 @@ Cuidado también con la **pesca de segmentos**. Si el resultado global es plano 
 - **Comparar dos CIs que se solapan y llamarlo prueba.** Dos intervalos separados pueden solaparse mientras la diferencia pareada es claramente significativa. Prueba la diferencia directamente.
 - **Remuestrear corridas o turnos en lugar de ítems.** Los intervalos salen demasiado estrechos.
 - **Espiar (peeking).** Revisar el p-value cada 20 ítems y parar cuando baja de 0.05 infla los falsos positivos. Fija `n` de antemano o usa un método secuencial a propósito.
-- **Tratar temperature 0 como determinista.** Mide el piso de ruido A/A.
+- **Suponer que las salidas son deterministas** (o que un parámetro de muestreo las hará deterministas). Mide el piso de ruido A/A y muestrea cada ítem varias veces.
 - **"No hay diferencia significativa, entonces son iguales."** Sin potencia o sin margen de no inferioridad, esa conclusión no tiene respaldo.
 - **Reportar p-values sin tamaños de efecto ni intervalos.**
 

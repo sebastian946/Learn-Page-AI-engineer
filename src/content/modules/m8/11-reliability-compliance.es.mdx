@@ -1,0 +1,176 @@
+## Dos preguntas que hace todo cliente regulado
+
+Cuando presentas una plataforma LLM a un banco, una aseguradora o un hospital, aparecen dos preguntas temprano:
+
+1. **"¿Qué pasa cuando se rompe?"** Caída del proveedor, caída de una región, un release malo, falta de GPUs.
+2. **"¿Qué pasa con nuestros datos?"** A dónde van, quién los ve, cuánto tiempo se guardan y cómo lo demuestras.
+
+Esta lección te da el vocabulario de arquitectura para responder ambas. Es orientación de ingeniería, no asesoría legal. Las decisiones reales de cumplimiento corresponden a los equipos legales, de privacidad y de cumplimiento del cliente; tu trabajo es construir un sistema que haga sus requisitos aplicables y auditables.
+
+## Modos de falla propios de las plataformas LLM
+
+El Módulo 5 cubrió la degradación elegante dentro de un servicio. A nivel de plataforma, enumera los modos de falla y decide la respuesta **antes** de que ocurran:
+
+| Falla | Señal típica | Respuesta |
+|---|---|---|
+| Proveedor totalmente caído | 5xx o errores de conexión en todos los modelos | El gateway hace failover al segundo proveedor o región |
+| Proveedor degradado | El p95 del TTFT se triplica, errores parciales | El circuit breaker se abre para ese deployment, el tráfico se mueve |
+| Cuota agotada | 429 sin caída | Descartar tráfico de baja prioridad, encolar trabajo batch, pedir aumento |
+| Tu región caída | Los health checks fallan desde afuera | Failover por DNS a la región standby |
+| Sin capacidad de GPU autoalojada | Pods pendientes, sin nodos GPU | Encolar las cargas con PII; nunca hacer failover de PII a una API pública |
+| Release malo | Fallan los gates del canary | Rollback automático (lección 1) |
+| Gateway caído | Todas las funcionalidades de IA fallan a la vez | Gateway con varias réplicas y multi-AZ; gateways separados por nivel de criticidad |
+
+Fíjate en la asimetría de la fila de GPU. Disponibilidad y cumplimiento pueden entrar en conflicto. Para algunas cargas, "no disponible durante 20 minutos" es aceptable y "procesado por un proveedor no aprobado" no lo es. Escríbelo por carga de trabajo; es la línea más importante de tu plan de DR.
+
+## Multiproveedor y multirregión
+
+Las plataformas LLM tienen dos ejes de redundancia independientes:
+
+- **Redundancia de modelos:** la misma capacidad desde dos fuentes (API de Anthropic y Bedrock, o Bedrock en dos regiones vía inferencia cross-region, o dos réplicas autoalojadas en zonas distintas). El gateway (lección 5) lo maneja con fallbacks y cooldowns.
+- **Redundancia de plataforma:** tus propios componentes (gateway, app, vector store, almacén de conversaciones, registro de prompts) en una segunda región.
+
+Para el DR de la plataforma, usa los nombres estándar de estrategias de AWS, ordenados por costo y tiempo de recuperación:
+
+| Estrategia | Qué corre en la región standby | RTO típico | Costo |
+|---|---|---|---|
+| Backup and restore | Nada; IaC más backups | Horas | El más bajo |
+| Pilot light | Datos replicados; cómputo apagado | Decenas de minutos | Bajo |
+| Warm standby | Stack completo a escala reducida | Minutos | Medio |
+| Multi-site active-active | Stack completo sirviendo tráfico | Casi cero | El más alto |
+
+El **RTO** (recovery time objective) es cuánto tiempo puedes estar caído. El **RPO** (recovery point objective) es cuántos datos puedes perder. Decídelos por componente:
+
+- **Índice vectorial:** a menudo se puede reconstruir desde los documentos fuente. El RPO puede ser grande si puedes re-embeber a tiempo; si no, replica (por ejemplo Aurora Global Database para pgvector, o snapshots copiados entre regiones).
+- **Historial de conversaciones y logs de auditoría:** normalmente RPO pequeño; replica de forma continua.
+- **Base de datos del gateway** (keys, presupuestos, gasto): debe existir en el standby o nadie podrá autenticarse después del failover.
+- **Registro de prompts y manifiestos de release:** en git, así que ya están replicados; asegúrate de que el standby pueda leerlos.
+- **Pesos de modelos autoalojados:** replícalos de antemano al almacenamiento de la región standby. Descargar 40 GB durante un incidente no es un plan.
+
+Luego **pruébalo**. Lo sabes por QA: un plan de DR sin probar es una hipótesis. Haz game days: bloquea el proveedor principal en el gateway, haz fallar el health check de una región, mata nodos GPU. Mide el RTO real y escríbelo en el runbook.
+
+## Manejo de PII
+
+Empieza por la **clasificación de datos**: público, interno, confidencial, regulado (PII, PHI, datos de pago). Cada carga de trabajo y cada alias de modelo en el gateway recibe una clasificación máxima que puede procesar. El ruteo lo hace cumplir.
+
+Luego aplica, en orden de preferencia:
+
+1. **Minimizar.** No envíes lo que el modelo no necesita. Un resumidor de reclamos puede necesitar el código de diagnóstico, no el nombre y la dirección del afiliado.
+2. **Seudonimizar.** Reemplaza los identificadores por placeholders antes de la llamada y restáuralos después. El modelo ve `[PERSON_1]`, el usuario ve el nombre.
+3. **Rutear a un procesador aprobado.** Los datos regulados van solo a modelos aprobados para ellos: autoalojados, o un proveedor bajo el acuerdo correcto (para HIPAA en EE. UU., un Business Associate Agreement que cubra ese servicio específico).
+4. **Escanear las salidas.** Los modelos pueden repetir o alucinar identificadores. Revisa las respuestas antes de mostrarlas y antes de registrarlas.
+
+Un pequeño paso de seudonimización reversible usando el analizador de Microsoft Presidio:
+
+```python
+from dataclasses import dataclass, field
+
+from presidio_analyzer import AnalyzerEngine
+
+analyzer = AnalyzerEngine()
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "LOCATION", "DATE_TIME"]
+
+@dataclass
+class Pseudonymizer:
+    mapping: dict[str, str] = field(default_factory=dict)   # placeholder -> original
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def mask(self, text: str) -> str:
+        results = analyzer.analyze(text=text, entities=ENTITIES, language="en")
+        # Replace from the end so earlier offsets stay valid
+        for r in sorted(results, key=lambda r: r.start, reverse=True):
+            original = text[r.start:r.end]
+            existing = next((k for k, v in self.mapping.items() if v == original), None)
+            if existing is None:
+                self.counters[r.entity_type] = self.counters.get(r.entity_type, 0) + 1
+                existing = f"[{r.entity_type}_{self.counters[r.entity_type]}]"
+                self.mapping[existing] = original
+            text = text[:r.start] + existing + text[r.end:]
+        return text
+
+    def unmask(self, text: str) -> str:
+        for placeholder, original in self.mapping.items():
+            text = text.replace(placeholder, original)
+        return text
+
+# p = Pseudonymizer(); safe = p.mask(user_text); answer = p.unmask(call_llm(safe))
+```
+
+Presidio puede devolver spans superpuestos (por ejemplo un `LOCATION` dentro de un `PERSON`). En producción, elimina primero las superposiciones y quédate con el span de mayor puntaje, o los reemplazos pueden corromperse entre sí. Guarda el mapeo en memoria solo durante el request. La detección es probabilística: se le escapan cosas y marca falsos positivos. Mídela como cualquier clasificador, con un set de prueba etiquetado de tus tipos de documento reales, y trátala como una capa, no como una garantía.
+
+## Retención y borrado
+
+Los sistemas LLM copian datos a más lugares de los que la gente imagina. Para cada clase de datos, enumera cada almacén y su retención:
+
+| Almacén | ¿Contiene contenido del usuario? | Retención de ejemplo |
+|---|---|---|
+| Logs de aplicación | No debería (registra ids, no texto) | 30 días |
+| Traces (Langfuse, OTel) | A menudo sí | 14–30 días, o enmascarados |
+| Logs de invocación de Bedrock | Sí | Solo si se justifica; corta, cifrada |
+| Cachés de respuestas y semánticas | Sí | Horas, con clave por tenant |
+| Vector store | Sí (chunks de documentos) | Vida útil del documento fuente |
+| Datasets de evaluación | Posiblemente | Usa datos sintéticos o desidentificados |
+| Lado del proveedor | Depende de los términos | Revisa los términos de uso y retención de datos; algunos ofrecen acuerdos de cero retención |
+
+Un pedido de borrado (por ejemplo bajo GDPR) debe llegar a **todos**, incluidas cachés, traces y datasets de evaluación. Si no puedes enumerar los almacenes, no puedes cumplir el borrado. Esa enumeración es un entregable, no una nota al pie.
+
+## Logs de auditoría
+
+Los auditores quieren reconstruir quién hizo qué. En una plataforma LLM, un registro de auditoría por request suele incluir:
+
+- id del request, timestamp, tenant o equipo, id del usuario final (o un id seudónimo);
+- alias de la key del gateway, alias del modelo y modelo resuelto, id del release (lección 10);
+- clasificación de datos del request y la ruta elegida;
+- resultados de los guardrails (bloqueado, enmascarado, aprobado);
+- cantidad de tokens y costo;
+- **no** el prompt en crudo, salvo que la política lo exija, y en ese caso en un almacén separado y más estricto.
+
+Haz que los logs de auditoría sean **a prueba de manipulación**: escríbelos en una cuenta de AWS separada, activa S3 Object Lock o CloudTrail Lake y restringe los borrados. Mantén CloudTrail activo en todas las cuentas para el plano de control: quién cambió IAM, quién movió un alias de prompt, quién editó un guardrail.
+
+## Arquitectura pensada para SOC 2 y HIPAA
+
+No necesitas ser auditor, pero sí saber qué decisiones de arquitectura producen evidencia para los controles comunes:
+
+| Área de control | Evidencia en la arquitectura |
+|---|---|
+| Control de acceso | SSO para consolas, IAM de mínimo privilegio, keys virtuales del gateway por equipo, revisiones de acceso trimestrales |
+| Cifrado | TLS en todas partes, KMS keys gestionadas por el cliente para logs, cachés y vector stores |
+| Gestión de cambios | IaC en git, revisiones de PR, manifiestos de release con reportes de evaluación, deploys canary |
+| Monitoreo y respuesta a incidentes | Dashboards, alertas, runbooks, registros de game days, revisiones post-incidente |
+| Gestión de proveedores | Reportes de seguridad y acuerdos de los proveedores (DPA, BAA cuando aplique) archivados |
+| Retención y eliminación de datos | Tabla de retención aplicada con reglas de lifecycle, procedimiento de borrado probado |
+
+Todo lo que construiste en este módulo es evidencia: historial de Terraform, resultados de análisis de los Rollouts, logs de gasto y acceso del gateway, manifiestos de release.
+
+## Errores comunes
+
+- **Un solo plan de DR para todas las cargas.** Las cargas con PII necesitan un camino de failover distinto al de las públicas.
+- **Failover que nunca se probó.** El RTO en papel no es RTO.
+- **Registrar prompts completos por defecto** en traces y logs de invocación.
+- **Olvidar las cachés y los datasets de evaluación** en la retención y el borrado.
+- **Tratar la detección de PII como perfecta.** Mide el recall con tus datos.
+- **Asumir que el cumplimiento del proveedor te cubre.** El reporte SOC 2 de un proveedor cubre al proveedor; tu configuración es tu responsabilidad.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Diseña la estrategia de failover de una plataforma LLM que atiende tanto cargas sensibles a PII como cargas generales." level="senior">
+
+Primero clasifico las cargas. Las generales usan un alias del gateway respaldado por dos proveedores o dos regiones, con reintentos, cooldowns y fallback automático; una caída del proveedor cuesta segundos. Las cargas con PII usan un alias restringido a procesadores aprobados, por ejemplo réplicas autoalojadas en dos zonas más una región en warm standby. Su fallback es otra réplica aprobada o una cola durable, nunca una API pública, y aceptamos una degradación corta a cambio.
+
+Para la plataforma en sí, elijo RTO y RPO por componente: almacenes de conversaciones y auditoría replicados, la base de datos del gateway en el standby, pesos preubicados, índices vectoriales replicados o reconstruibles dentro del RTO. Los health checks de DNS disparan el failover regional. Hacemos game days cada trimestre y registramos el RTO medido.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Nombra los almacenes">
+
+Cuando te pregunten por borrado bajo GDPR o por retención, enumera los almacenes: logs, traces, logs de invocación, cachés, vector store, datasets de evaluación, lado del proveedor. Los candidatos que solo dicen "lo borramos de la base de datos" pierden puntos.
+
+</Callout>
+
+## Lecturas adicionales
+
+- Whitepaper de AWS, Disaster Recovery of Workloads on AWS: https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-workloads-on-aws.html
+- Microsoft Presidio: https://microsoft.github.io/presidio/
+- Referencia de servicios elegibles para HIPAA en AWS: https://aws.amazon.com/compliance/hipaa-eligible-services-reference/
+- Amazon S3 Object Lock: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html
+- OWASP Top 10 para aplicaciones LLM (divulgación de información sensible): https://owasp.org/www-project-top-10-for-large-language-model-applications/

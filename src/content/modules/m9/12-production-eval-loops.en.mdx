@@ -1,0 +1,158 @@
+## Offline evals age. Production keeps them honest.
+
+Your golden set reflects the inputs you imagined last quarter. Production shows you the inputs users actually send this week. Module 3 covered online evals, tracing and drift monitoring. This lesson closes the loop: how production signals become review queues, how review findings become regression cases, and how the whole cycle drives development. It also covers two topics every senior eval owner is asked about: safety and fairness evals, and how to read public benchmarks.
+
+For an SDET, this is the defect lifecycle. Production incident, triage, root cause, regression test that fails before the fix and passes after, added to the suite forever.
+
+## Feedback signals
+
+**Explicit feedback**: thumbs up/down, star ratings, "report a problem", corrections. High signal per event, but sparse and biased: users who rate are not typical, and they rate mostly when delighted or angry. Never read the thumbs-up rate as a quality metric on its own.
+
+**Implicit feedback**: behavior that hints at quality.
+
+| Signal | What it may indicate |
+|---|---|
+| User regenerates or rephrases the same question | The answer missed |
+| Draft accepted with small edit distance vs heavily edited | Quality of a generated draft (email, summary) |
+| Copy or click on a citation | Answer was useful or trusted |
+| Escalation to a human, ticket reopened | Task not solved |
+| Session abandoned right after an answer | Possibly unhelpful, possibly solved; ambiguous |
+
+Implicit signals are noisy proxies. Calibrate them like a judge: sample 100–200 sessions, label them, and check how well each signal predicts the human label before you put it on a dashboard.
+
+## Sampling traces for review
+
+You cannot review everything, and random sampling alone wastes reviewer time on easy successes. Use **stratified sampling** with strata such as:
+
+- A **random baseline** stratum (for example 1% of traffic) for unbiased quality estimates.
+- **Negative feedback**: all or most thumbs-down.
+- **Low judge score** or judge-jury disagreement (lesson 5).
+- **Outliers**: high cost, high latency, many tool calls, hit a step cap.
+- **New territory**: inputs far from any golden-set cluster (embedding distance), new languages, new tenants.
+
+Targeted strata find failures fast but are biased by design. If you want an overall quality estimate from the mixed sample, weight each reviewed item by the inverse of its sampling probability.
+
+```python
+import random
+from dataclasses import dataclass
+
+@dataclass
+class Trace:
+    id: str
+    thumbs_down: bool
+    judge_score: float      # 0-1, calibrated judge
+    cost_usd: float
+
+RATES = {"thumbs_down": 0.8, "low_judge": 0.3, "high_cost": 0.2, "random": 0.01}
+
+def stratum(t: Trace) -> str:
+    if t.thumbs_down:
+        return "thumbs_down"
+    if t.judge_score < 0.5:
+        return "low_judge"
+    if t.cost_usd > 0.10:
+        return "high_cost"
+    return "random"
+
+def sample_for_review(traces: list[Trace], seed: int = 1) -> list[tuple[Trace, float]]:
+    """Returns (trace, weight) pairs. Weight = 1 / sampling probability, for unbiased estimates."""
+    rng = random.Random(seed)
+    picked = []
+    for t in traces:
+        p = RATES[stratum(t)]
+        if rng.random() < p:
+            picked.append((t, 1.0 / p))
+    return picked
+
+def weighted_failure_rate(reviewed: list[tuple[bool, float]]) -> float:
+    """reviewed: (human_says_failure, weight) for each reviewed trace."""
+    total = sum(w for _, w in reviewed)
+    return sum(w for failed, w in reviewed if failed) / total
+```
+
+## From production failure to regression case
+
+Treat every confirmed failure like a defect:
+
+1. **Triage.** Severity (wrong money amount is critical; awkward tone is minor) and category from your error taxonomy: retrieval miss, wrong reasoning, policy violation, tool misuse, formatting, refusal when it should answer, hallucinated citation.
+2. **Root cause.** Prompt, retrieval, data, model, tool or upstream system. The fix differs for each.
+3. **Minimize and anonymize.** Strip PII, reduce the conversation to the turns that matter, keep the retrieved context snapshot so the case is reproducible.
+4. **Add to the regression set** with provenance: trace id, date, severity, category, linked issue. Mark it `source: production`.
+5. **Prove it.** The new case must fail on the current version and pass on the fix, exactly like a regression test for a bug.
+6. **Track the taxonomy over time.** A shrinking category means your fixes work. A growing one tells you where to invest next.
+
+Doing open-ended **error analysis** first helps: read 50–100 failed traces, write a free-text note for each, then group the notes into categories. The taxonomy that emerges from your own data beats any generic list.
+
+## Eval dashboards
+
+A useful eval dashboard answers "is quality OK, where is it not, and is that real?":
+
+- Primary metrics per release with confidence intervals, not bare points.
+- Breakdown by segment (tenant, language, intent, document type).
+- Judge model and rubric version annotated, so judge changes are visible (lesson 5).
+- Production-sampled quality (weighted) next to offline scores; a growing gap means the golden set is stale.
+- Cost per successful task and p95 latency on the same page, because every quality decision is also a cost decision.
+- Regression set size and production-sourced share over time.
+
+## Safety, bias and fairness evals
+
+Safety and fairness are eval dimensions with their own suites, not afterthoughts:
+
+- **Harmful content and policy compliance**: a categorized prompt set (self-harm, illegal activity, medical or legal advice beyond scope) with expected behavior per category. Red-teaming from Module 3 feeds new cases here.
+- **Over-refusal**: legitimate requests that look risky ("how do I kill a Python process?"). A model that refuses these is broken for users. Track false refusal rate next to harmful-compliance rate.
+- **Counterfactual fairness**: metamorphic tests (lesson 8) that swap names, genders, nationalities or dialect markers while keeping everything else constant. The decision, tone and quality should not change. Report the flip rate per attribute with CIs.
+- **Outcome parity across segments**: compare quality, refusal rate and escalation rate across languages or customer segments you can legitimately observe. Do not infer protected attributes of real users to build these slices; use counterfactual synthetic inputs instead.
+
+Document what you tested and what you did not. A fairness eval with known gaps is far better than an implied guarantee.
+
+## Benchmark literacy
+
+Vendors and leaderboards report scores on public benchmarks. Read them critically:
+
+- **What they measure.** MMLU is multiple-choice knowledge across 57 subjects. It says little about whether a model follows your extraction schema or your refund policy.
+- **Saturation.** When top models all score near the ceiling, differences are noise.
+- **Contamination.** Public test items leak into training data over time. A high score may partly reflect memorization.
+- **Setup sensitivity.** Prompt format, number of few-shot examples, chain-of-thought and answer extraction all move scores. Two reported numbers with different setups are not comparable.
+- **Preference leaderboards.** Pairwise human votes (Chatbot Arena style) capture general preference, including style and length preferences, not your task.
+
+That is why you need **private benchmarks**: your task distribution, your segments, your metrics, never published, versioned. Keep a **sealed holdout** split that is never used for prompt tuning, and look at it only for release decisions. Otherwise you overfit prompts to the eval set, and Goodhart's law takes over: the measure becomes the target and stops measuring.
+
+## Eval-driven development
+
+Put it together and you get a workflow that feels like TDD:
+
+1. A failure or a new requirement arrives. Write eval cases that capture it first. They fail (red).
+2. Change the prompt, retrieval or model until they pass (green), checking the full dev split for regressions.
+3. Refactor (shorten the prompt, cut cost) while the evals stay green.
+4. Before release, run the sealed holdout and the statistical comparison from lesson 02.
+5. After release, production sampling finds the next failure. Repeat.
+
+## Common mistakes
+
+- **Treating thumbs-up rate as quality.** It is sparse and biased.
+- **Only reviewing thumbs-down traces.** You will never see silent failures.
+- **Estimating quality from a targeted sample without weights.**
+- **Adding production cases without minimizing and anonymizing them.** Your regression set becomes a PII store.
+- **Choosing models from public leaderboards.** Use them to shortlist, then decide on your private benchmark.
+- **Tuning prompts on the holdout.** The holdout stops being a holdout.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you turn production traffic into better evals?" level="senior">
+
+I sample traces in strata: a small random slice for unbiased estimates, plus targeted strata for thumbs-down, low judge scores, jury disagreement, cost and latency outliers, and inputs far from my golden set. Reviewers label them; I weight by inverse sampling probability when I report overall quality. Confirmed failures go through triage like defects: severity, error category, root cause. I minimize and anonymize each one, add it to the regression set with provenance, and require it to fail before the fix and pass after. I track error categories over time and keep a sealed holdout that is never used for tuning.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A vendor says their new model beats yours by 4 points on MMLU. Should you switch?" level="mid">
+
+Not on that basis. MMLU measures broad multiple-choice knowledge, which is not my task. Scores depend on setup like prompt format and few-shot count, the benchmark is near saturation, and contamination is possible. I would shortlist the model, run it on our private benchmark with task-specific metrics, check cost, latency and segment-level risks, and use a paired comparison with confidence intervals or a non-inferiority test before deciding.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Hendrycks et al., "Measuring Massive Multitask Language Understanding" (MMLU): https://arxiv.org/abs/2009.03300
+- Liang et al., "Holistic Evaluation of Language Models" (HELM): https://arxiv.org/abs/2211.09110
+- OWASP Top 10 for LLM Applications: https://owasp.org/www-project-top-10-for-large-language-model-applications/
+- Langfuse scores and annotation queues: https://langfuse.com/docs

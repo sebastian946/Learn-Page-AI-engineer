@@ -21,9 +21,9 @@ prompts:
   - file://prompts/router_v2.txt
 providers:
   - id: anthropic:messages:claude-sonnet-5-5
-    config: { temperature: 0, max_tokens: 20 }
+    config: { max_tokens: 1024 }   # no temperature: current Claude models reject sampling params
   - id: anthropic:messages:claude-haiku-5-5
-    config: { temperature: 0, max_tokens: 20 }
+    config: { max_tokens: 1024 }   # no temperature: current Claude models reject sampling params
 defaultTest:
   options:
     transform: output.trim().toLowerCase()

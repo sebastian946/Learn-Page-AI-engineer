@@ -32,7 +32,7 @@ def stream_answer(question: str, context: str) -> Iterator[str]:
         modelId=MODEL_ID,
         system=[{"text": "Answer only from the provided policy context. Cite section ids."}],
         messages=[{"role": "user", "content": [{"text": f"{context}\n\nQuestion: {question}"}]}],
-        inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+        inferenceConfig={"maxTokens": 800},   # no temperature/top_p: current Claude models reject them
         guardrailConfig=GUARDRAIL,
     )
     for event in resp["stream"]:
@@ -43,6 +43,8 @@ def stream_answer(question: str, context: str) -> Iterator[str]:
         elif "metadata" in event:
             record_usage(event["metadata"]["usage"])  # inputTokens, outputTokens
 ```
+
+Fíjate en lo que falta en `inferenceConfig`: los parámetros de sampling. Los modelos Claude actuales (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) rechazan `temperature`, `top_p` y `top_k` con un 400. La palanca de costo/calidad para ellos es la configuración `effort` (`low`, `medium`, `high`); revisa la documentación de Bedrock para ver cómo la expone tu modelo. Los parámetros de sampling siguen siendo válidos para otras familias de modelos.
 
 boto3 es síncrono. En un servicio FastAPI, córrelo en un thread pool o usa un wrapper asíncrono como `aioboto3`; si no, el event loop queda bloqueado durante todo el stream. El modo de reintentos `adaptive` agrega rate limiting del lado del cliente cuando Bedrock devuelve `ThrottlingException`.
 

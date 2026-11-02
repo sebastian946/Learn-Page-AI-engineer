@@ -1,8 +1,8 @@
-<ClientBrief company="Harborline Freight" industry="Logística / Logística tercerizada (3PL)" duration="5 días" />
+<ClientBrief company="Tidewater Freight" industry="Logística / Logística tercerizada (3PL)" duration="5 días" />
 
 ## Contexto de la empresa
 
-Harborline Freight es una empresa ficticia de logística tercerizada (3PL) de tamaño mediano. Opera cuatro bodegas en el Medio Oeste y la Costa Este de Estados Unidos y despacha unos 18,000 pedidos al día para 140 marcas de e-commerce. No tiene camiones propios. Reserva capacidad de paquetería y LTL con seis carriers y la revende a sus clientes.
+Tidewater Freight es una empresa ficticia de logística tercerizada (3PL) de tamaño mediano. Opera cuatro bodegas en el Medio Oeste y la Costa Este de Estados Unidos y despacha unos 18,000 pedidos al día para 140 marcas de e-commerce. No tiene camiones propios. Reserva capacidad de paquetería y LTL con seis carriers y la revende a sus clientes.
 
 El equipo de operaciones de clientes tiene 22 agentes. Trabajan una bandeja de entrada compartida y un sistema de tickets. La mayor parte de su día es repetitiva: "¿Dónde está mi pedido?", "¿Pueden entregar el viernes en vez de hoy?", "La caja llegó dañada", "Por favor cancelen este pedido antes de que salga", "¿Cuánto costaría enviar este pallet a Denver?". Cada solicitud necesita de dos a cinco consultas entre el sistema de gestión de pedidos (OMS), las APIs de los carriers y la herramienta de tickets.
 
@@ -80,7 +80,7 @@ Automatizar los cinco tipos de solicitud más comunes para que al menos el 60% d
 
 ## Arquitectura sugerida
 
-<Diagram caption="Agente de operaciones de Harborline: intake, agente LangGraph con guardas y HITL, herramientas, logging y evals" chart={`flowchart LR
+<Diagram caption="Agente de operaciones de Tidewater: intake, agente LangGraph con guardas y HITL, herramientas, logging y evals" chart={`flowchart LR
   subgraph Intake
     M["Fixtures de buzón"] --> P["Parser y extractor de intención"]
     Q["Cola de eventos de pedidos"] --> P

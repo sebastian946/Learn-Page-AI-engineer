@@ -1,0 +1,151 @@
+## Los evals de un solo turno no ven los bugs de conversación
+
+La mayoría de tus sets de eval hasta ahora son una entrada, una salida. Los bots de soporte y agentes reales fallan de formas que solo aparecen a lo largo de varios turnos:
+
+- Olvidan una restricción que el usuario dio tres turnos atrás.
+- Piden información que el usuario ya proporcionó.
+- Cumplen la política en el turno 1 y la abandonan en el turno 6 ("verificar identidad antes de cambiar la dirección").
+- Nunca se recuperan después de malinterpretar al usuario.
+- Llaman dos veces a la herramienta de reembolso porque el usuario se repitió.
+
+En el módulo 4 evaluaste trayectorias de agentes: la secuencia de tool calls comparada con un camino esperado. Esta lección va más a fondo: cómo generar conversaciones realistas a escala con **usuarios simulados**, cómo puntuar a **nivel de conversación**, cómo juzgar el **uso de herramientas** con precisión y cómo tratar el **costo y los pasos** como dimensiones de eval de primera clase.
+
+## Dos formas de conducir una conversación
+
+**Guiones de escenario.** Una lista fija de turnos del usuario, como un script de Playwright. Determinista, barato, perfecto para regresión: "el usuario pide un reembolso, da un id de orden incorrecto y luego el correcto". La debilidad es que las conversaciones reales se ramifican. Si el bot hace una pregunta inesperada, la siguiente línea del guion ya no tiene sentido.
+
+**Usuarios simulados.** Un LLM hace de usuario. Recibe una persona, un objetivo, hechos privados que solo revela cuando se los piden y una condición de parada. Responde a lo que sea que diga el bot. Así evalúan benchmarks como τ-bench a los agentes de atención al cliente: un usuario simulado habla con el agente, y el éxito se verifica contra el **estado final de la base de datos**, no contra una transcripción.
+
+Usa ambos. Guiones para los caminos críticos conocidos, como gate en CI. Simuladores para amplitud y para encontrar nuevos modos de fallo, corridos cada noche o antes de los releases.
+
+### Hacer confiables a los usuarios simulados
+
+Un simulador es otro modelo en tu montaje de pruebas, y también puede equivocarse:
+
+- **Demasiado cooperativo.** Lo suelta todo de una vez. Indícale que responda solo lo que le preguntan y que revele los hechos privados solo cuando se los pidan.
+- **Filtra el objetivo o hace de agente.** Empieza a sugerir soluciones. Mantén sus instrucciones cortas y fijas en su rol, y revisa las transcripciones para detectarlo.
+- **Nunca para, o para demasiado pronto.** Dale un token de parada explícito (`###DONE###`) y un límite estricto de turnos.
+- **Misma familia de modelos que el bot.** Los dos pueden "entenderse" demasiado bien. Usa otra familia para el simulador.
+- **Estilo poco realista.** Compara contra transcripciones reales: distribución de la longitud de los mensajes, tasa de errores de tipeo, qué tan seguido los usuarios cambian de opinión. Haz que un humano califique el realismo de 20 conversaciones simuladas antes de confiar en el montaje.
+
+## Métricas a nivel de conversación
+
+Puntúa la conversación completa, con la conversación como unidad de análisis (lección 02):
+
+| Dimensión | Cómo medirla |
+|---|---|
+| Éxito de la tarea | Verificación del estado final: la orden quedó reembolsada, la dirección cambió, el ticket se escaló. Objetiva, no necesita juez |
+| Apego a la política | Verificaciones de reglas sobre la traza ("ningún `issue_refund` antes de `verify_identity`") más un juez para políticas blandas |
+| Eficiencia | Turnos hasta la resolución, preguntas redundantes, solicitudes de información repetidas |
+| Consistencia | Sin contradicciones con turnos anteriores (juez con la transcripción completa) |
+| Escalamiento correcto | Escaló cuando debía, no escaló cuando podía resolverlo |
+| Experiencia del usuario | Trayectoria de frustración o de tono calificada por un juez; en tráfico real, calificaciones explícitas y abandono |
+
+### Confiabilidad: pass^k
+
+Un bot que resuelve una tarea el 80% de las veces no es 80% confiable para los usuarios; cada usuario tiene un intento, y un cliente grande tiene miles. τ-bench introdujo **pass^k**: la probabilidad de que **los k** intentos independientes de la misma tarea tengan éxito. Si el éxito por intento es 0.8 y los intentos son independientes, pass^4 es de aproximadamente 0.41. Para un bot de soporte, pass^k es una mejor métrica de confiabilidad que el éxito promedio porque castiga el comportamiento inestable. Es la versión eval de una prueba flaky que pasa el 80% de las veces: nadie dice que esa prueba es "80% buena".
+
+Dados `n` intentos por tarea con `c` éxitos, una estimación sin sesgo de pass^k es `C(c, k) / C(n, k)`, promediada sobre las tareas.
+
+## Corrección en el uso de herramientas
+
+Mira cada tool call, no solo la respuesta final:
+
+- **Selección:** la herramienta correcta para la situación; ninguna tool call cuando no hace falta.
+- **Argumentos:** válidos según el esquema (tus modelos Pydantic lo atrapan) y semánticamente correctos (el monto del reembolso es igual al total de la orden, no un número que inventó el usuario).
+- **Restricciones de orden:** se respetan las precondiciones (verificar identidad y luego cambiar la dirección).
+- **Llamadas prohibidas:** nunca llamar a `delete_account` en un escenario de reembolso.
+- **Seguridad de efectos secundarios:** sin reembolsos duplicados cuando el usuario repite una solicitud. La idempotencia es una dimensión del eval.
+- **Manejo de errores:** cuando una herramienta devuelve un error, el agente reintenta con sentido o se lo dice al usuario, y nunca afirma que tuvo éxito.
+
+La mayoría son verificaciones deterministas sobre la traza. Reserva los jueces para lo que el código no puede verificar.
+
+## Presupuestos de costo y pasos como dimensiones del eval
+
+Un agente que tiene éxito en 40 pasos por 1.20 dólares puede ser peor que uno que tiene éxito 3 puntos menos en 6 pasos por 0.08 dólares. Registra por conversación: tokens de entrada y salida, costo, tool calls, turnos y tiempo real. Luego reporta:
+
+- **Costo por tarea exitosa** (costo total dividido entre éxitos), no solo costo por conversación.
+- **Violaciones de presupuesto:** conversaciones que llegaron al límite de pasos o de costo. Son fallos aunque el usuario al final obtuviera una respuesta.
+- **Vista de Pareto:** tasa de éxito vs costo por tarea para cada configuración. Un candidato de migración debe estar sobre la frontera o cerca de ella.
+
+## Código: bucle de usuario simulado, verificación de estado final y pass^k
+
+```python
+from math import comb
+
+import anthropic
+
+client = anthropic.AsyncAnthropic()
+SIM_MODEL = "claude-haiku-5-5"   # pick a different family from the bot if you can
+STOP = "###DONE###"
+
+def user_system(s: dict) -> str:
+    return (
+        f"You are a customer. Persona: {s['persona']}. Goal: {s['goal']}.\n"
+        f"Private facts, reveal ONLY when asked: {s['private_facts']}.\n"
+        "Write short, realistic messages. Never suggest solutions. "
+        f"When your goal is met or clearly impossible, reply with {STOP} only."
+    )
+
+async def simulate(bot, scenario: dict, max_turns: int = 12) -> dict:
+    """bot: async callable(history) -> (reply_text, tool_calls, cost_usd). Returns a transcript record."""
+    history: list[dict] = []
+    sim_view = [{"role": "user", "content": "Start the conversation with the support bot."}]
+    cost, tool_calls, hit_cap = 0.0, [], False
+    for _ in range(max_turns):
+        sim = await client.messages.create(model=SIM_MODEL, max_tokens=2000,
+                                           system=user_system(scenario), messages=sim_view)
+        user_msg = sim.content[0].text.strip()
+        if STOP in user_msg:
+            break
+        history.append({"role": "user", "content": user_msg})
+        reply, calls, c = await bot(history)
+        history.append({"role": "assistant", "content": reply})
+        tool_calls += calls
+        cost += c
+        sim_view += [{"role": "assistant", "content": user_msg}, {"role": "user", "content": reply}]
+    else:
+        hit_cap = True   # loop ended without the simulator saying it was done
+    return {"scenario_id": scenario["id"], "history": history, "tool_calls": tool_calls,
+            "turns": len(history) // 2, "cost_usd": cost, "hit_turn_cap": hit_cap}
+
+def end_state_ok(db_after: dict, expected: dict) -> bool:
+    return all(db_after.get(k) == v for k, v in expected.items())
+
+def pass_hat_k(results: dict[str, list[bool]], k: int) -> float:
+    """results: task_id -> list of success flags over n trials (n >= k)."""
+    per_task = [comb(sum(r), k) / comb(len(r), k) for r in results.values()]
+    return sum(per_task) / len(per_task)
+```
+
+Fíjate en la inversión de roles: desde el punto de vista del simulador, las respuestas del bot son mensajes "user" y sus propios mensajes son "assistant". Equivocarse en esto es el bug de simulador más común.
+
+## Errores comunes
+
+- **Juzgar una transcripción cuando podrías verificar el estado final.** El estado de la base de datos es objetivo; un juez que lee la transcripción puede ser engañado por un bot que *dice* que reembolsó.
+- **Éxito promedio en lugar de pass^k.** Los agentes inestables se ven bien en los promedios.
+- **Simulador de la misma familia, sin verificación de realismo.**
+- **Contar turnos como muestras.** La conversación es la unidad.
+- **Ignorar los límites de costo y pasos.** Un éxito que tomó 40 tool calls es un incidente de producción esperando a ocurrir.
+- **Solo simuladores LLM, sin guiones.** Pierdes cobertura de regresión determinista de los caminos críticos.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo evaluarías un agente de soporte multi-turno antes del release?" level="senior">
+
+Combino escenarios con guion para los caminos críticos, como gate en CI, con usuarios simulados por LLM para dar amplitud. Los simuladores reciben una persona, un objetivo, hechos privados que solo revelan si se los piden y un token de parada; usan una familia de modelos distinta a la del bot, y valido su realismo en una muestra con evaluadores humanos. El éxito se verifica contra el estado final de una base de datos sandbox, no contra la transcripción. Verifico de forma determinista las reglas de uso de herramientas sobre la traza: precondiciones, llamadas prohibidas, corrección de argumentos y ausencia de efectos secundarios duplicados. Reporto el éxito de la tarea con CIs sobre conversaciones, pass^k para la confiabilidad, violaciones de política, turnos hasta la resolución, costo por tarea exitosa y veces que se alcanzó el límite de presupuesto.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Qué es pass^k y por qué importa para los agentes?" level="mid">
+
+pass^k es la probabilidad de que los k intentos independientes de la misma tarea tengan éxito. Mide confiabilidad en lugar de capacidad promedio. Un agente con 80% de éxito por intento tiene un pass^4 de aproximadamente 41% si los intentos son independientes, lo que revela una inestabilidad que el promedio esconde. Para un producto de soporte donde cada cliente tiene un intento y los clientes grandes pasan por los mismos flujos miles de veces, la confiabilidad es lo que importa. La estimo por tarea a partir de n intentos como C(c, k) / C(n, k) y promedio entre tareas.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Yao et al., "τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains": https://arxiv.org/abs/2406.12045
+- Agentes y herramientas en Inspect AI: https://inspect.aisi.org.uk/
+- Métricas conversacionales de DeepEval: https://docs.confident-ai.com
+- Conceptos de evaluación en LangSmith: https://docs.smith.langchain.com

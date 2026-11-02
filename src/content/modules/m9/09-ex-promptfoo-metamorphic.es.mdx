@@ -23,7 +23,7 @@ Empieza con 40 **casos fuente** etiquetados a mano en `sources.jsonl` (reutiliza
 
 <AcceptanceCriteria>
 
-- [ ] `prompts/triage.txt` y `promptfooconfig.yaml` corren contra dos modelos (dos proveedores, o dos niveles de un proveedor) con temperature 0
+- [ ] `prompts/triage.txt` y `promptfooconfig.yaml` corren contra dos modelos (dos proveedores, o dos niveles de un proveedor) con ids de modelo fijados y sin parámetros de muestreo en los modelos Claude (rechazan `temperature`; controla la varianza con repeticiones)
 - [ ] Al menos 40 casos fuente con categoría y prioridad gold; al menos 8 relaciones implementadas en `generate_mr_tests.py` (al menos 5 de invariancia y 3 direccionales)
 - [ ] Las transformaciones son código determinista (con semilla); cualquier paráfrasis o traducción generada por LLM está en caché y revisaste al menos 20, con los resultados anotados en el README
 - [ ] Las pruebas generadas llevan `metadata` con `source_id`, `relation` y `kind` (`source`, `invariance`, `directional`)
@@ -45,10 +45,10 @@ prompts:
 providers:
   - id: anthropic:messages:claude-sonnet-5-5
     label: baseline
-    config: { temperature: 0, max_tokens: 60 }
+    config: { max_tokens: 1024 }   # no temperature: current Claude models reject sampling params
   - id: anthropic:messages:claude-haiku-5-5
     label: candidate
-    config: { temperature: 0, max_tokens: 60 }
+    config: { max_tokens: 1024 }   # no temperature: current Claude models reject sampling params
 defaultTest:
   assert:
     - type: is-json

@@ -1,0 +1,197 @@
+## Objetivo
+
+Construye un harness de evaluación para un bot de soporte multi-turno que usa herramientas. El harness conduce conversaciones con **usuarios simulados**, verifica el éxito contra el **estado final** de una base de datos sandbox, verifica **reglas de política** sobre la traza de tool calls y reporta **pass^k**, el costo por tarea exitosa y las veces que se alcanzó el límite de presupuesto para dos configuraciones del bot.
+
+Esta es la carpeta `04-simulated-users/` de `llm-eval-lab`. Es el ejercicio más "agéntico" del módulo y reutiliza ideas del módulo 4 (diseño de herramientas, guardas de bucle) y del módulo 5 (asistente de soporte).
+
+## Contexto
+
+El bot atiende una tienda en línea. Tiene cinco herramientas sobre una base de datos en memoria:
+
+| Herramienta | Efecto | Política |
+|---|---|---|
+| `lookup_order(order_id)` | Devuelve el estado de la orden, el total y el email del cliente | Se puede llamar libremente |
+| `verify_identity(order_id, email)` | Marca la sesión como verificada si el email coincide | Obligatoria antes de cualquier escritura |
+| `issue_refund(order_id, amount)` | Reembolsa la orden | Solo tras la verificación; el monto debe ser igual al total de la orden; como máximo una vez por orden |
+| `update_address(order_id, address)` | Cambia la dirección de envío | Solo tras la verificación; solo si el estado es `processing` |
+| `escalate(reason)` | Transfiere a un humano | Obligatoria para amenazas legales y reembolsos de más de 500 dólares |
+
+Escribe **20 escenarios** de estos tipos: reembolso simple, reembolso con email incorrecto primero, cambio de dirección en una orden ya enviada (debe rechazarse), reembolso por encima del límite (debe escalar), el usuario repite la solicitud de reembolso (no debe reembolsar dos veces), amenaza legal (debe escalar), el usuario cambia de opinión a mitad de la conversación y pregunta fuera de alcance. Cada escenario tiene una persona, un objetivo, hechos privados y el **estado final esperado**.
+
+```json
+{"id": "sc-07", "persona": "impatient, writes in short lowercase messages", "goal": "get a refund for order A-1009", "private_facts": {"order_id": "A-1009", "email": "li.wei@example.com"}, "db_seed": "seeds/a1009_delivered.json", "expected_state": {"A-1009.refunded": true, "A-1009.refund_count": 1}, "must_escalate": false}
+```
+
+<AcceptanceCriteria>
+
+- [ ] El bot corre un bucle de tool use con un máximo de 8 tool calls por turno y devuelve `(reply, tool_calls, cost_usd)` por turno
+- [ ] 20 escenarios cubren los ocho tipos de arriba, cada uno con una base de datos nueva sembrada por intento
+- [ ] El simulador usa un system prompt fijo en su rol, con hechos privados revelados solo a pedido, un token de parada y un límite de 12 turnos; si es posible usa otra familia de modelos que el bot
+- [ ] El éxito se calcula a partir del estado final de la base de datos (más el escalamiento cuando se requiere), nunca solo a partir de la transcripción
+- [ ] Las verificaciones de política corren sobre la traza: escritura antes de la verificación, monto de reembolso incorrecto, reembolso duplicado, cambio de dirección en una orden que no está en `processing`, escalamiento faltante; cada violación se registra con el índice del turno
+- [ ] Al menos 5 escenarios de regresión con guion (sin LLM) para los caminos críticos corren en CI sin simulador
+- [ ] Cada escenario corre 4 intentos por configuración del bot; el reporte muestra la tasa de éxito con un CI sobre escenarios, pass^1, pass^2 y pass^4, violaciones por cada 100 conversaciones, turnos promedio, costo por tarea exitosa y veces que se alcanzó el límite de turnos
+- [ ] Se comparan dos configuraciones del bot (por ejemplo dos system prompts o dos modelos), con una comparación pareada por escenario
+- [ ] Calificaste manualmente el realismo (1–4) de 10 transcripciones simuladas y anotaste los modos de fallo del simulador que observaste
+- [ ] Todas las transcripciones se guardan como JSONL con id de escenario, intento, configuración y traza de herramientas, para que cualquier fallo se pueda reproducir
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 04-simulated-users/harness/policy.py
+from dataclasses import dataclass, field
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+class ToolCall(BaseModel):
+    turn: int
+    name: Literal["lookup_order", "verify_identity", "issue_refund", "update_address", "escalate"]
+    args: dict
+    ok: bool                   # tool returned success
+    result: dict | None = None
+
+
+@dataclass
+class Violation:
+    rule: str
+    turn: int
+    detail: str
+
+
+@dataclass
+class PolicyState:
+    verified: set[str] = field(default_factory=set)
+    refunds: dict[str, int] = field(default_factory=dict)
+
+
+def check_policy(trace: list[ToolCall], db_seed: dict, must_escalate: bool) -> list[Violation]:
+    state, out = PolicyState(), []
+    for call in trace:
+        oid = call.args.get("order_id")
+        if call.name == "verify_identity" and call.ok:
+            state.verified.add(oid)
+        if call.name in {"issue_refund", "update_address"} and oid not in state.verified:
+            out.append(Violation("write_before_verification", call.turn, f"{call.name} on {oid}"))
+        if call.name == "issue_refund" and call.ok:
+            state.refunds[oid] = state.refunds.get(oid, 0) + 1
+            # TODO(you): wrong amount vs db_seed[oid]["total"]; duplicate refund when count > 1
+        # TODO(you): update_address when db_seed[oid]["status"] != "processing"
+    # TODO(you): must_escalate and no successful escalate call -> "missing_escalation"
+    return out
+
+
+def end_state_ok(db_after: dict, expected: dict[str, object]) -> bool:
+    """expected keys look like 'A-1009.refunded'."""
+    for dotted, want in expected.items():
+        oid, attr = dotted.split(".", 1)
+        if db_after.get(oid, {}).get(attr) != want:
+            return False
+    return True
+```
+
+```python
+# 04-simulated-users/harness/run.py  (outline)
+import asyncio
+import json
+from pathlib import Path
+
+from harness.bot import make_bot            # TODO(you): tool-use loop over a FakeDB, per config
+from harness.db import FakeDB
+from harness.policy import check_policy, end_state_ok
+from harness.simulate import simulate       # the loop from lesson 10
+
+CONFIGS = ["prompt_v1", "prompt_v2"]
+TRIALS = 4
+
+
+async def run_one(scenario: dict, config: str, trial: int, sem: asyncio.Semaphore) -> dict:
+    async with sem:
+        db = FakeDB.from_seed(scenario["db_seed"])
+        bot = make_bot(config, db)
+        record = await simulate(bot, scenario)
+        record.update(config=config, trial=trial)
+        record["violations"] = [v.__dict__ for v in check_policy(db.trace, db.seed, scenario["must_escalate"])]
+        record["success"] = end_state_ok(db.snapshot(), scenario["expected_state"]) and (
+            db.escalated or not scenario["must_escalate"]
+        )
+        return record
+
+
+async def main() -> None:
+    scenarios = [json.loads(l) for l in Path("scenarios.jsonl").read_text("utf-8").splitlines()]
+    sem = asyncio.Semaphore(4)
+    jobs = [run_one(s, c, t, sem) for s in scenarios for c in CONFIGS for t in range(TRIALS)]
+    records = await asyncio.gather(*jobs)
+    Path("runs/transcripts.jsonl").write_text("\n".join(json.dumps(r) for r in records), "utf-8")
+    # TODO(you): metrics.py -> success CI over scenarios, pass^k, violations/100, cost per success
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Construye primero la base de datos falsa y el verificador de políticas, y pruébalos con trazas escritas a mano. Un verificador de políticas con un bug reportará "violaciones" que no son reales, y perderás tiempo ajustando el bot contra un oráculo roto.</Hint>
+  <Hint>Las herramientas del bot deben escribir en `db.trace` con el índice del turno, incluso cuando la herramienta falla. Las llamadas fallidas importan: un intento de reembolso bloqueado por tu capa de herramientas sigue siendo una violación de política del modelo, y quieres contarlo.</Hint>
+  <Hint>Si el simulador termina las conversaciones demasiado pronto, revisa dos cosas: la inversión de roles (las respuestas del bot deben ser mensajes "user" desde la vista del simulador) y si tu instrucción de parada es demasiado ansiosa. Si cuenta de más, agrega "Responde solo lo que se te pregunta. Si no te piden tu email, no lo menciones." Lee al menos 10 transcripciones antes de confiar en cualquier número.</Hint>
+  <Hint>Para la comparación, calcula la tasa de éxito por escenario sobre 4 intentos para cada configuración y luego haz bootstrap de la diferencia media por escenario sobre los 20 escenarios. Con 20 escenarios el intervalo será ancho; dilo, y usa pass^k y las violaciones para explicar en qué difieren las configuraciones. Una configuración con el mismo éxito pero menos reembolsos duplicados es la opción más segura.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  04-simulated-users/
+    README.md
+    scenarios.jsonl
+    seeds/                 # per-scenario database seeds
+    scripted/              # 5 deterministic regression conversations
+    harness/
+      bot.py
+      db.py
+      tools.py
+      simulate.py
+      policy.py
+      metrics.py
+      run.py
+    prompts/
+      bot_v1.md
+      bot_v2.md
+      simulator.md
+    runs/
+      transcripts.jsonl
+    realism_ratings.csv
+    REPORT.md
+    tests/
+      test_policy.py       # hand-written traces for every rule
+      test_db.py
+      test_scripted.py     # CI: scripted conversations, no simulator
+```
+
+Esquema de `04-simulated-users/README.md`:
+
+- El bot, sus herramientas y sus políticas (tabla)
+- Catálogo de escenarios por tipo y estado final esperado
+- Diseño del simulador y resultados de la verificación de realismo
+- Definiciones de métricas: éxito por estado final, pass^k, reglas de violación, costo por éxito
+- Resultados por configuración con CIs, y la recomendación
+- Cómo reproducir una transcripción fallida
+
+Commits sugeridos:
+
+- `feat(sim): fake store database with tool layer and trace`
+- `feat(sim): policy checker with unit tests per rule`
+- `feat(sim): simulated user loop with stop token and turn cap`
+- `feat(sim): 20 scenarios and scripted regression conversations`
+- `feat(sim): metrics with pass^k and cost per successful task`
+- `docs(sim): comparison report for two bot configurations`
+
+</CommitBox>
+
+<Checklist id="m9-11-review" title="Autorrevisión" items={["El éxito viene del estado final de la base de datos, no de lo que dice el bot", "El verificador de políticas tiene pruebas unitarias para cada regla", "Los intentos fallidos de herramientas se registran y pueden contar como violaciones", "La inversión de roles del simulador es correcta y leí transcripciones para confirmar un comportamiento realista", "Las conversaciones de regresión con guion corren en CI sin un simulador LLM", "Reporto pass^k, no solo el éxito promedio", "El costo por tarea exitosa y los límites de turnos alcanzados están en el reporte", "La comparación de configuraciones es pareada por escenario y honesta sobre el ancho de su intervalo", "Cualquier fallo se puede reproducir a partir de la transcripción y la semilla guardadas"]} />

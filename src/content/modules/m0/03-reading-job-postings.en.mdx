@@ -1,5 +1,3 @@
-# How to read an AI Engineer job posting
-
 A job posting is a requirements document written by several people with different goals: the hiring manager, the team, HR and sometimes a recruiter who copied half of it from another posting. Your job is the same as when you get a vague user story: extract the real requirements, separate must-haves from noise and spot the risks.
 
 This lesson gives you a repeatable method and walks through a fictional posting end to end.
@@ -123,7 +121,7 @@ Nice-to-haves: LangGraph (Module 4), regulated industry (your QA work in any reg
 
 ## Automate the first pass
 
-When you are reading 30 postings a week, a structured extraction helps. Below, Claude extracts must-haves and nice-to-haves into a Pydantic model using forced tool use, then you compare against your own skills. Treat the output as a first draft: you still do pass 4 yourself.
+When you are reading 30 postings a week, a structured extraction helps. Below, Claude extracts must-haves and nice-to-haves into a Pydantic model using structured outputs (`messages.parse` with `output_format`), then you compare against your own skills. Treat the output as a first draft: you still do pass 4 yourself.
 
 ```python
 from __future__ import annotations
@@ -149,20 +147,15 @@ MY_SKILLS = {"python", "rag", "evals", "ci/cd", "docker", "aws", "pgvector"}
 
 
 async def analyze(posting: str) -> PostingAnalysis:
-    msg = await client.messages.create(
+    # Structured outputs: the response is validated against the Pydantic model.
+    msg = await client.messages.parse(
         model="claude-sonnet-5-5",
         max_tokens=1500,
         system="You analyze AI Engineer job postings for a senior SDET. Be literal; do not invent requirements.",
-        tools=[{
-            "name": "record_analysis",
-            "description": "Record the structured analysis of a job posting.",
-            "input_schema": PostingAnalysis.model_json_schema(),
-        }],
-        tool_choice={"type": "tool", "name": "record_analysis"},
         messages=[{"role": "user", "content": posting}],
+        output_format=PostingAnalysis,
     )
-    tool_use = next(b for b in msg.content if b.type == "tool_use")
-    return PostingAnalysis.model_validate(tool_use.input)
+    return msg.parsed_output
 
 
 async def main() -> None:

@@ -1,0 +1,145 @@
+## Objetivo
+
+Convierte los números de la lección 3 en tus propias mediciones. Vas a servir un modelo pequeño de pesos abiertos detrás de la API compatible con OpenAI de vLLM, llevarlo de 1 a 32 streams concurrentes y encontrar el **codo**: la concurrencia donde el tiempo al primer token (TTFT) empieza a subir rápido mientras el throughput total deja de crecer. Ese codo es el número que le darías a un autoscaler y a `--max-num-seqs`.
+
+Este ejercicio es opcional porque necesita una GPU o paciencia:
+
+- **Camino GPU (recomendado):** cualquier GPU NVIDIA de 8 GB o más, usando la imagen oficial `vllm/vllm-openai`.
+- **Camino CPU:** vLLM tiene un backend para CPU (sigue la guía de instalación para CPU en la documentación de vLLM). Es lento, pero la forma de las curvas igual es instructiva. Si vLLM en CPU no corre en tu máquina, `llama-server` de `llama.cpp` también expone un endpoint compatible con OpenAI; úsalo y anota que sus métricas son distintas.
+- **Camino cloud:** una instancia con una GPU pequeña durante una hora (por ejemplo una `g6.xlarge` de AWS; revisa los precios actuales) y apágala al terminar.
+
+Usa un modelo de instrucciones pequeño con licencia permisiva, como `Qwen/Qwen2.5-0.5B-Instruct` o `Qwen/Qwen2.5-1.5B-Instruct`. El objetivo es el método, no el modelo.
+
+¿Por qué no k6 del Módulo 5? k6 es excelente para la latencia a nivel de request, pero medir el TTFT y la latencia entre tokens requiere leer el stream SSE token por token. Un cliente async corto en Python lo hace con precisión.
+
+<AcceptanceCriteria>
+
+- [ ] vLLM sirve un modelo pequeño en `/v1/chat/completions` con versión de imagen fijada, `--max-model-len` y `--gpu-memory-utilization` definidos explícitamente, y API key obligatoria
+- [ ] Un script de carga corre los niveles de concurrencia 1, 2, 4, 8, 16 y 32 con requests en streaming y registra, por nivel: TTFT p50 y p95, latencia media entre tokens, tokens de salida por segundo por request y tokens de salida por segundo totales
+- [ ] Cada nivel usa el mismo set de prompts (al menos 20 prompts distintos) y el mismo `max_tokens`, y corre al menos 60 segundos o 50 requests
+- [ ] Durante cada nivel, el script muestrea `/metrics` y registra el pico de `vllm:num_requests_waiting` y el pico de uso del KV cache
+- [ ] Los resultados se guardan en CSV y se grafican (TTFT p95 y tokens por segundo totales versus concurrencia)
+- [ ] El README indica el codo, un `--max-num-seqs` recomendado y un objetivo de autoscaling (por ejemplo "escalar cuando los requests en espera se mantengan por encima de 0 durante 60 segundos"), con el razonamiento
+- [ ] El README compara la capacidad de KV medida con la estimación rápida de la lección 3 para este modelo y esta GPU, y explica cualquier diferencia
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```bash
+# GPU path: serve a small model (pin a version you tested)
+docker run --rm --gpus all -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:v0.11.0 \
+  --model Qwen/Qwen2.5-0.5B-Instruct --served-model-name small \
+  --max-model-len 4096 --gpu-memory-utilization 0.85 \
+  --api-key "$VLLM_API_KEY"
+```
+
+```python
+# loadtest/stream_bench.py — measure TTFT and inter-token latency under concurrency
+import asyncio
+import json
+import os
+import random
+import statistics
+import time
+from dataclasses import dataclass
+
+import httpx
+
+URL = "http://localhost:8000/v1/chat/completions"
+HEADERS = {"Authorization": f"Bearer {os.environ['VLLM_API_KEY']}"}
+
+@dataclass
+class Sample:
+    ttft: float
+    itl: float          # mean seconds between tokens after the first
+    tokens: int
+    duration: float
+
+async def one_request(client: httpx.AsyncClient, prompt: str) -> Sample:
+    body = {"model": "small", "stream": True, "max_tokens": 256, "temperature": 0.7,
+            "messages": [{"role": "user", "content": prompt}]}
+    start = time.perf_counter()
+    stamps: list[float] = []
+    async with client.stream("POST", URL, json=body, headers=HEADERS) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            delta = json.loads(line[6:])["choices"][0]["delta"].get("content")
+            if delta:
+                stamps.append(time.perf_counter())
+    end = time.perf_counter()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    return Sample(ttft=stamps[0] - start if stamps else end - start,
+                  itl=statistics.mean(gaps) if gaps else 0.0,
+                  tokens=len(stamps), duration=end - start)
+
+async def run_level(concurrency: int, prompts: list[str], total: int) -> list[Sample]:
+    sem = asyncio.Semaphore(concurrency)
+    async with httpx.AsyncClient(timeout=120) as client:
+        async def guarded() -> Sample:
+            async with sem:
+                return await one_request(client, random.choice(prompts))
+        return await asyncio.gather(*(guarded() for _ in range(total)))
+
+# TODO: loop over [1, 2, 4, 8, 16, 32], compute p50/p95 TTFT, mean ITL,
+#       total tokens / wall time, sample /metrics in a background task, write CSV
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Contar los chunks del stream aproxima los tokens lo suficiente para comparar niveles, pero para números exactos pide el uso dentro del stream (`"stream_options": {"include_usage": true}`), que vLLM soporta, y lee `usage.completion_tokens` del último chunk.</Hint>
+  <Hint>El throughput total es la suma de tokens de salida dividida por el tiempo de reloj de todo el nivel, no la suma de las tasas por request. Corre primero un nivel corto de calentamiento y descártalo; los primeros requests después del arranque incluyen la captura de CUDA graphs y el calentamiento de cachés.</Hint>
+  <Hint>Para `/metrics`, corre una tarea en segundo plano que consulte cada segundo y parsee las líneas que empiezan con `vllm:num_requests_waiting` y el gauge de uso del KV cache (`vllm:kv_cache_usage_perc`, o `vllm:gpu_cache_usage_perc` en versiones anteriores). Guarda el máximo por nivel. vLLM también registra al arrancar la cantidad de bloques de KV cache; multiplícala por el tamaño de bloque para obtener la capacidad en tokens que realmente reservó.</Hint>
+  <Hint>Define el codo de forma concreta, por ejemplo "la menor concurrencia donde el TTFT p95 es más del doble del valor con un usuario, o donde el throughput total crece menos del 10% respecto del nivel anterior". Con una definición, tu recomendación es reproducible en lugar de a ojo. Extra: registra el servidor en tu gateway del Módulo 8 como `chat-private` y vuelve a correr un nivel a través de LiteLLM para medir el overhead del gateway.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  04-vllm-load-test/
+    serve.sh                # docker run command with pinned version and flags
+    loadtest/
+      stream_bench.py
+      prompts.jsonl         # 20+ prompts, mixed lengths
+      plot.py
+    results/
+      bench.csv
+      ttft_vs_concurrency.png
+      throughput_vs_concurrency.png
+      metrics_peaks.csv
+    README.md
+```
+
+Esquema del README:
+
+1. Hardware, modelo, versión de vLLM y flags.
+2. Método: niveles, prompts, `max_tokens`, duración, cómo se miden el TTFT y la ITL.
+3. Tabla de resultados y los dos gráficos.
+4. El codo, con tu definición, y el `--max-num-seqs` y la señal de autoscaling recomendados.
+5. Estimación rápida vs capacidad de KV medida, y por qué difieren.
+6. Qué cambiaría en producción: modelo más grande, cuantización, KV cache en FP8, prefix caching para system prompts compartidos.
+
+Commits sugeridos:
+
+- `feat(vllm): serve a small model with pinned version and explicit limits`
+- `feat(vllm): streaming benchmark measuring TTFT and inter-token latency`
+- `feat(vllm): sample server metrics during each level`
+- `docs(vllm): results, knee and autoscaling recommendation`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m8-12-review" title="Autoevaluación" items={["La versión de la imagen de vLLM y cada flag están registradas en serve.sh", "La corrida de calentamiento está excluida de los resultados", "El throughput total usa el tiempo de reloj de todo el nivel", "Registré el pico de requests en espera y de uso de KV en cada nivel", "Mi codo tiene una definición escrita y numérica", "La recomendación de autoscaling usa profundidad de cola o TTFT, no utilización de GPU", "Comparé la capacidad de KV medida con la estimación de la lección 3", "La instancia GPU en la nube (si la hubo) está apagada"]} />
