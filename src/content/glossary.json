@@ -1,10 +1,31 @@
 [
   {
+    "term": "Adjudication",
+    "termEs": "Adjudicación",
+    "module": "m9",
+    "en": "Resolving annotator disagreements by a senior expert who sets the gold label, while raw labels are kept and unclear rules feed back into the guideline.",
+    "es": "Resolver los desacuerdos entre anotadores mediante un experto senior que fija la etiqueta gold, conservando las etiquetas originales y llevando las reglas poco claras de vuelta a la guía."
+  },
+  {
+    "term": "Agent",
+    "termEs": "Agente",
+    "module": "m4",
+    "en": "An LLM system that decides its own next step in a loop, choosing which tools to call based on intermediate results, until it reaches a goal or a guard stops it.",
+    "es": "Un sistema con LLM que decide su propio siguiente paso en un bucle, eligiendo qué tools llamar según los resultados intermedios, hasta alcanzar un objetivo o hasta que una guarda lo detiene."
+  },
+  {
     "term": "AI Engineer",
     "termEs": "AI Engineer (ingeniero de IA)",
     "module": "m0",
     "en": "A software engineer who builds products on top of existing foundation models: retrieval pipelines, prompts, tools, agents, evaluation and reliable serving. Also titled Applied AI Engineer, LLM Engineer or Software Engineer, GenAI.",
     "es": "Un ingeniero de software que construye productos sobre modelos fundacionales existentes: pipelines de retrieval, prompts, herramientas, agentes, evaluación y serving confiable. También se titula Applied AI Engineer, LLM Engineer o Software Engineer, GenAI."
+  },
+  {
+    "term": "AI gateway",
+    "termEs": "AI gateway",
+    "module": "m8",
+    "en": "A shared proxy in front of LLM providers that centralizes routing, fallbacks, virtual keys, budgets, logging, caching and guardrails.",
+    "es": "Un proxy compartido delante de los proveedores de LLM que centraliza ruteo, fallbacks, keys virtuales, presupuestos, logging, caché y guardrails."
   },
   {
     "term": "AI-first company",
@@ -21,11 +42,305 @@
     "es": "Un rol de ingeniería de IA en una empresa establecida que agrega funcionalidades de IA a un producto existente. Prioriza integración, costo, confiabilidad, seguridad y riesgo. La familia más grande por número de ofertas."
   },
   {
+    "term": "AnalysisTemplate",
+    "termEs": "AnalysisTemplate",
+    "module": "m8",
+    "en": "An Argo Rollouts resource that defines metric queries and success conditions used to decide whether a rollout step passes.",
+    "es": "Un recurso de Argo Rollouts que define consultas de métricas y condiciones de éxito para decidir si un paso del rollout aprueba."
+  },
+  {
+    "term": "Annotation guideline",
+    "termEs": "Guía de anotación",
+    "module": "m9",
+    "en": "A versioned document defining the labeling task, label definitions, decision procedure and borderline examples. The contract between eval owners and annotators.",
+    "es": "Un documento versionado que define la tarea de etiquetado, las definiciones de etiquetas, el procedimiento de decisión y los ejemplos frontera. El contrato entre los dueños del eval y los anotadores."
+  },
+  {
+    "term": "Answer relevance",
+    "termEs": "Answer relevance (relevancia de la respuesta)",
+    "module": "m2",
+    "en": "An evaluation metric that scores whether an answer addresses the question asked, regardless of whether it is correct. Low scores reveal evasive or off-topic answers.",
+    "es": "Métrica de evaluación que puntúa si una respuesta atiende la pregunta formulada, sin importar si es correcta. Los scores bajos revelan respuestas evasivas o fuera de tema."
+  },
+  {
+    "term": "Applicant tracking system (ATS)",
+    "termEs": "Applicant tracking system (ATS, sistema de seguimiento de candidatos)",
+    "module": "m7",
+    "en": "Software recruiters use to store and search applications, often by keywords from the job posting.",
+    "es": "Software que usan los reclutadores para guardar y buscar postulaciones, a menudo por palabras clave de la oferta."
+  },
+  {
+    "term": "Approximate nearest neighbor (ANN)",
+    "termEs": "Approximate nearest neighbor (ANN, vecino más cercano aproximado)",
+    "module": "m2",
+    "en": "Search that finds vectors close to a query without comparing against every row, trading a little recall for large speed gains. The index is only used when the query operator matches the index operator class.",
+    "es": "Búsqueda que encuentra vectores cercanos a una consulta sin comparar contra cada fila, sacrificando un poco de recall a cambio de grandes ganancias de velocidad. El índice solo se usa si el operador de la consulta coincide con la clase de operador del índice."
+  },
+  {
+    "term": "Architecture Decision Record (ADR)",
+    "termEs": "Architecture Decision Record (ADR, registro de decisión de arquitectura)",
+    "module": "m7",
+    "en": "A short document per significant decision with context, decision, alternatives considered and consequences.",
+    "es": "Un documento corto por cada decisión importante, con contexto, decisión, alternativas consideradas y consecuencias."
+  },
+  {
+    "term": "Argo Rollouts",
+    "termEs": "Argo Rollouts",
+    "module": "m8",
+    "en": "A Kubernetes controller that replaces Deployments with Rollouts supporting canary and blue/green steps, analysis gates and automatic rollback.",
+    "es": "Un controlador de Kubernetes que reemplaza los Deployments por Rollouts con pasos canary y blue/green, gates de análisis y rollback automático."
+  },
+  {
+    "term": "Arrival-rate executor",
+    "termEs": "Executor de arrival rate",
+    "module": "m5",
+    "en": "A k6 executor that starts iterations at a target rate regardless of response time (open model), which reflects real traffic better than a fixed number of looping users.",
+    "es": "Executor de k6 que inicia iteraciones a una tasa objetivo sin importar el tiempo de respuesta (modelo abierto), lo que refleja el tráfico real mejor que un número fijo de usuarios en bucle."
+  },
+  {
+    "term": "Attack success rate",
+    "termEs": "Tasa de éxito de ataques",
+    "module": "m3",
+    "en": "Share of red-team attacks that achieve their goal. Always reported alongside the false refusal rate on benign inputs.",
+    "es": "Porcentaje de ataques de red-team que logran su objetivo. Siempre se reporta junto con la tasa de rechazos falsos en entradas benignas."
+  },
+  {
+    "term": "Auto Loader",
+    "termEs": "Auto Loader",
+    "module": "m6",
+    "en": "Databricks' incremental file ingestion (cloudFiles) that tracks processed files with a checkpoint so each new file is loaded once.",
+    "es": "La ingesta incremental de archivos de Databricks (cloudFiles) que lleva registro de los archivos procesados con un checkpoint para cargar cada archivo nuevo una sola vez."
+  },
+  {
+    "term": "Back-of-envelope estimate",
+    "termEs": "Estimación de servilleta",
+    "module": "m7",
+    "en": "A quick, rounded capacity calculation (QPS, concurrency, tokens, storage, cost) used in system design to find bottlenecks and size components.",
+    "es": "Un cálculo de capacidad rápido y redondeado (QPS, concurrencia, tokens, almacenamiento, costo) usado en system design para encontrar cuellos de botella y dimensionar componentes."
+  },
+  {
+    "term": "Backpressure",
+    "termEs": "Backpressure (contrapresión)",
+    "module": "m1",
+    "en": "Flow control that slows a fast producer, such as an LLM stream, to the pace of a slow consumer. In Python it comes from pull-based async generators and bounded queues; unbounded buffers leak memory.",
+    "es": "Control de flujo que frena a un productor rápido, como un stream de LLM, al ritmo de un consumidor lento. En Python surge de generadores async basados en pull y colas acotadas; los buffers sin límite fugan memoria."
+  },
+  {
+    "term": "Bedrock Guardrails",
+    "termEs": "Bedrock Guardrails",
+    "module": "m8",
+    "en": "Versioned Bedrock policies that filter content, deny topics, mask or block PII and check grounding on model inputs and outputs.",
+    "es": "Políticas versionadas de Bedrock que filtran contenido, deniegan temas, enmascaran o bloquean PII y verifican el grounding en inputs y outputs del modelo."
+  },
+  {
+    "term": "Bi-encoder",
+    "termEs": "Bi-encoder",
+    "module": "m2",
+    "en": "A model that embeds queries and documents separately, so document vectors can be precomputed and searched with an ANN index. Used for first-stage retrieval.",
+    "es": "Modelo que genera embeddings de consultas y documentos por separado, de modo que los vectores de documentos se precalculan y se buscan con un índice ANN. Se usa en el retrieval de primera etapa."
+  },
+  {
+    "term": "Blast radius",
+    "termEs": "Blast radius (radio de impacto)",
+    "module": "m7",
+    "en": "How far the impact of a failure or breach can spread, for example one tenant versus all tenants.",
+    "es": "Hasta dónde puede propagarse el impacto de una falla o brecha, por ejemplo un tenant frente a todos los tenants."
+  },
+  {
+    "term": "Blue/green deployment",
+    "termEs": "Deployment blue/green",
+    "module": "m8",
+    "en": "Running two full environments and switching all traffic from the old (blue) to the new (green) at once, with instant rollback by switching back.",
+    "es": "Correr dos entornos completos y pasar todo el tráfico del viejo (blue) al nuevo (green) de una vez, con rollback instantáneo volviendo a cambiar."
+  },
+  {
+    "term": "BM25",
+    "termEs": "BM25",
+    "module": "m2",
+    "en": "A classic lexical ranking function based on term frequency, inverse document frequency and length normalization. Strong on exact terms such as form numbers and product codes.",
+    "es": "Función clásica de ranking léxico basada en frecuencia de términos, frecuencia inversa de documento y normalización por longitud. Fuerte en términos exactos como números de formulario y códigos de producto."
+  },
+  {
+    "term": "Bootstrap",
+    "termEs": "Bootstrap",
+    "module": "m9",
+    "en": "Resampling the units of analysis with replacement many times and recomputing a metric to estimate its confidence interval, with no distributional assumptions.",
+    "es": "Remuestrear con reemplazo las unidades de análisis muchas veces y recalcular una métrica para estimar su intervalo de confianza, sin supuestos de distribución."
+  },
+  {
+    "term": "Bridge model",
+    "termEs": "Modelo bridge",
+    "module": "m7",
+    "en": "Isolation model with shared infrastructure but a separate schema, collection or namespace per tenant.",
+    "es": "Modelo de aislamiento con infraestructura compartida pero un schema, colección o namespace separado por tenant."
+  },
+  {
+    "term": "C4 model",
+    "termEs": "Modelo C4",
+    "module": "m7",
+    "en": "A way to diagram software architecture at four zoom levels: system context, containers, components and code.",
+    "es": "Una forma de diagramar arquitectura de software en cuatro niveles de zoom: contexto del sistema, contenedores, componentes y código."
+  },
+  {
+    "term": "Canary release",
+    "termEs": "Release canary",
+    "module": "m8",
+    "en": "A rollout that sends a small, growing share of traffic to a new version and checks metrics at each step, aborting automatically if a gate fails.",
+    "es": "Un rollout que envía una parte pequeña y creciente del tráfico a una versión nueva y revisa métricas en cada paso, abortando automáticamente si falla un gate."
+  },
+  {
+    "term": "Canary test (isolation)",
+    "termEs": "Test canario (aislamiento)",
+    "module": "m7",
+    "en": "A test that seeds a unique string into one tenant's data and asserts that queries from another tenant never retrieve, cache or return it.",
+    "es": "Un test que siembra una cadena única en los datos de un tenant y verifica que las consultas de otro tenant nunca la recuperen, cacheen ni devuelvan."
+  },
+  {
+    "term": "Cell architecture",
+    "termEs": "Arquitectura de celdas",
+    "module": "m7",
+    "en": "Deploying a full, independent stack per region or tenant group (a cell), with a thin global control plane that routes each tenant to its home cell.",
+    "es": "Desplegar un stack completo e independiente por región o grupo de tenants (una celda), con un control plane global delgado que enruta cada tenant a su celda de origen."
+  },
+  {
+    "term": "Change Data Feed",
+    "termEs": "Change Data Feed",
+    "module": "m6",
+    "en": "A Delta table feature that records row-level inserts, updates and deletes; required for Delta Sync Vector Search indexes.",
+    "es": "Una función de las tablas Delta que registra inserciones, actualizaciones y borrados por fila; es obligatoria para los índices Delta Sync de Vector Search."
+  },
+  {
+    "term": "Checkpointer",
+    "termEs": "Checkpointer",
+    "module": "m4",
+    "en": "A LangGraph persistence layer, such as MemorySaver or a Postgres saver, that stores the graph state after each step per thread_id, enabling multi-turn threads, interrupts and resuming.",
+    "es": "Una capa de persistencia de LangGraph, como MemorySaver o un saver de Postgres, que guarda el estado del grafo después de cada paso por thread_id, permitiendo hilos multi-turno, interrupciones y reanudación."
+  },
+  {
+    "term": "Chunking",
+    "termEs": "Chunking (fragmentación)",
+    "module": "m2",
+    "en": "Splitting documents into smaller passages (chunks) before embedding and indexing. Strategies include fixed-size, recursive, semantic and document-aware splitting by headings and sections.",
+    "es": "Dividir los documentos en pasajes más pequeños (chunks) antes de generar embeddings e indexarlos. Las estrategias incluyen tamaño fijo, recursiva, semántica y consciente del documento por encabezados y secciones."
+  },
+  {
+    "term": "Circuit breaker",
+    "termEs": "Circuit breaker",
+    "module": "m5",
+    "en": "A pattern that stops calling a failing dependency after a failure threshold (open), fails fast for a cooldown, then lets a probe through (half-open) before closing again.",
+    "es": "Patrón que deja de llamar a una dependencia que falla tras un umbral de fallas (abierto), falla rápido durante un enfriamiento y luego deja pasar una prueba (half-open) antes de volver a cerrarse."
+  },
+  {
+    "term": "Citation validation",
+    "termEs": "Validación de citas",
+    "module": "m2",
+    "en": "A post-generation check that every cited chunk id was actually retrieved and that each quoted span exists in the cited chunk. Failures trigger a retry, a refusal or an alert.",
+    "es": "Verificación posterior a la generación de que cada ID de chunk citado realmente se recuperó y de que cada fragmento citado existe en ese chunk. Las fallas disparan un reintento, un rechazo o una alerta."
+  },
+  {
+    "term": "Cohen's kappa",
+    "termEs": "Kappa de Cohen",
+    "module": "m3",
+    "en": "Agreement statistic between two raters that corrects for agreement expected by chance. Used to check whether an LLM judge agrees with human labels.",
+    "es": "Estadístico de acuerdo entre dos evaluadores que corrige el acuerdo esperado por azar. Se usa para verificar si un juez LLM coincide con las etiquetas humanas."
+  },
+  {
+    "term": "Confidence calibration",
+    "termEs": "Calibración de confianza",
+    "module": "m1",
+    "en": "Checking whether stated confidence matches observed accuracy, for example by bucketing predictions by confidence on a labeled set. LLM self-reported confidence is often overconfident and must be calibrated before it drives decisions.",
+    "es": "Verificar si la confianza declarada coincide con la precisión observada, por ejemplo agrupando predicciones por confianza en un set etiquetado. La confianza autodeclarada de un LLM suele ser excesiva y debe calibrarse antes de guiar decisiones."
+  },
+  {
+    "term": "Confidence interval",
+    "termEs": "Intervalo de confianza",
+    "module": "m9",
+    "en": "A range that expresses the uncertainty of an estimate, such as an accuracy or a difference between models. Eval results should be reported with one, not as bare points.",
+    "es": "Un rango que expresa la incertidumbre de una estimación, como una accuracy o una diferencia entre modelos. Los resultados de evals deben reportarse con uno, no como puntos sueltos."
+  },
+  {
+    "term": "Connection pooling",
+    "termEs": "Connection pooling",
+    "module": "m5",
+    "en": "Reusing a bounded set of database connections across requests (in-app pools or PgBouncer) so concurrent streams do not exhaust Postgres connections.",
+    "es": "Reutilizar un conjunto acotado de conexiones a la base de datos entre peticiones (pools en la app o PgBouncer) para que los streams concurrentes no agoten las conexiones de Postgres."
+  },
+  {
+    "term": "Constrained decoding",
+    "termEs": "Decodificación restringida",
+    "module": "m1",
+    "en": "A provider feature that restricts token generation so the output matches a supplied JSON Schema. It guarantees structure, not correctness or business rules.",
+    "es": "Una característica del proveedor que restringe la generación de tokens para que la salida cumpla un JSON Schema dado. Garantiza la estructura, no la corrección ni las reglas de negocio."
+  },
+  {
+    "term": "Context precision",
+    "termEs": "Context precision (precisión de contexto)",
+    "module": "m2",
+    "en": "A retrieval metric that rewards relevant chunks appearing at the top of the retrieved list. Low values with high recall suggest adding or tuning a re-ranker.",
+    "es": "Métrica de retrieval que premia que los chunks relevantes aparezcan arriba en la lista recuperada. Valores bajos con recall alto sugieren agregar o ajustar un re-ranker."
+  },
+  {
+    "term": "Context recall",
+    "termEs": "Context recall (recall de contexto)",
+    "module": "m2",
+    "en": "A retrieval metric: the share of statements in the reference answer that can be attributed to the retrieved context. Low values mean retrieval missed needed information.",
+    "es": "Métrica de retrieval: proporción de enunciados de la respuesta de referencia que se pueden atribuir al contexto recuperado. Valores bajos significan que el retrieval omitió información necesaria."
+  },
+  {
+    "term": "Context window",
+    "termEs": "Ventana de contexto",
+    "module": "m1",
+    "en": "The maximum number of tokens a model can attend to in one request. It is a single budget shared by the system prompt, tool definitions, history, retrieved documents and the generated output.",
+    "es": "El número máximo de tokens que un modelo puede atender en un request. Es un único presupuesto compartido por el system prompt, las definiciones de tools, el historial, los documentos recuperados y la salida generada."
+  },
+  {
+    "term": "Continuous batching",
+    "termEs": "Continuous batching",
+    "module": "m6",
+    "en": "An inference scheduling method that adds and removes sequences from the running batch at every decoding step, keeping GPUs busy.",
+    "es": "Un método de planificación de inferencia que agrega y retira secuencias del lote en ejecución en cada paso de decodificación, manteniendo las GPUs ocupadas."
+  },
+  {
+    "term": "Control plane",
+    "termEs": "Control plane (plano de control)",
+    "module": "m7",
+    "en": "The part of a platform that manages configuration rather than serving requests: auth, tenant directory, billing, routing rules.",
+    "es": "La parte de una plataforma que gestiona la configuración en lugar de atender peticiones: auth, directorio de tenants, facturación, reglas de enrutamiento."
+  },
+  {
     "term": "Conventional Commits",
     "termEs": "Conventional Commits",
     "module": "m0",
     "en": "A commit message convention with typed prefixes such as feat, fix, docs, test, ci and chore, which keeps history readable and enables automated changelogs.",
     "es": "Una convención de mensajes de commit con prefijos tipados como feat, fix, docs, test, ci y chore, que mantiene el historial legible y permite generar changelogs automáticos."
+  },
+  {
+    "term": "Conversation condensation",
+    "termEs": "Condensación de conversación",
+    "module": "m2",
+    "en": "Rewriting chat history plus the latest follow-up into one standalone query before retrieval, so questions like 'and for condos?' retrieve the right documents.",
+    "es": "Reescribir el historial del chat más el último seguimiento en una sola consulta autocontenida antes del retrieval, para que preguntas como '¿y para condominios?' recuperen los documentos correctos."
+  },
+  {
+    "term": "Cosine similarity",
+    "termEs": "Similitud coseno",
+    "module": "m2",
+    "en": "The cosine of the angle between two vectors, from -1 to 1. For unit-normalized vectors it equals the dot product. pgvector exposes cosine distance (1 minus similarity) with the <=> operator.",
+    "es": "El coseno del ángulo entre dos vectores, de -1 a 1. Para vectores normalizados es igual al producto punto. pgvector expone la distancia coseno (1 menos la similitud) con el operador <=>."
+  },
+  {
+    "term": "Cost attribution",
+    "termEs": "Atribución de costos",
+    "module": "m7",
+    "en": "Tagging every cost event (LLM, embedding, re-rank, compute, storage) with tenant and feature so cost per tenant and margin per plan can be computed.",
+    "es": "Etiquetar cada evento de costo (LLM, embeddings, re-rank, cómputo, almacenamiento) con tenant y funcionalidad para poder calcular el costo por tenant y el margen por plan."
+  },
+  {
+    "term": "Cost cap",
+    "termEs": "Límite de costo",
+    "module": "m4",
+    "en": "A per-run or per-tenant spending budget computed from token usage and configured prices, checked before each model call to stop runaway spending.",
+    "es": "Un presupuesto de gasto por ejecución o por tenant calculado desde el uso de tokens y los precios configurados, revisado antes de cada llamada al modelo para frenar gastos descontrolados."
   },
   {
     "term": "Cost per 1k requests",
@@ -35,6 +350,62 @@
     "es": "El costo de servir mil requests, calculado a partir de los tokens promedio de entrada y salida y los precios por token del proveedor. Una forma estándar de comparar modelos y presupuestar funcionalidades con LLM."
   },
   {
+    "term": "Cross-encoder",
+    "termEs": "Cross-encoder",
+    "module": "m2",
+    "en": "A model that reads a (query, document) pair together and outputs one relevance score. More accurate than a bi-encoder but must run per candidate at query time, so it is used for re-ranking.",
+    "es": "Modelo que lee un par (consulta, documento) junto y devuelve un único score de relevancia. Más preciso que un bi-encoder, pero debe ejecutarse por candidato en tiempo de consulta, por eso se usa para re-ranking."
+  },
+  {
+    "term": "Cross-region inference profile",
+    "termEs": "Inference profile cross-region",
+    "module": "m8",
+    "en": "A Bedrock model id that routes requests across several regions in a geography (or globally) for higher throughput and resilience.",
+    "es": "Un id de modelo de Bedrock que rutea requests entre varias regiones de una geografía (o globalmente) para más throughput y resiliencia."
+  },
+  {
+    "term": "CTE",
+    "termEs": "CTE (expresión de tabla común)",
+    "module": "m6",
+    "en": "Common Table Expression: a named sub-query defined with WITH that lets you write an analysis as readable, testable steps.",
+    "es": "Common Table Expression: una subconsulta con nombre definida con WITH que permite escribir un análisis como pasos legibles y fáciles de probar."
+  },
+  {
+    "term": "Data contamination",
+    "termEs": "Contaminación de datos",
+    "module": "m9",
+    "en": "Test items leaking into training data, few-shot examples or tuning sets, which inflates scores. A key reason to keep private, deduplicated benchmarks.",
+    "es": "Ítems de prueba que se filtran a datos de entrenamiento, ejemplos few-shot o sets de ajuste, lo que infla los puntajes. Una razón clave para mantener benchmarks privados y deduplicados."
+  },
+  {
+    "term": "Data lineage",
+    "termEs": "Lineage de datos (linaje)",
+    "module": "m6",
+    "en": "The record of where data came from and how it was transformed, from source documents to chunks, indexes and model outputs.",
+    "es": "El registro de dónde vienen los datos y cómo se transformaron, desde los documentos fuente hasta los chunks, índices y salidas de modelos."
+  },
+  {
+    "term": "Data residency",
+    "termEs": "Residencia de datos",
+    "module": "m7",
+    "en": "A requirement that a tenant's data, including embeddings, inference calls, traces and backups, stays within a specific geographic region.",
+    "es": "Un requisito de que los datos de un tenant, incluidos embeddings, llamadas de inferencia, traces y backups, permanezcan dentro de una región geográfica específica."
+  },
+  {
+    "term": "Delta Lake",
+    "termEs": "Delta Lake",
+    "module": "m6",
+    "en": "An open table format on object storage with ACID transactions, MERGE, schema enforcement and time travel; the default table format on Databricks.",
+    "es": "Un formato de tabla abierto sobre object storage con transacciones ACID, MERGE, enforcement de schema y time travel; el formato de tabla por defecto en Databricks."
+  },
+  {
+    "term": "Delta Sync index",
+    "termEs": "Índice Delta Sync",
+    "module": "m6",
+    "en": "A Vector Search index derived from a Delta table and kept in sync automatically, in TRIGGERED or CONTINUOUS mode, with managed or self-managed embeddings.",
+    "es": "Un índice de Vector Search derivado de una tabla Delta y sincronizado automáticamente, en modo TRIGGERED o CONTINUOUS, con embeddings administrados o propios."
+  },
+  {
     "term": "Demo GIF",
     "termEs": "GIF de demo",
     "module": "m0",
@@ -42,11 +413,151 @@
     "es": "Una grabación animada corta (de 10 a 20 segundos) al principio de un README que muestra al proyecto produciendo un resultado realista, grabada con herramientas como VHS, ScreenToGif o el video de Playwright."
   },
   {
+    "term": "Direct Vector Access index",
+    "termEs": "Índice Direct Vector Access",
+    "module": "m6",
+    "en": "A Vector Search index with no source table; the application upserts and deletes vectors through the API.",
+    "es": "Un índice de Vector Search sin tabla fuente; la aplicación hace upsert y delete de vectores a través de la API."
+  },
+  {
+    "term": "Drift",
+    "termEs": "Drift (deriva)",
+    "module": "m3",
+    "en": "A change over time in inputs, retrieved content, model behavior or outputs that degrades quality without any code change.",
+    "es": "Un cambio con el tiempo en las entradas, el contenido recuperado, el comportamiento del modelo o las salidas que degrada la calidad sin ningún cambio de código."
+  },
+  {
+    "term": "ECS Fargate",
+    "termEs": "ECS Fargate",
+    "module": "m5",
+    "en": "AWS's serverless container runtime for ECS: you define task CPU and memory, and AWS runs the containers without managing EC2 hosts.",
+    "es": "Runtime de contenedores serverless de AWS para ECS: defines CPU y memoria de la task, y AWS corre los contenedores sin que administres hosts EC2."
+  },
+  {
+    "term": "Effort",
+    "termEs": "Effort (esfuerzo)",
+    "module": "m1",
+    "en": "A request setting on current Claude models (output_config effort: low, medium, high and above) that controls how much the model thinks and how many tokens it spends. It is the main cost and quality lever where sampling parameters are unavailable.",
+    "es": "Una configuración del request en los modelos actuales de Claude (effort en output_config: low, medium, high y superiores) que controla cuánto piensa el modelo y cuántos tokens gasta. Es la principal palanca de costo y calidad donde no hay parámetros de sampling."
+  },
+  {
+    "term": "Embedding",
+    "termEs": "Embedding (vector semántico)",
+    "module": "m2",
+    "en": "A fixed-length vector of floats produced by a model so that texts with similar meaning are close in vector space. Vectors from different models are not comparable.",
+    "es": "Vector de números de punto flotante de longitud fija producido por un modelo, de modo que textos con significado parecido quedan cerca en el espacio vectorial. Los vectores de modelos distintos no son comparables."
+  },
+  {
+    "term": "Error budget burn rate",
+    "termEs": "Burn rate del error budget",
+    "module": "m5",
+    "en": "How fast a service consumes its allowed unreliability relative to the SLO window. Multi-window burn-rate alerts page on fast burns and ticket on slow ones.",
+    "es": "Qué tan rápido un servicio consume su margen de falla permitido respecto a la ventana del SLO. Las alertas de burn rate multi-ventana hacen page ante consumos rápidos y abren tickets ante consumos lentos."
+  },
+  {
+    "term": "Error contract",
+    "termEs": "Contrato de error",
+    "module": "m4",
+    "en": "A stable, structured error format returned by a tool, typically with code, message, retryable flag and hint, so the model can decide whether to retry, ask the user or stop.",
+    "es": "Un formato de error estable y estructurado que devuelve una tool, normalmente con código, mensaje, flag de reintento y pista, para que el modelo decida si reintentar, preguntar al usuario o detenerse."
+  },
+  {
+    "term": "Eval",
+    "termEs": "Eval (evaluación)",
+    "module": "m3",
+    "en": "A repeatable measurement of an LLM system's behavior on a set of inputs, producing scores instead of a single pass/fail. The LLM equivalent of a test suite.",
+    "es": "Una medición repetible del comportamiento de un sistema LLM sobre un conjunto de entradas, que produce puntajes en lugar de un único aprobado/reprobado. El equivalente LLM de una suite de pruebas."
+  },
+  {
+    "term": "Eval baseline",
+    "termEs": "Línea base de evals",
+    "module": "m3",
+    "en": "Stored scores from the last accepted version on main. CI compares new runs against it with a tolerance to detect regressions.",
+    "es": "Puntajes guardados de la última versión aceptada en main. CI compara las nuevas corridas contra ella con una tolerancia para detectar regresiones."
+  },
+  {
+    "term": "Eval gate",
+    "termEs": "Eval gate",
+    "module": "m5",
+    "en": "A CI job that runs the golden dataset and blocks a merge or deploy if quality metrics such as faithfulness fall below a threshold.",
+    "es": "Job de CI que corre el golden dataset y bloquea un merge o deploy si métricas de calidad como faithfulness caen bajo un umbral."
+  },
+  {
+    "term": "Eval pyramid",
+    "termEs": "Pirámide de evals",
+    "module": "m3",
+    "en": "Layered eval strategy: many cheap deterministic checks at the base, model-graded evals in the middle, and a small amount of human review at the top. Mirrors the test pyramid.",
+    "es": "Estrategia de evals por capas: muchos checks determinísticos baratos en la base, evals calificados por modelo en el medio y poca revisión humana en la cima. Refleja la pirámide de testing."
+  },
+  {
+    "term": "Eval-driven development",
+    "termEs": "Desarrollo guiado por evals",
+    "module": "m9",
+    "en": "A TDD-like workflow where eval cases capturing a failure or requirement are written first, the system is changed until they pass, and a sealed holdout guards against overfitting.",
+    "es": "Un flujo similar a TDD donde primero se escriben los casos de eval que capturan un fallo o requisito, se cambia el sistema hasta que pasan y un split sellado protege contra el sobreajuste."
+  },
+  {
+    "term": "Exact cache",
+    "termEs": "Caché exacta",
+    "module": "m5",
+    "en": "A cache that returns a stored LLM answer only when the full key matches: tenant, normalized question, model, prompt version and corpus version.",
+    "es": "Caché que devuelve una respuesta de LLM guardada solo cuando coincide la key completa: tenant, pregunta normalizada, modelo, versión del prompt y versión del corpus."
+  },
+  {
     "term": "Exam gate",
     "termEs": "Gate del examen",
     "module": "m0",
     "en": "The platform rule that unlocks the next module only when the current module's best exam score is at least 70%, with a manual override for content you already know.",
     "es": "La regla de la plataforma que desbloquea el siguiente módulo solo cuando el mejor puntaje del examen del módulo actual es de al menos 70 %, con una opción manual para contenido que ya conoces."
+  },
+  {
+    "term": "Exponential backoff",
+    "termEs": "Backoff exponencial",
+    "module": "m1",
+    "en": "A retry strategy where the wait doubles after each failed attempt, up to a cap, giving an overloaded service time to recover. It should be combined with jitter, a maximum number of attempts and a total deadline.",
+    "es": "Una estrategia de reintentos en la que la espera se duplica tras cada intento fallido, hasta un tope, dando tiempo a un servicio sobrecargado para recuperarse. Debe combinarse con jitter, un número máximo de intentos y una fecha límite total."
+  },
+  {
+    "term": "External model endpoint",
+    "termEs": "Endpoint de modelo externo",
+    "module": "m6",
+    "en": "A Databricks serving endpoint that proxies a third-party model provider, centralizing credentials, permissions and AI Gateway controls.",
+    "es": "Un endpoint de serving de Databricks que hace de proxy hacia un proveedor externo de modelos, centralizando credenciales, permisos y controles de AI Gateway."
+  },
+  {
+    "term": "Faithfulness",
+    "termEs": "Faithfulness (fidelidad)",
+    "module": "m2",
+    "en": "An evaluation metric: the share of claims in an answer that are supported by the retrieved context. Detects hallucination and needs no reference answer.",
+    "es": "Métrica de evaluación: proporción de afirmaciones de una respuesta respaldadas por el contexto recuperado. Detecta alucinaciones y no necesita respuesta de referencia."
+  },
+  {
+    "term": "FastMCP",
+    "termEs": "FastMCP",
+    "module": "m4",
+    "en": "The high-level server API in the official MCP Python SDK. Decorators like @mcp.tool() and @mcp.resource() turn functions into MCP primitives, deriving schemas from type hints and descriptions from docstrings.",
+    "es": "La API de alto nivel para servidores en el SDK oficial de MCP para Python. Decoradores como @mcp.tool() y @mcp.resource() convierten funciones en primitivas MCP, derivando schemas desde los type hints y descripciones desde los docstrings."
+  },
+  {
+    "term": "Field-level F1",
+    "termEs": "F1 por campo",
+    "module": "m9",
+    "en": "Extraction metric computed per field after normalization. A wrong value counts as both a false positive and a false negative; a hallucinated value for an empty gold field is a false positive.",
+    "es": "Métrica de extracción calculada por campo tras normalizar. Un valor incorrecto cuenta como falso positivo y falso negativo; un valor alucinado para un campo gold vacío es un falso positivo."
+  },
+  {
+    "term": "Final-state check",
+    "termEs": "Chequeo de estado final",
+    "module": "m4",
+    "en": "An agent eval assertion on what actually changed in the system, such as recorded refunds or tickets in a fake backend, rather than on the reply text.",
+    "es": "Una verificación de un eval de agente sobre lo que realmente cambió en el sistema, como reembolsos o tickets registrados en un backend falso, en lugar del texto de la respuesta."
+  },
+  {
+    "term": "Fleiss' kappa",
+    "termEs": "Kappa de Fleiss",
+    "module": "m9",
+    "en": "A chance-corrected agreement coefficient for three or more annotators who all label every item with nominal labels.",
+    "es": "Un coeficiente de acuerdo corregido por azar para tres o más anotadores que etiquetan todos los ítems con etiquetas nominales."
   },
   {
     "term": "Foundation model",
@@ -63,11 +574,207 @@
     "es": "Una forma de leer una oferta de empleo: identificar la familia de roles, reescribir las responsabilidades como trabajo diario, separar imprescindibles de deseables y luego listar las señales de alerta como preguntas de entrevista."
   },
   {
+    "term": "G-Eval",
+    "termEs": "G-Eval",
+    "module": "m9",
+    "en": "A judging method that turns a criterion into explicit evaluation steps and computes a probability-weighted score; sampling the judge several times is a common substitute when log-probabilities are unavailable.",
+    "es": "Un método de juicio que convierte un criterio en pasos de evaluación explícitos y calcula un puntaje ponderado por probabilidad; muestrear al juez varias veces es un sustituto común cuando no hay log-probabilities."
+  },
+  {
+    "term": "GenAI semantic conventions",
+    "termEs": "Convenciones semánticas GenAI",
+    "module": "m3",
+    "en": "OpenTelemetry's standard attribute names for generative AI operations, such as gen_ai.request.model and gen_ai.usage.input_tokens. Still evolving.",
+    "es": "Los nombres de atributos estándar de OpenTelemetry para operaciones de IA generativa, como gen_ai.request.model y gen_ai.usage.input_tokens. Todavía en evolución."
+  },
+  {
+    "term": "Golden dataset",
+    "termEs": "Golden dataset (dataset de referencia)",
+    "module": "m3",
+    "en": "A curated, versioned set of inputs with reference answers and metadata (tags, source, difficulty) used as the regression suite for an LLM application.",
+    "es": "Un conjunto curado y versionado de entradas con respuestas de referencia y metadata (tags, fuente, dificultad) que se usa como suite de regresión de una aplicación LLM."
+  },
+  {
+    "term": "Graceful degradation",
+    "termEs": "Degradación elegante",
+    "module": "m5",
+    "en": "Designing a service to keep giving useful, clearly labeled responses at lower quality (fallback model, cached answer, links) when dependencies fail.",
+    "es": "Diseñar un servicio para que siga dando respuestas útiles y claramente etiquetadas con menor calidad (modelo de fallback, respuesta cacheada, links) cuando fallan las dependencias."
+  },
+  {
+    "term": "Graceful shutdown",
+    "termEs": "Apagado elegante",
+    "module": "m8",
+    "en": "Stopping a server by refusing new requests and letting in-flight streams finish within a grace period, instead of cutting them.",
+    "es": "Detener un servidor rechazando requests nuevos y dejando terminar los streams en vuelo dentro de un período de gracia, en lugar de cortarlos."
+  },
+  {
+    "term": "Grounding",
+    "termEs": "Grounding (anclaje)",
+    "module": "m2",
+    "en": "The property that every claim in an answer is supported by the retrieved context rather than by the model's general knowledge. Enforced with citation requirements and measured with faithfulness.",
+    "es": "Propiedad de que cada afirmación de una respuesta está respaldada por el contexto recuperado y no por el conocimiento general del modelo. Se impone con requisitos de citas y se mide con faithfulness."
+  },
+  {
+    "term": "Guardrail",
+    "termEs": "Guardrail (barrera de protección)",
+    "module": "m3",
+    "en": "A check around an LLM call that filters or validates inputs and outputs: PII, topic restriction, schema, groundedness, policy.",
+    "es": "Un control alrededor de una llamada al LLM que filtra o valida entradas y salidas: PII, restricción de temas, schema, groundedness, políticas."
+  },
+  {
+    "term": "Handoff",
+    "termEs": "Handoff (traspaso)",
+    "module": "m4",
+    "en": "In a swarm, the transfer of control from one agent to another, usually through a handoff tool that returns a Command routing to the target agent.",
+    "es": "En un swarm, la transferencia del control de un agente a otro, normalmente mediante una handoff tool que devuelve un Command que enruta al agente destino."
+  },
+  {
+    "term": "High-water mark",
+    "termEs": "Marca de agua alta (watermark)",
+    "module": "m6",
+    "en": "The latest timestamp or id a pipeline has processed, stored so the next run reads only newer records.",
+    "es": "El timestamp o id más reciente que procesó un pipeline, guardado para que la siguiente corrida lea solo registros más nuevos."
+  },
+  {
+    "term": "HNSW",
+    "termEs": "HNSW",
+    "module": "m5",
+    "en": "Hierarchical Navigable Small World: a graph-based approximate nearest-neighbor index. In pgvector it offers strong recall and latency with no training step, at the cost of memory and build time.",
+    "es": "Hierarchical Navigable Small World: índice de vecinos más cercanos aproximado basado en grafos. En pgvector ofrece buen recall y latencia sin paso de entrenamiento, a costa de memoria y tiempo de construcción."
+  },
+  {
+    "term": "Human-in-the-loop (HITL)",
+    "termEs": "Human-in-the-loop (HITL)",
+    "module": "m4",
+    "en": "A design where a person reviews, approves, edits or rejects an agent's proposed action before it executes, typically for irreversible or high-risk operations.",
+    "es": "Un diseño en el que una persona revisa, aprueba, edita o rechaza una acción propuesta por un agente antes de que se ejecute, normalmente para operaciones irreversibles o de alto riesgo."
+  },
+  {
+    "term": "Hybrid search",
+    "termEs": "Búsqueda híbrida",
+    "module": "m2",
+    "en": "Running a keyword retriever (BM25 or Postgres full-text) and a vector retriever over the same corpus and fusing their results, so both exact terms and paraphrases are found.",
+    "es": "Ejecutar un retriever por palabras clave (BM25 o texto completo de Postgres) y uno vectorial sobre el mismo corpus y fusionar sus resultados, para encontrar tanto términos exactos como paráfrasis."
+  },
+  {
+    "term": "HyDE (Hypothetical Document Embeddings)",
+    "termEs": "HyDE (Hypothetical Document Embeddings)",
+    "module": "m2",
+    "en": "A rewriting technique that asks an LLM for a hypothetical answer and embeds it instead of the question, so the query vector lands near real document chunks. Fuse with the original query to limit hallucinated drift.",
+    "es": "Técnica de reescritura que pide a un LLM una respuesta hipotética y genera su embedding en lugar del de la pregunta, para que el vector de consulta caiga cerca de chunks reales. Se fusiona con la consulta original para limitar desvíos por alucinación."
+  },
+  {
+    "term": "Idempotency key",
+    "termEs": "Idempotency key (clave de idempotencia)",
+    "module": "m4",
+    "en": "A unique key sent with a write operation so that retries or duplicate calls apply the change only once. Essential for agent tools, since agents and resumes repeat calls.",
+    "es": "Una clave única que se envía con una operación de escritura para que los reintentos o llamadas duplicadas apliquen el cambio una sola vez. Esencial en tools de agentes, porque los agentes y las reanudaciones repiten llamadas."
+  },
+  {
+    "term": "Idempotent pipeline",
+    "termEs": "Pipeline idempotente",
+    "module": "m6",
+    "en": "A pipeline that produces the same result when re-run on the same input, typically via deterministic ids and upserts.",
+    "es": "Un pipeline que produce el mismo resultado al volver a ejecutarse con la misma entrada, normalmente mediante ids deterministas y upserts."
+  },
+  {
+    "term": "Indirect prompt injection",
+    "termEs": "Prompt injection indirecto",
+    "module": "m3",
+    "en": "Malicious instructions planted in content the model reads, such as a retrieved document or web page, rather than typed by the user.",
+    "es": "Instrucciones maliciosas plantadas en contenido que el modelo lee, como un documento recuperado o una página web, en lugar de ser escritas por el usuario."
+  },
+  {
+    "term": "Inference table",
+    "termEs": "Inference table",
+    "module": "m6",
+    "en": "A Delta table where a serving endpoint automatically logs request and response payloads for monitoring and evaluation.",
+    "es": "Una tabla Delta donde un endpoint de serving registra automáticamente los payloads de request y response para monitoreo y evaluación."
+  },
+  {
+    "term": "Inter-token latency",
+    "termEs": "Latencia entre tokens",
+    "module": "m8",
+    "en": "Average time between generated tokens during decode; sets how fast a user sees text stream.",
+    "es": "Tiempo promedio entre tokens generados durante el decode; define qué tan rápido ve el usuario el texto en streaming."
+  },
+  {
+    "term": "Interrupt",
+    "termEs": "Interrupt (interrupción)",
+    "module": "m4",
+    "en": "A LangGraph call, interrupt(payload), that pauses a graph inside a node and surfaces a payload to a human. The graph resumes with Command(resume=value), and the node re-runs from its start.",
+    "es": "Una llamada de LangGraph, interrupt(payload), que pausa el grafo dentro de un nodo y muestra un payload a una persona. El grafo se reanuda con Command(resume=valor), y el nodo se vuelve a ejecutar desde su inicio."
+  },
+  {
+    "term": "IVFFlat",
+    "termEs": "IVFFlat",
+    "module": "m5",
+    "en": "An inverted-file vector index that clusters existing vectors into lists and searches the nearest `probes` lists. Fast to build, but must be built after data is loaded.",
+    "es": "Índice vectorial de archivo invertido que agrupa los vectores existentes en listas y busca en las `probes` listas más cercanas. Rápido de construir, pero debe crearse después de cargar los datos."
+  },
+  {
+    "term": "Jitter",
+    "termEs": "Jitter",
+    "module": "m1",
+    "en": "Randomness added to retry delays so many clients do not retry at the same instant. Full jitter samples the wait uniformly between zero and the exponential backoff value.",
+    "es": "Aleatoriedad agregada a las esperas de reintento para que muchos clientes no reintenten en el mismo instante. El full jitter muestrea la espera uniformemente entre cero y el valor del backoff exponencial."
+  },
+  {
     "term": "Job posting red flag",
     "termEs": "Señal de alerta en una oferta",
     "module": "m0",
     "en": "A sign of risk in a posting, such as unrealistic years of LLM experience, every tool listed as mandatory, no mention of evaluation, or no clear data access.",
     "es": "Un indicio de riesgo en una oferta, como años irreales de experiencia con LLM, todas las herramientas como obligatorias, ninguna mención a evaluación o falta de claridad sobre el acceso a los datos."
+  },
+  {
+    "term": "JSON Schema",
+    "termEs": "JSON Schema",
+    "module": "m1",
+    "en": "A standard vocabulary for describing the shape of JSON data. LLM APIs use it for tool inputs and structured outputs; generate it from a Pydantic model with model_json_schema() to keep one source of truth.",
+    "es": "Un vocabulario estándar para describir la forma de datos JSON. Las APIs de LLM lo usan para inputs de tools y salidas estructuradas; genéralo desde un modelo Pydantic con model_json_schema() para mantener una sola fuente de verdad."
+  },
+  {
+    "term": "Judge drift",
+    "termEs": "Drift del juez",
+    "module": "m9",
+    "en": "A change in eval scores caused by a change in the judge model or rubric rather than in the system under test. Handled by pinning versions and re-baselining.",
+    "es": "Un cambio en los puntajes de eval causado por un cambio en el modelo juez o la rúbrica, no en el sistema bajo prueba. Se maneja fijando versiones y recalculando el baseline."
+  },
+  {
+    "term": "Judge jury",
+    "termEs": "Jurado de jueces",
+    "module": "m9",
+    "en": "An ensemble of LLM judges, ideally from different providers, whose scores are aggregated. Reduces idiosyncratic errors and self-preference bias; disagreement routes items to humans.",
+    "es": "Un ensamble de jueces LLM, idealmente de distintos proveedores, cuyos puntajes se agregan. Reduce los errores idiosincráticos y el sesgo de autopreferencia; el desacuerdo envía ítems a humanos."
+  },
+  {
+    "term": "Kappa paradox",
+    "termEs": "Paradoja del kappa",
+    "module": "m9",
+    "en": "When one label dominates, kappa can be low despite high raw agreement because chance agreement is already high. Mitigated by oversampling the rare class and reporting per-class agreement.",
+    "es": "Cuando una etiqueta domina, el kappa puede ser bajo pese a un acuerdo bruto alto porque el acuerdo por azar ya es alto. Se mitiga sobremuestreando la clase rara y reportando el acuerdo por clase."
+  },
+  {
+    "term": "KEDA",
+    "termEs": "KEDA",
+    "module": "m8",
+    "en": "Kubernetes Event-Driven Autoscaling: scales workloads on external signals such as queue depth or Prometheus queries, including down to zero.",
+    "es": "Kubernetes Event-Driven Autoscaling: escala cargas según señales externas como profundidad de cola o consultas de Prometheus, incluso hasta cero."
+  },
+  {
+    "term": "Krippendorff's alpha",
+    "termEs": "Alpha de Krippendorff",
+    "module": "m9",
+    "en": "A flexible agreement coefficient for any number of annotators, missing labels and nominal, ordinal or interval data.",
+    "es": "Un coeficiente de acuerdo flexible para cualquier número de anotadores, etiquetas faltantes y datos nominales, ordinales o de intervalo."
+  },
+  {
+    "term": "KV cache",
+    "termEs": "KV cache",
+    "module": "m8",
+    "en": "GPU memory holding attention keys and values for every token of active sequences; it limits how many requests a server can batch.",
+    "es": "Memoria de la GPU que guarda las keys y values de atención de cada token de las secuencias activas; limita cuántos requests puede agrupar un servidor."
   },
   {
     "term": "Learning log",
@@ -84,6 +791,13 @@
     "es": "Un esquema simple de repetición espaciada con cajas numeradas: una respuesta correcta mueve la tarjeta a una caja que se repasa con menos frecuencia; un fallo la devuelve a la caja 1."
   },
   {
+    "term": "Little's law",
+    "termEs": "Ley de Little",
+    "module": "m5",
+    "en": "Concurrency equals arrival rate times time in system. Used to size connection pools, tasks and provider limits from rps and latency.",
+    "es": "La concurrencia es igual a la tasa de llegada por el tiempo en el sistema. Se usa para dimensionar connection pools, tasks y límites del proveedor a partir de rps y latencia."
+  },
+  {
     "term": "LLM integration",
     "termEs": "Integración de LLM",
     "module": "m0",
@@ -91,11 +805,151 @@
     "es": "Llamar a las APIs de proveedores de modelos desde servicios reales, incluyendo streaming, reintentos, manejo de rate limits, tool calling y control de costos."
   },
   {
+    "term": "LLM-as-judge",
+    "termEs": "LLM-as-judge (LLM como juez)",
+    "module": "m3",
+    "en": "Using a language model with a rubric to grade another model's outputs. Scalable, but biased and in need of calibration against human labels.",
+    "es": "Usar un modelo de lenguaje con una rúbrica para calificar las salidas de otro modelo. Escalable, pero con sesgos y necesita calibración contra etiquetas humanas."
+  },
+  {
+    "term": "Long-term memory store",
+    "termEs": "Store de memoria de largo plazo",
+    "module": "m4",
+    "en": "Cross-thread storage, namespaced per user or tenant, that holds durable facts and preferences an agent can retrieve in future conversations.",
+    "es": "Almacenamiento entre hilos, con namespace por usuario o tenant, que guarda hechos y preferencias duraderos que un agente puede recuperar en conversaciones futuras."
+  },
+  {
+    "term": "Loop guard",
+    "termEs": "Guarda de bucle",
+    "module": "m4",
+    "en": "A hard limit that stops an agent run, such as a maximum step count or detection of the same tool call with the same arguments repeated N times.",
+    "es": "Un límite duro que detiene la ejecución de un agente, como un número máximo de pasos o la detección de la misma tool call con los mismos argumentos repetida N veces."
+  },
+  {
+    "term": "LoRA",
+    "termEs": "LoRA",
+    "module": "m6",
+    "en": "Low-Rank Adaptation: fine-tuning that freezes base weights and trains small low-rank adapter matrices, cutting memory and producing small swappable artifacts.",
+    "es": "Low-Rank Adaptation: fine-tuning que congela los pesos base y entrena pequeñas matrices adaptadoras de bajo rango, reduciendo memoria y produciendo artefactos pequeños e intercambiables."
+  },
+  {
+    "term": "Macro-F1",
+    "termEs": "Macro-F1",
+    "module": "m9",
+    "en": "The unweighted average of per-class F1 scores. Treats rare classes as equally important as frequent ones, unlike micro-F1 or accuracy.",
+    "es": "El promedio sin ponderar del F1 de cada clase. Trata a las clases raras como igual de importantes que las frecuentes, a diferencia del micro-F1 o la accuracy."
+  },
+  {
+    "term": "max_tokens",
+    "termEs": "max_tokens",
+    "module": "m1",
+    "en": "The request parameter that caps how many output tokens the model may generate. Hitting it truncates the answer and sets the stop reason to max_tokens; you pay for tokens generated, not for the cap.",
+    "es": "El parámetro del request que limita cuántos tokens de salida puede generar el modelo. Alcanzarlo trunca la respuesta y pone el stop reason en max_tokens; pagas por los tokens generados, no por el tope."
+  },
+  {
+    "term": "McNemar's test",
+    "termEs": "Prueba de McNemar",
+    "module": "m9",
+    "en": "A paired significance test for binary outcomes that only uses discordant pairs, the items where exactly one system passes. The exact version is a binomial test on those counts.",
+    "es": "Una prueba de significancia pareada para resultados binarios que solo usa los pares discordantes, los ítems donde exactamente un sistema aprueba. La versión exacta es una prueba binomial sobre esos conteos."
+  },
+  {
+    "term": "MCP (Model Context Protocol)",
+    "termEs": "MCP (Model Context Protocol)",
+    "module": "m4",
+    "en": "An open protocol that standardizes how AI applications connect to external tools, resources and prompts exposed by servers, over JSON-RPC.",
+    "es": "Un protocolo abierto que estandariza cómo las aplicaciones de IA se conectan a tools, resources y prompts externos expuestos por servidores, sobre JSON-RPC."
+  },
+  {
+    "term": "MCP resource",
+    "termEs": "Resource de MCP",
+    "module": "m4",
+    "en": "Read-only data exposed by an MCP server and addressed by a URI, such as inventory://warehouses, that a client can load into context.",
+    "es": "Datos de solo lectura expuestos por un servidor MCP e identificados por una URI, como inventory://warehouses, que un cliente puede cargar en el contexto."
+  },
+  {
+    "term": "Metadata filtering",
+    "termEs": "Filtrado por metadata",
+    "module": "m2",
+    "en": "Restricting retrieval with structured fields such as jurisdiction, doc_type, effective_date or is_current, applied inside each retrieval leg before fusion.",
+    "es": "Restringir el retrieval con campos estructurados como jurisdiction, doc_type, effective_date o is_current, aplicados dentro de cada rama del retrieval antes de la fusión."
+  },
+  {
+    "term": "Metamorphic testing",
+    "termEs": "Metamorphic testing",
+    "module": "m9",
+    "en": "Testing without a full oracle by checking relations between outputs for an input and a transformed input, such as invariance under a name swap or a known direction of change.",
+    "es": "Probar sin un oráculo completo verificando relaciones entre las salidas de una entrada y de una entrada transformada, como la invariancia ante un cambio de nombre o una dirección de cambio conocida."
+  },
+  {
+    "term": "Minimum detectable effect",
+    "termEs": "Efecto mínimo detectable",
+    "module": "m3",
+    "en": "The smallest difference between A/B variants an experiment is powered to detect. Drives the required sample size.",
+    "es": "La diferencia más pequeña entre variantes A/B que un experimento tiene potencia para detectar. Determina el tamaño de muestra necesario."
+  },
+  {
     "term": "ML Engineer",
     "termEs": "ML Engineer (ingeniero de machine learning)",
     "module": "m0",
     "en": "An engineer who trains, fine-tunes and optimizes models: training pipelines, feature engineering, GPUs and inference optimization. Different from an AI Engineer, who mostly consumes models through APIs.",
     "es": "Un ingeniero que entrena, ajusta y optimiza modelos: pipelines de entrenamiento, feature engineering, GPUs y optimización de inferencia. Distinto de un AI Engineer, que principalmente consume modelos a través de APIs."
+  },
+  {
+    "term": "Model alias",
+    "termEs": "Alias de modelo",
+    "module": "m8",
+    "en": "A stable name apps request (such as chat-default) that the gateway maps to concrete models, enabling central model swaps.",
+    "es": "Un nombre estable que piden las apps (como chat-default) y que el gateway mapea a modelos concretos, lo que permite cambiar modelos de forma centralizada."
+  },
+  {
+    "term": "Model cascade",
+    "termEs": "Cascada de modelos",
+    "module": "m1",
+    "en": "A routing pattern that sends each request to a cheap model first and escalates to a stronger model, then to a human, when confidence is low, validation fails or the case is high-risk. Thresholds should be calibrated on labeled data.",
+    "es": "Un patrón de enrutamiento que envía cada request primero a un modelo barato y escala a un modelo más fuerte, y luego a un humano, cuando la confianza es baja, la validación falla o el caso es de alto riesgo. Los umbrales deben calibrarse con datos etiquetados."
+  },
+  {
+    "term": "Model deprecation",
+    "termEs": "Deprecación de modelos",
+    "module": "m8",
+    "en": "A provider's scheduled retirement of a model version, requiring inventory, evaluation of successors and migration before the end-of-life date.",
+    "es": "El retiro programado de una versión de modelo por parte del proveedor, que exige inventario, evaluación de sucesores y migración antes de la fecha de fin de vida."
+  },
+  {
+    "term": "Model routing",
+    "termEs": "Enrutamiento de modelos",
+    "module": "m7",
+    "en": "Choosing a model tier per request based on difficulty, plan, tools needed or budget state, to balance quality, latency and cost.",
+    "es": "Elegir un nivel de modelo por petición según la dificultad, el plan, las herramientas necesarias o el estado del presupuesto, para equilibrar calidad, latencia y costo."
+  },
+  {
+    "term": "Models from code",
+    "termEs": "Models from code",
+    "module": "m6",
+    "en": "An MLflow logging pattern where the model is defined in a Python file marked with set_model, logged as source instead of a pickled object.",
+    "es": "Un patrón de registro de MLflow donde el modelo se define en un archivo Python marcado con set_model y se registra como código fuente en lugar de un objeto serializado con pickle."
+  },
+  {
+    "term": "Multi-stage build",
+    "termEs": "Build multi-stage",
+    "module": "m5",
+    "en": "A Dockerfile with several `FROM` stages where dependencies are built in one stage and only the needed artifacts are copied into a slim runtime image.",
+    "es": "Dockerfile con varias etapas `FROM` en el que las dependencias se construyen en una etapa y solo los artefactos necesarios se copian a una imagen runtime liviana."
+  },
+  {
+    "term": "Multi-tenancy",
+    "termEs": "Multi-tenancy (multiinquilino)",
+    "module": "m7",
+    "en": "Architecture where one deployment serves many customers (tenants) with strict boundaries between their data, limits and configuration.",
+    "es": "Arquitectura en la que un solo deploy atiende a muchos clientes (tenants) con fronteras estrictas entre sus datos, límites y configuración."
+  },
+  {
+    "term": "Multiple comparisons correction",
+    "termEs": "Corrección por comparaciones múltiples",
+    "module": "m9",
+    "en": "Adjusting significance thresholds when running many tests, for example Holm-Bonferroni or Benjamini-Hochberg, so noise is not reported as a finding.",
+    "es": "Ajustar los umbrales de significancia cuando se corren muchas pruebas, por ejemplo con Holm-Bonferroni o Benjamini-Hochberg, para no reportar ruido como hallazgo."
   },
   {
     "term": "Must-have requirement",
@@ -112,11 +966,144 @@
     "es": "Un elemento de una oferta listado como bonus o preferido, o perdido en una larga lista de herramientas intercambiables. No tenerlo rara vez descalifica a un candidato."
   },
   {
+    "term": "Noisy neighbor",
+    "termEs": "Vecino ruidoso",
+    "module": "m7",
+    "en": "A tenant whose heavy usage degrades performance for others on shared infrastructure. Mitigated with per-tenant rate limits, quotas and work-queue caps.",
+    "es": "Un tenant cuyo uso intensivo degrada el rendimiento de los demás en infraestructura compartida. Se mitiga con rate limits, cuotas y topes de colas por tenant."
+  },
+  {
+    "term": "Non-inferiority margin",
+    "termEs": "Margen de no inferioridad",
+    "module": "m9",
+    "en": "The largest quality loss stakeholders accept, agreed before testing. A candidate is non-inferior if the lower bound of the CI of (candidate minus baseline) is above minus the margin.",
+    "es": "La mayor pérdida de calidad que aceptan los stakeholders, acordada antes de probar. Un candidato es no inferior si el límite inferior del CI de (candidato menos baseline) está por encima de menos el margen."
+  },
+  {
+    "term": "Novelty effect",
+    "termEs": "Efecto novedad",
+    "module": "m3",
+    "en": "A temporary change in user behavior caused by something being new, which fades over time and can mislead short A/B tests.",
+    "es": "Un cambio temporal en el comportamiento de los usuarios causado por algo nuevo, que se diluye con el tiempo y puede engañar a A/B tests cortos."
+  },
+  {
+    "term": "Offline eval",
+    "termEs": "Eval offline",
+    "module": "m3",
+    "en": "Evaluation run before release on a fixed dataset. Reproducible and comparable across versions.",
+    "es": "Evaluación que corre antes del release sobre un dataset fijo. Reproducible y comparable entre versiones."
+  },
+  {
+    "term": "OIDC federation",
+    "termEs": "Federación OIDC",
+    "module": "m5",
+    "en": "Letting GitHub Actions exchange a short-lived OIDC token for cloud credentials (for example an AWS IAM role), removing the need for stored long-lived keys.",
+    "es": "Permitir que GitHub Actions intercambie un token OIDC de corta duración por credenciales de la nube (por ejemplo un rol IAM de AWS), eliminando la necesidad de llaves guardadas de larga duración."
+  },
+  {
+    "term": "Online eval",
+    "termEs": "Eval online",
+    "module": "m3",
+    "en": "Evaluation on real production traffic using sampled judge scores, user feedback signals, latency and cost.",
+    "es": "Evaluación sobre tráfico real de producción usando puntajes muestreados de un juez, señales de feedback de usuarios, latencia y costo."
+  },
+  {
+    "term": "Online eval gate",
+    "termEs": "Gate de evaluación online",
+    "module": "m8",
+    "en": "A rollout check based on live-traffic quality signals per version, such as contract validity, refusal rate or a sampled judge score.",
+    "es": "Un control del rollout basado en señales de calidad del tráfico real por versión, como validez del contrato, tasa de rechazos o un puntaje de juez muestreado."
+  },
+  {
+    "term": "PagedAttention",
+    "termEs": "PagedAttention",
+    "module": "m6",
+    "en": "vLLM's technique of storing the KV cache in fixed-size blocks allocated on demand, like OS memory pages, to fit more concurrent sequences per GPU.",
+    "es": "La técnica de vLLM que guarda el KV cache en bloques de tamaño fijo asignados bajo demanda, como páginas de memoria del sistema operativo, para que quepan más secuencias concurrentes por GPU."
+  },
+  {
+    "term": "Paired comparison",
+    "termEs": "Comparación pareada",
+    "module": "m9",
+    "en": "Comparing two systems on the same items and analyzing per-item differences. Cancels shared item difficulty and gives much narrower intervals than comparing independent scores.",
+    "es": "Comparar dos sistemas sobre los mismos ítems y analizar las diferencias por ítem. Cancela la dificultad compartida de los ítems y da intervalos mucho más estrechos que comparar puntajes independientes."
+  },
+  {
+    "term": "Pairwise evaluation",
+    "termEs": "Evaluación pairwise (por pares)",
+    "module": "m3",
+    "en": "Judging which of two outputs is better for the same input, as opposed to pointwise evaluation, which scores a single output on an absolute scale.",
+    "es": "Juzgar cuál de dos salidas es mejor para la misma entrada, a diferencia de la evaluación pointwise, que puntúa una sola salida en una escala absoluta."
+  },
+  {
+    "term": "Parent-child retrieval",
+    "termEs": "Parent-child retrieval (recuperación padre-hijo)",
+    "module": "m2",
+    "en": "Indexing small child chunks for precise matching, then sending their larger parent section to the LLM. Requires deduplicating parents and capping their length.",
+    "es": "Indexar chunks hijos pequeños para un matching preciso y luego enviar al LLM su sección padre más grande. Requiere deduplicar los padres y limitar su longitud."
+  },
+  {
+    "term": "pass^k",
+    "termEs": "pass^k",
+    "module": "m9",
+    "en": "The probability that all k independent attempts at the same task succeed. Measures reliability and exposes flaky agents that look fine on average success.",
+    "es": "La probabilidad de que los k intentos independientes de la misma tarea tengan éxito. Mide confiabilidad y expone agentes inestables que se ven bien en el éxito promedio."
+  },
+  {
+    "term": "pgvector",
+    "termEs": "pgvector",
+    "module": "m2",
+    "en": "A PostgreSQL extension that adds a vector column type, distance operators and ANN indexes (HNSW, IVFFlat), so vectors live next to relational data and full-text search.",
+    "es": "Extensión de PostgreSQL que agrega un tipo de columna vector, operadores de distancia e índices ANN (HNSW, IVFFlat), para que los vectores vivan junto a los datos relacionales y la búsqueda de texto completo."
+  },
+  {
+    "term": "PII scrubbing",
+    "termEs": "Eliminación de PII",
+    "module": "m6",
+    "en": "Detecting and redacting or pseudonymizing personally identifiable information before it reaches embeddings, logs or eval datasets.",
+    "es": "Detectar y redactar o seudonimizar información de identificación personal antes de que llegue a embeddings, logs o datasets de evaluación."
+  },
+  {
+    "term": "Plan-and-execute",
+    "termEs": "Plan-and-execute",
+    "module": "m4",
+    "en": "An agent pattern where a planner writes an explicit list of steps, an executor runs them, and a replanner revises the plan when results change.",
+    "es": "Un patrón de agente en el que un planificador escribe una lista explícita de pasos, un ejecutor los corre y un re-planificador ajusta el plan cuando cambian los resultados."
+  },
+  {
+    "term": "PodDisruptionBudget",
+    "termEs": "PodDisruptionBudget",
+    "module": "m8",
+    "en": "A Kubernetes policy that limits how many pods of an application can be down at once during voluntary disruptions like node drains.",
+    "es": "Una política de Kubernetes que limita cuántos pods de una aplicación pueden estar caídos a la vez durante disrupciones voluntarias como los drains de nodos."
+  },
+  {
+    "term": "Pool model",
+    "termEs": "Modelo pool",
+    "module": "m7",
+    "en": "Isolation model where all tenants share one table or collection and every row carries a tenant id that every query must filter on. Cheapest, but needs strong enforcement such as RLS.",
+    "es": "Modelo de aislamiento en el que todos los tenants comparten una tabla o colección y cada fila lleva un tenant id por el que toda consulta debe filtrar. El más barato, pero necesita una aplicación fuerte como RLS."
+  },
+  {
     "term": "Portfolio hub",
     "termEs": "Hub del portafolio",
     "module": "m0",
     "en": "A single repo (here ai-engineer-portfolio) that introduces you, links every project with its key result and holds the shared templates and conventions.",
     "es": "Un único repo (aquí ai-engineer-portfolio) que te presenta, enlaza cada proyecto con su resultado clave y contiene las plantillas y convenciones compartidas."
+  },
+  {
+    "term": "Position bias",
+    "termEs": "Sesgo de posición",
+    "module": "m3",
+    "en": "A judge's tendency to prefer an answer because of where it appears (first or second) in a pairwise comparison. Mitigated by swapping order.",
+    "es": "La tendencia de un juez a preferir una respuesta por su posición (primera o segunda) en una comparación pairwise. Se mitiga intercambiando el orden."
+  },
+  {
+    "term": "Prediction-powered inference",
+    "termEs": "Prediction-powered inference",
+    "module": "m9",
+    "en": "A method that combines many judge scores with a small random human-labeled subset to correct the judge's bias and produce an unbiased estimate with a valid interval.",
+    "es": "Un método que combina muchos puntajes de juez con un pequeño subconjunto aleatorio etiquetado por humanos para corregir el sesgo del juez y producir una estimación sin sesgo con un intervalo válido."
   },
   {
     "term": "Production mindset",
@@ -126,6 +1113,48 @@
     "es": "Pensar desde el principio en latencia, costo por request, modos de falla, monitoreo y regresiones, no solo en una demo que funciona. Un rasgo que las ofertas piden una y otra vez."
   },
   {
+    "term": "Prompt caching",
+    "termEs": "Prompt caching (caché de prompts)",
+    "module": "m2",
+    "en": "A provider feature that caches an identical prompt prefix (system prompt, rules, examples) so later requests read it at a reduced rate and lower latency. Any volatile content in the prefix breaks it.",
+    "es": "Función del proveedor que cachea un prefijo de prompt idéntico (system prompt, reglas, ejemplos) para que las solicitudes posteriores lo lean a una tarifa reducida y con menor latencia. Cualquier contenido volátil en el prefijo lo rompe."
+  },
+  {
+    "term": "Prompt feature flag",
+    "termEs": "Feature flag de prompt",
+    "module": "m5",
+    "en": "A runtime switch that selects which reviewed prompt version a request uses, enabling canaries, per-tenant variants and instant rollback without a deploy.",
+    "es": "Switch en runtime que elige qué versión revisada del prompt usa una petición, permitiendo canaries, variantes por tenant y rollback instantáneo sin deploy."
+  },
+  {
+    "term": "Prompt versioning",
+    "termEs": "Versionado de prompts",
+    "module": "m1",
+    "en": "Managing prompts as files with semantic versions, changelogs, tests and pinned versions in production, and logging the version with every call. Changing the output contract is a major version bump.",
+    "es": "Gestionar los prompts como archivos con versiones semánticas, changelogs, tests y versiones fijadas en producción, registrando la versión en cada llamada. Cambiar el contrato de salida es un incremento de versión major."
+  },
+  {
+    "term": "Provider abstraction",
+    "termEs": "Abstracción de proveedores",
+    "module": "m1",
+    "en": "A thin layer that hides vendor SDKs behind your own request, response, error and stream types, so features can switch between providers such as Anthropic, OpenAI and Bedrock through configuration.",
+    "es": "Una capa delgada que oculta los SDKs de los vendors detrás de tus propios tipos de request, respuesta, error y stream, para que las features puedan cambiar entre proveedores como Anthropic, OpenAI y Bedrock mediante configuración."
+  },
+  {
+    "term": "Provisioned throughput",
+    "termEs": "Provisioned throughput",
+    "module": "m6",
+    "en": "A Databricks Foundation Model API serving mode with dedicated, reserved capacity for predictable performance and fine-tuned models.",
+    "es": "Un modo de serving de Foundation Model APIs de Databricks con capacidad dedicada y reservada para un rendimiento predecible y para modelos con fine-tuning."
+  },
+  {
+    "term": "Pseudonymization",
+    "termEs": "Seudonimización",
+    "module": "m8",
+    "en": "Replacing identifiers with placeholders before an LLM call and restoring them afterwards, so the model never sees the real values.",
+    "es": "Reemplazar identificadores por placeholders antes de una llamada al LLM y restaurarlos después, para que el modelo nunca vea los valores reales."
+  },
+  {
     "term": "Pull request template",
     "termEs": "Plantilla de pull request",
     "module": "m0",
@@ -133,11 +1162,214 @@
     "es": "Un archivo .github/pull_request_template.md que completa de antemano la descripción de cada PR. En este curso pide resultados de evals antes/después e impacto en costo/latencia."
   },
   {
+    "term": "pydantic-settings",
+    "termEs": "pydantic-settings",
+    "module": "m5",
+    "en": "A Pydantic library that loads typed, validated configuration from environment variables and `.env` files, failing fast at startup on missing or invalid values.",
+    "es": "Librería de Pydantic que carga configuración tipada y validada desde variables de entorno y archivos `.env`, fallando rápido al arrancar si faltan valores o son inválidos."
+  },
+  {
+    "term": "QLoRA",
+    "termEs": "QLoRA",
+    "module": "m6",
+    "en": "LoRA trained on top of a base model loaded in 4-bit precision, enabling fine-tuning of large models on a single GPU.",
+    "es": "LoRA entrenado sobre un modelo base cargado en precisión de 4 bits, lo que permite hacer fine-tuning de modelos grandes en una sola GPU."
+  },
+  {
+    "term": "Quantization",
+    "termEs": "Cuantización",
+    "module": "m8",
+    "en": "Storing model weights (or KV cache) in fewer bits, such as FP8 or 4-bit AWQ/GPTQ, to save memory at a possible quality cost.",
+    "es": "Guardar los pesos del modelo (o el KV cache) con menos bits, como FP8 o AWQ/GPTQ de 4 bits, para ahorrar memoria con un posible costo de calidad."
+  },
+  {
+    "term": "Query rewriting",
+    "termEs": "Query rewriting (reescritura de consultas)",
+    "module": "m2",
+    "en": "Transforming the user's question before retrieval, for example into paraphrases (multi-query), a more general question (step-back) or a hypothetical answer (HyDE).",
+    "es": "Transformar la pregunta del usuario antes del retrieval, por ejemplo en paráfrasis (multi-query), una pregunta más general (step-back) o una respuesta hipotética (HyDE)."
+  },
+  {
+    "term": "Rate limit (RPM, ITPM, OTPM)",
+    "termEs": "Rate limit (RPM, ITPM, OTPM)",
+    "module": "m1",
+    "en": "Provider quotas on requests per minute, input tokens per minute and output tokens per minute, usually per model and organization. Exceeding any one of them returns HTTP 429.",
+    "es": "Cuotas del proveedor sobre requests por minuto, tokens de entrada por minuto y tokens de salida por minuto, normalmente por modelo y organización. Exceder cualquiera de ellas devuelve HTTP 429."
+  },
+  {
+    "term": "Re-ranking",
+    "termEs": "Re-ranking (reordenamiento)",
+    "module": "m2",
+    "en": "A second retrieval stage that re-scores a wide candidate list (for example 40) with a slower, more accurate model such as a cross-encoder or a hosted rerank API, keeping only the top few.",
+    "es": "Segunda etapa del retrieval que vuelve a puntuar una lista amplia de candidatos (por ejemplo 40) con un modelo más lento y preciso, como un cross-encoder o una API de rerank hospedada, y se queda con los mejores."
+  },
+  {
+    "term": "ReAct",
+    "termEs": "ReAct",
+    "module": "m4",
+    "en": "Reason + Act: a pattern where the model alternates between reasoning about the task and calling tools, feeding each observation back into the next step.",
+    "es": "Reason + Act: un patrón en el que el modelo alterna entre razonar sobre la tarea y llamar tools, devolviendo cada observación al siguiente paso."
+  },
+  {
     "term": "README contract",
     "termEs": "Contrato del README",
     "module": "m0",
     "en": "The fixed README structure every course project follows: pitch and demo GIF, Problem, Architecture, Evaluation, Cost & latency, Trade-offs, Run it, Limitations. Results come before instructions.",
     "es": "La estructura fija de README que sigue cada proyecto del curso: pitch y GIF de demo, Problem, Architecture, Evaluation, Cost & latency, Trade-offs, Run it, Limitations. Los resultados van antes que las instrucciones."
+  },
+  {
+    "term": "Reciprocal rank fusion (RRF)",
+    "termEs": "Reciprocal rank fusion (RRF, fusión por rango recíproco)",
+    "module": "m2",
+    "en": "A rank-based fusion method: each document scores the sum of 1 / (k + rank) across result lists, with k around 60. Needs no score normalization.",
+    "es": "Método de fusión basado en posiciones: cada documento suma 1 / (k + rank) en cada lista de resultados, con k alrededor de 60. No necesita normalizar scores."
+  },
+  {
+    "term": "Red-teaming",
+    "termEs": "Red-teaming",
+    "module": "m3",
+    "en": "Structured adversarial testing that tries to make an LLM system misbehave (jailbreaks, injection, data exfiltration) to find and fix weaknesses.",
+    "es": "Pruebas adversariales estructuradas que intentan hacer que un sistema LLM se comporte mal (jailbreaks, injection, exfiltración de datos) para encontrar y corregir debilidades."
+  },
+  {
+    "term": "Reducer",
+    "termEs": "Reducer",
+    "module": "m4",
+    "en": "A function attached to a state key that defines how a node's update merges with the current value, for example add_messages to append messages. Without a reducer, updates overwrite.",
+    "es": "Una función asociada a una key del estado que define cómo la actualización de un nodo se combina con el valor actual, por ejemplo add_messages para agregar mensajes. Sin reducer, las actualizaciones reemplazan el valor."
+  },
+  {
+    "term": "Reference-free metric",
+    "termEs": "Métrica sin referencia",
+    "module": "m9",
+    "en": "A metric that judges an output on its own or against its input (faithfulness, format, safety) without a gold answer. Scales to production traffic but needs calibration.",
+    "es": "Una métrica que juzga una salida por sí sola o contra su entrada (faithfulness, formato, seguridad) sin respuesta gold. Escala al tráfico de producción pero necesita calibración."
+  },
+  {
+    "term": "Reflection",
+    "termEs": "Reflexión",
+    "module": "m4",
+    "en": "A pattern where a draft output is critiqued, by the same model or a checker, and then revised. Most effective when the critique uses objective signals such as tests or validators.",
+    "es": "Un patrón en el que una salida borrador se critica, por el mismo modelo o un verificador, y luego se corrige. Es más efectivo cuando la crítica usa señales objetivas como tests o validadores."
+  },
+  {
+    "term": "Release manifest",
+    "termEs": "Manifiesto de release",
+    "module": "m8",
+    "en": "A versioned file pinning everything that shapes an LLM feature's behavior: prompt version, model snapshot, parameters, guardrail and eval evidence.",
+    "es": "Un archivo versionado que fija todo lo que define el comportamiento de una funcionalidad LLM: versión del prompt, snapshot del modelo, parámetros, guardrail y evidencia de evaluación."
+  },
+  {
+    "term": "Repair loop",
+    "termEs": "Bucle de reparación",
+    "module": "m1",
+    "en": "A bounded retry pattern for invalid model output: the previous answer and the validation errors are sent back so the model can correct them. After a small number of attempts, failures escalate to a fallback instead of passing invalid data downstream.",
+    "es": "Un patrón de reintento acotado para salidas inválidas del modelo: se devuelven la respuesta anterior y los errores de validación para que el modelo los corrija. Tras pocos intentos, las fallas escalan a un fallback en lugar de pasar datos inválidos hacia adelante."
+  },
+  {
+    "term": "Retrieval-augmented generation (RAG)",
+    "termEs": "Retrieval-augmented generation (RAG, generación aumentada con recuperación)",
+    "module": "m2",
+    "en": "A pattern where the system retrieves relevant passages from your own documents and passes them to the LLM as context, so answers are grounded in that content instead of the model's training data.",
+    "es": "Patrón en el que el sistema recupera pasajes relevantes de tus propios documentos y se los pasa al LLM como contexto, para que las respuestas se basen en ese contenido y no en los datos de entrenamiento del modelo."
+  },
+  {
+    "term": "Retry-After header",
+    "termEs": "Header Retry-After",
+    "module": "m1",
+    "en": "An HTTP response header, often sent with 429 or overload errors, that tells the client how many seconds to wait before retrying. Use it as the minimum delay.",
+    "es": "Un header de respuesta HTTP, a menudo enviado con errores 429 o de sobrecarga, que le indica al cliente cuántos segundos esperar antes de reintentar. Úsalo como espera mínima."
+  },
+  {
+    "term": "Review App",
+    "termEs": "Review App",
+    "module": "m6",
+    "en": "A Databricks chat UI created by agents.deploy where subject-matter experts test an agent, give feedback and label traces.",
+    "es": "Una interfaz de chat de Databricks creada por agents.deploy donde los expertos del dominio prueban un agente, dan feedback y etiquetan traces."
+  },
+  {
+    "term": "Row-level security (RLS)",
+    "termEs": "Row-level security (RLS, seguridad a nivel de fila)",
+    "module": "m7",
+    "en": "PostgreSQL feature that applies a policy to every query on a table, so rows outside the current tenant are invisible even if the query forgets a filter.",
+    "es": "Funcionalidad de PostgreSQL que aplica una política a cada consulta sobre una tabla, de modo que las filas de otros tenants son invisibles aunque la consulta olvide un filtro."
+  },
+  {
+    "term": "RTO and RPO",
+    "termEs": "RTO y RPO",
+    "module": "m8",
+    "en": "Recovery time objective (how long a system may be down) and recovery point objective (how much data may be lost) in a disaster.",
+    "es": "Recovery time objective (cuánto tiempo puede estar caído un sistema) y recovery point objective (cuántos datos se pueden perder) ante un desastre."
+  },
+  {
+    "term": "Rubric",
+    "termEs": "Rúbrica",
+    "module": "m3",
+    "en": "Explicit grading criteria, ideally binary or low-cardinality with examples, given to a human or LLM judge so scores are consistent.",
+    "es": "Criterios explícitos de calificación, idealmente binarios o de pocos niveles y con ejemplos, que se dan a un juez humano o LLM para que los puntajes sean consistentes."
+  },
+  {
+    "term": "Runbook",
+    "termEs": "Runbook",
+    "module": "m5",
+    "en": "Step-by-step operational instructions for routine and emergency tasks: deploy, rollback, rotate secrets, scale, flip flags.",
+    "es": "Instrucciones operativas paso a paso para tareas rutinarias y de emergencia: deploy, rollback, rotar secretos, escalar, cambiar flags."
+  },
+  {
+    "term": "Scorer",
+    "termEs": "Scorer",
+    "module": "m6",
+    "en": "In MLflow GenAI evaluation, a function that assesses an app's output: a built-in LLM judge, a Guidelines rule or custom code.",
+    "es": "En la evaluación GenAI de MLflow, una función que evalúa la salida de una app: un juez LLM integrado, una regla Guidelines o código personalizado."
+  },
+  {
+    "term": "Self-preference bias",
+    "termEs": "Sesgo de autopreferencia",
+    "module": "m3",
+    "en": "A judge's tendency to favor outputs produced by itself or its own model family. Mitigated by using a judge from a different family.",
+    "es": "La tendencia de un juez a favorecer salidas producidas por sí mismo o por su misma familia de modelos. Se mitiga usando un juez de otra familia."
+  },
+  {
+    "term": "Semantic cache",
+    "termEs": "Caché semántica",
+    "module": "m5",
+    "en": "A cache that reuses an answer when a new question's embedding is within a similarity threshold of a cached one. Higher hit rate, but risks serving answers to materially different questions.",
+    "es": "Caché que reutiliza una respuesta cuando el embedding de una pregunta nueva está dentro de un umbral de similitud de una cacheada. Mayor hit rate, pero con riesgo de servir respuestas a preguntas materialmente distintas."
+  },
+  {
+    "term": "Semaphore (asyncio)",
+    "termEs": "Semáforo (asyncio)",
+    "module": "m1",
+    "en": "An asyncio primitive that allows at most N coroutines inside a block at once. It is the standard way to cap concurrent LLM calls in async Python.",
+    "es": "Una primitiva de asyncio que permite como máximo N corrutinas dentro de un bloque a la vez. Es la forma estándar de limitar llamadas LLM concurrentes en Python async."
+  },
+  {
+    "term": "Server-Sent Events (SSE)",
+    "termEs": "Server-Sent Events (SSE)",
+    "module": "m5",
+    "en": "A one-way HTTP streaming protocol (`text/event-stream`) where the server pushes `event:`/`data:` messages to the client. The standard way to stream LLM tokens to browsers.",
+    "es": "Protocolo de streaming HTTP unidireccional (`text/event-stream`) en el que el servidor envía mensajes `event:`/`data:` al cliente. La forma estándar de hacer streaming de tokens de un LLM a navegadores."
+  },
+  {
+    "term": "Shadow traffic",
+    "termEs": "Tráfico en sombra",
+    "module": "m3",
+    "en": "Copying production requests to a new version whose responses are logged and evaluated but never shown to users.",
+    "es": "Copiar peticiones de producción a una nueva versión cuyas respuestas se registran y evalúan, pero nunca se muestran a los usuarios."
+  },
+  {
+    "term": "Silo model",
+    "termEs": "Modelo silo",
+    "module": "m7",
+    "en": "Isolation model with a dedicated database or stack per tenant. Strongest isolation and smallest blast radius, highest cost and operational load.",
+    "es": "Modelo de aislamiento con una base de datos o stack dedicado por tenant. El aislamiento más fuerte y el menor blast radius, con el mayor costo y carga operativa."
+  },
+  {
+    "term": "Simulated user",
+    "termEs": "Usuario simulado",
+    "module": "m9",
+    "en": "An LLM playing a user with a persona, goal, private facts and a stop condition, used to drive multi-turn conversations with a bot or agent at scale.",
+    "es": "Un LLM que hace de usuario con una persona, un objetivo, hechos privados y una condición de parada, usado para conducir conversaciones multi-turno con un bot o agente a escala."
   },
   {
     "term": "Skill demand tier",
@@ -154,10 +1386,241 @@
     "es": "Una técnica de estudio que repasa un elemento justo antes de olvidarlo, aumentando el intervalo cada vez que lo recuerdas correctamente."
   },
   {
+    "term": "Span",
+    "termEs": "Span",
+    "module": "m3",
+    "en": "One timed unit of work inside a trace, with a name, start and end time, parent and attributes such as model and token usage.",
+    "es": "Una unidad de trabajo cronometrada dentro de un trace, con nombre, inicio y fin, padre y atributos como el modelo y el uso de tokens."
+  },
+  {
+    "term": "STAR method",
+    "termEs": "Método STAR",
+    "module": "m7",
+    "en": "A structure for behavioral answers: Situation, Task, Action, Result, often extended with what you learned.",
+    "es": "Una estructura para respuestas conductuales: Situación, Tarea, Acción, Resultado, a menudo ampliada con lo que aprendiste."
+  },
+  {
+    "term": "StateGraph",
+    "termEs": "StateGraph",
+    "module": "m4",
+    "en": "LangGraph's builder for a graph of nodes that read and update a shared typed state, connected by normal and conditional edges.",
+    "es": "El constructor de LangGraph para un grafo de nodos que leen y actualizan un estado tipado compartido, conectados por edges normales y condicionales."
+  },
+  {
+    "term": "Statistical power",
+    "termEs": "Potencia estadística",
+    "module": "m9",
+    "en": "The probability that a study detects a real difference of a given size. Underpowered evals usually report no difference even when one exists.",
+    "es": "La probabilidad de que un estudio detecte una diferencia real de cierto tamaño. Los evals con poca potencia suelen reportar que no hay diferencia aunque exista."
+  },
+  {
+    "term": "Stop reason",
+    "termEs": "Stop reason (motivo de parada)",
+    "module": "m1",
+    "en": "The field that explains why generation ended, such as end_turn, max_tokens, tool_use or refusal on Anthropic, or finish_reason on OpenAI. Always check it before trusting or parsing the output.",
+    "es": "El campo que explica por qué terminó la generación, como end_turn, max_tokens, tool_use o refusal en Anthropic, o finish_reason en OpenAI. Revísalo siempre antes de confiar en la salida o parsearla."
+  },
+  {
+    "term": "Streamable HTTP",
+    "termEs": "Streamable HTTP",
+    "module": "m4",
+    "en": "The MCP transport for remote servers: clients talk to one HTTP endpoint and the server can stream responses. Used instead of stdio when many clients share a server.",
+    "es": "El transporte de MCP para servidores remotos: los clientes hablan con un endpoint HTTP y el servidor puede enviar respuestas en streaming. Se usa en lugar de stdio cuando muchos clientes comparten un servidor."
+  },
+  {
+    "term": "Streaming",
+    "termEs": "Streaming",
+    "module": "m1",
+    "en": "Receiving model output incrementally as events instead of one final response. It lowers perceived latency and enables cancellation, but requires idle timeouts, handling of mid-stream errors and careful treatment of partial data.",
+    "es": "Recibir la salida del modelo de forma incremental como eventos en lugar de una respuesta final única. Reduce la latencia percibida y permite cancelar, pero requiere timeouts de inactividad, manejo de errores a mitad del stream y cuidado con los datos parciales."
+  },
+  {
+    "term": "Structured concurrency (TaskGroup)",
+    "termEs": "Concurrencia estructurada (TaskGroup)",
+    "module": "m1",
+    "en": "A model where concurrent tasks live inside a scope that waits for all of them and cancels the rest if one fails. Python 3.11 provides it as asyncio.TaskGroup, which raises an ExceptionGroup on failure.",
+    "es": "Un modelo en el que las tareas concurrentes viven dentro de un ámbito que espera a todas y cancela el resto si una falla. Python 3.11 lo ofrece como asyncio.TaskGroup, que lanza un ExceptionGroup ante una falla."
+  },
+  {
+    "term": "Structured output",
+    "termEs": "Salida estructurada",
+    "module": "m1",
+    "en": "Model output that follows a machine-readable contract, usually JSON matching a schema, so code can consume it safely. In production it combines provider schema enforcement with application-side validation.",
+    "es": "Salida del modelo que sigue un contrato legible por máquinas, normalmente JSON que cumple un schema, para que el código pueda consumirla de forma segura. En producción combina la imposición del schema por el proveedor con validación del lado de la aplicación."
+  },
+  {
+    "term": "Supervisor pattern",
+    "termEs": "Patrón supervisor",
+    "module": "m4",
+    "en": "A multi-agent design where a central router agent decides which specialist agent runs next, and control returns to the supervisor after each step.",
+    "es": "Un diseño multi-agente en el que un agente enrutador central decide qué agente especialista corre después, y el control vuelve al supervisor tras cada paso."
+  },
+  {
+    "term": "System prompt",
+    "termEs": "System prompt",
+    "module": "m1",
+    "en": "The operator instructions that define a model's role, inputs, output contract, rules and edge-case behavior for a feature. In production it is treated as a versioned software contract.",
+    "es": "Las instrucciones del operador que definen el rol del modelo, las entradas, el contrato de salida, las reglas y el comportamiento ante casos borde para una feature. En producción se trata como un contrato de software versionado."
+  },
+  {
+    "term": "Temperature",
+    "termEs": "Temperature (temperatura)",
+    "module": "m1",
+    "en": "A sampling parameter that scales logits before softmax: low values make output more focused, high values more varied. Many current reasoning models, including current Claude models, no longer accept non-default values, so clients must treat it as an optional capability.",
+    "es": "Un parámetro de sampling que escala los logits antes del softmax: valores bajos hacen la salida más enfocada, valores altos más variada. Muchos modelos de razonamiento actuales, incluidos los modelos actuales de Claude, ya no aceptan valores no predeterminados, así que los clientes deben tratarlo como una capacidad opcional."
+  },
+  {
+    "term": "Tenant",
+    "termEs": "Tenant (inquilino)",
+    "module": "m7",
+    "en": "One customer organization in a multi-tenant system, such as a law firm on a legal-tech SaaS. Owns its data, users, plan and quotas.",
+    "es": "Una organización cliente en un sistema multi-tenant, como un bufete en un SaaS de legal-tech. Es dueña de sus datos, usuarios, plan y cuotas."
+  },
+  {
+    "term": "Tenant isolation",
+    "termEs": "Aislamiento por tenant",
+    "module": "m7",
+    "en": "The guarantee that one tenant can never read or affect another tenant's data, across storage, indexes, caches, tools, traces and eval data.",
+    "es": "La garantía de que un tenant nunca puede leer ni afectar los datos de otro, en almacenamiento, índices, cachés, herramientas, traces y datos de evals."
+  },
+  {
+    "term": "Time to first token (TTFT)",
+    "termEs": "Time to first token (TTFT, tiempo al primer token)",
+    "module": "m3",
+    "en": "Latency from sending a request until the first streamed token arrives. Drives perceived responsiveness more than total latency.",
+    "es": "Latencia desde que se envía una petición hasta que llega el primer token en streaming. Influye más en la percepción de rapidez que la latencia total."
+  },
+  {
+    "term": "Time travel",
+    "termEs": "Time travel",
+    "module": "m6",
+    "en": "Querying a Delta table as of an earlier version or timestamp, used to reproduce past evaluations exactly.",
+    "es": "Consultar una tabla Delta en una versión o timestamp anterior, útil para reproducir exactamente evaluaciones pasadas."
+  },
+  {
+    "term": "Token",
+    "termEs": "Token",
+    "module": "m1",
+    "en": "The sub-word unit a model reads and writes. Cost, latency, context windows and rate limits are all measured in tokens. Tokenization is model-specific; JSON, code and non-English text usually need more tokens per character than English prose.",
+    "es": "La unidad de sub-palabra que un modelo lee y escribe. El costo, la latencia, las ventanas de contexto y los rate limits se miden en tokens. La tokenización es específica de cada modelo; el JSON, el código y el texto en otros idiomas suelen necesitar más tokens por carácter que la prosa en inglés."
+  },
+  {
+    "term": "Token bucket",
+    "termEs": "Token bucket",
+    "module": "m5",
+    "en": "A rate-limiting algorithm where a bucket refills at a fixed rate up to a capacity, and each request spends from it. Allows short bursts while enforcing an average rate.",
+    "es": "Algoritmo de rate limiting en el que un bucket se recarga a una tasa fija hasta una capacidad y cada petición gasta de él. Permite ráfagas cortas mientras impone una tasa promedio."
+  },
+  {
+    "term": "Token-based rate limit",
+    "termEs": "Rate limit por tokens",
+    "module": "m5",
+    "en": "A limit on LLM tokens per time window rather than request count, estimated before the call and reconciled with actual usage afterwards.",
+    "es": "Límite de tokens de LLM por ventana de tiempo en lugar de cantidad de peticiones, estimado antes de la llamada y conciliado después con el uso real."
+  },
+  {
+    "term": "Tool calling",
+    "termEs": "Tool calling (llamada a herramientas)",
+    "module": "m1",
+    "en": "A protocol where the model returns a structured request to run a function (name plus JSON arguments), your code executes it and sends the result back, and the model continues. Also called function calling. The model never executes anything itself.",
+    "es": "Un protocolo en el que el modelo devuelve una solicitud estructurada para ejecutar una función (nombre más argumentos JSON), tu código la ejecuta y devuelve el resultado, y el modelo continúa. También se llama function calling. El modelo nunca ejecuta nada por sí mismo."
+  },
+  {
+    "term": "Tool-call accuracy",
+    "termEs": "Precisión de tool calls",
+    "module": "m4",
+    "en": "The share of tool calls where the agent picked the right tool with the right key arguments for the scenario.",
+    "es": "La proporción de tool calls en las que el agente eligió la tool correcta con los argumentos clave correctos para el escenario."
+  },
+  {
+    "term": "Top-p (nucleus sampling)",
+    "termEs": "Top-p (nucleus sampling)",
+    "module": "m1",
+    "en": "A sampling strategy that keeps the smallest set of tokens whose cumulative probability reaches p and samples only from that set. Like temperature, support varies by model.",
+    "es": "Una estrategia de sampling que conserva el conjunto más pequeño de tokens cuya probabilidad acumulada llega a p y muestrea solo de ese conjunto. Igual que temperature, su soporte varía según el modelo."
+  },
+  {
+    "term": "Trace",
+    "termEs": "Trace (traza)",
+    "module": "m3",
+    "en": "The full record of one request through a system, made of nested spans (for example query rewrite, retrieval, re-ranking, generation).",
+    "es": "El registro completo de una petición a través de un sistema, formado por spans anidados (por ejemplo reescritura de consulta, retrieval, re-ranking, generación)."
+  },
+  {
+    "term": "Trajectory evaluation",
+    "termEs": "Evaluación de trayectoria",
+    "module": "m4",
+    "en": "Evaluating the sequence of steps and tool calls an agent took, compared to a reference with strict, unordered, subset or superset matching, not only its final answer.",
+    "es": "Evaluar la secuencia de pasos y tool calls que siguió un agente, comparada con una referencia mediante coincidencia strict, unordered, subset o superset, no solo su respuesta final."
+  },
+  {
     "term": "Two-minute review",
     "termEs": "Revisión de dos minutos",
     "module": "m0",
     "en": "The quick scan a hiring manager gives a portfolio repo without cloning it: first screen of the README, architecture, eval numbers, cost and latency, a code skim and the commit history.",
     "es": "La revisión rápida que un hiring manager hace de un repo del portafolio sin clonarlo: primera pantalla del README, arquitectura, números de evals, costo y latencia, un vistazo al código y el historial de commits."
+  },
+  {
+    "term": "Unit economics",
+    "termEs": "Unit economics (economía unitaria)",
+    "module": "m7",
+    "en": "Cost and revenue per unit, such as cost per request, per tenant or per plan compared with its price.",
+    "es": "Costo e ingreso por unidad, como el costo por petición, por tenant o por plan comparado con su precio."
+  },
+  {
+    "term": "Unity Catalog",
+    "termEs": "Unity Catalog",
+    "module": "m6",
+    "en": "Databricks' governance layer: a catalog.schema.object namespace with one permission model, lineage and auditing for tables, volumes, models, functions and vector indexes.",
+    "es": "La capa de gobernanza de Databricks: un namespace catalog.schema.object con un solo modelo de permisos, lineage y auditoría para tablas, volumes, modelos, funciones e índices vectoriales."
+  },
+  {
+    "term": "Vector store",
+    "termEs": "Vector store (almacén vectorial)",
+    "module": "m2",
+    "en": "A database or index that stores embeddings with metadata and answers nearest-neighbor queries. Examples: pgvector in Postgres, Chroma, Qdrant.",
+    "es": "Base de datos o índice que guarda embeddings con su metadata y responde consultas de vecinos más cercanos. Ejemplos: pgvector en Postgres, Chroma, Qdrant."
+  },
+  {
+    "term": "Verbosity bias",
+    "termEs": "Sesgo de verbosidad",
+    "module": "m3",
+    "en": "A judge's tendency to rate longer answers higher regardless of correctness.",
+    "es": "La tendencia de un juez a puntuar mejor las respuestas más largas sin importar si son correctas."
+  },
+  {
+    "term": "Virtual key",
+    "termEs": "Key virtual",
+    "module": "m8",
+    "en": "A gateway-issued API key for a team or service, mapped to allowed models and budgets, so real provider keys never leave the gateway.",
+    "es": "Una API key emitida por el gateway para un equipo o servicio, asociada a modelos y presupuestos permitidos, para que las keys reales del proveedor nunca salgan del gateway."
+  },
+  {
+    "term": "Volume",
+    "termEs": "Volume",
+    "module": "m6",
+    "en": "A Unity Catalog object for governed storage of non-tabular files such as PDFs and images, accessed at /Volumes/catalog/schema/volume paths.",
+    "es": "Un objeto de Unity Catalog para almacenamiento gobernado de archivos no tabulares como PDFs e imágenes, accesible en rutas /Volumes/catalog/schema/volume."
+  },
+  {
+    "term": "VPC endpoint",
+    "termEs": "VPC endpoint",
+    "module": "m8",
+    "en": "A private connection from a VPC to an AWS service such as bedrock-runtime, so traffic stays off the internet and can be restricted by policy.",
+    "es": "Una conexión privada desde una VPC a un servicio de AWS como bedrock-runtime, para que el tráfico no pase por internet y pueda restringirse con una política."
+  },
+  {
+    "term": "Window function",
+    "termEs": "Window function (función de ventana)",
+    "module": "m6",
+    "en": "A SQL function that computes a value over a set of rows related to the current row (ranking, running totals, LAG/LEAD) without collapsing them like GROUP BY.",
+    "es": "Función de SQL que calcula un valor sobre un conjunto de filas relacionadas con la fila actual (rankings, totales acumulados, LAG/LEAD) sin colapsarlas como GROUP BY."
+  },
+  {
+    "term": "Workflow (LLM)",
+    "termEs": "Workflow (LLM)",
+    "module": "m4",
+    "en": "An LLM application whose control flow is fixed in code, with model calls at predefined steps. Cheaper and more predictable than an agent when the steps are known in advance.",
+    "es": "Una aplicación con LLM cuyo flujo de control está fijo en código, con llamadas al modelo en pasos predefinidos. Más barata y predecible que un agente cuando los pasos se conocen de antemano."
   }
 ]
