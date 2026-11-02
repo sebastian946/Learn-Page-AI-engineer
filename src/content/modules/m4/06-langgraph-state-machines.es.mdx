@@ -1,0 +1,221 @@
+## ¿Por qué una máquina de estados?
+
+Un bucle ReAct escrito a mano es un `while` con una llamada al LLM y un despachador de herramientas. Funciona para una demo. Deja de funcionar cuando necesitas pausar para que un humano apruebe, reanudar después de una caída, ramificar según una clasificación, limitar el número de pasos o reproducir una ejecución para depurarla.
+
+LangGraph modela un agente como una **máquina de estados** explícita:
+
+- **Estado (state)**: un diccionario tipado que cada nodo lee y actualiza parcialmente.
+- **Nodos**: funciones normales de Python (sync o async). Reciben el estado y devuelven una *actualización parcial*, no un estado nuevo.
+- **Edges (aristas)**: transiciones fijas (`A -> B`) o **conditional edges** que llaman a una función router para elegir el siguiente nodo.
+- **Reducers**: reglas por clave que definen cómo se fusiona la actualización de un nodo con el estado actual.
+- **Checkpointer**: persiste el estado después de cada paso, indexado por un `thread_id`.
+
+Si vienes de automatización de pruebas, piénsalo como un Page Object Model para el flujo de control. En lugar de un bucle oculto, obtienes un grafo que puedes dibujar, probar nodo por nodo e inspeccionar en cualquier paso. El grafo es el contrato. El LLM decide *dentro* del grafo; no decide cómo es el grafo.
+
+## Estado tipado y reducers
+
+El estado suele ser un `TypedDict` (también sirven modelos Pydantic y dataclasses). Cada clave puede llevar un reducer mediante `Annotated`. Sin reducer, el valor que devuelve un nodo **sobrescribe** la clave. Con reducer, LangGraph llama `reducer(actual, actualizacion)`.
+
+El reducer más común es `add_messages`. Agrega mensajes nuevos al final y reemplaza un mensaje en su lugar si la actualización trae el mismo `id` de mensaje. Ese segundo comportamiento importa para las ediciones human-in-the-loop, que verás en la siguiente lección.
+
+```python
+# state.py
+import operator
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]  # append / replace by id
+    step_count: int                                       # overwrite
+    cost_usd: float                                       # overwrite
+    tool_log: Annotated[list[dict], operator.add]         # always append
+```
+
+Reglas prácticas:
+
+- Los contadores que calculas tú mismo (`state["step_count"] + 1`) usan sobrescritura. No agregues también `operator.add`, o contarás doble.
+- Las listas a las que contribuyen varios nodos (logs, hallazgos de ramas paralelas) necesitan un reducer de append. Sin él, ramas paralelas que escriben la misma clave lanzan un `InvalidUpdateError`.
+- Mantén el estado pequeño y serializable. Se escribe en el checkpointer en cada paso. Guarda IDs y resúmenes, no PDFs de 5 MB.
+
+## Los nodos devuelven actualizaciones parciales
+
+Un nodo devuelve un dict con **solo las claves que cambia**. LangGraph lo fusiona a través de los reducers. Devolver el estado completo es un bug clásico: con `add_messages` casi no hace daño, pero con `operator.add` en `tool_log` duplicas cada entrada.
+
+```python
+# graph.py
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+
+from .state import AgentState
+from .tools import get_order, reschedule_delivery, create_ticket
+
+TOOLS = [get_order, reschedule_delivery, create_ticket]
+llm = ChatAnthropic(model="claude-sonnet-5-5", max_tokens=1024).bind_tools(TOOLS)
+
+SYSTEM = "You are a logistics support agent. Use tools; never invent order data."
+
+
+def call_model(state: AgentState) -> dict:
+    response = llm.invoke([("system", SYSTEM), *state["messages"]])
+    usage = response.usage_metadata or {}
+    # Example rates: check the provider's current pricing.
+    cost = usage.get("input_tokens", 0) * 3e-6 + usage.get("output_tokens", 0) * 15e-6
+    return {
+        "messages": [response],
+        "step_count": state.get("step_count", 0) + 1,
+        "cost_usd": state.get("cost_usd", 0.0) + cost,
+    }
+
+
+builder = StateGraph(AgentState)
+builder.add_node("agent", call_model)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)  # -> "tools" or END
+builder.add_edge("tools", "agent")
+
+graph = builder.compile(checkpointer=MemorySaver())
+```
+
+`ToolNode` ejecuta cada tool call del último mensaje de la IA (en paralelo cuando hay varias) y agrega un `ToolMessage` por llamada. `tools_condition` enruta a `"tools"` si el último mensaje tiene tool calls y a `END` si no. Estos dos prebuilts son el bucle ReAct de la lección 01, expresado como grafo. Nota: las tarifas del ejemplo son ilustrativas; revisa los precios actuales del proveedor.
+
+## Conditional edges: tus propios routers
+
+Los prebuilts sirven hasta que necesitas políticas. Un router es una función que lee el estado y devuelve el nombre del siguiente nodo. Pasa un mapa para que el grafo conozca todos los destinos posibles (también hace que el diagrama renderizado sea correcto).
+
+```python
+MAX_STEPS = 8
+
+
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if state["step_count"] >= MAX_STEPS:
+        return "give_up"
+    if not getattr(last, "tool_calls", None):
+        return "done"
+    if any(tc["name"] == "issue_refund" for tc in last.tool_calls):
+        return "needs_approval"
+    return "tools"
+
+
+builder.add_conditional_edges(
+    "agent",
+    route_after_agent,
+    {"tools": "tools", "needs_approval": "approval", "give_up": "fallback", "done": END},
+)
+```
+
+Observa lo que pasó: el límite de pasos y la política de reembolsos viven en código determinista, no en el prompt. El modelo no puede convencer a nadie para saltárselos. Esta es la razón principal para preferir un grafo explícito sobre un agente libre.
+
+Hay un segundo estilo de enrutamiento: un nodo puede devolver un `Command` que actualiza el estado y elige el siguiente nodo al mismo tiempo.
+
+```python
+from typing import Literal
+from langgraph.types import Command
+
+
+def triage(state: AgentState) -> Command[Literal["agent", "fallback"]]:
+    text = state["messages"][-1].content
+    if "legal" in text.lower():
+        return Command(goto="fallback", update={"tool_log": [{"event": "escalated_legal"}]})
+    return Command(goto="agent")
+```
+
+Usa conditional edges cuando el enrutamiento es una función pura del estado. Usa `Command` cuando el nodo que calcula algo es también el lugar natural para decidir a dónde ir (los supervisores en grafos multi-agente lo usan mucho).
+
+## Checkpointers e hilos (threads)
+
+Compila con un checkpointer y cada super-step queda guardado. Cada conversación o trabajo recibe un `thread_id` en la config:
+
+```python
+config = {"configurable": {"thread_id": "order-ORD-1042"}}
+
+result = graph.invoke(
+    {"messages": [("user", "Where is order ORD-1042?")], "step_count": 0, "cost_usd": 0.0},
+    config,
+)
+print(result["messages"][-1].content)
+
+# Same thread_id: the graph loads the saved state and continues the conversation.
+graph.invoke({"messages": [("user", "Move it to Friday.")]}, config)
+
+snapshot = graph.get_state(config)
+print(snapshot.values["step_count"], snapshot.next)  # next == () when finished
+
+for past in graph.get_state_history(config):  # time travel / debugging
+    print(past.config["configurable"]["checkpoint_id"], past.next)
+```
+
+Lo que obtienes de un checkpointer:
+
+- **Memoria de corto plazo**: los turnos siguientes en el mismo hilo ven los mensajes anteriores.
+- **Durabilidad**: si el proceso muere a mitad de ejecución, puedes reanudar desde el último checkpoint.
+- **Human-in-the-loop**: `interrupt()` necesita un checkpointer para guardar el estado pausado.
+- **Depuración**: `get_state_history` te permite reproducir o bifurcar desde cualquier paso pasado, como un trace que puedes volver a ejecutar.
+
+`MemorySaver` guarda todo en la memoria del proceso. Es para tests y notebooks. En producción usa un saver durable como `PostgresSaver` de `langgraph.checkpoint.postgres` (llama `.setup()` una vez para crear las tablas), o la variante async para servicios FastAPI.
+
+## Probar nodos como funciones
+
+Como los nodos son funciones del estado, puedes probarlos sin compilar el grafo. Los routers son los tests de mayor valor: codifican tu política.
+
+```python
+from langchain_core.messages import AIMessage
+
+
+def test_refund_goes_to_approval():
+    msg = AIMessage(content="", tool_calls=[
+        {"name": "issue_refund", "args": {"order_id": "ORD-1"}, "id": "c1"}
+    ])
+    state = {"messages": [msg], "step_count": 2, "cost_usd": 0.01, "tool_log": []}
+    assert route_after_agent(state) == "needs_approval"
+
+
+def test_step_limit_wins_over_tools():
+    msg = AIMessage(content="", tool_calls=[{"name": "get_order", "args": {}, "id": "c2"}])
+    state = {"messages": [msg], "step_count": 8, "cost_usd": 0.0, "tool_log": []}
+    assert route_after_agent(state) == "give_up"
+```
+
+Para tests del grafo completo, reemplaza el modelo por un fake con guion (la lección 08 muestra cómo) y verifica el estado final y la secuencia de tool calls.
+
+## Errores comunes
+
+- **Devolver el estado completo desde un nodo.** Devuelve solo las claves que cambian. Devolverlo completo duplica entradas con reducers de append.
+- **Mutar el estado en su lugar.** `state["messages"].append(x)` se salta los reducers y puede corromper checkpoints. Devuelve un valor nuevo.
+- **Olvidar el mapa de rutas en conditional edges.** El grafo igual corre, pero el diagrama queda mal y los errores de tipeo en nombres de nodos solo fallan en runtime.
+- **Usar `MemorySaver` en producción.** El estado desaparece al reiniciar y no se comparte entre réplicas. Usa Postgres (u otro saver durable).
+- **Reusar un solo `thread_id` para todo.** Entonces todos los usuarios y trabajos comparten historial. Deriva los thread ids de una clave de negocio real (id de ticket, id de pedido, id de sesión).
+- **Poner la política solo en el prompt.** "Nunca reembolses más de $200" va en un router o en una guarda de la herramienta, no solo en el system prompt.
+- **Estado enorme.** Blobs grandes en cada checkpoint hacen que cada paso sea lento y caro. Guarda referencias.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Por qué usarías LangGraph en lugar de un agente con un simple bucle while?" level="mid">
+
+Un bucle while oculta el flujo de control. LangGraph lo hace explícito: estado tipado, nodos, edges y routers. Eso me da cuatro cosas prácticas. Primero, **checkpointing**: el estado se guarda por paso y por hilo, así que obtengo memoria de conversación, recuperación ante caídas y replay. Segundo, **human-in-the-loop**: `interrupt()` puede pausar una ejecución para aprobación y reanudarla después, incluso en otro proceso. Tercero, **política determinista**: límites de pasos, reglas de aprobación y escalamiento viven en código de routers que el modelo no puede anular. Cuarto, **testabilidad**: nodos y routers son funciones normales que puedo probar con unit tests, y el grafo se puede renderizar para revisiones. Para una sola tool call sin ramificaciones no lo usaría; una función simple es más sencilla.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Qué es un reducer en LangGraph y cuándo lo necesitas?" level="senior">
+
+Un reducer define cómo la actualización parcial de un nodo se fusiona con una clave existente del estado. Sin reducer, la actualización sobrescribe la clave. `add_messages` agrega mensajes y reemplaza por id de mensaje, que es lo que permite editar una tool call pendiente. `operator.add` concatena listas. Necesitas un reducer siempre que varios nodos, sobre todo ramas paralelas en el mismo super-step, escriban la misma clave; si no, LangGraph lanza un error de actualización inválida. *No* debes combinar un reducer con un nodo que ya calcula el valor completo (como `count + 1` con `operator.add`), o contarás doble. Yo mantengo los contadores como claves de sobrescritura y los logs como claves de append.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Preguntas de lectura de código">
+
+Espera preguntas del tipo "¿qué devuelve este nodo?". La respuesta siempre es una **actualización parcial** que luego fusiona el reducer. Si la clave tiene `add_messages`, el mensaje devuelto se agrega al final. Si no tiene reducer, reemplaza el valor anterior.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Conceptos de bajo nivel de LangGraph (estado, reducers, nodos, edges): https://langchain-ai.github.io/langgraph/concepts/low_level/
+- Persistencia y checkpointers en LangGraph: https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- Documentación de tool use de Anthropic: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview

@@ -1,0 +1,192 @@
+## You already know how to do this
+
+As an SDET you would never ship a service without a test suite. Yet most RAG demos are validated by "I asked it five questions and it looked fine." That is manual exploratory testing, and it does not scale or catch regressions.
+
+RAG evaluation is a test suite for a non-deterministic system. It has three ingredients you already recognize:
+
+- **Fixtures:** a golden dataset of questions with expected answers and, ideally, the chunks that contain them.
+- **Assertions:** metrics that score each response, with thresholds.
+- **A runner:** a script or pytest suite that runs the pipeline on every question and reports pass/fail, locally and in CI.
+
+The twist: assertions are fuzzy. "Does the answer mean the same as the reference?" cannot be checked with `==`. So most RAG metrics use an LLM as a judge, which brings its own noise. Module 3 goes deep on judge reliability; here you learn the four core metrics and how to run them.
+
+## The four core metrics
+
+Split evaluation by stage, exactly like the failure-mode map from lesson 13. Retrieval metrics tell you whether the right context arrived. Generation metrics tell you what the model did with it.
+
+| Metric | Stage | Question it answers | Needs reference answer? |
+|---|---|---|---|
+| **Context precision** | Retrieval | Are the relevant chunks ranked at the top of what we retrieved? | Usually yes (or judged against the question) |
+| **Context recall** | Retrieval | Did we retrieve everything needed to produce the reference answer? | Yes |
+| **Faithfulness** | Generation | Is every claim in the answer supported by the retrieved context? | No |
+| **Answer relevance** | Generation | Does the answer actually address the question? | No |
+
+How they work, roughly:
+
+- **Faithfulness:** a judge LLM splits the answer into atomic claims, then checks each claim against the context. Score = supported claims / total claims. An answer that is correct but pulled from the model's own memory scores *low*, which is exactly what you want in a grounded system.
+- **Answer relevance:** the judge generates questions that the answer would answer, embeds them, and compares them with the original question. Evasive or off-topic answers score low. It does not check correctness.
+- **Context precision:** for each retrieved chunk, the judge decides if it is relevant; the score rewards relevant chunks appearing at higher ranks (a mean-precision-style calculation).
+- **Context recall:** the judge splits the *reference answer* into statements and checks whether each can be attributed to the retrieved context. Low recall means retrieval missed something.
+
+Reading the metrics together is where the value is:
+
+| Pattern | Likely diagnosis |
+|---|---|
+| Low context recall, low faithfulness | Retrieval missed content; model filled the gap from memory |
+| High context recall, low faithfulness | Right context arrived, model ignored it or embellished |
+| High faithfulness, low answer relevance | Model is grounded but answering a different question (often bad query rewriting) |
+| Low context precision, high recall | Right chunks are there but buried; add or tune a re-ranker |
+
+If you have labeled chunk IDs, also compute deterministic retrieval metrics: **recall@k** and **MRR**. They are free, fast and not noisy. Use LLM-judged metrics for what deterministic ones cannot capture.
+
+## Running the metrics with Ragas
+
+Ragas is a library focused on RAG metrics. You build samples, pick metrics and an evaluator LLM, and call `evaluate`.
+
+```python
+import os
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import OpenAIEmbeddings
+from ragas import EvaluationDataset, SingleTurnSample, evaluate
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import LangchainLLMWrapper
+from ragas.metrics import (
+    Faithfulness,
+    LLMContextPrecisionWithReference,
+    LLMContextRecall,
+    ResponseRelevancy,
+)
+
+judge = LangchainLLMWrapper(ChatAnthropic(model="claude-sonnet-5-5", temperature=0))
+embeddings = LangchainEmbeddingsWrapper(
+    OpenAIEmbeddings(model=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"))  # example
+)
+
+samples = [
+    SingleTurnSample(
+        user_input="What is the maximum DTI for a conventional loan with compensating factors?",
+        retrieved_contexts=[
+            "Conventional loans: maximum DTI is 45%. Up to 50% is permitted with "
+            "compensating factors such as 6+ months of reserves.",
+        ],
+        response="Up to 50% with compensating factors like at least 6 months of reserves; otherwise 45%.",
+        reference="45% standard; up to 50% with compensating factors such as 6 months of reserves.",
+    ),
+]
+
+result = evaluate(
+    dataset=EvaluationDataset(samples=samples),
+    metrics=[Faithfulness(), ResponseRelevancy(), LLMContextPrecisionWithReference(), LLMContextRecall()],
+    llm=judge,
+    embeddings=embeddings,
+)
+print(result)                  # aggregate scores
+df = result.to_pandas()        # per-sample scores for debugging
+```
+
+Always look at the per-sample table. An average of 0.82 can hide five questions scoring 0.0, and those five are your bugs.
+
+## Running the same idea with DeepEval
+
+DeepEval is pytest-native, which will feel familiar. Each metric has a `threshold`, and `assert_test` fails the test if the score is below it.
+
+```python
+import pytest
+from deepeval import assert_test
+from deepeval.metrics import (
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+    FaithfulnessMetric,
+)
+from deepeval.test_case import LLMTestCase
+
+from app.rag import answer_question  # your pipeline
+from tests.golden import load_golden  # list of dicts from golden.jsonl
+
+METRICS = [
+    FaithfulnessMetric(threshold=0.8),
+    AnswerRelevancyMetric(threshold=0.7),
+    ContextualPrecisionMetric(threshold=0.6),
+    ContextualRecallMetric(threshold=0.7),
+]
+
+
+@pytest.mark.parametrize("item", load_golden(), ids=lambda i: i["id"])
+def test_rag_golden(item: dict) -> None:
+    result = answer_question(item["question"])
+    case = LLMTestCase(
+        input=item["question"],
+        actual_output=result.answer,
+        expected_output=item["reference"],
+        retrieval_context=[c.text for c in result.chunks],
+    )
+    assert_test(case, METRICS)
+```
+
+Run with `deepeval test run tests/test_rag_golden.py`. By default DeepEval uses an OpenAI judge model; you can plug in another model through its custom-model interface. Pick one judge and keep it fixed so scores are comparable across runs.
+
+**Ragas or DeepEval?** Both implement the same family of metrics. Ragas is convenient for batch analysis in notebooks and dataframes. DeepEval fits test suites and CI gates. Many teams use one for exploration and one for gating. What matters is that you pin versions, pin the judge model, and keep the dataset in git.
+
+## Golden datasets
+
+The dataset matters more than the library. A golden item looks like this:
+
+```json
+{"id": "dti-007", "question": "Can a borrower exceed 45% DTI on a conventional loan?",
+ "reference": "Yes, up to 50% with compensating factors such as 6 months of reserves.",
+ "relevant_chunk_ids": ["uw-guide-4.2-a1f3"], "tags": ["dti", "conventional"], "answerable": true}
+```
+
+Build it like a test plan:
+
+- **Coverage by topic:** DTI, LTV, gift funds, reserves, credit events, property types, rate locks.
+- **Coverage by difficulty:** simple lookup, multi-hop (needs two chunks), comparison, numeric.
+- **Unanswerable questions:** 10–20% where the right answer is "not in our policies."
+- **Real traffic:** once live, sample real questions (scrubbed of PII) and add them.
+- **Every bug becomes a test:** a reported failure goes into the dataset before the fix.
+
+You can bootstrap with synthetic generation (Ragas has a test-set generator), but have a domain expert review every item. A wrong reference answer is a wrong assertion: it will fail correct behavior forever.
+
+Start with 30–50 items. That is enough to catch big regressions. Grow toward a few hundred as the product matures.
+
+## How this prefigures Module 3
+
+This lesson gives you metrics and a runner. Module 3 makes them production-grade: measuring judge agreement with human labels, handling non-determinism (repeat runs, confidence intervals), a CI gate that blocks a PR when faithfulness drops, online evaluation on live traffic, and tracing with LangSmith or Langfuse. The capstone of Module 3 applies that framework to the assistant you build in this module, so the golden dataset you start now is an investment.
+
+## Common mistakes
+
+- **Only measuring end-to-end.** A single "correctness" score cannot tell you which stage broke. Measure retrieval and generation separately.
+- **Trusting averages.** Inspect the worst 10 items every run.
+- **Changing the judge model between runs.** Scores shift with the judge. Pin it, and re-baseline when you change it.
+- **Using the same model as generator and judge without checking.** Self-preference bias exists. At least spot-check against human labels.
+- **A golden set written by the developer alone.** You will encode your own blind spots. Get a domain expert to review.
+- **No unanswerable questions.** Your faithfulness can be perfect while the system confidently answers things it should refuse.
+- **Running evals only once.** LLM outputs vary. For decisions, run twice and compare, or use a larger set.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Explain faithfulness vs answer relevance vs context recall." level="mid">
+
+Faithfulness checks whether every claim in the answer is supported by the retrieved context; it catches hallucination and does not need a reference answer. Answer relevance checks whether the answer addresses the question, regardless of correctness. Context recall checks whether retrieval brought back everything needed to produce the reference answer, so it needs a reference. Together they localize failures: low recall points to retrieval, high recall with low faithfulness points to generation, and high faithfulness with low relevance usually means the model answered a different question.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How would you build the first evaluation dataset for a new RAG product?" level="senior">
+
+I start with 30–50 items written with a domain expert, covering the main topics, several difficulty types (lookup, multi-hop, numeric) and 10–20% unanswerable questions. Each item has a reference answer and the relevant chunk IDs so I can compute deterministic recall@k next to LLM-judged metrics. I may bootstrap with synthetic generation but every item is reviewed. The dataset lives in git with versioning, every production bug becomes a new item, and once there is traffic I sample real questions. I pin the judge model and metric library versions so scores are comparable over time.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Lean on your QA background">
+
+Say it explicitly: "A golden dataset is a fixture, metrics are assertions with thresholds, and the eval run is a regression suite in CI." Interviewers hiring for AI engineering roles value candidates who bring testing discipline to LLM systems.
+
+</Callout>
+
+## Further reading
+
+- Ragas documentation (metrics): https://docs.ragas.io/en/stable/concepts/metrics/
+- DeepEval documentation (RAG metrics): https://docs.confident-ai.com/docs/metrics-introduction
+- Es et al., "RAGAS: Automated Evaluation of Retrieval Augmented Generation": https://arxiv.org/abs/2309.15217
+- LangSmith evaluation concepts: https://docs.smith.langchain.com/evaluation

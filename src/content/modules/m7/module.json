@@ -1,0 +1,42 @@
+{
+  "id": "m7",
+  "order": 7,
+  "days": 5,
+  "hours": 30,
+  "title": { "en": "Final capstone & job readiness", "es": "Capstone final y preparación laboral" },
+  "summary": {
+    "en": "Combine everything into one multi-tenant RAG + agent product with evals, observability, CI/CD and a cost dashboard. Then learn to document it, defend its trade-offs, pass the system-design round and map your work to job-posting keywords.",
+    "es": "Combina todo en un producto multi-tenant de RAG + agentes con evals, observabilidad, CI/CD y un dashboard de costos. Luego aprende a documentarlo, defender sus trade-offs, pasar la ronda de system design y mapear tu trabajo a las palabras clave de las ofertas."
+  },
+  "lessons": [
+    { "slug": "01-multi-tenant-architecture", "type": "concept", "minutes": 50, "title": { "en": "Multi-tenant architecture for AI products", "es": "Arquitectura multi-tenant para productos de IA" } },
+    { "slug": "02-readme-architecture-doc", "type": "concept", "minutes": 45, "title": { "en": "Writing the README and the architecture doc", "es": "Escribir el README y el documento de arquitectura" } },
+    { "slug": "03-talking-trade-offs", "type": "concept", "minutes": 45, "title": { "en": "Talking through trade-offs", "es": "Cómo argumentar trade-offs" } },
+    { "slug": "04-mock-system-design-rag", "type": "concept", "minutes": 60, "title": { "en": "Mock system design: a RAG system for 10k users", "es": "System design simulado: un sistema RAG para 10k usuarios" } },
+    { "slug": "05-ex-system-design", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: timed system-design write-ups", "es": "Ejercicio: write-ups de system design cronometrados" } },
+    { "slug": "06-behavioral-project-stories", "type": "concept", "minutes": 40, "title": { "en": "Behavioral prep and \"tell me about a project\"", "es": "Preparación conductual y \"cuéntame de un proyecto\"" } },
+    { "slug": "07-resume-linkedin-mapping", "type": "concept", "minutes": 45, "title": { "en": "Resume and LinkedIn skills mapping, plus a job-search plan", "es": "Mapeo de habilidades para CV y LinkedIn, más un plan de búsqueda" } },
+    { "slug": "08-ex-resume-linkedin", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: rewrite your resume bullets and LinkedIn profile", "es": "Ejercicio: reescribe tus bullets del CV y tu perfil de LinkedIn" } },
+    { "slug": "09-ex-demo-readme", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: record the demo GIF and write the final README", "es": "Ejercicio: graba el GIF de demo y escribe el README final" } },
+    { "slug": "10-exam", "type": "exam", "minutes": 35, "title": { "en": "Module 7 exam", "es": "Examen del módulo 7" } },
+    { "slug": "11-capstone-multi-tenant-platform", "type": "project", "minutes": 1500, "title": { "en": "Final capstone: multi-tenant AI platform", "es": "Capstone final: plataforma de IA multi-tenant" } }
+  ],
+  "repos": [
+    {
+      "id": "m7-platform",
+      "name": "multi-tenant-ai-platform",
+      "description": {
+        "en": "Final capstone: multi-tenant RAG + agent product with tenant isolation, evals in CI, tracing, CI/CD to AWS and a per-tenant cost dashboard.",
+        "es": "Capstone final: producto multi-tenant de RAG + agentes con aislamiento por tenant, evals en CI, tracing, CI/CD a AWS y dashboard de costos por tenant."
+      }
+    },
+    {
+      "id": "m7-system-design",
+      "name": "system-design-notes",
+      "description": {
+        "en": "Timed mock system-design interview write-ups for AI systems (RAG for 10k users, agent platform for customer support).",
+        "es": "Write-ups cronometrados de entrevistas simuladas de system design para sistemas de IA (RAG para 10k usuarios, plataforma de agentes para soporte)."
+      }
+    }
+  ]
+}

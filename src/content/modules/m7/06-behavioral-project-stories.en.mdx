@@ -1,0 +1,144 @@
+## Your career change is a story, so tell it on purpose
+
+Every interviewer will ask some version of "why are you moving from QA to AI engineering?" and "tell me about a project you're proud of". Weak answers sound apologetic ("I was just a tester, but..."). Strong answers frame the SDET background as the reason you are good at the hardest part of AI engineering: making non-deterministic systems reliable.
+
+This lesson gives you the narrative, a story bank built from your capstones, and the behavioral questions you should rehearse.
+
+## The positioning statement
+
+Write a 30-second answer to "tell me about yourself". Structure: past, bridge, present, next.
+
+> "I spent [N] years as a senior SDET building test frameworks and CI quality gates for [domain]. Two years ago I started applying that to LLM features, and realized the hard part of AI products is exactly what I'd been doing: proving a system behaves correctly when outputs aren't deterministic. Since then I've built RAG and agent systems end to end, including a multi-tenant RAG + agent platform with tenant isolation, evals that gate every PR, tracing and per-tenant cost tracking. I'm looking for an AI engineer role where I own features from retrieval to production."
+
+Notice: no apology, concrete artifacts, the SDET skill framed as an advantage, and a clear ask.
+
+## Translating SDET experience into AI engineering language
+
+| What you did as an SDET | How to say it in an AI engineering interview |
+|---|---|
+| Built a test framework used by 5 teams | Built reusable evaluation infrastructure; designed abstractions other engineers adopted |
+| Flaky test triage | Managing non-determinism: retries, seeds, statistical thresholds, separating signal from noise |
+| CI quality gates | Regression gates for prompts and retrieval; blocking merges on faithfulness drops |
+| Test data management, fixtures | Golden dataset curation, versioning and coverage analysis |
+| Contract tests between services | Tool schemas and error contracts for agents; structured output validation |
+| Performance testing | Latency budgets, p95/p99, load testing streaming endpoints with k6 |
+| Root-cause analysis of production bugs | Trace-driven debugging of RAG failures (retrieval vs generation) |
+| Test pyramid strategy | Eval pyramid: unit checks, component evals, end-to-end evals, online monitoring |
+
+Use the right column. It is the same work, in the vocabulary of the role.
+
+## "Tell me about a project": the 4-minute structure
+
+This is the most important answer you will give. Use the final capstone. Practice until it is fluent but not memorized.
+
+1. **Context (30 s):** the client, the problem, why it matters. "A legal-tech SaaS serving 12 law firms needed a research assistant over each firm's documents, with strict isolation."
+2. **Your role and constraints (20 s):** solo, 5 days, latency and cost targets, isolation requirement.
+3. **Architecture (60 s):** the request path in one breath. Point at the diagram if you can share a screen.
+4. **The hardest problem (60 s):** one deep technical problem and how you solved it. For example, small tenants getting poor recall because of HNSW post-filtering in a pooled index.
+5. **Results with numbers (30 s):** eval scores against targets, leak tests, p95, cost per 1k requests. Only your measured numbers.
+6. **What you would do differently (20 s):** shows judgment.
+
+Then stop. Let them pick what to dig into. Prepare for the follow-ups: "Why that vector store?", "How did you build the golden set?", "How does it fail?", "What did it cost?".
+
+## A story bank as data
+
+Treat your stories like test cases: structured, versioned, and checked for coverage. Keep them in a file in your portfolio hub repo and rehearse from it.
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+Competency = Literal["ownership", "conflict", "failure", "ambiguity", "influence",
+                     "quality", "speed_vs_quality", "learning", "customer_focus"]
+
+class Story(BaseModel):
+    title: str
+    source: str                      # e.g. "m4 capstone" or "2023 job, payments team"
+    competencies: list[Competency]
+    situation: str
+    task: str
+    action: str
+    result: str = Field(description="Include a measured number")
+    learned: str
+
+WORDS_PER_MINUTE = 150
+
+def speaking_minutes(s: Story) -> float:
+    words = sum(len(x.split()) for x in (s.situation, s.task, s.action, s.result, s.learned))
+    return round(words / WORDS_PER_MINUTE, 1)
+
+def coverage_gaps(stories: list[Story]) -> set[str]:
+    covered = {c for s in stories for c in s.competencies}
+    return set(Competency.__args__) - covered
+
+def lint(stories: list[Story]) -> list[str]:
+    issues = []
+    for s in stories:
+        if speaking_minutes(s) > 2.0:
+            issues.append(f"{s.title}: too long ({speaking_minutes(s)} min)")
+        if not any(ch.isdigit() for ch in s.result):
+            issues.append(f"{s.title}: result has no number")
+    return issues + [f"missing competency: {c}" for c in sorted(coverage_gaps(stories))]
+```
+
+Aim for 8 to 10 stories that cover every competency at least twice. Mix capstone stories with stories from your SDET years. Interviewers value real workplace stories with real people in them, especially for conflict and influence.
+
+## Behavioral questions to rehearse
+
+- Tell me about a time you disagreed with a technical decision. (Use a story where data settled it, like an eval result.)
+- Tell me about a failure. (Pick a real one. Show the fix and the process change. An eval gate you added after a regression is perfect.)
+- Tell me about a time you had to learn something fast. (Your transition into AI itself, with concrete milestones.)
+- How do you handle ambiguous requirements? (Turning "make it accurate" into a golden set and a threshold.)
+- Tell me about a time you pushed back on shipping. (Quality gates, with the business trade-off explained.)
+- How do you decide when something is good enough? (Targets defined upfront, measured, and a plan for online monitoring.)
+- Why AI engineering, why now, and why this company? (Prepare the last part per company.)
+
+## Handling the "you don't have AI production experience" challenge
+
+Answer directly. Do not argue.
+
+> "That's fair: my production experience is in quality engineering, and my AI systems are portfolio projects. What I can show is that they're built the way production systems are: CI/CD to AWS, evals gating every change, tracing, cost tracking per tenant, runbooks. And the part teams struggle with most in production, evaluation and reliability, is the part I've done professionally for years."
+
+## Questions you ask them
+
+Ask questions that show you think like an AI engineer:
+
+- How do you evaluate changes to prompts or models before shipping?
+- What does your observability look like for LLM features?
+- What is the biggest source of production incidents in your AI features?
+- How do you balance cost and quality, and who owns that decision?
+
+## Common mistakes
+
+- Apologizing for the QA background instead of using it.
+- Telling the project story as a feature list with no hard problem.
+- Numbers you cannot explain, or that were not measured.
+- Using "we" so much that your contribution disappears. In capstones it was you; say "I".
+- Memorized answers that sound robotic. Rehearse the structure, not the script.
+- No questions for the interviewer.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Why should we hire an SDET for an AI engineer role?" level="mid">
+
+Because the bottleneck in most AI products is not getting a demo working; it is knowing whether the system is correct, keeping it correct as prompts, models and data change, and debugging it when it isn't. That is evaluation, regression testing and observability, which is what I've done for years. I've added the AI engineering side on top: RAG with hybrid retrieval and re-ranking, LangGraph agents with human approval, FastAPI services deployed to AWS. My capstone shows both halves together: the platform and the eval and tracing system that proves it works.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tell me about a time an AI system you built failed." level="senior">
+
+Pick a real failure from a capstone. Example structure: "My support agent passed final-answer evals at 0.9 but in trajectory evals it called the refund tool before checking order status in 4 of 30 cases. Final answers looked fine because the mock refund succeeded. I added a precondition in the tool contract, rejecting refunds without a prior lookup in the same run, plus trajectory assertions in CI. The lesson: evaluate the path, not just the output." Then mention the process change you made.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Lead with the artifact">
+
+Whenever possible, say "I can show you" and share the repo, the eval report or a trace. A link beats an adjective.
+
+</Callout>
+
+## Further reading
+
+- The STAR method (overview): https://en.wikipedia.org/wiki/Situation,_task,_action,_result
+- Anthropic docs, building effective agents: https://www.anthropic.com/research/building-effective-agents
+- LangSmith evaluation concepts (for vocabulary): https://docs.smith.langchain.com/evaluation

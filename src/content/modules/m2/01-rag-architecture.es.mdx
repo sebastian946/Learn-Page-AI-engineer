@@ -1,0 +1,203 @@
+## Por qué existe RAG
+
+Un modelo de lenguaje grande sabe lo que estaba en sus datos de entrenamiento, congelado en una fecha de corte. No conoce la política de préstamos vigente de tu prestamista, el memo de underwriting de la semana pasada ni la página de FAQ que marketing cambió ayer. Tienes tres formas de darle ese conocimiento:
+
+1. **Meter todo en el prompt.** Funciona para un manual de 20 páginas. Falla con 4,000 PDFs de políticas: revientas la ventana de contexto, pagas cada token en cada request y el modelo empeora al buscar el párrafo relevante en un mar de texto.
+2. **Hacer fine-tuning del modelo.** Caro, lento de actualizar, y enseña estilo y formato mucho mejor que hechos. No puedes citar un peso del modelo.
+3. **Recuperar y luego generar (RAG, Retrieval-Augmented Generation).** En tiempo de consulta, encuentras el puñado de pasajes que importan y pones solo esos en el prompt. El conocimiento vive en una base de datos que controlas, se actualiza en minutos y cada respuesta puede apuntar a su fuente.
+
+Para un asistente de conocimiento interno en un prestamista hipotecario, la opción 3 gana en todos los ejes que importan: frescura (las políticas cambian cada mes), auditabilidad (compliance quiere una cita por cada afirmación) y costo (envías 3–6 chunks, no 4,000 documentos).
+
+Este módulo sigue un ejemplo continuo: un corpus de **PDFs de políticas de préstamo, guías de underwriting y páginas FAQ en HTML** de un prestamista ficticio. Para la lección 20 lo vas a entregar como `mortgage-knowledge-assistant`.
+
+## Los dos pipelines
+
+Todo sistema RAG son en realidad dos pipelines que comparten un store.
+
+<Diagram caption="Los pipelines de indexación (offline) y de consulta (online) comparten el vector store" chart={`flowchart LR
+  subgraph Offline["Indexación (batch, offline)"]
+    A["Carga (PDF, HTML)"] --> B[Limpieza]
+    B --> C[Chunking]
+    C --> D["Embedding (batch)"]
+    D --> E[(Vector store)]
+  end
+  subgraph Online["Consulta (por request)"]
+    Q[Pregunta del usuario] --> R["Embedding de la consulta"]
+    R --> S["Retrieve top-k"]
+    E --> S
+    S --> T["Prompt con contexto"]
+    T --> U[LLM]
+    U --> V["Respuesta + citas"]
+  end`} />
+
+**Indexación (offline).** Cargas documentos crudos, los limpias, los divides en chunks (fragmentos), conviertes cada chunk en un vector con un modelo de embeddings y escribes vectores más metadata en un store. Esto corre en un job batch o ante un evento de documento modificado. La latencia aquí casi no importa; la corrección y la repetibilidad importan mucho.
+
+**Consulta (online).** Generas el embedding de la pregunta con el *mismo* modelo, buscas los chunks más cercanos, los metes en un prompt con instrucciones y llamas al LLM. Esto corre en cada request, así que la latencia y el costo por request importan.
+
+Como SDET ya conoces esta separación: es como la preparación de datos de prueba (fixtures) frente a la ejecución del test. Los bugs del setup aparecen como fallas confusas en la ejecución. En RAG, la mayoría de los bugs de "el modelo alucinó" son en realidad bugs de indexación: el pasaje correcto nunca fue recuperable.
+
+## Componentes y sus perillas
+
+| Componente | Perilla principal | Valor inicial típico | Qué sale mal |
+|---|---|---|---|
+| Loader | parser por tipo de archivo | `pypdf` para PDFs con texto, BeautifulSoup para HTML | encabezados, pies de página y tablas se vuelven ruido |
+| Chunker | tamaño y solapamiento | 800 caracteres, 100 de overlap | los chunks cortan secciones a la mitad |
+| Embedder | modelo y dimensiones | un modelo pequeño y barato de tu proveedor | consulta y documentos con modelos distintos |
+| Vector store | tipo de índice, distancia | HNSW, coseno | sin metadata, así que no hay filtrado |
+| Retriever | k, filtros, híbrido | k = 4, solo vector | el documento correcto queda en el puesto 9 |
+| Prompt | instrucciones de grounding | "responde solo con el contexto, cita fuentes" | el modelo responde de memoria |
+| LLM | modelo, temperatura | modelo de gama media, temperatura 0 | respuestas largas y sin citas |
+
+Cada fila tiene su propia lección en este módulo. Hoy conectas todas con valores por defecto razonables para tener una línea base que mejorar y contra la cual medir.
+
+## Tu primer pipeline con LangChain
+
+La especificación del curso es deliberada: construye primero con LangChain para tener un sistema funcionando rápido, y en la lección 17 reconstruye el núcleo sin framework para entender cada línea. LangChain te da loaders, splitters, adaptadores de vector stores y una interfaz uniforme para modelos de chat.
+
+Instala las piezas (fija versiones en tu `pyproject.toml`):
+
+```bash
+pip install langchain-core langchain-community langchain-text-splitters \
+  langchain-anthropic langchain-openai pypdf
+```
+
+Anthropic no ofrece un endpoint de embeddings, así que combinamos Claude para la generación con un modelo de embeddings de otro proveedor. El nombre del modelo viene de la configuración. El valor por defecto de abajo es un ejemplo — revisa la lista y los precios actuales del proveedor.
+
+```python
+# rag_v0.py — baseline RAG over mortgage policy PDFs
+import os
+from pathlib import Path
+
+from langchain_anthropic import ChatAnthropic
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")  # example
+CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5-5")
+
+
+def load_corpus(folder: Path) -> list[Document]:
+    docs: list[Document] = []
+    for pdf in sorted(folder.glob("*.pdf")):
+        docs.extend(PyPDFLoader(str(pdf)).load())  # one Document per page
+    return docs
+
+
+def build_index(docs: list[Document]) -> InMemoryVectorStore:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    store = InMemoryVectorStore(OpenAIEmbeddings(model=EMBED_MODEL))
+    store.add_documents(chunks)
+    print(f"indexed {len(chunks)} chunks from {len(docs)} pages")
+    return store
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You answer questions for loan officers using ONLY the context below. "
+     "If the context does not contain the answer, say you don't know. "
+     "Cite sources as [source p.page] after each claim.\n\n{context}"),
+    ("human", "{question}"),
+])
+
+
+def format_context(chunks: list[Document]) -> str:
+    return "\n\n".join(
+        f"[{Path(c.metadata['source']).name} p.{c.metadata.get('page', 0) + 1}]\n{c.page_content}"
+        for c in chunks
+    )
+
+
+def answer(store: InMemoryVectorStore, question: str, k: int = 4) -> str:
+    chunks = store.similarity_search(question, k=k)
+    llm = ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    messages = PROMPT.invoke({"context": format_context(chunks), "question": question})
+    return llm.invoke(messages).content
+
+
+if __name__ == "__main__":
+    store = build_index(load_corpus(Path("data/policies")))
+    print(answer(store, "What is the maximum DTI for a conventional loan with manual underwriting?"))
+```
+
+Ese es un sistema RAG completo en unas 50 líneas. Tiene cada etapa del diagrama: carga, chunking, embedding, almacenamiento, retrieval, prompt y generación. También es ingenuo en al menos seis aspectos, y el resto del módulo los corrige uno por uno:
+
+- `PyPDFLoader` conserva encabezados repetidos como "Northwind Mortgage — Confidential — Rev. 2026-03" en cada página (lección 2).
+- Los chunks de tamaño fijo parten tablas y secciones numeradas de la política (lección 4).
+- El modelo de embeddings se eligió por defecto, no por medición (lección 6).
+- El store en memoria desaparece al reiniciar y no tiene filtros (lecciones 7–8).
+- La búsqueda puramente vectorial no encuentra términos exactos como "Form 1003" o "LTV 97%" (lección 9).
+- No hay evaluación, así que no puedes saber si un cambio ayudó (lección 14).
+
+### El mismo pipeline como cadena LCEL
+
+LangChain Expression Language compone runnables con `|`. El código de producción suele usar esta forma porque te da streaming, batching y tracing sin esfuerzo extra.
+
+```python
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+retriever = store.as_retriever(search_kwargs={"k": 4})
+
+chain = (
+    {"context": retriever | RunnableLambda(format_context),
+     "question": RunnablePassthrough()}
+    | PROMPT
+    | ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    | StrOutputParser()
+)
+
+for token in chain.stream("Can gift funds cover the full down payment on an FHA loan?"):
+    print(token, end="", flush=True)
+```
+
+Ambas formas están bien. La versión con funciones explícitas es más fácil de depurar y testear; la versión LCEL es más fácil de hacer streaming y trazar. Elige una por codebase y sé consistente.
+
+## A dónde se van el tiempo y el dinero
+
+Presupuesto aproximado de latencia para una consulta en esta línea base (tus números serán distintos; mídelos):
+
+- Embedding de la consulta: una llamada pequeña a la API, normalmente decenas de milisegundos.
+- Búsqueda vectorial: en memoria o pgvector con índice, unos pocos milisegundos para un corpus de este tamaño.
+- Generación del LLM: dominada por los tokens de salida; a menudo 1–4 segundos para un párrafo con citas.
+
+La generación domina. Por eso las lecciones posteriores sobre caché (lección 16) y sobre enviar menos chunks pero mejores (lecciones 9–11) son las que más rinden. El costo sigue el mismo patrón: los tokens de entrada crecen linealmente con `k` por el tamaño del chunk, así que `k = 4` con chunks de 800 caracteres son aproximadamente 800–1,000 tokens de contexto por pregunta.
+
+## Errores comunes
+
+- **Tratar RAG como un problema del modelo.** Cuando las respuestas están mal, los equipos cambian el LLM primero. Revisa el retrieval primero: imprime los chunks recuperados para la pregunta que falla. Si la respuesta no está en ellos, ningún modelo puede arreglarlo.
+- **Modelos de embeddings distintos al indexar y al consultar.** Los vectores de dos modelos viven en espacios diferentes. Los puntajes de similitud pierden sentido y nada lanza error. Guarda el nombre del modelo junto al índice y verifícalo en tiempo de consulta.
+- **Sin metadata de fuente.** Si los chunks no llevan `source`, `page` y luego `section`, no puedes citar. Agregarlo después implica reindexar todo.
+- **Prompt sin grounding.** Sin "responde solo con el contexto" y "di que no sabes", el modelo llena huecos con sus datos de entrenamiento. En un dominio regulado eso es un incidente de compliance.
+- **Saltarse la línea base.** Construir búsqueda híbrida y re-ranking antes de tener una línea base medida significa que no puedes demostrar que algo de eso ayudó.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Explícame la arquitectura de un sistema RAG que construirías para documentos internos de políticas." level="mid">
+
+Divídelo en dos pipelines. **Indexación:** carga PDFs y HTML, limpia el boilerplate, haz chunking con un splitter que respete la estructura, genera embeddings en batches y guarda vectores con metadata (fuente, página, sección, tipo de documento, fecha de vigencia) en un vector store como pgvector. **Consulta:** genera el embedding de la pregunta con el mismo modelo, ejecuta retrieval híbrido (vector más palabras clave) con filtros de metadata, opcionalmente aplica re-ranking, arma un prompt con grounding que exija citas y genera. Luego nombra lo que medirías: recall@k del retrieval sobre un golden set, faithfulness de las respuestas, latencia p95 y costo por consulta. Cierra con el riesgo principal: la mayoría de las fallas son de retrieval, así que evalúas el retrieval por separado de la generación.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuándo elegirías RAG en lugar de fine-tuning y cuándo los combinarías?" level="senior">
+
+RAG cuando el conocimiento cambia seguido, debe citarse o tiene control de acceso por usuario: actualizas una base de datos, no pesos, y puedes filtrar por permisos al momento del retrieval. Fine-tuning cuando necesitas un formato de salida, tono o patrón de razonamiento de dominio consistente que el prompting no logra de forma confiable, o para que un modelo más pequeño sea suficiente y bajar costos. Combínalos cuando un modelo pequeño con fine-tuning es el generador sobre el contexto recuperado, por ejemplo para seguir un formato de citas estricto a bajo costo. El fine-tuning por sí solo es una mala forma de inyectar hechos: es difícil de actualizar, difícil de auditar y aun así puede alucinar con total seguridad.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Muestra la mentalidad de línea base">
+
+A los entrevistadores les gustan los candidatos que dicen "entregaría primero el pipeline más simple, armaría un golden set de 30–50 preguntas y solo entonces agregaría búsqueda híbrida o re-ranking si las métricas lo justifican". Es el mismo instinto que escribir un test que falla antes del fix.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- [LangChain — Construye una app RAG (tutorial)](https://python.langchain.com/docs/tutorials/rag/)
+- [Anthropic — Embeddings (qué proveedores combinar con Claude)](https://docs.anthropic.com/en/docs/build-with-claude/embeddings)
+- [Lewis et al., Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (arXiv:2005.11401)](https://arxiv.org/abs/2005.11401)
+- [OpenAI — Guía de embeddings](https://platform.openai.com/docs/guides/embeddings)

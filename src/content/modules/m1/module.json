@@ -1,0 +1,45 @@
+{
+  "id": "m1",
+  "order": 1,
+  "days": 3,
+  "hours": 18,
+  "title": { "en": "LLM foundations for engineers", "es": "Fundamentos de LLM para ingenieros" },
+  "summary": {
+    "en": "Tokens, context windows, sampling, structured outputs, tool calling, streaming, prompts as versioned contracts, provider abstraction, retries, rate limits, cost tracking and async Python. You build a provider-agnostic LLM client and a production-style support ticket router.",
+    "es": "Tokens, ventanas de contexto, sampling, salidas estructuradas, tool calling, streaming, prompts como contratos versionados, abstracción de proveedores, reintentos, rate limits, seguimiento de costos y Python asíncrono. Construyes un cliente LLM agnóstico al proveedor y un router de tickets de soporte estilo producción."
+  },
+  "lessons": [
+    { "slug": "01-tokens-context-sampling", "type": "concept", "minutes": 45, "title": { "en": "Tokens, context windows and sampling", "es": "Tokens, ventanas de contexto y sampling" } },
+    { "slug": "02-structured-outputs", "type": "concept", "minutes": 45, "title": { "en": "Structured outputs: JSON Schema, Pydantic v2 and repair loops", "es": "Salidas estructuradas: JSON Schema, Pydantic v2 y bucles de reparación" } },
+    { "slug": "03-tool-calling", "type": "concept", "minutes": 50, "title": { "en": "Function and tool calling: Anthropic and OpenAI side by side", "es": "Function y tool calling: Anthropic y OpenAI lado a lado" } },
+    { "slug": "04-streaming", "type": "concept", "minutes": 40, "title": { "en": "Streaming: SSE events, partial JSON and backpressure", "es": "Streaming: eventos SSE, JSON parcial y backpressure" } },
+    { "slug": "05-system-prompts-versioning", "type": "concept", "minutes": 40, "title": { "en": "System prompts as software contracts, and prompt versioning", "es": "System prompts como contratos de software y versionado de prompts" } },
+    { "slug": "06-provider-abstraction", "type": "concept", "minutes": 45, "title": { "en": "Provider abstraction: Anthropic, OpenAI and Bedrock behind one interface", "es": "Abstracción de proveedores: Anthropic, OpenAI y Bedrock detrás de una interfaz" } },
+    { "slug": "07-async-python", "type": "concept", "minutes": 45, "title": { "en": "Async Python for LLM workloads: httpx, asyncio, semaphores, timeouts", "es": "Python asíncrono para cargas LLM: httpx, asyncio, semáforos y timeouts" } },
+    { "slug": "08-retries-rate-limits", "type": "concept", "minutes": 40, "title": { "en": "Retries, backoff with jitter and rate limits", "es": "Reintentos, backoff con jitter y rate limits" } },
+    { "slug": "09-cost-tracking", "type": "concept", "minutes": 35, "title": { "en": "Cost tracking per request and per feature", "es": "Seguimiento de costos por request y por feature" } },
+    { "slug": "10-ex-llm-client", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: provider-agnostic LLM client with streaming, retries and cost logging", "es": "Ejercicio: cliente LLM agnóstico al proveedor con streaming, reintentos y registro de costos" } },
+    { "slug": "11-ex-structured-extraction", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: structured extraction with Pydantic and a repair loop", "es": "Ejercicio: extracción estructurada con Pydantic y un bucle de reparación" } },
+    { "slug": "12-ex-tool-calling", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: a complete tool calling round-trip", "es": "Ejercicio: un ciclo completo de tool calling" } },
+    { "slug": "13-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 1 exam", "es": "Examen del módulo 1" } },
+    { "slug": "14-capstone-ticket-router", "type": "project", "minutes": 1200, "title": { "en": "Capstone: support ticket classifier and router", "es": "Capstone: clasificador y router de tickets de soporte" } }
+  ],
+  "repos": [
+    {
+      "id": "m1-llm-client",
+      "name": "llm-provider-client",
+      "description": {
+        "en": "Provider-agnostic async LLM client (Anthropic, OpenAI, Bedrock) with streaming, retries with jitter, rate limiting and per-request cost logging, plus milestones for structured extraction and tool calling.",
+        "es": "Cliente LLM asíncrono agnóstico al proveedor (Anthropic, OpenAI, Bedrock) con streaming, reintentos con jitter, rate limiting y registro de costos por request, más milestones de extracción estructurada y tool calling."
+      }
+    },
+    {
+      "id": "m1-ticket-router",
+      "name": "support-ticket-router",
+      "description": {
+        "en": "Support ticket classifier and router for a fictional e-commerce client: structured output, confidence scores, cheap-to-strong model escalation, human review queue and a cost report.",
+        "es": "Clasificador y router de tickets de soporte para un cliente e-commerce ficticio: salida estructurada, scores de confianza, escalamiento de modelo barato a fuerte, cola de revisión humana y reporte de costos."
+      }
+    }
+  ]
+}

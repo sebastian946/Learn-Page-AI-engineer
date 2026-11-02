@@ -1,0 +1,196 @@
+## Agents fail in new ways
+
+A normal service fails loudly. It throws, returns a 500, and your alerting fires. An agent fails quietly. It calls the same tool eight times. It apologizes in a loop. It retries a refund that already went through. It burns 400k tokens on a question that needed 4k. Every one of those runs can end with HTTP 200.
+
+As an SDET you already know the cure for quiet failures: make them loud, make them bounded, and make them observable. This lesson covers the three layers you need in every production agent:
+
+1. **Tool-level failure handling** — errors the model can read and act on.
+2. **Loop guards** — hard limits on steps and detection of repeated actions.
+3. **Cost caps and budgets** — a per-run and per-tenant ceiling on spend.
+
+## The failure taxonomy
+
+Group agent failures by who can fix them. It tells you where the handling code belongs.
+
+| Failure | Example | Who fixes it | Where to handle |
+|---|---|---|---|
+| Transient infra | carrier API timeout, 429 | your code | retry with backoff inside the tool |
+| Bad input from the model | `get_order("ORD 123")` with a space | the model | return an error contract with a hint |
+| Business rule | refund larger than order total | the model or a human | error contract, or escalate |
+| Model failure | malformed tool call, hallucinated tool name | your code | validate, return a correction message |
+| Runaway loop | same call repeated, no progress | your code | loop guard, stop gracefully |
+| Budget exhausted | cost over the per-run cap | your code | cost guard, stop gracefully |
+
+The key rule: **do not let the model handle what your code can handle**. A 429 from the carrier API should never reach the model. The tool retries it. The model should only see errors it can do something about.
+
+## Layer 1: tool-level handling
+
+Retries live inside the tool, close to the network call. Use the error contract from lesson 3 for everything that bubbles up.
+
+```python
+import asyncio
+import httpx
+from typing import Any
+
+RETRYABLE_STATUS = {429, 502, 503, 504}
+
+def tool_error(code: str, message: str, retryable: bool, hint: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+
+async def get_carrier_rates(origin_zip: str, dest_zip: str, weight_kg: float) -> dict[str, Any]:
+    if weight_kg <= 0 or weight_kg > 1000:
+        return tool_error("INVALID_WEIGHT", f"weight_kg={weight_kg} out of range",
+                          False, "Use a weight between 0.1 and 1000 kg.")
+    delay = 0.5
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        for attempt in range(3):
+            try:
+                r = await client.get("https://rates.internal/v1/quote", params={
+                    "from": origin_zip, "to": dest_zip, "kg": weight_kg})
+                if r.status_code in RETRYABLE_STATUS:
+                    raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+                r.raise_for_status()
+                return {"rates": r.json()["rates"][:5]}  # cap payload size
+            except (httpx.TimeoutException, httpx.HTTPStatusError):
+                if attempt == 2:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
+    return tool_error("CARRIER_UNAVAILABLE", "Rate service did not respond after 3 attempts",
+                      True, "Tell the user rates are temporarily unavailable. Do not retry now.")
+```
+
+Notice the hint on the final error: "Do not retry now." `retryable: true` means the operation is safe to retry later. It does not mean the model should hammer it in the same run. Be explicit. Models follow instructions in tool results.
+
+Also catch model mistakes before they hit your backend. If the model calls a tool that does not exist or passes arguments that fail Pydantic validation, return a short correction instead of raising. `ToolNode` in LangGraph does this by default with `handle_tool_errors=True`: it turns exceptions into a `ToolMessage` with the error text. That is fine for development. In production, prefer your own contract so the message is short and actionable, and so a stack trace never leaks into the context.
+
+## Layer 2: loop guards
+
+LangGraph already has one guard: `recursion_limit`. Every super-step counts. When the graph exceeds the limit, it raises `GraphRecursionError`.
+
+```python
+from langgraph.errors import GraphRecursionError
+
+try:
+    result = await graph.ainvoke(inputs, config={"recursion_limit": 25,
+                                                 "configurable": {"thread_id": tid}})
+except GraphRecursionError:
+    result = {"final": "I could not finish this request. A ticket was opened for a human."}
+```
+
+That is a backstop, not a strategy. It fires late, it throws instead of producing a useful answer, and it does not tell you *why*. Add guards inside the graph so the agent stops on purpose, with a message.
+
+**Max steps.** Keep `step_count` in state. Increment it in the agent node. Route to a `stop` node when it reaches the limit. Pick a limit from data: look at the p95 step count of successful traces and add headroom. For a support agent that is often 6 to 10 tool calls.
+
+**Repeated-action detection.** Hash each tool call as tool name plus canonical JSON of the arguments. If the same hash appears N times in one run (N = 2 or 3), the agent is stuck. The model is not getting new information, so another call will not help.
+
+**No-progress detection.** Harder, but useful: if the last K tool results are identical errors, stop. The model keeps trying variations that all fail the same way.
+
+```python
+import hashlib
+import json
+from langchain_core.messages import AIMessage
+
+def call_signature(name: str, args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{name}:{canonical}".encode()).hexdigest()[:16]
+
+def repeated_calls(messages: list, threshold: int = 3) -> str | None:
+    counts: dict[str, int] = {}
+    for m in messages:
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls:
+                sig = call_signature(tc["name"], tc["args"])
+                counts[sig] = counts.get(sig, 0) + 1
+                if counts[sig] >= threshold:
+                    return tc["name"]
+    return None
+
+def guard_router(state: dict) -> str:
+    if state["step_count"] >= MAX_STEPS:
+        return "stop"
+    if repeated_calls(state["messages"]):
+        return "stop"
+    if state["cost_usd"] >= MAX_COST_USD:
+        return "stop"
+    last = state["messages"][-1]
+    return "tools" if isinstance(last, AIMessage) and last.tool_calls else END
+```
+
+The `stop` node should do something useful. Write a final message to the user ("I could not complete this. A teammate will follow up."), open a ticket with the trace id, and set a `stop_reason` field in state. That field is gold for evals and dashboards.
+
+## Layer 3: cost caps and budgets
+
+Tokens are your cloud bill. An agent that loops with a 50k-token context costs real money per extra step, because every step resends the whole history. Cost grows roughly with the square of the step count when context accumulates.
+
+Track cost per run from `usage_metadata` on each `AIMessage`. Load prices from config, never hardcode them in logic.
+
+```python
+# config/pricing.yaml — example values, check the provider's current pricing
+# claude-sonnet-5-5: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+
+def message_cost(msg: AIMessage, prices: dict[str, float]) -> float:
+    usage = msg.usage_metadata or {}
+    return (usage.get("input_tokens", 0) * prices["input_per_mtok"]
+            + usage.get("output_tokens", 0) * prices["output_per_mtok"]) / 1_000_000
+
+async def agent_node(state: AgentState) -> dict:
+    response = await llm_with_tools.ainvoke(state["messages"])
+    return {
+        "messages": [response],
+        "step_count": state["step_count"] + 1,
+        "cost_usd": state["cost_usd"] + message_cost(response, PRICES),
+    }
+```
+
+Use three budget levels:
+
+- **Per run.** Hard cap, for example 0.25 USD for a support request. Checked by the router before each model call.
+- **Per tenant per day.** Stored in Redis with an atomic `INCRBYFLOAT` and a TTL. When exceeded, degrade: switch to a cheaper model or queue for a human.
+- **Global.** A circuit breaker on total spend per hour. It protects you from a bad deploy that makes every run loop.
+
+Check the budget *before* the expensive call, not after. A pre-call estimate is simple: current context tokens times input price plus `max_tokens` times output price. If the estimate would push the run over budget, stop now.
+
+Also cap the inputs that make cost explode: truncate large tool results, set `max_tokens` on every call, and summarize history after N turns (lesson 9).
+
+## Graceful degradation
+
+When a guard fires, the user should still get a decent outcome:
+
+1. Tell the user what happened, without internal details.
+2. Preserve the work done so far (the checkpointer already has it).
+3. Hand off: create a ticket, or route to a human queue with the thread id.
+4. Record `stop_reason` (`max_steps`, `repeated_action`, `budget`, `tool_unavailable`) and emit a metric.
+
+Alert on the rate of guard trips, not on single trips. A sudden jump in `repeated_action` after a prompt change is a regression. Treat it like a flaky test spike in CI: something changed, find it.
+
+## Common mistakes
+
+- **Relying only on `recursion_limit`.** It throws, gives no reason and no user message.
+- **Retrying non-idempotent tools.** A retried `issue_refund` without an idempotency key pays twice. Retry only reads, or writes with keys.
+- **Letting transient errors reach the model.** The model will "retry" by calling again and again. Handle 429 and timeouts in code.
+- **Vague errors.** `"Error occurred"` gives the model nothing. Return a code, a reason and a hint.
+- **Counting cost after the fact.** By the time you log it, the money is spent. Check before each call.
+- **No `stop_reason`.** Without it you cannot tell a good stop from a crash in your dashboards or evals.
+- **Same limits for every task.** A research agent needs more steps than an order lookup. Make limits per graph or per intent.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your agent occasionally gets stuck calling the same tool over and over. How do you fix it?" level="mid">
+First, find out why with traces: is the tool returning an error the model cannot act on, or a result the model misreads? Fix the root cause, usually a vague error message or a missing hint. Then add guards anyway: a step counter in state, repeated-call detection by hashing tool name plus canonical arguments, and a stop node that answers the user, opens a ticket and records `stop_reason`. Keep `recursion_limit` as the last backstop. Finally, add the stuck scenario to the trajectory eval set so it cannot come back.
+</InterviewQuestion>
+
+<InterviewQuestion question="How would you keep an agent's LLM cost under control in production?" level="senior">
+Layer the budget. Per run: track cost from usage metadata on every model response and check a pre-call estimate against a cap before each step. Per tenant: a daily counter in Redis with atomic increments, degrading to a cheaper model or a human queue when exceeded. Global: a spend circuit breaker that catches a bad deploy. Reduce cost at the source too: `max_tokens` on every call, truncated tool results, history summarization, prompt caching for the stable system prompt and tool definitions, and a cheaper model for routing. Prices come from config so they are easy to update. Dashboards show cost per run p50/p95 and guard trip rates.
+</InterviewQuestion>
+
+<Callout type="interview" title="Say this">
+"A 200 from an agent does not mean success. I measure stop reasons, step counts and cost per run, and I alert on changes in those distributions."
+</Callout>
+
+## Further reading
+
+- LangGraph docs, recursion limit and error handling: https://langchain-ai.github.io/langgraph/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- Anthropic docs, tool use and token counting: https://docs.anthropic.com
+- OWASP Top 10 for LLM Applications (Excessive Agency, Unbounded Consumption): https://owasp.org/www-project-top-10-for-large-language-model-applications/

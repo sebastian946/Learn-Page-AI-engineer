@@ -1,0 +1,171 @@
+## Objetivo
+
+Tu proyecto final del Módulo 2, `mortgage-knowledge-assistant`, corre en tu laptop con `uvicorn --reload` y un Postgres que levantaste a mano. En este ejercicio haces que corra en cualquier lugar con un solo comando, en una imagen que te sentirías cómodo enviando a producción.
+
+Al final tendrás:
+
+- Un `Dockerfile` multi-stage construido con uv, cache mounts, una base slim, un usuario no root y un health check.
+- Un `docker-compose.yml` que levanta la API, Postgres con pgvector y Redis, con arranque condicionado a health checks.
+- Un `.dockerignore` que deja datos, virtualenvs y archivos `.env` fuera del contexto de build.
+- Endpoints `/healthz` y `/readyz`.
+- Un tamaño de imagen medido y una sección corta del README que explica las decisiones.
+
+Trabaja en una rama: `git switch -c m5/containerize`.
+
+**Límite de tiempo:** 75 minutos. Si la dependencia de `torch` del re-ranker te obliga a pelear con la imagen, cambia el re-ranker a una API hospedada o desactívalo detrás de una configuración por ahora, y anótalo en el README como un trade-off consciente.
+
+## Contexto
+
+El servicio sigue la estructura de las lecciones anteriores: `app/main.py` con un lifespan que abre el pool de la DB y el cliente de Redis, `app/settings.py` con pydantic-settings, `app/llm.py` con `LLM_PROVIDER=anthropic|mock`. Si tu código del Módulo 2 es distinto, adáptalo primero: la contenerización es mucho más fácil cuando la configuración viene solo de variables de entorno.
+
+El proveedor mock es importante aquí. Con `LLM_PROVIDER=mock`, todo el stack corre localmente sin API key y sin costo. Así también correrá CI el smoke test de tu contenedor en un ejercicio posterior.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+- [ ] `docker compose up --build` levanta `api`, `db` (imagen `pgvector/pgvector:pg16`) y `redis` sin pasos manuales, y la API espera a que `db` y `redis` estén saludables antes de arrancar.
+- [ ] El `Dockerfile` tiene al menos dos stages; el stage de runtime no contiene el binario de uv, ni compilador, ni caché de paquetes.
+- [ ] Las dependencias se instalan desde `uv.lock` con `--frozen`, en una capa que no se invalida con cambios dentro de `app/`.
+- [ ] Se usan cache mounts de BuildKit para la caché de uv; un rebuild después de editar un archivo Python tarda menos de 15 segundos con la caché caliente.
+- [ ] El contenedor corre como usuario no root y usa `CMD` en forma exec (uvicorn es el PID 1).
+- [ ] `GET /healthz` devuelve 200 sin tocar dependencias; `GET /readyz` devuelve 200 solo cuando Postgres y Redis responden, y 503 en caso contrario.
+- [ ] No hay secretos en la imagen: `docker history` y `docker inspect` no muestran API keys; `.env` está en `.dockerignore` y `.gitignore`; se versiona un `.env.example`.
+- [ ] El tamaño final de la imagen queda registrado en el README. Meta: menos de 400 MB sin modelo local, menos de 1.2 GB con un cross-encoder solo CPU.
+- [ ] Con `LLM_PROVIDER=mock`, `curl -N -X POST localhost:8000/v1/chat/stream ...` emite eventos `token` seguidos de `citations` y `done`.
+</AcceptanceCriteria>
+
+## Código inicial
+
+Parte de este esqueleto. Completa los huecos marcados con `TODO`.
+
+<StarterCode>
+```dockerfile
+# syntax=docker/dockerfile:1.7
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
+# TODO: install dependencies only (bind-mount pyproject.toml + uv.lock, cache mount)
+# TODO: copy app/ and install the project
+
+FROM python:${PYTHON_VERSION}-slim AS runtime
+# TODO: create a non-root user
+WORKDIR /app
+# TODO: copy the venv and code from builder with the right owner
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+# TODO: USER, EXPOSE, HEALTHCHECK (no curl in slim)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "30"]
+```
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://mka:mka@db:5432/mka
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: mka
+      POSTGRES_PASSWORD: mka
+      POSTGRES_DB: mka
+    volumes: ["pgdata:/var/lib/postgresql/data", "./infra/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    # TODO: healthcheck with pg_isready
+  redis:
+    image: redis:7-alpine
+    # TODO: healthcheck with redis-cli ping
+volumes:
+  pgdata:
+```
+
+```python
+# app/api/health.py
+from fastapi import APIRouter, Request, Response
+
+router = APIRouter()
+
+
+@router.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/readyz")
+async def readyz(request: Request, response: Response) -> dict[str, str]:
+    checks: dict[str, str] = {}
+    # TODO: SELECT 1 on request.app.state.db with a 1 s timeout -> checks["postgres"]
+    # TODO: PING on request.app.state.redis with a 1 s timeout -> checks["redis"]
+    # TODO: set response.status_code = 503 if any check failed
+    return checks
+```
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Construye la capa de dependencias con bind mounts, no con COPY. `RUN --mount=type=bind,source=uv.lock,target=uv.lock --mount=type=bind,source=pyproject.toml,target=pyproject.toml --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project --no-dev`. Luego `COPY app ./app` más los dos archivos del proyecto y ejecuta `uv sync --frozen --no-dev` otra vez.</Hint>
+  <Hint>Para los readiness checks, envuelve cada prueba en `asyncio.timeout(1)` y captura `Exception`, registrando `"ok"` o `"fail"`. Usa `await pool.fetchval("SELECT 1")` para asyncpg y `await redis.ping()` para redis-py. Nunca llames al proveedor LLM desde `/readyz`.</Hint>
+  <Hint>Health checks de Compose: `test: ["CMD-SHELL", "pg_isready -U mka -d mka"]` y `test: ["CMD", "redis-cli", "ping"]`, ambos con `interval: 5s` y `retries: 10`. Tu `infra/db/init.sql` debe ejecutar `CREATE EXTENSION IF NOT EXISTS vector;` para que la migración del esquema no necesite superusuario después.</Hint>
+  <Hint>Si la imagen es inesperadamente grande, ejecuta `docker history mka:dev`. Una capa enorme en el paso de sync suele significar `torch` con CUDA: agrega el índice CPU de la lección 02 a `pyproject.toml`, ejecuta `uv lock` y reconstruye. Una capa `COPY` enorme significa que a tu `.dockerignore` le falta `data/` o `.venv`.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Rama: `m5/containerize`. Abre un PR hacia `main` y haz merge cuando pase el checklist.
+
+```text
+mortgage-knowledge-assistant/
+  app/
+    main.py
+    settings.py
+    llm.py
+    api/
+      chat.py
+      health.py
+    rag/
+  infra/
+    db/
+      init.sql
+  tests/
+    test_health.py
+  Dockerfile
+  docker-compose.yml
+  .dockerignore
+  .env.example
+  pyproject.toml
+  uv.lock
+  README.md
+```
+
+Adiciones al README (nueva sección "Running with Docker"):
+
+1. Quick start de un comando: `cp .env.example .env && docker compose up --build`.
+2. Tabla de servicios: api, db, redis, puertos e imágenes.
+3. Diseño de la imagen: stages, imagen base, usuario no root, health check, cómo se manejan los pesos.
+4. Tamaño de imagen medido y tiempo de rebuild con caché caliente (con el comando que usaste).
+5. Configuración: enlace a `.env.example`, nota de que los secretos se inyectan en runtime.
+
+Commits sugeridos:
+
+- `chore(docker): add multi-stage Dockerfile with uv and cache mounts`
+- `feat(api): add /healthz and /readyz endpoints`
+- `chore(compose): add api, pgvector and redis services with health checks`
+- `chore: add .dockerignore and .env.example`
+- `docs: document container setup, image size and trade-offs`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m5-04-review" title="Autoevaluación" items={["docker compose up --build funciona desde un clon limpio copiando solo .env desde .env.example", "Editar un archivo dentro de app/ no vuelve a descargar ni reinstalar dependencias", "La imagen de runtime no tiene uv, compilador ni caché de build (verificado con docker history)", "El contenedor corre como no root y uvicorn es el PID 1 (CMD en forma exec)", "/readyz devuelve 503 cuando Redis está detenido y se recupera cuando vuelve a arrancar", "Ninguna API key aparece en docker history, docker inspect ni en el contexto de build", "El tamaño de la imagen y el tiempo de rebuild están medidos y escritos en el README", "El proveedor mock emite eventos token, citations y done a través del contenedor"]} />

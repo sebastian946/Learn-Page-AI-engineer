@@ -1,0 +1,179 @@
+## What an agent actually is
+
+Strip away the hype and an agent is a loop. The model looks at the conversation, decides whether to call a tool, your code runs the tool, the result goes back into the conversation, and the model decides again. It stops when the model answers instead of calling a tool, or when your code says "enough".
+
+That loop has a name in the literature: **ReAct** (Reason + Act). The 2022 paper showed that interleaving reasoning ("I need the order status first") with actions (call `get_order`) and observations (the tool result) beats both pure reasoning and pure acting on multi-step tasks. Modern tool-calling APIs bake this pattern in. You no longer parse `Action:` lines out of free text. The model returns structured `tool_use` blocks and you return structured `tool_result` blocks.
+
+The loop has four parts:
+
+1. **Context**: system prompt, tool definitions, message history.
+2. **Decision**: one model call. The output is either text (done) or one or more tool calls.
+3. **Execution**: your code validates arguments, runs the tool, and captures the result or the error.
+4. **Observation**: the result is appended to the history as a `tool_result`, and the loop repeats.
+
+As an SDET, think of it as a test runner where the model writes the next test step at runtime. Everything you know about flaky steps, timeouts and isolation applies. The difference is that the "script" is non-deterministic, so guards and logs are not optional.
+
+## Workflows vs agents
+
+Anthropic's "Building effective agents" draws a line that you should use in every design review:
+
+- A **workflow** is a system where LLM calls and tools are orchestrated through **predefined code paths**. You decide the steps. The model fills in the blanks: classify, extract, summarize, route.
+- An **agent** is a system where the **model decides** the steps and the number of steps, using tools in a loop, based on what it observes.
+
+Common workflow patterns: prompt chaining (step A output feeds step B), routing (classify, then send to a specialized prompt), parallelization (run N checks at once and vote or merge), orchestrator-workers, and evaluator-optimizer. Most production "AI features" are workflows. They are cheaper, faster, easier to test and easier to explain to an auditor.
+
+| | Workflow | Agent |
+|---|---|---|
+| Who picks the next step | Your code | The model |
+| Number of LLM calls | Fixed or bounded | Variable, open-ended |
+| Latency and cost | Predictable | Variable, can spike |
+| Testing | Classic unit and integration tests per step | Trajectory evals, statistical pass rates |
+| Best for | Known processes, high volume | Open-ended tasks, many tool combinations |
+
+### When NOT to build an agent
+
+Do not build an agent when:
+
+- **The steps are known.** "Read email, extract order id, look up order, draft reply" is a pipeline. Write it as four functions. An agent adds failure modes and buys nothing.
+- **A single call with good retrieval solves it.** Many "agent" requests are really RAG plus a structured output.
+- **Latency budgets are tight.** Each loop iteration is a full model round trip. Five iterations at 1.5 s each is 7.5 s before streaming the answer.
+- **Errors are expensive and irreversible**, and you cannot put a human gate in front of the risky action.
+- **You cannot evaluate it.** If you have no way to say whether a trajectory was correct, you cannot ship changes safely.
+
+Build an agent when the path genuinely depends on intermediate results: "this customer's delivery failed, figure out why and fix it" might need an order lookup, a carrier status check, a rate comparison and a reschedule, or just a ticket. The combinations explode, and hand-coding the decision tree becomes the bigger risk.
+
+A good default: start with a workflow, measure where it breaks, and promote only that step to an agentic sub-loop with a small tool set.
+
+## The loop in plain Python
+
+Before using LangGraph, write the loop once by hand with the Anthropic SDK. It removes the magic and you will debug frameworks faster.
+
+```python
+import json
+import anthropic
+
+client = anthropic.AsyncAnthropic()
+
+TOOLS = [
+    {
+        "name": "get_order",
+        "description": "Look up one order by id. Returns status, carrier, promised_date and items.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"order_id": {"type": "string", "pattern": "^ORD-[0-9]{6}$"}},
+            "required": ["order_id"],
+        },
+    },
+]
+
+async def get_order(order_id: str) -> dict:
+    # Fake backend for the example
+    if order_id != "ORD-104233":
+        return {"error": {"code": "ORDER_NOT_FOUND", "message": f"{order_id} does not exist",
+                          "retryable": False, "hint": "Ask the customer to confirm the id."}}
+    return {"order_id": order_id, "status": "delayed", "carrier": "FastFreight",
+            "promised_date": "2026-11-04"}
+
+REGISTRY = {"get_order": get_order}
+
+async def run_agent(user_msg: str, max_steps: int = 6) -> str:
+    messages = [{"role": "user", "content": user_msg}]
+    for step in range(max_steps):
+        resp = await client.messages.create(
+            model="claude-sonnet-5-5",
+            max_tokens=1024,
+            system="You are a logistics support agent. Use tools; never guess order data.",
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            return "".join(b.text for b in resp.content if b.type == "text")
+
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            fn = REGISTRY.get(block.name)
+            output = await fn(**block.input) if fn else {"error": {"code": "UNKNOWN_TOOL"}}
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(output),
+                "is_error": "error" in output,
+            })
+        messages.append({"role": "user", "content": results})
+    return "Stopped: step limit reached. Escalating to a human."
+```
+
+Things to notice:
+
+- The assistant turn is appended **with its tool_use blocks**. If you drop them, the next call fails because the `tool_result` refers to an id the API never saw.
+- All tool results for one assistant turn go back in **one** user message. The model can request parallel tool calls.
+- `is_error=True` tells the model the call failed, so it can recover (ask for a new id, try another tool) instead of treating the error text as data.
+- `max_steps` is the simplest loop guard. Lesson 11 adds more.
+
+The same loop in TypeScript, for comparison:
+
+<CodeTabs>
+```python
+# Python: the decision point
+if resp.stop_reason != "tool_use":
+    return final_text(resp)
+```
+```typescript
+// TypeScript: the decision point with @anthropic-ai/sdk
+if (resp.stop_reason !== "tool_use") {
+  return resp.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+}
+```
+</CodeTabs>
+
+## Reading a trajectory
+
+A **trajectory** is the ordered list of steps the agent took: model call, tool call with arguments, tool result, model call, and so on. Log it for every run. A healthy trajectory for "Where is ORD-104233?" looks like:
+
+```text
+1. model -> tool_use get_order {"order_id": "ORD-104233"}
+2. tool  -> {"status": "delayed", "carrier": "FastFreight", ...}
+3. model -> text "Your order is delayed with FastFreight; promised date Nov 4."
+```
+
+An unhealthy one calls `get_order` three times with the same argument, or invents an id. Trajectories are what you evaluate in lesson 13, the same way you would inspect a Playwright trace to see which step went wrong.
+
+## Common mistakes
+
+- **Building an agent for a pipeline.** If you can draw the flowchart before runtime, write the flowchart in code.
+- **No step limit.** A model that keeps getting an ambiguous error can loop until your token budget is gone.
+- **Returning errors as plain strings without `is_error`.** The model may quote "Internal Server Error" to the customer as if it were the answer.
+- **Dropping the assistant tool_use turn from history.** Breaks the protocol and confuses the model.
+- **Giving the agent 30 tools on day one.** Tool selection accuracy drops as the tool list grows. Start with 3–7 well-described tools.
+- **Not logging the trajectory.** Without it you cannot debug, evaluate or explain an action to a stakeholder.
+- **Letting the model execute irreversible actions directly.** Refunds and cancellations need approval gates (lesson 07).
+
+## How this shows up in interviews
+
+<InterviewQuestion question="What is the difference between a workflow and an agent, and how do you decide which to build?" level="mid">
+
+A workflow runs LLM calls and tools along code paths I define in advance. An agent lets the model choose the next step and the number of steps in a loop. I default to a workflow because it is cheaper, has predictable latency and is easier to test step by step. I move to an agent only when the path depends on intermediate results and the combinations are too many to hand-code. Even then, I keep the tool set small, add a step limit and cost cap, gate irreversible actions behind human approval, and evaluate trajectories, not just final answers.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Walk me through what happens in one iteration of a tool-calling agent loop." level="mid">
+
+The model gets the system prompt, tool schemas and history. It returns either text or tool_use blocks with ids and JSON arguments. My code validates the arguments, executes each tool with a timeout, and wraps the output or a structured error into tool_result blocks with the matching tool_use_id and an is_error flag. I append the assistant turn and the results to history, increment counters for steps and cost, check the guards, and call the model again. The loop ends on a final text answer or when a guard trips, in which case I escalate.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Senior signal">
+
+Interviewers love candidates who argue *against* an agent. Say "I would start with a routing workflow and only make the investigation step agentic" and explain why: cost predictability, testability and blast radius.
+
+</Callout>
+
+## Further reading
+
+- Anthropic — Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- ReAct: Synergizing Reasoning and Acting in Language Models: https://arxiv.org/abs/2210.03629
+- Anthropic tool use docs: https://docs.anthropic.com/en/docs/build-with-claude/tool-use
+- LangGraph — workflows and agents: https://langchain-ai.github.io/langgraph/tutorials/workflows/

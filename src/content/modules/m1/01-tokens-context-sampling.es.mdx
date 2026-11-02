@@ -1,0 +1,173 @@
+## Por qué importa esta lección
+
+Cada factura de LLM, cada presupuesto de latencia y cada bug de "el modelo ignoró mis instrucciones" se explica por tres cosas: los **tokens**, la **ventana de contexto** y **cómo se elige el siguiente token**. No necesitas las matemáticas de los transformers para entregar features con LLM. Sí necesitas un modelo mental de ingeniero sobre estas tres cosas, porque deciden costo, velocidad y confiabilidad.
+
+Piénsalo como piensas en un navegador en Playwright. No necesitas saber cómo Blink pinta píxeles. Sí necesitas saber a qué resuelve un selector, cuándo el DOM está estable y qué timeouts existen.
+
+## Tokens: la unidad de todo
+
+Un modelo nunca ve caracteres ni palabras. Un **tokenizer** divide el texto en **tokens**: fragmentos de sub-palabras de un vocabulario fijo (normalmente construido con byte-pair encoding). Las palabras comunes en inglés suelen ser un token. Las palabras raras, los números, el código y el texto en otros idiomas se dividen en más piezas.
+
+Reglas prácticas (siempre mide con tus datos):
+
+- Prosa en inglés: unos 3–4 caracteres por token.
+- Español y otros idiomas: a menudo 10–30% más tokens que el mismo contenido en inglés.
+- JSON, código, UUIDs, base64 y números largos: mucho más densos en tokens que la prosa. Un UUID de 36 caracteres puede ser fácilmente 20+ tokens.
+- Los espacios y el formato cuentan. El JSON con sangría cuesta más que el JSON compacto.
+
+Los tokenizers son **específicos de cada modelo**. El mismo texto produce conteos distintos en distintas familias de modelos, y a veces entre generaciones del mismo proveedor. Nunca codifiques una estimación de "caracteres / 4" en tu lógica de facturación. Usa el endpoint de conteo del proveedor.
+
+Por qué te importa:
+
+1. **Costo.** Pagas por token de entrada y por token de salida. Los tokens de salida suelen ser varias veces más caros que los de entrada.
+2. **Latencia.** Los tokens de entrada se procesan en paralelo (rápido). Los tokens de salida se generan uno a uno (lento). Una respuesta de 800 tokens de salida es mucho más lenta que una de 80, casi sin importar el tamaño de la entrada.
+3. **Límites.** Las ventanas de contexto, `max_tokens` y los rate limits se miden en tokens.
+
+### Contar tokens antes de enviar
+
+```python
+import asyncio
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+
+SYSTEM = "You classify e-commerce support tickets. Reply with JSON only."
+
+async def estimate(ticket_text: str) -> int:
+    result = await client.messages.count_tokens(
+        model="claude-haiku-5-5",
+        system=SYSTEM,
+        messages=[{"role": "user", "content": ticket_text}],
+    )
+    return result.input_tokens
+
+async def main() -> None:
+    samples = [
+        "Where is my order #A-10023? It was due Monday.",
+        "¿Dónde está mi pedido #A-10023? Debía llegar el lunes.",
+        '{"order_id": "6f1c2a9e-4b7d-4c1e-9a3f-2d8b7e5c1a04", "status": "late"}',
+    ]
+    for s in samples:
+        print(await estimate(s), "tokens ->", s[:40])
+
+asyncio.run(main())
+```
+
+Ejecuta algo así contra 50 muestras reales de tu dominio. Pon la distribución (p50, p95, máximo) en tu documento de diseño. Ese número guía tu modelo de costos y tu presupuesto de contexto.
+
+## La ventana de contexto: un solo presupuesto compartido
+
+La **ventana de contexto** es el número máximo de tokens que el modelo puede atender en un request. Es un único presupuesto compartido por:
+
+- el system prompt,
+- las definiciones de tools (sus JSON schemas también son tokens),
+- el historial de la conversación,
+- los documentos recuperados,
+- **y la salida** que genera el modelo.
+
+`max_tokens` es el tope de tokens de salida para ese request. Si el modelo lo alcanza, la respuesta se corta a mitad de frase y `stop_reason` es `"max_tokens"`. Los modelos actuales de Claude (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) tienen ventanas muy grandes (1M de tokens al momento de escribir esto). Eso no significa que debas llenarlas:
+
+- **El costo escala linealmente** con el tamaño de la entrada. Un prompt de 200K tokens enviado 10,000 veces al día es una línea real de presupuesto.
+- **La latencia crece** con el tamaño de la entrada (sube el tiempo al primer token).
+- **La calidad puede caer** cuando el dato relevante queda enterrado. El estudio "lost in the middle" mostró que los modelos usan mejor la información al inicio y al final de contextos largos que la del medio.
+- **Algunos precios son escalonados** según el largo del prompt. Revisa la página de precios del modelo que elijas.
+
+Trata el contexto como la memoria en un sistema embebido: presupuéstalo explícitamente.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ContextBudget:
+    window: int = 200_000          # what YOU allow, not the model max
+    max_output: int = 2_000
+    system_and_tools: int = 3_000
+    history: int = 20_000
+
+    @property
+    def retrieval(self) -> int:
+        return self.window - self.max_output - self.system_and_tools - self.history
+
+budget = ContextBudget()
+print(budget.retrieval)  # tokens left for documents
+```
+
+Cuando se excede un presupuesto, tú decides qué descartar: primero los turnos más antiguos, resumir el historial o recuperar menos chunks. Nunca dejes que el proveedor devuelva un 400 en producción porque el prompt creció.
+
+## Cómo se elige el siguiente token: sampling
+
+En cada paso el modelo produce un puntaje (logit) para cada token de su vocabulario. Softmax convierte los puntajes en probabilidades. Luego una estrategia de **sampling** (muestreo) elige un token. Las perillas clásicas:
+
+- **Temperature** divide los logits antes del softmax. Una temperatura baja (cerca de 0) afila la distribución: el token principal casi siempre gana. Una temperatura alta (1+) la aplana: más variedad, más errores.
+- **Top-p (nucleus sampling)** conserva el conjunto más pequeño de tokens cuya probabilidad acumulada llega a p (por ejemplo 0.9) y muestrea solo de ese conjunto.
+- **Top-k** conserva solo los k tokens más probables.
+
+El consejo clásico era: temperatura 0 para extracción y clasificación, 0.7–1.0 para escritura creativa, y cambiar temperatura *o* top-p, no ambos.
+
+### La realidad moderna: las perillas de sampling están desapareciendo
+
+Aquí muchos tutoriales están desactualizados. Los modelos de razonamiento piensan antes de responder, y los proveedores cada vez más **eliminan los controles de sampling**:
+
+- Los modelos actuales de Claude rechazan valores no predeterminados de `temperature`, `top_p` y `top_k` con un error 400. La palanca que obtienes a cambio es el **effort** (`output_config={"effort": "low" | "medium" | "high" | ...}`), que controla cuánto piensa el modelo y cuántos tokens gasta.
+- Varios modelos de razonamiento de OpenAI también rechazan o ignoran `temperature`. Los modelos de chat más antiguos todavía lo aceptan.
+- Otros proveedores y modelos open-weight (servidos vía Bedrock, vLLM, etc.) normalmente aún aceptan los tres.
+
+Consecuencia de ingeniería: en un cliente multi-proveedor, los parámetros de sampling son una **capacidad opcional por modelo**, no un campo universal. Tu abstracción debe descartarlos o rechazarlos según la configuración del modelo, y tus tests no deben asumir que existen.
+
+```python
+# Effort, not temperature, is the cost/quality lever on current Claude models.
+resp = await client.messages.create(
+    model="claude-haiku-5-5",
+    max_tokens=512,
+    output_config={"effort": "low"},  # cheap, fast classification
+    system=SYSTEM,
+    messages=[{"role": "user", "content": "Refund not received after 10 days"}],
+)
+print(resp.stop_reason, resp.usage.input_tokens, resp.usage.output_tokens)
+```
+
+### El determinismo es un mito (planifica para eso)
+
+Incluso donde se permite temperatura 0, las salidas **no están garantizadas como idénticas** entre llamadas. El batching del lado del proveedor, la no asociatividad del punto flotante y las actualizaciones silenciosas de modelos introducen variación. Como ingeniero de QA ya conoces este patrón: es un test flaky. La solución es la misma:
+
+- Haz aserciones sobre **propiedades** (schema válido, etiqueta en el conjunto permitido, contiene cita), no sobre strings exactos.
+- Ejecuta evals sobre muchas muestras y monitorea **tasas**, no resultados individuales.
+- Fija versiones de modelo en la configuración y registra el id del modelo en cada línea de log.
+
+## Errores comunes
+
+- **Estimar costo con "palabras × 1.3".** Usa el endpoint de conteo y muestras reales. Los payloads en otros idiomas y en JSON rompen las estimaciones ingenuas.
+- **Poner `max_tokens` muy bajo "para ahorrar".** Pagas por lo que se genera, no por el tope. Un tope muy bajo trunca el JSON y cuesta un reintento. Ponlo con margen y controla el largo en el prompt o con effort.
+- **Ignorar `stop_reason`.** Revísalo siempre. `"max_tokens"` significa salida truncada. `"refusal"` significa que el modelo se negó. Ninguna de las dos es una respuesta válida.
+- **Llenar la ventana porque puedes.** Los prompts más grandes son más lentos, más caros y a veces peores.
+- **Codificar `temperature=0` en un cliente compartido.** Dará 400 en modelos que no lo soportan.
+- **Olvidar que los schemas de tools cuentan.** Diez definiciones de tools verbosas pueden costar miles de tokens en cada llamada.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Tu endpoint de resúmenes cuesta 3 veces lo estimado. ¿Cómo lo investigas?" level="mid">
+
+Empieza por los datos, no por suposiciones. Registra `usage.input_tokens` y `usage.output_tokens` por request y mira la distribución. Causas típicas: el prompt lleva todo el historial de la conversación o un contexto recuperado sobredimensionado; el JSON o la entrada en otro idioma se tokeniza peor de lo que suponía la estimación; las salidas son más largas de lo necesario (sin instrucción de largo, effort alto); los reintentos duplican llamadas; las definiciones de tools se envían en cada llamada. Corrige primero el mayor contribuyente: recorta contexto con un presupuesto explícito, limita el largo de salida, usa un modelo más barato o menor effort para esa ruta, y agrega prompt caching para el prefijo estable. Luego agrega un dashboard de costo por request para detectar regresiones temprano.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo haces que la salida de un LLM sea lo bastante reproducible para testearla?" level="senior">
+
+Aceptas que la reproducibilidad exacta no está disponible, ni siquiera con temperatura 0, porque el batching del proveedor y los efectos de punto flotante introducen variación, y muchos modelos actuales ya ni exponen temperature. Así que diseñas los tests alrededor de invariantes: validez del schema, etiquetas en un conjunto permitido, campos requeridos presentes, rangos numéricos. Fijas ids de modelo, versionas prompts y ejecutas sets de evaluación de decenas o cientos de ejemplos, monitoreando tasas de aprobación con umbrales en CI en lugar de aserciones individuales. Para la regresión pura del código de plomería, grabas y reproduces respuestas con un proveedor falso.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Una frase que vale la pena memorizar">
+
+"Los tokens de entrada determinan el costo, los tokens de salida determinan la latencia, y la ventana de contexto es un solo presupuesto compartido por system prompt, tools, historial, documentos y la respuesta."
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Anthropic, conteo de tokens: https://docs.anthropic.com/en/docs/build-with-claude/token-counting
+- Anthropic, resumen de modelos y ventanas de contexto: https://docs.anthropic.com/en/docs/about-claude/models/overview
+- Anthropic, effort y extended thinking: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+- OpenAI, generación de texto y modelos de razonamiento: https://platform.openai.com/docs/guides/reasoning
+- Liu et al., "Lost in the Middle: How Language Models Use Long Contexts": https://arxiv.org/abs/2307.03172
+- Holtzman et al., "The Curious Case of Neural Text Degeneration" (nucleus sampling): https://arxiv.org/abs/1904.09751

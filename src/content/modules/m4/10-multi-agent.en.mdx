@@ -1,0 +1,182 @@
+## Why split one agent into several?
+
+A single agent with 30 tools and a 4,000-word system prompt starts to degrade. It picks the wrong tool more often, the prompt becomes hard to change without regressions, and every call pays for tool schemas it does not need. Multi-agent designs split the work into **specialists** with small prompts and few tools each, plus a way to pass control between them.
+
+The benefits are real but narrower than the hype:
+
+- **Smaller tool sets per agent**, so tool selection is more accurate.
+- **Separate prompts** that different teams can own, version and test.
+- **Different models per role**: a cheap fast model for triage, a stronger one for hard reasoning.
+- **Isolation**: a billing agent never sees carrier tools, and vice versa.
+
+The costs are just as real: more LLM calls, more latency, more places for context to get lost, and much harder debugging. Think of it like microservices. Splitting a monolith fixes some problems and creates distributed-systems problems.
+
+## Pattern 1: supervisor
+
+A **supervisor** node decides which specialist runs next. Specialists do their work and return control to the supervisor, which either routes again or finishes. Control always flows through one hub.
+
+<Diagram caption="Supervisor pattern: every specialist reports back to one router" chart={`flowchart TD
+  U[User request] --> S{Supervisor}
+  S -->|order question| O[Orders agent]
+  S -->|carrier or rates| C[Carrier agent]
+  S -->|refund or ticket| B[Billing agent]
+  O --> S
+  C --> S
+  B --> S
+  S -->|done| E[Final answer]`} />
+
+A hand-rolled supervisor uses structured output to pick the next worker and `Command(goto=...)` to route:
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Command
+
+Worker = Literal["orders", "carrier", "billing"]
+
+
+class Route(BaseModel):
+    next: Worker | Literal["FINISH"]
+    reason: str = Field(description="One sentence, for logs.")
+
+
+router_llm = ChatAnthropic(model="claude-haiku-5-5").with_structured_output(Route)
+SUPERVISOR = (
+    "You route logistics support work. orders: order status and delivery dates. "
+    "carrier: rates and rescheduling. billing: refunds and tickets. "
+    "Reply FINISH when the user's request is fully answered."
+)
+
+
+def supervisor(state: MessagesState) -> Command[Worker | Literal["__end__"]]:
+    route = router_llm.invoke([("system", SUPERVISOR), *state["messages"]])
+    if route.next == "FINISH":
+        return Command(goto=END)
+    return Command(goto=route.next)
+
+
+worker_llm = ChatAnthropic(model="claude-sonnet-5-5")
+orders_agent = create_react_agent(worker_llm, [get_order, list_orders], name="orders")
+carrier_agent = create_react_agent(worker_llm, [get_carrier_rates, reschedule_delivery], name="carrier")
+billing_agent = create_react_agent(worker_llm, [issue_refund, create_ticket], name="billing")
+
+builder = StateGraph(MessagesState)
+builder.add_node("supervisor", supervisor)
+for name, agent in [("orders", orders_agent), ("carrier", carrier_agent), ("billing", billing_agent)]:
+    builder.add_node(name, agent)          # a compiled graph can be a node (subgraph)
+    builder.add_edge(name, "supervisor")   # always report back
+builder.add_edge(START, "supervisor")
+graph = builder.compile(checkpointer=checkpointer)
+```
+
+Points to notice:
+
+- Each specialist is a compiled subgraph with its **own small tool list**.
+- The supervisor uses a cheap model and structured output. Routing does not need the strongest model.
+- The `reason` field goes to your logs and traces. When routing is wrong, you want to know why.
+- Add a guard: count supervisor turns in state and stop after N (lesson 11). A supervisor that ping-pongs between two workers is a common failure.
+
+The `langgraph-supervisor` package wraps this pattern (`create_supervisor`). Build it by hand once so you understand what the library does, then use the library if it fits.
+
+## Pattern 2: swarm (handoffs)
+
+In a **swarm**, there is no central router. Each agent can hand off control directly to a peer by calling a **handoff tool**. The currently active agent talks to the user until it decides someone else should take over. This feels natural for conversations: "let me transfer you to billing".
+
+A handoff tool returns a `Command` that tells the **parent** graph to jump to another agent node:
+
+```python
+from typing import Annotated
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool, InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+
+
+def make_handoff(agent_name: str, description: str):
+    @tool(f"transfer_to_{agent_name}", description=description)
+    def handoff(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        ack = ToolMessage(content=f"Transferred to {agent_name}.", tool_call_id=tool_call_id)
+        return Command(
+            goto=agent_name,
+            graph=Command.PARENT,  # route in the parent graph, not inside this agent
+            update={"messages": state["messages"] + [ack], "active_agent": agent_name},
+        )
+    return handoff
+
+
+to_billing = make_handoff("billing", "Hand off when the user asks for a refund or compensation.")
+to_orders = make_handoff("orders", "Hand off when the user asks about order status or delivery.")
+
+orders_agent = create_react_agent(worker_llm, [get_order, list_orders, to_billing], name="orders")
+billing_agent = create_react_agent(worker_llm, [issue_refund, create_ticket, to_orders], name="billing")
+```
+
+The parent graph stores `active_agent` in state, so when the user sends the next message on the same thread, a small router at `START` sends it straight to whoever was active. The `langgraph-swarm` package (`create_swarm`) implements this bookkeeping for you.
+
+Note the `ToolMessage` acknowledgment: the handoff is itself a tool call, so it needs a tool result, or the next model call fails.
+
+## Supervisor vs swarm
+
+| | Supervisor | Swarm |
+|---|---|---|
+| Control | Central router decides every hop | Agents hand off peer to peer |
+| Extra LLM calls | One router call per hop | None for routing; the handoff is a tool call |
+| Predictability | Higher; one place to log and guard | Lower; any agent can send control anywhere it has a tool for |
+| Best for | Back-office workflows, parallel research, strict policy | Conversational assistants with clear domain boundaries |
+| Typical failure | Ping-pong between workers, router as bottleneck | Handoff loops, lost context after transfer |
+
+You can mix them: a supervisor at the top, and one of its workers is itself a small team.
+
+## When multi-agent is overkill
+
+Most production "agents" should be **one agent, or a workflow**. Before splitting, check:
+
+1. **Can a fixed workflow do it?** If the steps are known (classify, look up, draft, approve), a graph with plain nodes is cheaper and more reliable than any agent. See lesson 01.
+2. **Is the single agent actually failing?** Measure tool-selection accuracy on an eval set first. If it is above your target, stop.
+3. **Can you fix it more cheaply?** Better tool descriptions, fewer overlapping tools, or loading only the relevant tools per request often fix "too many tools" without more agents.
+4. **Can you afford the latency?** Each hop adds at least one LLM round trip. A supervisor with three hops can easily double end-to-end latency.
+5. **Can you debug it?** You need traces that show every hop, the routing reason and each agent's tool calls. Without them, multi-agent bugs are nearly impossible to reproduce.
+
+A good rule: start with one agent, add specialists only when evals show a specific, persistent failure that splitting fixes, and keep the number of agents small.
+
+## Common mistakes
+
+- **Multi-agent by default.** Adding agents because it sounds advanced. It adds cost and failure modes with no measured gain.
+- **Overlapping responsibilities.** Two agents that both "handle delivery issues" make routing a coin flip. Write crisp, non-overlapping descriptions.
+- **Losing context at handoff.** If the receiving agent does not see the relevant history or a structured summary, the user repeats themselves.
+- **No hop limit.** Supervisors ping-pong; swarms loop. Count hops in state and stop with a safe fallback.
+- **Giving every agent every tool.** It defeats the purpose. A billing agent with carrier tools will use them.
+- **Evaluating only the final answer.** You also need to know whether the right agent handled the request and how many hops it took (lesson 13).
+
+## How this shows up in interviews
+
+<InterviewQuestion question="When would you choose a multi-agent architecture over a single agent?" level="mid">
+
+Only when a single agent measurably fails and splitting fixes that failure. Typical triggers are too many tools, which hurts tool selection, prompts that different teams need to own separately, or roles that need different models or permissions. Before splitting, I try cheaper fixes: clearer tool descriptions, removing overlapping tools, or loading only relevant tools per request. If I do split, I prefer a supervisor for back-office work because it gives one place to log, guard and test routing. I add a hop limit, and I evaluate routing accuracy and hop count, not only the final answer.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explain the difference between a supervisor and a swarm, and the main failure mode of each." level="senior">
+
+In a supervisor design, a central router node picks the next specialist after every step, and specialists always return to it. It is predictable and easy to guard, but it costs an extra LLM call per hop and tends to ping-pong between two workers. In a swarm, each agent has handoff tools that return a `Command` routing the parent graph to a peer, and the active agent is stored in state so the next user turn goes straight to it. It is cheaper and feels conversational, but handoff loops and context lost after a transfer are common. In both cases I count hops in state, require an acknowledgment tool message for handoffs, and trace the routing reason for every hop.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="A strong signal">
+
+Saying "I started with one agent, measured tool-selection accuracy, and only split when it dropped below target" shows engineering judgment. It beats a diagram with seven agents.
+
+</Callout>
+
+## Further reading
+
+- LangGraph multi-agent concepts: https://langchain-ai.github.io/langgraph/concepts/multi_agent/
+- LangGraph low-level concepts (Command, subgraphs): https://langchain-ai.github.io/langgraph/concepts/low_level/
+- Anthropic, Building effective agents (workflows vs agents, orchestrator-workers): https://www.anthropic.com/research/building-effective-agents
+- LangSmith tracing for multi-step runs: https://docs.smith.langchain.com/

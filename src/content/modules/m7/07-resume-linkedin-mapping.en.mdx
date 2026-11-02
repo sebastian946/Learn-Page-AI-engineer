@@ -1,0 +1,125 @@
+## Recruiters search for keywords, engineers read for evidence
+
+Your resume has two readers. First, an applicant tracking system (ATS) and a recruiter scanning for keywords from the job posting: "RAG", "LangGraph", "evals", "FastAPI", "AWS". Second, an engineer who reads your bullets looking for evidence that you did real work with real results.
+
+So every bullet needs both: the keyword a recruiter searches for, and a measured outcome an engineer believes. This lesson maps each module of this course to skills, keywords and example bullets, then gives you a job-search plan.
+
+## The bullet formula
+
+**Action verb + what you built + with which technology + measured result.**
+
+- Weak: "Worked on a RAG chatbot."
+- Strong: "Built a hybrid-search RAG assistant (pgvector + BM25 + cross-encoder re-ranking) over 1,200 mortgage policy PDFs; raised faithfulness from 0.81 to 0.93 on a 60-question golden set while keeping p95 latency under 2 s."
+
+The numbers in this lesson are **examples**. Replace every one with a number from your own eval reports, traces and dashboards. If you cannot back a number with an artifact, do not use it.
+
+## Module to keyword mapping
+
+| Module | Skills proven | Job-posting keywords | Example bullet (replace numbers with yours) |
+|---|---|---|---|
+| M1 LLM foundations | Provider abstraction, structured outputs, tool calling, streaming, retries, cost tracking | LLM integration, prompt engineering, OpenAI API, Anthropic Claude, Amazon Bedrock, function calling, JSON schema, Pydantic, async Python | Built a provider-agnostic LLM client (Anthropic, OpenAI, Bedrock) with streaming, exponential backoff and per-request cost logging; classified support tickets with structured outputs at 94% accuracy on a 300-ticket labeled set |
+| M2 RAG | Ingestion, chunking, embeddings, hybrid search, re-ranking, citations, RAG evaluation, caching | RAG, retrieval-augmented generation, vector databases, pgvector, Qdrant, embeddings, semantic search, hybrid search, LangChain, re-ranking | Designed a RAG pipeline with document-aware chunking, hybrid retrieval and re-ranking over 1,200 PDFs; improved context recall by 18 points and cut cost per 1k queries by 40% with semantic caching |
+| M3 Evals and observability | Golden datasets, LLM-as-judge, CI eval gates, tracing, guardrails, red-teaming | LLM evaluation, evals, Ragas, DeepEval, LangSmith, Langfuse, OpenTelemetry, observability, guardrails, prompt injection, A/B testing | Built an LLM eval harness running in GitHub Actions that blocks PRs when faithfulness drops more than 2 points; caught 3 prompt regressions before release |
+| M4 Agents | Tool design, LangGraph state machines, HITL, memory, multi-agent, MCP, trajectory evals | AI agents, agentic workflows, LangGraph, tool use, Model Context Protocol, MCP, multi-agent systems, human-in-the-loop | Built a LangGraph operations agent with 6 MCP tools, human approval for high-risk actions and loop guards; trajectory eval suite of 30 scenarios at 0.87 correct tool-sequence rate |
+| M5 Serving | FastAPI streaming, Docker, Redis caching and rate limiting, CI/CD, AWS deploy, k6 load tests, SLOs | FastAPI, Python, Docker, Kubernetes, CI/CD, GitHub Actions, AWS, ECS, Lambda, Redis, PostgreSQL, load testing, SLOs | Deployed a streaming FastAPI LLM service to AWS ECS Fargate with GitHub Actions CI/CD, Redis rate limiting and a k6 load test sustaining 50 concurrent streams at p95 first-token 1.2 s |
+| M6 Data and platform | SQL, ingestion pipelines, Databricks Vector Search, MLflow evaluation, Unity Catalog, fine-tuning trade-offs | Databricks, MLflow, Unity Catalog, Spark, data pipelines, SQL, Mosaic AI, fine-tuning, LoRA, vLLM | Built a document intelligence pipeline on Databricks (Unity Catalog, Vector Search, MLflow evaluation) processing 5k documents with tracked extraction accuracy per document type |
+| M7 Final capstone | Multi-tenancy, tenant isolation, cost attribution, architecture docs, system design | Multi-tenant SaaS, system design, scalability, cost optimization, technical leadership, B2B | Built a multi-tenant RAG + agent platform with PostgreSQL row-level security, per-tenant quotas and cost dashboards; 0 cross-tenant leaks across 40 isolation tests in CI, cost per 1k requests tracked per tenant |
+| SDET background | Test strategy, automation frameworks, CI quality gates, performance testing | Test automation, quality engineering, Playwright, CI/CD, reliability, TypeScript | Reframe: "Designed quality gates and evaluation strategy" rather than "wrote test cases" |
+
+## A keyword coverage check
+
+Treat the job posting like a requirements doc and your resume like a test suite. Measure coverage.
+
+```python
+import re
+from collections import Counter
+
+KEYWORDS = {
+    "rag": ["rag", "retrieval-augmented", "retrieval augmented"],
+    "vector_db": ["pgvector", "qdrant", "pinecone", "vector database", "vector store", "chroma"],
+    "agents": ["agent", "agentic", "langgraph", "tool use", "function calling"],
+    "mcp": ["mcp", "model context protocol"],
+    "evals": ["eval", "ragas", "deepeval", "llm-as-judge", "golden dataset"],
+    "observability": ["langsmith", "langfuse", "opentelemetry", "tracing", "observability"],
+    "serving": ["fastapi", "docker", "kubernetes", "ecs", "lambda"],
+    "cloud": ["aws", "bedrock", "gcp", "azure"],
+    "cicd": ["ci/cd", "github actions", "pipeline"],
+    "data": ["databricks", "mlflow", "spark", "sql"],
+}
+
+def found(text: str) -> set[str]:
+    t = text.lower()
+    return {k for k, variants in KEYWORDS.items() if any(re.search(rf"\b{re.escape(v)}", t) for v in variants)}
+
+def coverage(posting: str, resume: str) -> dict[str, object]:
+    wanted, have = found(posting), found(resume)
+    return {
+        "coverage_pct": round(100 * len(wanted & have) / max(len(wanted), 1)),
+        "missing": sorted(wanted - have),
+        "extra": sorted(have - wanted),
+    }
+```
+
+Use it to tailor, not to stuff. If a posting asks for Pinecone and you used Qdrant, write "vector databases (Qdrant, pgvector)" and be ready to say you would learn Pinecone's API in a day. Never claim a tool you have not used.
+
+## Resume structure for this transition
+
+1. **Headline:** "AI Engineer | RAG, LLM Evaluation, Agents | Ex-Senior SDET".
+2. **Summary (3 lines):** the positioning statement from the previous lesson, compressed.
+3. **Skills (grouped):** LLM and RAG; Agents; Evaluation and observability; Backend and cloud; Data. Use posting vocabulary.
+4. **Projects (above experience while you transition):** the final capstone first, then 2 or 3 module capstones. Each with repo link, 2 to 3 bullets.
+5. **Experience:** your SDET roles, rewritten with the right-hand column from the translation table. Highlight anything with LLMs, data or Python services.
+6. **Certifications:** for example the Databricks Generative AI Engineer Associate if you took it after Module 6.
+
+One page if under ~10 years of experience, two at most.
+
+## LinkedIn
+
+- **Headline (220 characters max):** "AI Engineer: RAG, agents and LLM evals | Built a multi-tenant RAG + agent platform with evals in CI | Ex-Senior SDET who makes AI systems reliable".
+- **About:** 3 short paragraphs. What you do now; why the SDET background makes you good at it; what you've built (with links); what you are looking for. End with a call to action.
+- **Featured:** pin the capstone repo, its demo GIF or a short video, and one technical post.
+- **Skills:** add the top 10 keywords from the mapping table and order them so the most relevant three show first.
+- **Open to work:** set the exact titles: AI Engineer, LLM Engineer, Applied AI Engineer, GenAI Engineer, ML Engineer (LLM).
+
+## Job-search plan (6 weeks)
+
+| Week | Focus | Output |
+|---|---|---|
+| 1 | Finish capstone polish, resume v1, LinkedIn rewrite | Live repo with GIF, resume PDF, updated profile |
+| 2 | Target list of 40 companies in three tiers (AI-first, AI-support, adjacent to your domain), read 30 postings, run coverage checks | Spreadsheet with company, role, keywords, contact |
+| 3-6 | 10 tailored applications per week, 5 referral requests per week, 1 technical post per week | Pipeline tracked weekly: applied, screens, onsites |
+| 3-6 | 2 mock system-design sessions per week (repo `system-design-notes`), 1 behavioral rehearsal | Scores trending up |
+| Ongoing | Review: which resume version gets screens? Adjust | Weekly 30-minute retro |
+
+Referrals convert far better than cold applications in most hiring processes, so spend real time on them. A short message works: who you are, the specific role, one sentence on your most relevant project with a link, and a clear ask.
+
+Treat the search like a test campaign: define metrics (application to screen rate, screen to onsite rate), run experiments (two resume variants), and retro weekly.
+
+## Common mistakes
+
+- Keyword stuffing a skills section with tools you never used. Engineers will ask.
+- Bullets that describe duties ("responsible for testing") instead of outcomes.
+- Invented or unverifiable metrics.
+- Hiding projects at the bottom under old experience.
+- Applying with one generic resume to every posting.
+- Waiting until everything is perfect. Start applying in week 3 of this plan, not week 10.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Walk me through your resume." level="mid">
+
+Keep it to 90 seconds and make it a story, not a list. Start with the SDET years and the quality skills they built; the moment you started applying them to LLM features; the projects that prove the transition, ending with the multi-tenant capstone; then why you want this specific role. Point to one bullet with a number they can ask about.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Every number is a follow-up question">
+
+If your resume says "raised faithfulness from 0.81 to 0.93", expect "how did you measure faithfulness?", "how big was the dataset?" and "what changed?". Prepare those answers for every number you list.
+
+</Callout>
+
+## Further reading
+
+- Databricks Generative AI Engineer Associate certification: https://www.databricks.com/learn/certification/genai-engineer-associate
+- LinkedIn Help, profile sections: https://www.linkedin.com/help/linkedin
+- GitHub profile README: https://docs.github.com/en/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme

@@ -1,0 +1,194 @@
+## Un system prompt es un contrato de API
+
+En una demo, el system prompt es una frase: "Eres un asistente útil." En producción, es la **especificación de un componente**. Define entradas, salidas, reglas, casos borde y comportamiento ante fallas. Otro código depende de él. Si alguien lo edita a la ligera, se rompen los parsers, la lógica de enrutamiento y los evals que dependen de él — igual que cambiar una API pública sin subir la versión.
+
+Así que trátalo como tal:
+
+- Vive en **control de versiones**, como archivo, no como un string literal enterrado en una función.
+- Tiene una **versión** y un **changelog**.
+- Los cambios pasan por **revisión y tests automatizados** (evals) antes de llegar a producción.
+- Cada llamada al LLM **registra qué versión del prompt** la produjo.
+
+## Anatomía de un system prompt estilo contrato
+
+Una estructura confiable, en este orden:
+
+1. **Rol y objetivo** – una o dos frases. Qué papel cumple el modelo y cómo se ve el éxito.
+2. **Contexto** – datos del negocio que el modelo no puede adivinar (políticas, líneas de producto, SLAs).
+3. **Descripción de la entrada** – qué contiene el mensaje del usuario y qué nunca contiene.
+4. **Contrato de salida** – formato exacto. Con structured outputs el schema impone la forma, pero el prompt sigue explicando el *significado* de cada campo.
+5. **Reglas** – sentencias explícitas MUST / MUST NOT (debe / no debe), cada una testeable.
+6. **Casos borde y escalamiento** – qué hacer cuando falta información, la solicitud está fuera de alcance o el usuario es abusivo.
+7. **Ejemplos** – unos pocos pares entrada → salida, cortos y diversos, incluido uno difícil.
+
+```markdown
+---
+id: ticket-triage
+version: 1.4.0
+owner: support-ai@cartwheel.example
+models: [claude-haiku-5-5, claude-sonnet-5-5]
+schema: TicketTriage@2
+---
+You triage customer support tickets for Cartwheel Outfitters, an online
+outdoor-gear store shipping to the US and Canada.
+
+## Input
+One customer message (email or chat), possibly in English or Spanish.
+It may include order ids in the form A-12345. It never includes payment data.
+
+## Output meaning
+- category: the single best queue for this ticket (see definitions below).
+- priority: urgent only for safety issues, fraud, or orders lost over 10 days.
+- confidence: your probability (0-1) that the category is correct.
+- summary: one neutral sentence in English, no customer PII.
+
+## Rules
+- MUST choose "other" when no category clearly fits. Never invent a category.
+- MUST NOT promise refunds, credits or delivery dates.
+- MUST NOT copy email addresses or phone numbers into the summary.
+- If the message reports a safety hazard (fire, injury), priority is urgent.
+
+## Category definitions
+- order_status: customer asks where an order is, with no stated delay.
+- shipping_delay: the order is late versus the promised date.
+...
+
+## Examples
+Input: "Ordered the tent 3 weeks ago, A-10023, still nothing. Ridiculous."
+Output: {"category": "shipping_delay", "priority": "high", ...}
+```
+
+Observa: cada regla puede convertirse en un caso de prueba. "MUST NOT copy email addresses into the summary" se convierte en un eval que alimenta tickets con emails y verifica que el resumen no tenga ninguno.
+
+### Consejos de redacción que se sostienen
+
+- **Sé específico, no ruidoso.** "Usa urgent solo para seguridad, fraude o pedidos perdidos por más de 10 días" es mejor que "¡¡¡TEN MUCHO CUIDADO CON LA PRIORIDAD!!!". Los modelos modernos siguen bien las instrucciones precisas y reaccionan de más a los gritos.
+- **Explica el porqué** de las reglas no obvias. "No prometas fechas porque los ETAs de las transportadoras no son confiables" ayuda al modelo a generalizar.
+- **Define cada etiqueta.** Las categorías superpuestas (order_status vs shipping_delay) son donde se pierde precisión.
+- **Mantén estable el system prompt.** Sin timestamps, ids de request ni nombres de usuario. Pon los datos volátiles en el turno del usuario. Un prefijo estable también es lo que hace efectivo el prompt caching.
+- **Separa instrucciones de datos.** Envuelve el contenido no confiable en delimitadores claros (por ejemplo, tags estilo XML como `<ticket>...</ticket>`) y dile al modelo que ese contenido es dato, no instrucciones. Esto reduce, pero no elimina, el prompt injection.
+
+## Prompts como archivos, versiones como semver
+
+Guarda los prompts como archivos con front matter y cárgalos con un pequeño registro. El versionado semántico encaja perfectamente:
+
+| Incremento | Cuándo | Ejemplo |
+|---|---|---|
+| **MAJOR** | El contrato de salida cambia de forma que los consumidores deben manejar | Nueva categoría, campo renombrado, nueva versión del schema |
+| **MINOR** | Cambia el comportamiento, el contrato no | Mejores definiciones de categorías, nueva regla, nuevos ejemplos |
+| **PATCH** | Sin cambio de comportamiento intencional | Typo, formato, reordenamiento sin efecto en los evals |
+
+Agregar un valor a un enum es **major**: un consumidor con un `match` exhaustivo sobre las categorías se romperá. Es el mismo razonamiento que aplicas a una API REST.
+
+```python
+from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+import yaml  # pip install pyyaml
+
+@dataclass(frozen=True)
+class Prompt:
+    id: str
+    version: str
+    text: str
+    meta: dict
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(self.text.encode()).hexdigest()[:12]
+
+def load_prompt(prompt_id: str, version: str, root: Path = Path("prompts")) -> Prompt:
+    raw = (root / prompt_id / f"{version}.md").read_text(encoding="utf-8")
+    _, front, body = raw.split("---", 2)
+    meta = yaml.safe_load(front)
+    if meta["id"] != prompt_id or meta["version"] != version:
+        raise ValueError(f"front matter mismatch in {prompt_id}/{version}")
+    return Prompt(prompt_id, version, body.strip(), meta)
+
+# Pin the version in config, never "latest" in production.
+TRIAGE = load_prompt("ticket-triage", "1.4.0")
+```
+
+Registra `prompt_id`, `version` y `fingerprint` en cada llamada. Cuando la precisión caiga un martes, podrás responder "¿qué cambió?" en segundos. El fingerprint detecta el bug clásico de alguien que edita un archivo sin subir la versión.
+
+Una estructura que funciona:
+
+```text
+prompts/
+  ticket-triage/
+    1.3.0.md
+    1.4.0.md
+    CHANGELOG.md
+tests/
+  prompts/
+    test_ticket_triage_contract.py   # fast, deterministic checks
+evals/
+  ticket-triage/
+    golden.jsonl                     # labeled examples
+```
+
+```markdown
+# ticket-triage changelog
+## 1.4.0 - 2026-10-28
+- Clarified order_status vs shipping_delay using the promised delivery date.
+- Eval: macro-F1 0.86 -> 0.89 on golden v3 (n=240). No regressions in urgent recall.
+## 1.3.0 - 2026-10-14
+- Added rule: never copy emails or phone numbers into summary.
+```
+
+## Testear prompts como código
+
+Usa tus instintos de SDET. Construye una pirámide:
+
+1. **Tests de contrato estáticos** (milisegundos, sin LLM): el front matter es válido, cada categoría del `Literal` de Pydantic está definida en el prompt, los ejemplos del prompt validan contra el schema, no hay tokens prohibidos (fechas, `{placeholders}` sin renderizar).
+2. **Ejecuciones de evals** (minutos, LLM real): corre el golden set, calcula la precisión por categoría, compara con la versión anterior y falla el CI si una métrica cae más allá de un umbral. El módulo 3 convierte esto en un gate de GitHub Actions.
+3. **Monitoreo online** (producción): tasa de reparación, tasa de escalamiento y tasa de corrección humana por versión de prompt.
+
+```python
+import json, re, typing
+from llm_client.prompts import load_prompt
+from app.schemas import TicketTriage, Category
+
+def test_every_category_is_defined() -> None:
+    prompt = load_prompt("ticket-triage", "1.4.0")
+    for cat in typing.get_args(Category):
+        assert f"- {cat}:" in prompt.text, f"category {cat} has no definition"
+
+def test_examples_match_schema() -> None:
+    prompt = load_prompt("ticket-triage", "1.4.0")
+    for line in re.findall(r"^Output: (\{.*\})$", prompt.text, flags=re.M):
+        TicketTriage.model_validate({**json.loads(line), "confidence": 0.9, "summary": "x"})
+```
+
+Despliega nuevas versiones como features: modo shadow (ejecutar ambas y comparar), luego un rollout por porcentaje detrás de un flag (módulo 5), con rollback de una línea a la versión anterior.
+
+## Errores comunes
+
+- Prompts como f-strings inline dispersos por todo el código.
+- Editar un prompt en el lugar sin cambiar la versión, de modo que los logs no pueden explicar cambios de comportamiento.
+- Enviar prompts "latest" a producción en lugar de versiones fijadas.
+- Reglas que no se pueden testear ("sé inteligente con la prioridad").
+- Datos volátiles (fechas, nombres) en el system prompt, lo que anula el caching y hace más difícil comparar salidas.
+- Tratar un nuevo valor de enum como un cambio minor.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo gestionas los cambios de prompts en un equipo?" level="mid">
+
+Los prompts son archivos en el repo con front matter: id, versión semántica, dueño, modelos objetivo y la versión del schema que producen. Los cambios pasan por pull requests con una entrada en el changelog. El CI ejecuta checks estáticos rápidos y una suite de evals contra un golden dataset, y el PR muestra la diferencia de métricas frente a la versión actual. Producción fija una versión exacta por configuración, y cada llamada registra id del prompt, versión y un hash del contenido. Las nuevas versiones se despliegan en shadow o detrás de un flag, con rollback instantáneo.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Por qué llamar contrato de software a un system prompt? ¿Qué cambia en la práctica?" level="senior">
+
+Porque el código que viene después depende de su comportamiento como depende de una API: los parsers dependen del formato de salida, el enrutamiento depende del significado de las etiquetas, la analítica depende de la consistencia. Llamarlo contrato significa que tiene una especificación explícita (entradas, salidas, reglas, casos borde), versionado con semántica de cambios incompatibles, tests guiados por el consumidor y gestión de cambios. En la práctica: semver donde agregar una etiqueta es major, tests de contrato que cruzan el prompt con el schema de Pydantic, evals como suite de regresión y observabilidad etiquetada por versión de prompt, para que una caída de calidad se asocie a un cambio específico.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Anthropic, resumen de prompt engineering: https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview
+- Anthropic, usar tags XML para estructurar prompts: https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/use-xml-tags
+- OpenAI, guía de prompt engineering: https://platform.openai.com/docs/guides/prompt-engineering
+- Semantic Versioning 2.0.0: https://semver.org/
+- Langfuse, gestión de prompts: https://langfuse.com/docs/prompts/get-started

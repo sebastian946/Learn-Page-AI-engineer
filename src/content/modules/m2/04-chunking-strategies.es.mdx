@@ -1,0 +1,188 @@
+## Por qué el chunking importa más de lo que parece
+
+Un chunk es la unidad de retrieval. Es lo que se convierte en embedding, lo que se rankea y lo que se pega en el prompt. El chunking decide tres cosas a la vez:
+
+- **Qué significa un vector.** Un embedding es un solo punto que resume todo el chunk. Un chunk que cubre los límites de DTI *y* los requisitos de reservas es un promedio borroso de ambos temas, y no coincide bien con ninguna de las dos consultas.
+- **Qué ve el modelo.** Si la respuesta es "45% de DTI, hasta 50% con factores compensatorios", y el límite de tu chunk cae entre esas dos cláusulas, el modelo recibe media regla. En préstamos, media regla es una regla equivocada.
+- **Cuánto pagas.** Cada chunk recuperado cuesta tokens de entrada. Chunks más grandes con `k = 6` pueden significar varios miles de tokens de contexto por pregunta.
+
+No existe un tamaño de chunk universalmente correcto. Existe un tamaño correcto para tu corpus y tu mezcla de consultas, y lo encuentras midiendo (siguiente ejercicio). Esta lección te da las cuatro estrategias y sus trade-offs.
+
+## Estrategia 1: tamaño fijo
+
+Divide cada N caracteres (o tokens) con M caracteres de solapamiento (overlap).
+
+```python
+def fixed_chunks(text: str, size: int = 800, overlap: int = 100) -> list[str]:
+    step = size - overlap
+    return [text[i : i + size] for i in range(0, max(len(text) - overlap, 1), step)]
+```
+
+- **Ventajas:** trivial, cantidad de chunks y costo predecibles, rápido.
+- **Desventajas:** ignora la estructura. Corta a mitad de oración, de tabla, de lista. El overlap es un parche que duplica tokens.
+- **Úsalo como:** una línea base que debes superar, nunca como la respuesta final para documentos estructurados.
+
+Mide el tamaño en **tokens** cuando importan el costo o el límite de entrada del modelo de embeddings, y en caracteres cuando solo necesitas una aproximación rápida (más o menos 4 caracteres por token en prosa en inglés; verifícalo con el tokenizer de tu proveedor).
+
+## Estrategia 2: recursiva
+
+Intenta dividir primero por el separador natural más grande y solo recurre a los más pequeños cuando una pieza sigue siendo demasiado grande: párrafos, luego líneas, luego oraciones, luego palabras. Esto es el `RecursiveCharacterTextSplitter` de LangChain, y es el valor por defecto sensato para prosa.
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
+chunks = splitter.split_text(policy_text)
+
+# Token-based sizing with tiktoken, closer to what you actually pay for
+token_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="cl100k_base", chunk_size=256, chunk_overlap=32,
+)
+```
+
+- **Ventajas:** respeta los párrafos la mayoría de las veces, barato, buen valor por defecto.
+- **Desventajas:** sigue ciego a la semántica del documento. Un título de sección puede terminar como la última línea del chunk anterior, huérfano de su contenido.
+
+## Estrategia 3: semántica
+
+Genera el embedding de cada oración y empieza un chunk nuevo donde la similitud entre oraciones consecutivas cae bruscamente. Los chunks siguen los cambios de tema en lugar de un conteo de caracteres.
+
+```python
+import numpy as np
+
+def semantic_chunks(sentences: list[str], vectors: np.ndarray,
+                    percentile: float = 90, max_sentences: int = 12) -> list[str]:
+    """vectors: L2-normalized sentence embeddings, shape (n, d)."""
+    sims = np.sum(vectors[:-1] * vectors[1:], axis=1)       # cosine of neighbours
+    distances = 1 - sims
+    threshold = np.percentile(distances, percentile)
+    chunks, current = [], [sentences[0]]
+    for i, dist in enumerate(distances, start=1):
+        if dist > threshold or len(current) >= max_sentences:
+            chunks.append(" ".join(current))
+            current = []
+        current.append(sentences[i])
+    chunks.append(" ".join(current))
+    return chunks
+```
+
+LangChain lo ofrece como `SemanticChunker` en `langchain_experimental`.
+
+- **Ventajas:** los chunks son temáticamente coherentes, lo que puede mejorar la precisión en prosa larga y poco estructurada (memos, emails, notas de reuniones).
+- **Desventajas:** pagas por generar el embedding de cada oración al indexar; los resultados son sensibles al umbral; el tamaño de los chunks varía muchísimo; y en documentos que ya tienen títulos rara vez supera a simplemente usar esos títulos.
+
+Trata el chunking semántico como algo para *probar y medir*, no como una mejora por defecto.
+
+## Estrategia 4: consciente del documento (structure-aware)
+
+Usa la estructura que el autor ya te dio: títulos, secciones numeradas, pares pregunta-respuesta de FAQ, límites de tablas. Para nuestro corpus hipotecario esta suele ser la ganadora, porque los manuales de políticas están escritos como secciones numeradas donde cada una establece una regla.
+
+La receta:
+
+1. Divide por estructura (las secciones de la ingesta, lección 2).
+2. Si una sección es demasiado larga, divídela recursivamente *dentro* de la sección.
+3. Si una sección es diminuta, fusiónala con sus hermanas bajo el mismo título padre.
+4. **Antepón la ruta de títulos** al texto de cada chunk, para que el embedding conozca el contexto.
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
+
+class Chunk(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str                   # what gets embedded (with heading path)
+    heading_path: list[str]
+    page: int | None
+    metadata: dict
+
+inner = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+def structure_chunks(doc: dict, min_chars: int = 200) -> list[Chunk]:
+    out: list[Chunk] = []
+    buffer = ""
+    for s in doc["sections"]:
+        body = (buffer + "\n" + s["text"]).strip() if buffer else s["text"]
+        if len(body) < min_chars:
+            buffer = body                       # merge tiny sections forward
+            continue
+        buffer = ""
+        path = [doc["title"], s["heading"]]
+        for i, piece in enumerate(inner.split_text(body)):
+            out.append(Chunk(
+                chunk_id=f"{doc['doc_id']}:{len(out)}",
+                doc_id=doc["doc_id"],
+                text=" > ".join(path) + "\n\n" + piece,
+                heading_path=path, page=s.get("page"),
+                metadata={k: doc.get(k) for k in
+                          ("doc_type", "jurisdiction", "effective_date", "is_current", "source")},
+            ))
+    if buffer:  # trailing tiny section: attach to previous chunk instead of dropping it
+        if out:
+            out[-1].text += "\n" + buffer
+        else:
+            out.append(Chunk(chunk_id=f"{doc['doc_id']}:0", doc_id=doc["doc_id"], text=buffer,
+                             heading_path=[doc["title"]], page=None, metadata={}))
+    return out
+```
+
+El prefijo de títulos es barato y poderoso. Un chunk que solo dice "The maximum is 45%, or 50% with two compensating factors" es ambiguo. Con el prefijo "Conventional Loan Policy > 4.2 Debt-to-Income Limits", su embedding queda cerca de las preguntas sobre DTI y el modelo puede citar "§4.2".
+
+### Encabezados contextuales y contextual retrieval
+
+Una versión más fuerte de la misma idea: antes de generar el embedding, pide a un LLM barato que escriba una o dos oraciones que ubiquen el chunk dentro de su documento ("This chunk is from the 2026 Texas home equity policy and describes the 80% LTV cap under Section 50(a)(6)"). Anthropic lo publicó como *contextual retrieval*. Cuesta una llamada al LLM por chunk al indexar (el prompt caching sobre el documento completo lo abarata mucho) y ayuda más cuando los chunks son cortos y los documentos largos. Pruébalo después de tener una línea base.
+
+## Tablas y FAQs
+
+- **Tablas:** nunca dividas una tabla entre chunks. Mantén cada tabla como un chunk con su leyenda y su título, en formato Markdown. Para tablas grandes, emite un chunk por grupo de filas repitiendo la fila de encabezado.
+- **Páginas FAQ:** un par pregunta-respuesta por chunk. No fusiones preguntas no relacionadas para alcanzar un tamaño objetivo.
+
+## Retrieval padre-hijo (small-to-big)
+
+Hay una tensión: los chunks pequeños producen embeddings precisos, los grandes le dan al modelo suficiente contexto. Puedes tener ambos. Indexa **chunks hijos pequeños** (oraciones o ~200 tokens) para la coincidencia y guarda un puntero a su **padre** (la sección completa). Recupera por los hijos y luego devuelve al LLM los padres deduplicados. El `ParentDocumentRetriever` de LangChain implementa esto; también lo harás a mano en la lección 17.
+
+## Elegir parámetros
+
+Puntos de partida, que debes validar con métricas de retrieval sobre tu propio golden set:
+
+| Corpus | Estrategia | Tamaño | Overlap |
+|---|---|---|---|
+| Manuales de políticas con secciones numeradas | consciente del documento + recursiva dentro | 500–1,000 tokens máx. por pieza de sección | 10–15% dentro de secciones largas |
+| Páginas FAQ | un par pregunta-respuesta por chunk | natural | ninguno |
+| Memos largos sin estructura | recursiva, luego probar semántica | 300–500 tokens | 10–15% |
+| Tablas de tasas | una tabla (o grupo de filas) por chunk | natural | repetir fila de encabezado |
+
+El overlap no es gratis: 20% de overlap significa aproximadamente 20% más vectores, almacenamiento y costo de embeddings, y más resultados casi duplicados que desplazan a los diversos. Úsalo donde los límites son arbitrarios y omítelo donde los límites son estructurales.
+
+## Errores comunes
+
+- **Elegir el tamaño del chunk por intuición.** "512 tokens es el estándar" no es una razón. Mide recall@k con tus preguntas.
+- **Exceder el límite de entrada del modelo de embeddings.** Muchos modelos truncan entradas largas en silencio. Un chunk de 3,000 tokens embebido con un límite de 512 es mayormente invisible.
+- **Perder metadata al dividir.** Cada chunk debe llevar `doc_id`, página, ruta de títulos y campos de filtro. Si divides strings en lugar de documentos, los pierdes.
+- **Generar el embedding del texto con prefijo y mostrarle al modelo otra cosa.** Conserva `text` para el embedding y el cuerpo original para mostrar, pero asegúrate de que las citas apunten a la misma sección.
+- **Ids de chunk no deterministas.** Si los ids cambian en cada ejecución, la reindexación incremental y las referencias de las evals se rompen. Derívalos de `doc_id`, la sección y la posición.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo eliges una estrategia y un tamaño de chunking para un corpus nuevo?" level="mid">
+
+Empieza mirando los documentos y las consultas. Si los documentos tienen estructura (títulos, secciones numeradas, preguntas y respuestas), haz chunking sobre esa estructura y divide las secciones largas recursivamente, anteponiendo la ruta de títulos a cada chunk. Luego trata el tamaño y el overlap como hiperparámetros: arma un golden set pequeño de preguntas con la sección fuente esperada, corre dos o tres configuraciones y compara recall@k y MRR. Revisa también el costo en tokens por consulta y el límite de entrada del modelo de embeddings. Elegiría la configuración más pequeña que alcance el objetivo de recall, porque un contexto más chico es más barato y suele ser más fiel.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Qué es el retrieval padre-hijo y cuándo ayuda?" level="senior">
+
+Indexas chunks pequeños para una coincidencia precisa, pero devuelves al LLM su sección padre más grande. Ayuda cuando la señal de coincidencia es local (una oración menciona "gift funds") pero la respuesta necesita el contexto que la rodea (las condiciones en el resto de la sección). Los costos: más vectores que almacenar, una búsqueda de hijo a padre y deduplicación cuando varios hijos comparten padre. También puede inflar el tamaño del contexto si los padres son enormes, así que limita la longitud del padre o usa una ventana alrededor del hijo. Lo validaría contra chunks simples a nivel de sección sobre el golden set antes de adoptarlo.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- [LangChain — Text splitters](https://python.langchain.com/docs/concepts/text_splitters/)
+- [Anthropic — Introducing Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval)
+- [LangChain — Parent document retriever](https://python.langchain.com/docs/how_to/parent_document_retriever/)
+- [Pinecone — Estrategias de chunking para aplicaciones LLM](https://www.pinecone.io/learn/chunking-strategies/)

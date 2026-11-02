@@ -1,0 +1,293 @@
+## Why LLM services are different
+
+You have built REST services before. An LLM endpoint breaks most of the assumptions those services rely on:
+
+- **Latency is seconds, not milliseconds.** A RAG answer takes 2–15 s end to end. A typical API gateway timeout is 30 s. A long answer with a slow provider can hit it.
+- **The response is produced incrementally.** Users judge speed by *time to first token* (TTFT), not total time. Streaming turns an 8 s wait into a 600 ms wait plus reading time.
+- **Every request costs real money.** A retry storm is not just load. It is a bill.
+- **Upstream is flaky.** Provider 429s, 529 "overloaded" errors and slow tails are normal. Your service must absorb them.
+- **Clients disconnect.** People close the tab mid-answer. If you keep generating, you pay for tokens nobody reads.
+
+This lesson designs the FastAPI layer of `mortgage-knowledge-assistant` with those facts in mind. The goal is a thin, boring HTTP layer that streams, times out, deduplicates and offloads slow work.
+
+## The shape of the service
+
+```text
+app/
+  main.py          # create_app(), lifespan: open/close pools
+  settings.py      # pydantic-settings (next lessons)
+  llm.py           # provider wrapper: anthropic | mock
+  api/chat.py      # /v1/chat and /v1/chat/stream
+  rag/retriever.py # hybrid retrieval from Module 2
+  rag/generator.py # prompt + streaming generation
+```
+
+Two endpoints serve the same logic:
+
+- `POST /v1/chat` returns JSON. Good for batch callers, tests and evals.
+- `POST /v1/chat/stream` returns Server-Sent Events (SSE). Good for UIs.
+
+Plus `GET /healthz` (process is alive) and `GET /readyz` (Postgres and Redis reachable). Keep them separate. A load balancer that restarts your container because Redis blipped is a self-inflicted outage.
+
+## Lifespan: create clients once
+
+Database pools, Redis clients and the Anthropic client are expensive to create. Create them once per process in the lifespan handler and store them on `app.state`.
+
+```python
+# app/main.py
+from contextlib import asynccontextmanager
+
+import anthropic
+import asyncpg
+import redis.asyncio as redis
+from fastapi import FastAPI
+
+from app.api.chat import router as chat_router
+from app.settings import get_settings
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    s = get_settings()
+    app.state.db = await asyncpg.create_pool(s.database_url, min_size=2, max_size=10)
+    app.state.redis = redis.from_url(s.redis_url, decode_responses=True)
+    app.state.llm = anthropic.AsyncAnthropic(
+        api_key=s.anthropic_api_key.get_secret_value(),
+        timeout=s.llm_timeout_s,
+        max_retries=2,
+    )
+    yield
+    await app.state.db.close()
+    await app.state.redis.aclose()
+    await app.state.llm.close()
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="mortgage-knowledge-assistant", lifespan=lifespan)
+    app.include_router(chat_router, prefix="/v1")
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()
+```
+
+Note the SDK settings: an explicit `timeout` and a small `max_retries`. The SDK default timeout is generous (minutes). In a web request you want a budget you chose.
+
+## Streaming with SSE and `StreamingResponse`
+
+SSE is plain HTTP. The server sends `text/event-stream` and writes frames like `event: token` followed by `data: ...` and a blank line. Browsers consume it with `EventSource` or `fetch` plus a reader. It passes through most proxies, unlike WebSockets, and you do not need bidirectional traffic for chat.
+
+```python
+# app/api/chat.py
+import json
+import time
+from collections.abc import AsyncIterator
+
+from fastapi import APIRouter, Header, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.rag.generator import stream_answer
+from app.rag.retriever import retrieve
+
+router = APIRouter()
+
+
+class ChatRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    top_k: int = Field(default=6, ge=1, le=20)
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    body: ChatRequest,
+    request: Request,
+    x_tenant_id: str = Header(...),
+) -> StreamingResponse:
+    chunks = await retrieve(request.app.state.db, x_tenant_id, body.question, body.top_k)
+
+    async def events() -> AsyncIterator[str]:
+        started = time.perf_counter()
+        ttft_ms: int | None = None
+        n_tokens = 0
+        try:
+            async for token in stream_answer(request.app.state.llm, body.question, chunks):
+                if await request.is_disconnected():
+                    break  # stop paying for tokens nobody reads
+                if ttft_ms is None:
+                    ttft_ms = int((time.perf_counter() - started) * 1000)
+                n_tokens += 1
+                yield sse("token", {"text": token})
+            yield sse("citations", {"sources": [c.source_id for c in chunks]})
+            yield sse("done", {"ttft_ms": ttft_ms, "output_tokens": n_tokens})
+        except Exception as exc:  # headers are already sent: report in-band
+            yield sse("error", {"type": type(exc).__name__})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+```
+
+Key points:
+
+- **Do the retrieval before streaming starts.** If retrieval fails, you can still return a normal 4xx/5xx with a JSON body. Once the first byte is sent, the status code is locked at 200. After that, errors must travel *inside* the stream as an `error` event.
+- **Disable buffering.** `X-Accel-Buffering: no` tells nginx-style proxies not to buffer. Load balancers and compression middleware can also buffer. A stream that arrives all at once is a common production bug.
+- **Disconnect handling.** When the client goes away, Starlette cancels the response task on the next write in most setups, and `request.is_disconnected()` lets you check explicitly. Either way, make sure cancellation closes the upstream stream. The `async with client.messages.stream(...)` context manager does this for you.
+
+The generator side uses the Anthropic streaming helper:
+
+```python
+# app/rag/generator.py
+from collections.abc import AsyncIterator
+
+import anthropic
+
+SYSTEM = "Answer only from the provided context. Cite sources as [source_id]."
+
+
+async def stream_answer(
+    client: anthropic.AsyncAnthropic, question: str, chunks: list
+) -> AsyncIterator[str]:
+    context = "\n\n".join(f"[{c.source_id}] {c.text}" for c in chunks)
+    async with client.messages.stream(
+        model="claude-sonnet-5-5",
+        max_tokens=800,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
+```
+
+If the consumer stops iterating, the `async with` exits and the HTTP connection to the provider is closed. Tokens stop being generated and billed shortly after.
+
+## Request timeouts: budgets, not hopes
+
+Set timeouts at every layer and make them nest: the inner ones must be shorter than the outer ones.
+
+| Layer | Example budget |
+|---|---|
+| Load balancer idle timeout | 120 s (must exceed the longest stream gap) |
+| Whole request (non-streaming) | 30 s |
+| Retrieval (DB + re-rank) | 3 s |
+| LLM call, first token | 10 s |
+| LLM call, total | 25 s |
+
+For non-streaming code, wrap the work with `asyncio.timeout`:
+
+```python
+import asyncio
+from fastapi import HTTPException
+
+
+async def answer_with_budget(coro, seconds: float):
+    try:
+        async with asyncio.timeout(seconds):
+            return await coro
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="LLM budget exceeded") from None
+```
+
+For streams, the dangerous case is a stall: the connection is open but no tokens arrive. Track the time since the last token and abort if it exceeds a gap budget (for example 15 s). Also send an SSE comment line (`: ping`) every ~15 s when idle, so proxies do not kill a quiet connection.
+
+## Idempotency keys
+
+Clients retry. Mobile networks drop. A user double-clicks. Without protection, each retry is a new paid LLM call, and for actions with side effects (creating a ticket, sending an email) it is a duplicate action.
+
+The pattern, borrowed from payment APIs:
+
+1. The client sends `Idempotency-Key: <uuid>` with a POST.
+2. The server does an atomic `SET key "in_progress" NX EX 60` in Redis, scoped by tenant.
+3. If the set succeeds, process the request, then store the final response under the key with a longer TTL (for example 24 h).
+4. If the key exists with a stored response, return it. If it is still `in_progress`, return `409 Conflict` so the client backs off.
+
+```python
+async def run_idempotent(redis, tenant: str, key: str, handler) -> dict:
+    rkey = f"idem:{tenant}:{key}"
+    if not await redis.set(rkey, "in_progress", nx=True, ex=60):
+        cached = await redis.get(rkey)
+        if cached and cached != "in_progress":
+            return json.loads(cached)
+        raise HTTPException(status_code=409, detail="Request in progress")
+    try:
+        result = await handler()
+    except Exception:
+        await redis.delete(rkey)  # allow a clean retry
+        raise
+    await redis.set(rkey, json.dumps(result), ex=86_400)
+    return result
+```
+
+Also hash the request body and store it with the key. If the same key arrives with a different body, return `422`. That catches client bugs that reuse keys.
+
+For streaming endpoints, idempotency is usually applied to the side effects (for example, logging the conversation turn) rather than replaying the stream.
+
+## Background jobs
+
+Some work should not happen inside the request:
+
+- Ingesting a new 200-page PDF (minutes of parsing and embedding).
+- Writing traces, cost records and feedback to a slow store.
+- Running an online eval sample on 5% of answers.
+
+FastAPI's `BackgroundTasks` runs a function *after* the response is sent, in the same process. It is fine for small, losable work like writing a cost record. It is not a job queue: if the container restarts, the task is gone, and long tasks compete with requests for the event loop.
+
+For durable work, enqueue a job and return `202 Accepted` with a job id:
+
+```python
+@router.post("/documents", status_code=202)
+async def ingest(doc: DocumentIn, request: Request) -> dict[str, str]:
+    job_id = await enqueue(request.app.state.redis, "ingest", doc.model_dump())
+    return {"job_id": job_id, "status_url": f"/v1/jobs/{job_id}"}
+```
+
+Workers (arq, Celery, RQ, or an SQS consumer on ECS) pick jobs up, with retries and a dead-letter queue. Run them as a separate process or service from the same image with a different command. That way API latency is not affected by a slow ingestion.
+
+## Common mistakes
+
+- **Blocking calls in async routes.** A sync `requests.post` or a CPU-heavy re-ranker inside `async def` freezes every request on that worker. Use async clients, or `run_in_threadpool` / a separate service for CPU work.
+- **Returning errors as HTTP status after streaming began.** It is impossible. Design an `error` event and make the client handle it.
+- **No disconnect handling.** You pay for full answers to closed tabs. In a chat UI with frequent "stop" clicks this adds up.
+- **Creating the LLM client per request.** You lose connection pooling and add TLS handshakes to every call.
+- **Relying on SDK default timeouts.** Minutes-long defaults mean hung requests pile up until the pool is exhausted.
+- **Readiness checks that call the LLM provider.** A provider incident then marks every task unhealthy and the orchestrator restarts all of them. Check your own dependencies only.
+- **Using `BackgroundTasks` for ingestion.** It works in dev and silently loses jobs during deploys.
+
+<Callout type="tip" title="SDET angle">
+Test streaming with a contract test: assert the event order (one or more `token`, then `citations`, then `done`), assert that an upstream failure yields an `error` event, and assert the stream stops when the client disconnects. `httpx.AsyncClient` with `client.stream("POST", ...)` against the ASGI app makes these tests fast and deterministic with `LLM_PROVIDER=mock`.
+</Callout>
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you design a streaming chat endpoint for an LLM app, and what can go wrong in production?" level="mid">
+Use SSE over HTTP with FastAPI's `StreamingResponse` and `text/event-stream`. Do validation, auth and retrieval **before** the first byte, so failures can still return a proper status code. Stream typed events: `token`, `citations`, `done`, and an `error` event because the status is already 200 once streaming starts.
+
+What goes wrong: proxies or compression buffering the stream (fix with `X-Accel-Buffering: no` and no gzip on that route), idle timeouts on load balancers (send keep-alive comments), client disconnects that keep generating paid tokens (check `is_disconnected` and close the upstream stream), and stalls where the provider stops sending tokens (inter-token timeout).
+</InterviewQuestion>
+
+<InterviewQuestion question="A client retries POST /chat after a timeout and the user gets charged twice for an action. How do you fix it?" level="senior">
+Introduce idempotency keys. The client generates a UUID per logical operation and sends it in an `Idempotency-Key` header on every retry. The server atomically claims the key in Redis (`SET NX EX`), scoped by tenant, processes once, and stores the response. Retries with the same key get the stored response. Concurrent duplicates get `409`. Store a hash of the body to reject key reuse with a different payload. On failure, release the key so a clean retry is possible. Apply the same idea downstream: tool calls with side effects should pass the key to the external system if it supports one.
+</InterviewQuestion>
+
+<Callout type="interview">
+Expect "Where do you put timeouts?" Answer with the nesting rule: every inner timeout is shorter than its outer one, and name the layers (load balancer, request, retrieval, LLM first token, LLM total, inter-token gap).
+</Callout>
+
+## Further reading
+
+- FastAPI — Custom responses and `StreamingResponse`: https://fastapi.tiangolo.com/advanced/custom-response/
+- FastAPI — Lifespan events: https://fastapi.tiangolo.com/advanced/events/
+- FastAPI — Background tasks: https://fastapi.tiangolo.com/tutorial/background-tasks/
+- Anthropic — Streaming messages: https://docs.anthropic.com/en/docs/build-with-claude/streaming
+- MDN — Using server-sent events: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events

@@ -1,0 +1,32 @@
+{
+  "id": "m3",
+  "order": 3,
+  "days": 4,
+  "hours": 24,
+  "title": { "en": "Evaluation, testing & observability (the SDET advantage)", "es": "Evaluación, testing y observabilidad (la ventaja del SDET)" },
+  "summary": {
+    "en": "Turn your QA instincts into LLM quality engineering: golden datasets, LLM-as-judge, regression gates in CI, tracing with Langfuse, LangSmith and OpenTelemetry, monitoring, guardrails, red-teaming and A/B testing prompts.",
+    "es": "Convierte tu instinto de QA en ingeniería de calidad para LLMs: golden datasets, LLM-as-judge, gates de regresión en CI, tracing con Langfuse, LangSmith y OpenTelemetry, monitoreo, guardrails, red-teaming y A/B testing de prompts."
+  },
+  "lessons": [
+    { "slug": "01-why-evals-are-hard", "type": "concept", "minutes": 40, "title": { "en": "Why evals are the hardest part (and the eval pyramid)", "es": "Por qué los evals son la parte más difícil (y la pirámide de evals)" } },
+    { "slug": "02-golden-datasets", "type": "concept", "minutes": 45, "title": { "en": "Golden datasets: building, versioning, coverage and synthetic data", "es": "Golden datasets: construcción, versionado, cobertura y datos sintéticos" } },
+    { "slug": "03-llm-as-judge", "type": "concept", "minutes": 50, "title": { "en": "LLM-as-judge: rubrics, biases and calibration", "es": "LLM-as-judge: rúbricas, sesgos y calibración" } },
+    { "slug": "04-ex-judge-calibration", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: calibrate an LLM judge against human labels", "es": "Ejercicio: calibra un juez LLM contra etiquetas humanas" } },
+    { "slug": "05-regression-testing-ci", "type": "concept", "minutes": 50, "title": { "en": "Regression testing prompts in CI: pytest, thresholds, caching and cost", "es": "Pruebas de regresión de prompts en CI: pytest, umbrales, caché y costo" } },
+    { "slug": "06-ex-eval-harness-ci", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: an eval harness that blocks PRs in GitHub Actions", "es": "Ejercicio: un eval harness que bloquea PRs en GitHub Actions" } },
+    { "slug": "07-offline-online-ab-testing", "type": "concept", "minutes": 45, "title": { "en": "Offline vs online evals and A/B testing prompts", "es": "Evals offline vs online y A/B testing de prompts" } },
+    { "slug": "08-tracing-langsmith-langfuse", "type": "concept", "minutes": 45, "title": { "en": "Tracing LLM apps with LangSmith and Langfuse", "es": "Tracing de apps LLM con LangSmith y Langfuse" } },
+    { "slug": "09-opentelemetry-genai", "type": "concept", "minutes": 45, "title": { "en": "OpenTelemetry for LLM apps: GenAI semantic conventions", "es": "OpenTelemetry para apps LLM: convenciones semánticas GenAI" } },
+    { "slug": "10-ex-tracing-rag", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: add tracing to your Module 2 RAG app", "es": "Ejercicio: agrega tracing a tu app RAG del módulo 2" } },
+    { "slug": "11-monitoring-drift-cost-latency", "type": "concept", "minutes": 40, "title": { "en": "Monitoring drift, cost and latency in production", "es": "Monitoreo de drift, costo y latencia en producción" } },
+    { "slug": "12-guardrails-prompt-injection", "type": "concept", "minutes": 50, "title": { "en": "Guardrails and prompt-injection defense", "es": "Guardrails y defensa contra prompt injection" } },
+    { "slug": "13-red-teaming-basics", "type": "concept", "minutes": 40, "title": { "en": "Red-teaming basics for LLM applications", "es": "Fundamentos de red-teaming para aplicaciones LLM" } },
+    { "slug": "14-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 3 exam", "es": "Examen del módulo 3" } },
+    { "slug": "15-capstone-llm-qa-framework", "type": "project", "minutes": 720, "title": { "en": "Capstone: LLM QA framework for a mortgage lender's platform team", "es": "Proyecto final: framework de QA para LLMs para el equipo de plataforma de un prestamista hipotecario" } }
+  ],
+  "repos": [
+    { "id": "m3-eval-harness", "name": "llm-eval-harness", "description": { "en": "Exercises: judge calibration, a pytest-based eval harness with a GitHub Actions gate that blocks PRs on faithfulness regressions, and tracing experiments.", "es": "Ejercicios: calibración de jueces, un eval harness basado en pytest con un gate en GitHub Actions que bloquea PRs ante regresiones de faithfulness, y experimentos de tracing." } },
+    { "id": "m3-qa-framework", "name": "llm-qa-framework", "description": { "en": "Capstone: reusable eval + tracing toolkit (golden datasets, calibrated judges, CI gates, OpenTelemetry, red-team suite) applied to mortgage-knowledge-assistant, with a published quality report.", "es": "Proyecto final: toolkit reutilizable de evals + tracing (golden datasets, jueces calibrados, gates de CI, OpenTelemetry, suite de red-team) aplicado a mortgage-knowledge-assistant, con un reporte de calidad publicado." } }
+  ]
+}

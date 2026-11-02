@@ -1,0 +1,154 @@
+## Why this module is your unfair advantage
+
+Most AI engineers come from backend or data science. They can wire a model to a vector store in an afternoon. What they struggle with is the question every stakeholder eventually asks: **"How do you know it works?"**
+
+You have answered that question for years. You built test pyramids, fought flaky suites, designed regression gates and wrote test reports that managers actually read. This module translates those skills to LLM systems. The tools are new. The discipline is the one you already have.
+
+## Why evals are the hardest part
+
+Building a demo is easy. Knowing whether version 2 is better than version 1 is hard. Four properties make LLM evaluation different from classic testing.
+
+**1. There is no single correct output.** A unit test asserts `add(2, 2) == 4`. An LLM answering "What is the minimum down payment for an FHA loan?" can be correct in hundreds of phrasings. Exact-match assertions break on the first synonym.
+
+**2. Outputs are non-deterministic.** The same prompt, same model, same temperature can produce different text across calls. Even `temperature=0` is not a hard guarantee: providers batch requests, run on different hardware and update model snapshots. You get *mostly* stable outputs, not bit-identical ones.
+
+**3. Quality is multi-dimensional.** An answer can be faithful to the retrieved documents but irrelevant to the question. It can be relevant but cite the wrong source. It can be perfect but take 9 seconds and cost 4x the budget. You need several metrics, and they trade off against each other.
+
+**4. The input space is open.** A REST endpoint has a schema. A chat box accepts any string in any language, including attacks. You cannot enumerate inputs; you can only sample them well.
+
+Add the fact that every eval call can cost money and take seconds, and you see why teams skip evals and ship on vibes. Your job is to make evals cheap, fast and trustworthy enough that nobody wants to skip them.
+
+## Flaky tests vs non-determinism
+
+You already know the cure for flaky tests: find the source of randomness, control it, and only then trust the signal. The same playbook applies, with one twist. In classic testing, flakiness is a bug to remove. In LLM systems, some variance is a **property of the system** that you must measure.
+
+Your levers:
+
+- **Pin what you can.** Pin the model snapshot id, the prompt version, the retrieval index version and the decoding parameters. Log them with every result. An unpinned model id is like an unpinned dependency.
+- **Lower temperature for evaluation runs** of extraction or classification tasks. Keep production temperature for generative tasks, because that is what users get.
+- **Use seeds where supported**, but treat them as best-effort. Some providers expose a `seed` parameter; none promise identical outputs forever.
+- **Sample repeatedly.** Run each case `k` times (3–5 is common) and score the distribution. A case that passes 5/5 is solid. One that passes 3/5 is unstable, and that is a finding in itself.
+- **Use statistical thresholds, not single assertions.** Instead of "this answer must be faithful", assert "faithfulness over the dataset is at least 0.85, and did not drop more than 0.03 versus baseline."
+
+Here is the pattern as code. It runs a case several times and reports a pass rate instead of a boolean.
+
+```python
+import asyncio
+from dataclasses import dataclass
+from statistics import mean, pstdev
+
+from mortgage_assistant import answer  # Module 2 SUT: async def answer(q) -> RagResult
+
+
+@dataclass
+class CaseStats:
+    case_id: str
+    pass_rate: float
+    scores: list[float]
+
+    @property
+    def unstable(self) -> bool:
+        return 0.0 < self.pass_rate < 1.0
+
+
+def has_citation(result) -> float:
+    """L1 deterministic check: at least one citation that points to a retrieved doc."""
+    return 1.0 if result.citations else 0.0
+
+
+async def run_repeated(case_id: str, question: str, k: int = 5) -> CaseStats:
+    results = await asyncio.gather(*(answer(question) for _ in range(k)))
+    scores = [has_citation(r) for r in results]
+    return CaseStats(case_id, pass_rate=mean(scores), scores=scores)
+
+
+async def main() -> None:
+    stats = await run_repeated("fha-down-payment-001", "What is the minimum FHA down payment?")
+    print(f"{stats.case_id}: pass_rate={stats.pass_rate:.2f} sd={pstdev(stats.scores):.2f}")
+    if stats.unstable:
+        print("UNSTABLE: quarantine and investigate, like a flaky test")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Notice the vocabulary: *quarantine* an unstable case, *investigate* it, but do not delete it. That is exactly how you treated flaky UI tests.
+
+## The eval pyramid
+
+Your test pyramid had many fast unit tests, fewer integration tests and a thin layer of slow end-to-end tests. The eval pyramid has the same shape and the same economics.
+
+<Diagram caption="The eval pyramid: cheap, deterministic checks at the base; expensive human judgment at the top" chart={`flowchart TB
+  L3["L3: Human review (tens of cases, weekly)"]
+  L2["L2: Model-graded evals (hundreds of cases, per PR)"]
+  L1["L1: Deterministic checks (every case, every run)"]
+  L3 --- L2
+  L2 --- L1`} />
+
+**L1 — Deterministic checks (unit-test-like).** Fast, free, 100% reproducible. Does the output parse against the Pydantic schema? Are there citations? Do the cited doc ids exist in the retrieved contexts? Is the length under the limit? Does the bot refuse when asked for legal advice? Does a regex find a forbidden pattern like a full SSN? Run these on every case, every commit. They catch a surprising share of regressions: broken prompts often break format first.
+
+**L2 — Model-graded evals (integration-test-like).** An LLM judge or a metric library (Ragas, DeepEval) scores faithfulness, answer relevance, context precision. They cost money and have their own error rate, so you calibrate them (lesson 03) and run them on a curated golden dataset (lesson 02) per PR or nightly.
+
+**L3 — Human review (exploratory / UAT-like).** Domain experts read a sample of outputs, label them and catch what metrics miss: tone, regulatory nuance, subtle wrongness. Slow and expensive, so you do it on small samples and use the labels to calibrate L2.
+
+The rule from your QA days still holds: **push every check as low as it can go.** If a regex can catch it, do not pay a judge to catch it. If a judge can catch it reliably, do not wait for a human.
+
+## Mapping your QA background to evals
+
+| QA concept you know | LLM-eval equivalent | What changes |
+|---|---|---|
+| Test pyramid | Eval pyramid (L1 deterministic, L2 model-graded, L3 human) | Middle layer is probabilistic and must be calibrated |
+| Flaky tests | Non-determinism | Some variance is inherent; measure it with repeated sampling and thresholds |
+| Regression suite | Golden dataset | Expected outputs are references, not exact strings |
+| Contract tests | Output schemas (JSON Schema, Pydantic, tool schemas) | Enforce at generation time with structured outputs, verify in L1 |
+| Test reports | Eval reports | Show score distributions, deltas vs baseline, cost and worst cases |
+| Canary releases, feature flags | Online evals and A/B tests on prompts | Quality signals come from judges and user feedback, not just error rates |
+| Test data management | Dataset versioning and coverage by tag | Datasets drift as products and users change |
+| Exploratory testing | Red-teaming | Adversarial creativity against prompts, tools and retrieved content |
+
+Keep this table in mind for the whole module. Every lesson goes deeper on one row.
+
+## What "good" looks like
+
+A mature team can answer these in under a minute:
+
+- What is our faithfulness score on golden dataset v3, and what was it last week?
+- Which 10 cases are worst right now, and why?
+- What did this PR change in quality, latency and cost per 1k requests?
+- Which model snapshot and prompt version are in production?
+
+If you can build the system that answers those questions, you are doing the job companies actually struggle to fill.
+
+## Common mistakes
+
+- **Vibe checks as the only eval.** Trying five prompts in a playground is exploratory testing, not a regression suite. Nothing stops tomorrow's prompt edit from breaking case six.
+- **Exact-match assertions on free text.** They fail on harmless rephrasing and train the team to ignore red builds. Use L1 structural checks plus L2 semantic scoring.
+- **One run per case.** A single sample hides instability. A 0.88 score might be 0.80–0.95 across reruns.
+- **Unpinned model ids.** Using an alias that silently moves to a new snapshot changes your baseline under you.
+- **Only measuring quality.** Latency and cost are part of "works". A prompt that gains 2 points of faithfulness and doubles token spend may be a net loss.
+- **Skipping L1 because L2 exists.** Judges are expensive and fuzzy. Deterministic checks are free and exact.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you test an LLM feature where the output is different every time?" level="mid">
+Treat it like flaky-test management plus statistics. First, pin everything I can: model snapshot, prompt version, retrieval index, decoding parameters. Second, split checks into an eval pyramid. Deterministic L1 checks (schema validity, citations present, length, refusal behavior) are exact and run on every case. Semantic quality goes to L2: an LLM judge or Ragas metrics over a golden dataset, scored as aggregates with thresholds instead of per-case exact matches. Third, run each case several times to measure variance and flag unstable cases. The CI gate compares the aggregate against a baseline with a tolerance, for example "faithfulness at least 0.85 and no drop over 0.03". Small human-labeled samples calibrate the judge.
+</InterviewQuestion>
+
+<InterviewQuestion question="Your team says evals are too slow and expensive to run on every PR. What do you do?" level="senior">
+Apply test-pyramid economics. Move everything possible to free deterministic checks that run on every commit. Run the model-graded suite on a smaller smoke subset per PR (say 50 stratified cases) and the full dataset nightly or before release. Cache SUT and judge responses keyed by model, prompt hash and input, so unchanged cases cost nothing. Use a cheaper judge model for screening and a stronger one only for disputed cases. Only trigger the eval workflow when prompts, retrieval code or model config change. Then report cost per eval run next to the scores, so the trade-off is visible instead of argued about.
+</InterviewQuestion>
+
+<Callout type="interview" title="Say the mapping out loud">
+In interviews, explicitly connect your SDET background: "Golden datasets are my regression suite, output schemas are my contract tests, online evals are my canary." It reframes you from "career changer" to "the person who already knows how to make quality measurable."
+</Callout>
+
+## Further reading
+
+- Anthropic, "Create strong empirical evaluations": https://docs.anthropic.com/en/docs/test-and-evaluate/develop-tests
+- OpenAI, evals guide: https://platform.openai.com/docs/guides/evals
+- Ragas documentation: https://docs.ragas.io
+- DeepEval documentation: https://docs.confident-ai.com
+- LangSmith evaluation concepts: https://docs.smith.langchain.com
+
+<Checklist id="m3-01-review" title="Before moving on" items={["I can explain four reasons LLM evals are harder than classic tests", "I can describe the three layers of the eval pyramid with examples", "I know how to handle non-determinism with pinning, repeated sampling and thresholds", "I can map at least five QA concepts to their LLM-eval equivalents"]} />

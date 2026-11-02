@@ -1,0 +1,174 @@
+# What companies hire AI Engineers for
+
+You are not learning "AI" in general. You are learning the specific set of skills that companies put in job postings and test in interviews. This course was planned backwards from that list.
+
+The curriculum is based on an analysis of roughly 900 AI Engineer job postings collected in January 2026. The goal of this lesson is to give you a map: which skills show up almost everywhere, which ones separate strong candidates, and which ones are nice to have. Every later module maps to a part of this map.
+
+<Callout type="info" title="About the numbers">
+
+This lesson describes demand in **tiers**, not exact percentages. Posting counts move every month, and different scrapes give different numbers. What stays stable is the ranking: which skills are near-universal and which are niche. Use the tiers to plan, not to quote in an interview.
+
+</Callout>
+
+## The demand map
+
+Think of the skills in three tiers.
+
+### Tier 1 — Near-universal (shows up in most postings)
+
+- **RAG (retrieval-augmented generation).** The most requested single skill. Companies have documents, tickets, policies and code. They want an LLM that answers from *their* data, with citations. Module 2 is the longest module in this course for that reason.
+- **Prompt engineering.** Not "magic words". In postings it means: designing system prompts as contracts, structured outputs, few-shot examples, prompt versioning and testing. Module 1.
+- **LLM integration.** Calling provider APIs (Anthropic, OpenAI, Bedrock, Azure OpenAI) from real services: streaming, retries, rate limits, tool calling, cost control. Module 1 and Module 5.
+- **Python.** The default language of the role. Many postings also accept TypeScript for product-facing teams, but Python is the safe bet.
+
+### Tier 2 — Very common (separates "can demo" from "can ship")
+
+- **Agents and tool use.** LangGraph, function calling, MCP servers, human-in-the-loop. Growing fast. Module 4.
+- **Evaluation.** Golden datasets, LLM-as-judge, regression tests for prompts, tracing. Postings often phrase it as "experience measuring and improving LLM output quality". This is where your SDET background is a real advantage. Module 3.
+- **API and service skills.** FastAPI (most common), async Python, streaming responses. Module 5.
+- **Docker and CI/CD.** Containerized services, GitHub Actions pipelines, automated tests before deploy. You already know these; the course shows how they apply to LLM apps.
+- **Cloud, mainly AWS.** Lambda or ECS, S3, Bedrock, IAM basics. GCP and Azure appear, but AWS leads. Module 5.
+- **Vector databases.** pgvector, Pinecone, Qdrant, Weaviate, Chroma. Postings rarely care which one; they care that you understand indexing, filtering and hybrid search. Module 2.
+
+### Tier 3 — Secondary (nice to have, or role-specific)
+
+- **Fine-tuning** (LoRA, QLoRA, instruction tuning). It appears, but much less than RAG. Most teams fine-tune only after prompting and retrieval hit a ceiling. Module 6 covers when *not* to fine-tune.
+- **Data platforms** (Databricks, Snowflake, Spark). Common in enterprise and data-heavy companies. Module 6.
+- **Self-hosting models** (vLLM, TGI, Ollama). Relevant for privacy-sensitive or cost-sensitive teams.
+- **Classical ML** (scikit-learn, PyTorch training loops). Shows up in hybrid roles. It is rarely the core of an AI Engineer job.
+
+<Diagram caption="Demand tiers mapped to course modules" chart={`flowchart TB
+  subgraph T1["Tier 1: near-universal"]
+    RAG["RAG (M2)"]
+    PE["Prompt engineering (M1)"]
+    INT["LLM integration (M1, M5)"]
+    PY[Python]
+  end
+  subgraph T2["Tier 2: very common"]
+    AG["Agents and tools (M4)"]
+    EV["Evals and tracing (M3)"]
+    API["FastAPI, Docker, CI/CD, AWS (M5)"]
+    VDB["Vector DBs (M2)"]
+  end
+  subgraph T3["Tier 3: secondary"]
+    FT["Fine-tuning (M6)"]
+    DP["Databricks and data (M6)"]
+  end
+  T1 --> T2 --> T3`} />
+
+## What the tiers mean for you
+
+The tiers tell you where to spend time.
+
+1. **Go deep on Tier 1.** An interviewer will assume you can build a RAG pipeline and integrate an LLM API cleanly. If you stumble here, nothing else matters.
+2. **Be strong in at least two Tier 2 skills.** Evals is the obvious one for you. Pair it with agents or production serving. That combination is rarer than you think.
+3. **Know Tier 3 well enough to discuss trade-offs.** You should be able to say "we should not fine-tune here, because..." and explain LoRA in two sentences. You do not need to have trained a 7B model.
+
+A common trap is the opposite order. People spend weeks on fine-tuning tutorials because it feels like "real AI", then cannot explain chunking strategies or how they would test a RAG answer. Postings reward the boring, production-shaped skills.
+
+## The hidden requirement: production thinking
+
+Read enough postings and a second pattern appears. Beyond named tools, companies ask for traits like:
+
+- "Shipped LLM features to production."
+- "Comfortable with ambiguity and non-deterministic systems."
+- "Experience with monitoring, observability and cost management."
+- "Strong software engineering fundamentals."
+
+These are signals that the hiring team has been burned by prototypes that never shipped. They want engineers who think about latency, cost per request, failure modes and regressions. That is exactly how a senior SDET thinks. You already ask "how will this break?" and "how do we know it still works after the next change?". Keep asking.
+
+## Build your own keyword tracker
+
+You will read many postings during this course. Track them. The script below counts how often each skill appears across postings you saved as text files. It is simple keyword matching, not NLP, and that is fine: the goal is to see *your* target market, not to publish research.
+
+```python
+from __future__ import annotations
+
+import re
+from collections import Counter
+from pathlib import Path
+
+# Each skill maps to the regex patterns that count as a mention.
+SKILLS: dict[str, list[str]] = {
+    "rag": [r"\brag\b", r"retrieval[- ]augmented"],
+    "prompt_engineering": [r"prompt engineering", r"\bprompting\b"],
+    "llm_integration": [r"openai api", r"anthropic", r"\bbedrock\b", r"llm api"],
+    "agents": [r"\bagents?\b", r"langgraph", r"tool calling", r"\bmcp\b"],
+    "evals": [r"\bevals?\b", r"evaluation", r"llm-as-a?-?judge"],
+    "fastapi": [r"fastapi"],
+    "docker_cicd": [r"docker", r"ci/cd", r"github actions"],
+    "aws": [r"\baws\b", r"lambda", r"\becs\b"],
+    "vector_db": [r"pgvector", r"pinecone", r"qdrant", r"weaviate", r"vector (db|database|store)"],
+    "fine_tuning": [r"fine[- ]tun", r"\blora\b"],
+}
+
+
+def skills_in(text: str) -> set[str]:
+    lowered = text.lower()
+    return {
+        skill
+        for skill, patterns in SKILLS.items()
+        if any(re.search(p, lowered) for p in patterns)
+    }
+
+
+def rank(postings_dir: Path) -> list[tuple[str, int, float]]:
+    files = sorted(postings_dir.glob("*.txt"))
+    if not files:
+        raise SystemExit(f"No .txt postings in {postings_dir}")
+    counts: Counter[str] = Counter()
+    for f in files:
+        counts.update(skills_in(f.read_text(encoding="utf-8")))
+    total = len(files)
+    return [(s, n, n / total) for s, n in counts.most_common()]
+
+
+if __name__ == "__main__":
+    for skill, n, share in rank(Path("postings")):
+        print(f"{skill:20} {n:4}  {share:6.1%}")
+```
+
+Save 20–30 postings for roles you would actually apply to. Run the script every few weeks. If your local market leans hard on Azure or Databricks, you will see it, and you can adjust your focus inside Modules 5 and 6.
+
+<Callout type="tip" title="Count presence, not frequency">
+
+The script counts a skill once per posting, even if the word appears ten times. A posting that says "RAG" six times is not six times more likely to hire you for RAG. Presence per posting is the useful signal.
+
+</Callout>
+
+## Common mistakes
+
+- **Chasing the newest framework.** Postings list LangChain, LlamaIndex, LangGraph, CrewAI and more. The underlying skills (retrieval, tool design, evals) transfer. Learn one framework well, and know how to build the core without it. Module 2 does both.
+- **Treating fine-tuning as the main skill.** It is Tier 3. Teams want it occasionally. They want RAG and evals constantly.
+- **Ignoring the "boring" infrastructure.** Docker, CI, cloud and FastAPI appear in a large share of postings. You already have them. Make sure your portfolio *shows* them.
+- **Quoting market statistics in interviews.** Saying "RAG is in most postings" is fine. Saying "73.4% of postings require RAG" invites a question you cannot defend.
+- **Learning from tutorials only.** Tutorials show the happy path. Postings ask for production. Every module here ends with a project that has evals, cost numbers and a README for this reason.
+
+## How this shows up in interviews
+
+Interviewers rarely ask "what skills are in demand?". They do ask questions that test whether you understand *why* the role exists and where the value is.
+
+<InterviewQuestion question="What do you think is the most important skill for an AI engineer right now, and why?" level="mid">
+
+I would say building reliable retrieval-augmented systems, with evaluation built in from day one. Most company value from LLMs today comes from connecting a model to the company's own data: documents, tickets, policies. That is RAG. But a RAG demo is easy and a RAG product is hard. The hard part is knowing whether answers are correct, catching regressions when you change a prompt or a chunking strategy, and keeping latency and cost under control. So I focus on retrieval quality plus evals. My QA background helps directly here: I treat a golden dataset like a regression suite and put it in CI.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="When would you choose fine-tuning over RAG?" level="senior">
+
+Rarely as a first step. RAG is the default when the problem is knowledge: the model needs facts it was not trained on, and those facts change. Fine-tuning helps when the problem is behavior or format: a consistent style, a narrow classification task, or a domain-specific output structure that prompting cannot hold reliably. It can also reduce cost and latency by letting a smaller model do a task that otherwise needs a large one. Before fine-tuning, I would exhaust prompt design, structured outputs, few-shot examples and retrieval, and I would have an eval set that proves the ceiling. Fine-tuning without an eval set is guessing. And it adds a training pipeline, data curation and model versioning to maintain.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Use the map in your answers">
+
+When you describe your experience, connect it to Tier 1 and Tier 2 language. "I built a test framework" becomes "I built an evaluation harness that gates releases in CI". Same skill, vocabulary the posting uses.
+
+</Callout>
+
+## Further reading
+
+- [Anthropic — Building effective agents](https://www.anthropic.com/research/building-effective-agents)
+- [Anthropic docs — Prompt engineering overview](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview)
+- [OpenAI docs — Retrieval and file search](https://platform.openai.com/docs/guides/retrieval)
+- [Lewis et al. (2020) — Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://arxiv.org/abs/2005.11401)

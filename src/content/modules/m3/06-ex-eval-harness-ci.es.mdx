@@ -1,0 +1,314 @@
+## Objetivo
+
+Construye el quality gate que construirías en cualquier empresa que publique una funcionalidad con LLM: un eval harness que corre en GitHub Actions en cada pull request relevante y **bloquea el merge si el faithfulness baja del baseline**.
+
+Este es tu terreno como QA. Piénsalo como un paquete de regresión con un status check obligatorio. La diferencia: las aserciones son estadísticas, el "test runner" llama a un juez LLM y cada corrida cuesta dinero.
+
+Vas a evaluar el `mortgage-knowledge-assistant` del módulo 2 (o cualquier app RAG que exponga `async def answer(question: str) -> RagResult`). Si no lo tienes a mano, el starter code incluye un stub pequeño que puedes reemplazar después.
+
+Al final tendrás:
+
+- Un runner que carga un golden dataset en JSONL, llama al sistema bajo prueba y califica el faithfulness con un juez fijo.
+- Un gate en pytest que compara los puntajes con `evals/baseline.json` usando una tolerancia.
+- Un workflow que corre solo cuando cambian los prompts o el retrieval, cachea las llamadas al juez, sube un reporte y comenta en el PR.
+- Una regla de branch protection que hace obligatorio el check, más un flujo seguro para actualizar el baseline desde `main`.
+
+Tiempo: 90 minutos. Usa un subconjunto de 20 ítems de tu golden set para iterar rápido y barato.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] `evals/datasets/golden_v1.jsonl` tiene al menos 20 ítems con el formato del curso (id, question, reference_answer, reference_doc_ids, tags, difficulty, source, version).
+- [ ] `harness/runner.py` corre la suite de forma concurrente (acotada con un semáforo) y devuelve resultados por ítem más puntajes agregados.
+- [ ] `harness/judges.py` califica el faithfulness con `claude-sonnet-5-5` a `temperature=0`, usando una rúbrica versionada y salida JSON estructurada.
+- [ ] Las llamadas al juez se cachean en `.eval_cache/` con una clave que incluye el modelo, la versión de la rúbrica, la respuesta y los contextos.
+- [ ] `tests/test_regression.py` falla cuando el faithfulness está por debajo de `baseline - tolerance` e imprime el puntaje, el baseline y el CI en el mensaje.
+- [ ] `harness/report.py` escribe `reports/eval_report.md` con puntajes agregados, delta contra el baseline, costo y los 5 peores ítems.
+- [ ] `.github/workflows/evals.yml` se dispara en `pull_request` con un paths filter, restaura el caché, corre pytest, sube el reporte como artifact y publica un comentario en el PR.
+- [ ] El job `evals` es un status check obligatorio en `main` (captura de pantalla o nota en el README).
+- [ ] Un cambio de prompt deliberadamente malo (por ejemplo "responde con conocimiento general si no estás seguro") pone en rojo el check del PR.
+- [ ] Las actualizaciones del baseline ocurren solo desde `main` mediante un job manual con `workflow_dispatch`, nunca desde una rama de PR.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# harness/judges.py
+import json
+from typing import Any
+
+from anthropic import AsyncAnthropic
+from pydantic import BaseModel, Field
+
+from harness import cache
+
+JUDGE_MODEL = "claude-sonnet-5-5"
+RUBRIC_VERSION = "faithfulness-v1"
+SYSTEM = """You grade whether an ANSWER is supported by CONTEXTS.
+Split the answer into atomic factual claims. For each claim decide if it is
+fully supported by the contexts. Ignore style. Do not use outside knowledge.
+Return JSON only: {"claims": [{"claim": str, "supported": bool}], "score": float}
+where score = supported_claims / total_claims (1.0 if the answer makes no claims)."""
+
+
+class Verdict(BaseModel):
+    claims: list[dict[str, Any]] = Field(default_factory=list)
+    score: float = Field(ge=0.0, le=1.0)
+
+
+async def judge_faithfulness(client: AsyncAnthropic, answer: str, contexts: list[str]) -> Verdict:
+    user = f"CONTEXTS:\n{json.dumps(contexts, indent=1)}\n\nANSWER:\n{answer}"
+    key = cache.cache_key(JUDGE_MODEL, SYSTEM + RUBRIC_VERSION, [{"role": "user", "content": user}], {"temperature": 0}, 0)
+    if (hit := cache.get(key)) is not None:
+        return Verdict.model_validate(hit)
+    msg = await client.messages.create(
+        model=JUDGE_MODEL,
+        max_tokens=1024,
+        temperature=0,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": user}],
+    )
+    verdict = Verdict.model_validate_json(msg.content[0].text)
+    cache.put(key, verdict.model_dump())
+    return verdict
+```
+
+```python
+# harness/runner.py
+import asyncio
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from anthropic import AsyncAnthropic
+
+from harness.judges import judge_faithfulness
+from harness.metrics import Score, bootstrap_ci
+from sut import answer  # adapter around mortgage-knowledge-assistant
+
+
+@dataclass
+class ItemResult:
+    id: str
+    question: str
+    answer: str
+    faithfulness: float
+    cited_ok: bool
+
+
+@dataclass
+class EvalRun:
+    items: list[ItemResult] = field(default_factory=list)
+    scores: dict[str, Score] = field(default_factory=dict)
+    cost_usd: float = 0.0
+
+
+async def _run_item(row: dict, client: AsyncAnthropic, sem: asyncio.Semaphore) -> ItemResult:
+    async with sem:
+        result = await answer(row["question"])
+        verdict = await judge_faithfulness(client, result.answer, result.contexts)
+        cited_ok = bool(set(result.citations) & set(row["reference_doc_ids"]))
+        return ItemResult(row["id"], row["question"], result.answer, verdict.score, cited_ok)
+
+
+async def run_suite_async(dataset: str, limit: int | None = None, concurrency: int = 5) -> EvalRun:
+    rows = [json.loads(line) for line in Path(dataset).read_text().splitlines() if line.strip()]
+    rows = rows[:limit] if limit else rows
+    client, sem = AsyncAnthropic(), asyncio.Semaphore(concurrency)
+    items = await asyncio.gather(*(_run_item(r, client, sem) for r in rows))
+    run = EvalRun(items=list(items))
+    run.scores["faithfulness"] = bootstrap_ci([i.faithfulness for i in items])
+    run.scores["citation_accuracy"] = bootstrap_ci([float(i.cited_ok) for i in items])
+    # Extend: track usage from responses and fill run.cost_usd
+    return run
+
+
+def run_suite(dataset: str, limit: int | None = None) -> EvalRun:
+    return asyncio.run(run_suite_async(dataset, limit))
+```
+
+```python
+# sut.py  (stub: replace with an import from mortgage-knowledge-assistant)
+from pydantic import BaseModel
+
+
+class Usage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class RagResult(BaseModel):
+    answer: str
+    citations: list[str]
+    contexts: list[str]
+    usage: Usage = Usage()
+    latency_ms: float = 0.0
+
+
+async def answer(question: str) -> RagResult:
+    ctx = "Max DTI for conforming loans in policy POL-12 is 45% with compensating factors."
+    return RagResult(answer="The maximum DTI is 45% with compensating factors.", citations=["POL-12"], contexts=[ctx])
+```
+
+</StarterCode>
+
+El workflow es el corazón del ejercicio. Parte de esto y adapta las rutas a tu repo.
+
+```yaml
+# .github/workflows/evals.yml
+name: evals
+
+on:
+  pull_request:
+    paths:
+      - "prompts/**"
+      - "app/retrieval/**"
+      - "app/generation/**"
+      - "harness/**"
+      - "evals/**"
+      - "config/models.yaml"
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: "Write a new baseline from main"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore eval cache
+        uses: actions/cache@v4
+        with:
+          path: .eval_cache
+          key: eval-cache-${{ hashFiles('prompts/**', 'harness/judges.py', 'evals/datasets/**') }}
+          restore-keys: eval-cache-
+      - name: Run eval gate
+        id: gate
+        run: pytest -m eval tests/test_regression.py --subset pr --junitxml=reports/junit.xml
+      - name: Build report
+        if: always()
+        run: python -m harness.report --out reports/eval_report.md
+      - name: Job summary
+        if: always()
+        run: cat reports/eval_report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: reports/
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file reports/eval_report.md --edit-last || gh pr comment ${{ github.event.pull_request.number }} --body-file reports/eval_report.md
+
+  update-baseline:
+    if: github.event_name == 'workflow_dispatch' && inputs.update_baseline && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m harness.update_baseline --subset full --samples 3 --out evals/baseline.json
+      - name: Open baseline PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git checkout -b chore/baseline-${{ github.run_id }}
+          git add evals/baseline.json
+          git -c user.name=eval-bot -c user.email=eval-bot@users.noreply.github.com commit -m "chore(evals): update baseline"
+          git push origin HEAD
+          gh pr create --title "chore(evals): update baseline" --body "Automated baseline from main run ${{ github.run_id }}"
+```
+
+Luego haz obligatorio el check: **Settings → Branches → regla de branch protection para `main` → Require status checks to pass → agrega `evals`**. Los workflows con paths filter no reportan en los PRs que los saltan, así que un check obligatorio bloquearía esos PRs para siempre. Dos soluciones: un job mínimo "evals-skip" con el mismo nombre disparado con `paths-ignore`, o un solo workflow que siempre corre y decide internamente (por ejemplo con `dorny/paths-filter`) si ejecutar el paso caro.
+
+## Pistas
+
+<Hints>
+  <Hint>Primero pon el ciclo en verde localmente: `pytest -m eval --subset pr` contra el stub `sut.py`. Conecta GitHub Actions solo cuando el archivo de reporte ya se genere. Depurar YAML y Python al mismo tiempo es doloroso.</Hint>
+  <Hint>Para probar que el gate funciona, crea una rama que edite el system prompt a "Si el contexto es insuficiente, responde con tu conocimiento general sobre hipotecas". El faithfulness debería bajar porque el juez ve afirmaciones sin sustento. Si no baja, a tu golden set le faltan preguntas cuya respuesta NO está en el corpus. Agrega de 3 a 5.</Hint>
+  <Hint>Pon `rubric_version` y el model id del juez en la clave de caché. Cuando edites la rúbrica, cada veredicto cacheado se invalida automáticamente. Imprime también hits vs misses del caché en el reporte; en una segunda corrida sin cambios deberías ver casi 100% de hits y un costo cercano a cero.</Hint>
+  <Hint>Haz el reporte en Markdown primero: una tabla de encabezado (métrica, puntaje, CI 95%, baseline, delta, estado) y luego una tabla de "5 peores ítems" con la pregunta, el faithfulness y las afirmaciones sin sustento según el juez. Pasa el mismo archivo a `$GITHUB_STEP_SUMMARY` y a `gh pr comment --body-file` para escribirlo una sola vez.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="llm-eval-harness">
+
+```text
+llm-eval-harness/
+  .github/workflows/evals.yml
+  harness/
+    __init__.py
+    runner.py
+    judges.py
+    metrics.py
+    cache.py
+    report.py
+    update_baseline.py
+  evals/
+    datasets/golden_v1.jsonl
+    baseline.json
+  tests/
+    conftest.py
+    test_regression.py
+  sut.py
+  reports/            # gitignored, produced in CI
+  .eval_cache/        # gitignored, restored by actions/cache
+  pyproject.toml
+  requirements.txt
+  README.md
+```
+
+Estructura del README:
+
+1. Qué es: un quality gate de CI para apps RAG (un párrafo más el diagrama de la pirámide de evals).
+2. Cómo decide el gate: pisos absolutos, tolerancia contra baseline, ancho del CI, cantidad de muestras.
+3. Dataset: tamaño, cobertura de tags, de dónde salieron los ítems, versión.
+4. Costo: tokens y dólares por corrida de PR y por corrida nocturna, tasa de hits del caché.
+5. Demo: enlace a un PR donde el gate se puso en rojo por un mal prompt, y al PR siguiente que lo arregló.
+6. Actualizar el baseline: el flujo con `workflow_dispatch` y por qué los PRs no pueden hacerlo.
+7. Limitaciones: sesgo del juez, tamaño del dataset, qué no está cubierto.
+
+Mensajes de commit sugeridos:
+
+- `feat(harness): async runner with bounded concurrency`
+- `feat(judges): faithfulness judge with versioned rubric and cache`
+- `test(evals): baseline and floor gates with bootstrap CI`
+- `ci(evals): path-filtered workflow with report artifact and PR comment`
+- `ci(evals): manual baseline update from main`
+- `docs: gate design, cost per run and red-build demo`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m3-06-review" title="Autoevaluación" items={["El gate falla con un prompt deliberadamente infiel y pasa en main", "Los mensajes de falla muestran puntaje, baseline, tolerancia e intervalo de confianza", "El model id del juez y la versión de la rúbrica están fijos y forman parte de la clave de caché", "Una segunda corrida sin cambios usa el caché y cuesta casi cero", "El workflow solo corre cuando cambian prompts, retrieval, harness o datasets, y el check obligatorio igual se resuelve en otros PRs", "El baseline solo puede escribirse desde main mediante workflow_dispatch", "El reporte lista el costo por corrida y los 5 peores ítems con afirmaciones sin sustento", "ANTHROPIC_API_KEY vive en los secrets del repositorio y nunca aparece en logs ni en el reporte", "El README explica cuántos ítems respaldan el gate y qué tan ruidosa es la métrica"]} />

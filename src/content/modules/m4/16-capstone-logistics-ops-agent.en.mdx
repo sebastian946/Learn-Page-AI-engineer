@@ -1,0 +1,161 @@
+<ClientBrief company="Harborline Freight" industry="Logistics / Third-party logistics (3PL)" duration="5 days" />
+
+## Company context
+
+Harborline Freight is a fictional mid-size third-party logistics company. It runs four warehouses in the US Midwest and East Coast and ships about 18,000 orders a day for 140 e-commerce brands. It does not own trucks. It books parcel and LTL capacity with six carriers and resells it to its clients.
+
+The customer operations team has 22 agents. They work a shared inbox and a ticketing system. Most of their day is repetitive: "Where is my order?", "Can you deliver on Friday instead?", "The box arrived damaged", "Please cancel this order before it ships", "What would it cost to ship this pallet to Denver?". Each request needs two to five lookups across the order management system (OMS), carrier APIs and the ticketing tool.
+
+Average handling time is 9 minutes per email. Peak season doubles the volume. Last November the backlog reached 3 days and two large clients threatened to leave. Leadership wants an agent that handles the routine work end to end and prepares the risky work for a human to approve in one click.
+
+## Stakeholders
+
+| Person | Role | What they care about |
+|---|---|---|
+| Dana Okafor | VP Customer Operations (sponsor) | Backlog under 4 hours in peak, handling time cut in half |
+| Luis Ferreira | Ops team lead | Agents trust the tool, approvals are fast, no surprise refunds |
+| Priya Raman | Head of Engineering | Fits existing stack (Python, Postgres, AWS), observable, testable |
+| Marcus Lee | Finance controller | Every refund and cancellation is approved and auditable |
+| Aiko Tanaka | Security and compliance | No PII leaks to logs, least privilege on tools, prompt injection handled |
+
+## Business goal
+
+Automate the five most common request types so that at least 60% of inbound operations emails are resolved without a human touching them, and the rest arrive in the queue already researched, with a proposed action and a one-click approval. Every action must be logged and explainable to Finance and to the client.
+
+## Functional requirements
+
+1. **Intake.** Read new emails from a mailbox fixture (JSON or `.eml` files) and new order events from a queue fixture. Extract intent, order ids and customer id. Ignore auto-replies and newsletters.
+2. **Tools.** Implement and expose these tools with typed schemas and the standard error contract (`code`, `message`, `retryable`, `hint`):
+   - `get_order(order_id)` and `list_orders(customer_id, status, cursor, limit)` (paginated)
+   - `get_carrier_rates(origin_zip, dest_zip, weight_kg)`
+   - `reschedule_delivery(order_id, new_date, idempotency_key)`
+   - `create_ticket(order_id, category, summary)`
+   - `issue_refund(order_id, amount_cents, reason, idempotency_key)`
+   - `cancel_order(order_id, reason, idempotency_key)`
+3. **Agent.** A LangGraph `StateGraph` with typed state, a tools node, conditional routing and a Postgres or SQLite checkpointer so runs survive restarts.
+4. **Human-in-the-loop.** `issue_refund` and `cancel_order` always pause with `interrupt()` and show the approver the proposed call, the order details and the agent's reasoning summary. The approver can approve, reject or edit the arguments (for example lower the refund amount). The run resumes with `Command(resume=...)`. Refunds over 500 USD also require a reason code.
+5. **Reply drafting.** For resolved requests, the agent drafts a customer reply grounded in tool results. In this capstone, replies are written to an outbox folder, not sent.
+6. **Step logging.** Every node execution and tool call emits one structured JSON log line: `run_id`, `thread_id`, `step`, `node`, `tool`, `args` (PII-masked), `result_code`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`. Traces go to LangSmith or Langfuse.
+7. **Guards.** Max steps per run, repeated-action detection, per-run cost cap and a per-client daily budget. Every stop sets `stop_reason` and opens a ticket for a human.
+8. **Trajectory eval suite.** At least 30 scenarios, run in CI, covering every intent, HITL approve/reject/edit, tool failures, missing data and prompt injection in email bodies.
+9. **Optional.** Serve the order and carrier tools from an MCP server, reusing your `mcp-servers-lab` work, and have the agent load them through an MCP client adapter.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Latency | Fully automated request: p95 under 25 s end to end. First tool call under 4 s. |
+| Approval prep | Risky request reaches the approval queue in under 30 s, p95. |
+| Cost | Under 25 USD per 1,000 requests at your configured model prices (state the prices you assumed and label them as examples). Per-run hard cap 0.20 USD. |
+| Accuracy | Final-state pass rate at least 95% on the eval suite. Trajectory match rate at least 85%. Zero forbidden tool calls (refund or cancel without approval). |
+| Reliability | Transient tool errors retried in code. A carrier outage degrades to "rates unavailable" plus ticket, never a crash. |
+| Auditability | Every refund and cancellation has an approver id, timestamp, original and edited arguments in an audit table. |
+| Security | PII (emails, phone numbers, addresses) masked in logs. Tools run with a least-privilege service account. Email bodies are treated as untrusted data. |
+
+## Out of scope
+
+- Sending real emails or integrating a real mailbox. Use fixtures.
+- Real carrier or OMS integrations. Use fake services with realistic data and latency.
+- A production approval UI. A CLI or a minimal FastAPI endpoint is enough.
+- Multi-language support. English only.
+- Deploying to AWS. That is module 5.
+
+## Deliverables
+
+1. Repo `logistics-ops-agent` with source, tests, eval suite and CI workflow.
+2. README with architecture diagram, tool catalog, guard limits, cost analysis and latest eval results.
+3. `docs/runbook.md`: what to do when guards trip, when a tool is down, how to replay a thread.
+4. A 3-minute demo GIF or video: one automated reschedule, one refund approved with edited amount, one prompt-injection email safely handled.
+5. An eval report (`evals/report.md`) generated by CI on main.
+
+## Acceptance criteria
+
+- Running `make demo` processes the 20 fixture emails, writes replies to `outbox/`, queues risky actions and prints a summary table.
+- Approving, rejecting and editing a queued refund each work from the CLI and are recorded in the audit table.
+- Restarting the process mid-approval and then approving resumes the same thread without repeating earlier tool calls.
+- Every run produces JSON log lines and a trace link. No raw email address or phone number appears in logs.
+- Guards are covered by tests with a fake looping model.
+- CI runs unit tests on every push and the trajectory suite on PRs, and blocks merge below the accuracy targets above.
+- The cost analysis shows measured tokens per request type and cost per 1,000 requests, with assumed prices labeled as examples.
+
+## Suggested architecture
+
+<Diagram caption="Harborline operations agent: intake, LangGraph agent with guards and HITL, tools, logging and evals" chart={`flowchart LR
+  subgraph Intake
+    M["Mailbox fixtures"] --> P["Parser and intent extractor"]
+    Q["Order events queue"] --> P
+  end
+  P --> G["LangGraph agent"]
+  subgraph Agent["LangGraph StateGraph"]
+    G --> R{"Guard router"}
+    R -->|tool calls| T["Tools node"]
+    R -->|risky tool| A["Approval node (interrupt)"]
+    R -->|limit hit| S["Stop node"]
+    R -->|done| D["Reply drafter"]
+    A -->|approved or edited| T
+    A -->|rejected| D
+    T --> G
+  end
+  T --> MCP["MCP server or local tools"]
+  MCP --> OMS["Fake OMS"]
+  MCP --> CR["Fake carrier rates"]
+  MCP --> TK["Fake ticketing"]
+  A --> UI["Approver CLI"]
+  G -.-> CP[("Checkpointer: Postgres")]
+  G -.-> LOG["JSON logs and traces"]
+  D --> OUT["Outbox"]
+  S --> TK
+  EV["Trajectory eval suite in CI"] -.-> G`} />
+
+Key design choices to justify in your README:
+
+- **One agent, not a multi-agent system.** Five intents and seven tools fit one well-prompted agent. Explain why a supervisor would add latency and cost without benefit here (lesson 10).
+- **Deterministic intake.** Parsing order ids with a regex and a small classifier is cheaper and more testable than letting the agent discover them.
+- **Approval as a graph node.** HITL lives in the graph, not in the tool, so the decision is checkpointed and auditable.
+- **Fake backends as first-class code.** The same fakes power unit tests, evals and the demo.
+
+## Evaluation rubric
+
+| Criterion | Weight | Excellent (5) | Acceptable (3) | Weak (1) |
+|---|---|---|---|---|
+| Tool design | 15% | Typed schemas, clear descriptions, idempotency keys on writes, actionable error contract, pagination | Schemas and errors present, some vague | Untyped tools, raw exceptions reach the model |
+| Graph and HITL | 20% | Checkpointed approvals with approve, reject and edit, survives restart, audit table | Approve and reject work, no edit or restart | Approval is a prompt instruction only |
+| Guards and cost | 15% | All guards tested, cost per request measured and under target, stop reasons in dashboards | Guards exist, partial tests | Only `recursion_limit` |
+| Observability | 15% | Structured logs per step, PII masked, trace links, runbook | Logs exist, inconsistent fields | Print statements |
+| Evals | 25% | 30+ scenarios, 3 runs each, trajectory, args, forbidden tools and final state, CI gate | 15+ scenarios, final-state checks, manual run | Output-only checks |
+| Communication | 10% | README explains trade-offs, cost model and results honestly | README covers setup and features | Minimal README |
+
+## Suggested timeline
+
+| Day | Focus | End-of-day checkpoint |
+|---|---|---|
+| 1 | Fake backends, tool schemas, error contract, intake parser, unit tests | All tools callable from pytest with fixtures |
+| 2 | LangGraph agent, tools node, checkpointer, reply drafting, structured logging | `make demo` resolves happy-path emails end to end |
+| 3 | HITL for refunds and cancellations (approve, reject, edit), audit table, restart test | Refund flow works across a process restart |
+| 4 | Guards, cost tracking, budgets, trajectory eval suite with 30+ scenarios | Eval report generated locally |
+| 5 | CI gate, cost analysis, runbook, README, demo recording, optional MCP server | All acceptance criteria green, repo public |
+
+## Definition of Done
+
+<Checklist id="m4-16-dod" title="Definition of Done" items={["All seven tools have typed schemas, descriptions and the standard error contract", "Write tools require idempotency keys and are safe to retry", "Refunds and cancellations always pause for approval; approve, reject and edit all work", "Approvals survive a process restart and are written to an audit table", "Every step emits a structured JSON log line with PII masked, plus a trace", "Max steps, repeated-action detection, per-run cost cap and per-client budget are tested", "Trajectory eval suite has at least 30 scenarios including prompt injection and tool failures", "CI blocks merges below 95% final-state pass rate, 85% trajectory match or any forbidden call", "Cost per 1,000 requests is measured and documented with prices labeled as examples", "README has architecture diagram, tool catalog, guard limits, eval results and trade-offs", "Runbook covers guard trips, tool outages and thread replay", "Demo GIF shows an automated request, an edited refund approval and an injection attempt"]} />
+
+## How to present this in an interview
+
+Use a 4-minute structure. Interviewers remember stories with numbers.
+
+**1. The problem (30 seconds).** "A 3PL with 22 ops agents, 9 minutes per email, a 3-day backlog in peak. The goal was to automate routine requests end to end and make risky ones one-click approvals."
+
+**2. The architecture (60 seconds).** Show the diagram. Say why it is one agent and not five: "Seven tools and five intents fit one agent. A supervisor would add a model call per request and another place to fail." Point to the approval node: "Refunds pause inside the graph with `interrupt()`. The state is checkpointed in Postgres, so an approval can come hours later, after a deploy, and the run resumes exactly where it stopped."
+
+**3. Safety and cost (60 seconds).** "I treated the agent like an untrusted service. Writes need idempotency keys. Refunds and cancellations cannot execute without a human. Guards stop loops on step count, repeated calls and cost. Every stop has a reason and opens a ticket." Give your measured numbers: cost per 1,000 requests, p95 latency, guard trip rate.
+
+**4. Evals, the SDET angle (60 seconds).** "Output-only checks miss the dangerous bugs, like the agent saying it opened a ticket when it didn't. My suite runs 30+ scenarios three times each against a fake backend and asserts on recorded writes. It checks trajectories with the loosest match mode that still catches the bug, and fails CI on any forbidden call." Mention one regression the suite caught during development.
+
+**5. Trade-offs and next steps (30 seconds).** What you would change for production: real mailbox integration, an approval UI, online evaluation on sampled traces, per-client prompt variants behind feature flags, deploy on ECS (module 5).
+
+Prepare for follow-ups:
+
+- "What happens if the approver edits the refund to an invalid amount?" (Validation in the tool, error contract, the agent explains and re-queues.)
+- "How do you stop a malicious email from triggering a refund?" (Untrusted input, refunds gated by humans, injection scenarios in evals, least-privilege tools.)
+- "How did you pick the step limit?" (p95 of successful traces plus headroom.)
+- "Why not just a workflow?" (Intake and approvals are workflow-like and deterministic; only the research and resolution step is agentic. Show where you drew the line.)

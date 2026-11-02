@@ -1,0 +1,170 @@
+## Goal
+
+Build a production-shaped MCP server for a fictional logistics company, **Northstar Freight**. It exposes order and inventory data to any MCP client: Claude Desktop, the MCP Inspector, or the LangGraph agent you will build in exercise 08.
+
+You will ship:
+
+- **3 tools**: `get_order` (read), `check_stock` (read), `reschedule_delivery` (write, idempotent).
+- **1 resource**: `inventory://warehouses`, the list of warehouses with cut-off times.
+- A **structured error contract** on every tool (lesson 03).
+- **pytest** tests that go through a real MCP client session, not just direct function calls.
+- Notes and a screenshot from a manual session in the **MCP Inspector**.
+
+This lives in the `mcp-servers-lab` repo, folder `orders_server/`. Time box: 90 minutes.
+
+Data can be in memory or SQLite. Keep the store behind a small class so tests can reset it between runs, the same way you isolate fixtures in Playwright.
+
+<AcceptanceCriteria>
+
+- [ ] `uv run python -m orders_server` (or `python -m orders_server`) starts the server over stdio; `--http` starts it with `transport="streamable-http"` on `127.0.0.1:8000`.
+- [ ] `get_order(order_id)` validates the id format `ORD-` followed by 6 digits and returns `order_id`, `status`, `carrier`, `promised_date`, `warehouse_id`.
+- [ ] `check_stock(sku, warehouse_id)` returns `available` and `reserved` quantities; `warehouse_id` is optional and, when omitted, returns totals per warehouse.
+- [ ] `reschedule_delivery(order_id, new_date, idempotency_key)` rejects delivered or cancelled orders, rejects weekends and dates more than 14 days ahead, and returns the stored result on a repeated `idempotency_key` with `"replayed": true`.
+- [ ] Every business error uses the shape `{"error": {"code", "message", "retryable", "hint"}}` with at least these codes: `INVALID_ORDER_ID`, `ORDER_NOT_FOUND`, `ALREADY_DELIVERED`, `INVALID_DATE`, `UNKNOWN_SKU`.
+- [ ] Resource `inventory://warehouses` returns JSON with at least 3 warehouses (`id`, `city`, `cutoff_local`).
+- [ ] Tool docstrings state what the tool does, when to use it, what it returns and whether it changes state.
+- [ ] Nothing is printed to stdout; logs go to stderr or `ctx.info`.
+- [ ] `pytest` passes with at least 8 tests, including one that lists tools through a client session and one that proves idempotent replay.
+- [ ] README includes an Inspector screenshot and the exact command to reproduce it.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# orders_server/server.py
+import json
+import logging
+import re
+import sys
+from datetime import date, timedelta
+from mcp.server.fastmcp import FastMCP, Context
+
+from .store import Store
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+log = logging.getLogger("orders_server")
+
+mcp = FastMCP("northstar-orders")
+store = Store.seeded()
+ORDER_ID = re.compile(r"^ORD-[0-9]{6}$")
+
+
+def tool_error(code: str, message: str, *, retryable: bool, hint: str) -> dict:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+
+
+@mcp.tool()
+async def get_order(order_id: str) -> dict:
+    """Look up ONE order by id (format ORD-123456). Read-only.
+    Returns order_id, status, carrier, promised_date and warehouse_id.
+    Call this before reschedule_delivery."""
+    # TODO: validate format -> INVALID_ORDER_ID, look up -> ORDER_NOT_FOUND
+    raise NotImplementedError
+
+
+@mcp.tool()
+async def check_stock(sku: str, warehouse_id: str | None = None) -> dict:
+    """Check available and reserved stock for a SKU. Read-only.
+    Omit warehouse_id to get one entry per warehouse."""
+    # TODO
+    raise NotImplementedError
+
+
+@mcp.tool()
+async def reschedule_delivery(order_id: str, new_date: date, idempotency_key: str, ctx: Context) -> dict:
+    """Move delivery of ONE undelivered order to a new business day within 14 days.
+    CHANGES STATE. Safe to retry with the same idempotency_key."""
+    # TODO: replay check first, then business rules, then write + store response
+    raise NotImplementedError
+
+
+@mcp.resource("inventory://warehouses")
+def warehouses() -> str:
+    """All warehouses with city and daily cut-off time (local)."""
+    return json.dumps(store.warehouses())
+```
+
+```python
+# tests/test_server.py
+import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
+from orders_server import server
+
+
+@pytest.fixture(autouse=True)
+def fresh_store(monkeypatch):
+    monkeypatch.setattr(server, "store", server.Store.seeded())
+
+
+@pytest.mark.anyio
+async def test_lists_three_tools():
+    async with create_connected_server_and_client_session(server.mcp._mcp_server) as client:
+        tools = await client.list_tools()
+        assert {t.name for t in tools.tools} == {"get_order", "check_stock", "reschedule_delivery"}
+
+
+@pytest.mark.anyio
+async def test_unknown_order_returns_contract():
+    result = await server.get_order("ORD-000000")
+    assert result["error"]["code"] == "ORDER_NOT_FOUND"
+    assert result["error"]["retryable"] is False
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Start with the `Store` class: dictionaries for orders, stock and an `idempotency` map from key to response. Give it a `seeded()` classmethod with 5 orders in different statuses (pending, in_transit, delayed, delivered, cancelled). Tests become trivial once the data is predictable.</Hint>
+
+<Hint>In `reschedule_delivery`, check the idempotency map **before** any validation. A replay of a successful call must succeed even if the order status changed since (for example, it is now "rescheduled"). Only store successful responses, not errors.</Hint>
+
+<Hint>Weekend and window checks: `new_date.weekday() >= 5` is a weekend; compare against `date.today() + timedelta(days=14)`. Inject "today" through the store (`store.today`) so tests do not break on Fridays. That is the agent-world version of freezing time in a flaky E2E test.</Hint>
+
+<Hint>`create_connected_server_and_client_session` takes the low-level server, which FastMCP exposes as `mcp._mcp_server`. `call_tool` returns a `CallToolResult`; the JSON is in `result.content[0].text` (and in `result.structuredContent` on recent SDK versions). Add `anyio` to dev dependencies and use `@pytest.mark.anyio`. To test the resource, call `client.read_resource("inventory://warehouses")`.</Hint>
+
+</Hints>
+
+<CommitBox repo="mcp-servers-lab">
+
+Folder structure:
+
+```text
+mcp-servers-lab/
+  README.md
+  pyproject.toml
+  orders_server/
+    __init__.py
+    __main__.py        # argparse: --http flag, calls mcp.run(...)
+    server.py          # FastMCP tools + resource
+    store.py           # in-memory store, seeded data, idempotency map
+  tests/
+    conftest.py
+    test_tools.py      # direct calls: happy paths + every error code
+    test_session.py    # in-memory client session: list_tools, call_tool, read_resource
+  docs/
+    inspector.png
+  .github/workflows/ci.yml   # ruff + pytest
+```
+
+README outline:
+
+1. What this server does (one paragraph, the Northstar Freight scenario).
+2. Tools, resource and error codes (table).
+3. Run it: stdio, streamable HTTP, MCP Inspector command, Claude Desktop config snippet.
+4. Design decisions: idempotency strategy, why warehouses are a resource and not a tool, error contract.
+5. Tests and CI.
+6. Security notes: read-only vs write tools, binding to localhost.
+
+Suggested commits:
+
+- `feat(orders): seeded in-memory store with orders, stock, warehouses`
+- `feat(orders): get_order and check_stock tools with error contract`
+- `feat(orders): idempotent reschedule_delivery with business rules`
+- `feat(orders): inventory://warehouses resource and HTTP transport flag`
+- `test(orders): session-level tests for tools and resource`
+- `docs: README with Inspector screenshot and design decisions`
+
+</CommitBox>
+
+<Checklist id="m4-05-review" title="Self-review" items={["Every tool docstring says what, when, returns and side effects", "All business errors use the same code/message/retryable/hint shape", "Repeated idempotency_key returns the stored response with replayed=true", "No print() calls; logging goes to stderr or ctx", "Tests reset the store and freeze 'today'", "At least one test goes through a real client session", "Inspector screenshot and reproduce command are in the README", "HTTP transport binds to 127.0.0.1, not 0.0.0.0"]} />

@@ -1,0 +1,44 @@
+{
+  "id": "m6",
+  "order": 6,
+  "days": 3,
+  "hours": 18,
+  "title": { "en": "Data & platform skills", "es": "Habilidades de datos y plataforma" },
+  "summary": {
+    "en": "SQL and data pipelines for LLM logs and eval datasets, Databricks essentials for GenAI (Unity Catalog, Delta, Vector Search, Model Serving, MLflow evaluation, Mosaic AI Agent Framework) aligned with the Generative AI Engineer Associate exam, plus when to fine-tune and when to self-host with vLLM.",
+    "es": "SQL y pipelines de datos para logs de LLM y datasets de evaluación, fundamentos de Databricks para GenAI (Unity Catalog, Delta, Vector Search, Model Serving, evaluación con MLflow, Mosaic AI Agent Framework) alineados con el examen Generative AI Engineer Associate, y cuándo hacer fine-tuning y cuándo autoalojar con vLLM."
+  },
+  "lessons": [
+    { "slug": "01-sql-for-ai-engineers", "type": "concept", "minutes": 50, "title": { "en": "SQL for AI engineers: window functions, CTEs, JSONB and LLM logs", "es": "SQL para AI engineers: window functions, CTEs, JSONB y logs de LLM" } },
+    { "slug": "02-data-pipelines-eval-datasets", "type": "concept", "minutes": 45, "title": { "en": "Data pipelines for ingestion and eval datasets", "es": "Pipelines de datos para ingesta y datasets de evaluación" } },
+    { "slug": "03-unity-catalog-delta", "type": "concept", "minutes": 45, "title": { "en": "Databricks foundations: Unity Catalog, Volumes and Delta tables", "es": "Fundamentos de Databricks: Unity Catalog, Volumes y tablas Delta" } },
+    { "slug": "04-vector-search", "type": "concept", "minutes": 45, "title": { "en": "Mosaic AI Vector Search: endpoints and Delta Sync indexes", "es": "Mosaic AI Vector Search: endpoints e índices Delta Sync" } },
+    { "slug": "05-model-serving", "type": "concept", "minutes": 45, "title": { "en": "Model Serving: Foundation Model APIs, provisioned throughput and external models", "es": "Model Serving: Foundation Model APIs, provisioned throughput y modelos externos" } },
+    { "slug": "06-mlflow-genai-evaluation", "type": "concept", "minutes": 50, "title": { "en": "MLflow for LLM evaluation: tracing, scorers and LLM judges", "es": "MLflow para evaluar LLMs: tracing, scorers y jueces LLM" } },
+    { "slug": "07-agent-framework", "type": "concept", "minutes": 50, "title": { "en": "Mosaic AI Agent Framework: author, log, review and deploy agents", "es": "Mosaic AI Agent Framework: crear, registrar, revisar y desplegar agentes" } },
+    { "slug": "08-fine-tuning-self-hosting", "type": "concept", "minutes": 50, "title": { "en": "Fine-tuning (and when not to), LoRA/QLoRA and self-hosting with vLLM", "es": "Fine-tuning (y cuándo no hacerlo), LoRA/QLoRA y autoalojamiento con vLLM" } },
+    { "slug": "09-ex-sql-llm-logs", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: analyze LLM request logs with SQL and build an eval dataset", "es": "Ejercicio: analiza logs de requests de LLM con SQL y crea un dataset de evaluación" } },
+    { "slug": "10-ex-vector-search-index", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: build a Vector Search index over a Delta table", "es": "Ejercicio: crea un índice de Vector Search sobre una tabla Delta" } },
+    { "slug": "11-ex-mlflow-rag-eval", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: evaluate a RAG chain with MLflow", "es": "Ejercicio: evalúa una cadena RAG con MLflow" } },
+    { "slug": "12-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 6 exam", "es": "Examen del módulo 6" } },
+    { "slug": "13-capstone-doc-intelligence", "type": "project", "minutes": 1200, "title": { "en": "Capstone: document intelligence pipeline on Databricks", "es": "Capstone: pipeline de inteligencia documental en Databricks" } }
+  ],
+  "repos": [
+    {
+      "id": "m6-databricks-lab",
+      "name": "databricks-genai-lab",
+      "description": {
+        "en": "Certification-style labs: SQL analysis of LLM logs and eval dataset builder, Vector Search index over Delta (with a local Chroma/pgvector fallback), and MLflow evaluation of a RAG chain.",
+        "es": "Laboratorios estilo certificación: análisis SQL de logs de LLM y generador de datasets de evaluación, índice de Vector Search sobre Delta (con alternativa local en Chroma/pgvector) y evaluación de una cadena RAG con MLflow."
+      }
+    },
+    {
+      "id": "m6-doc-intel",
+      "name": "doc-intelligence-pipeline",
+      "description": {
+        "en": "Document intelligence pipeline for an insurance claims client: PDFs to Volumes, parsed chunks in Delta, Vector Search, extraction + Q&A chain, MLflow evaluation and a served endpoint.",
+        "es": "Pipeline de inteligencia documental para un cliente de reclamos de seguros: PDFs en Volumes, chunks parseados en Delta, Vector Search, cadena de extracción + Q&A, evaluación con MLflow y un endpoint servido."
+      }
+    }
+  ]
+}

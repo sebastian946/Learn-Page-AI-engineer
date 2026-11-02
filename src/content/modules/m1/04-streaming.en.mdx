@@ -1,0 +1,154 @@
+## Why stream
+
+Output tokens are generated one at a time. A 600-token answer can take many seconds to complete. Without streaming, the user stares at a spinner for the full duration. With streaming, the first words appear after the **time to first token (TTFT)**, often well under a second, and the rest flows in.
+
+Streaming also matters for the backend:
+
+- **Long generations** avoid HTTP timeouts on idle connections. SDKs recommend or require streaming for large `max_tokens`.
+- **Cancellation**: if the user closes the tab, you can stop generation and stop paying for tokens nobody will read.
+- **Progressive processing**: start rendering, routing or tool preparation before the full response arrives.
+
+The cost is complexity. You now handle a sequence of events, partial data, errors that arrive after a `200 OK`, and slow consumers.
+
+## Server-Sent Events in one minute
+
+Both Anthropic and OpenAI stream over **SSE**: a long-lived HTTP response with `Content-Type: text/event-stream`. The body is a series of text frames separated by blank lines:
+
+```text
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Your order"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" shipped"}}
+```
+
+SSE is one-way (server to client), runs over plain HTTP, and reconnects easily. That's why it is the default for LLM APIs and for your own LLM endpoints (module 5).
+
+## Anthropic's event sequence
+
+```text
+message_start          -> message id, model, usage.input_tokens
+content_block_start    -> index 0, type text | tool_use | thinking
+content_block_delta    -> text_delta (text) or input_json_delta (partial_json)
+content_block_stop     -> block index done
+... more blocks ...
+message_delta          -> stop_reason, usage.output_tokens (cumulative)
+message_stop           -> done
+(ping events may appear anywhere; an error event can arrive mid-stream)
+```
+
+OpenAI Chat Completions streams **chunks** instead: each has `choices[0].delta` with `content` or partial `tool_calls`, and a `finish_reason` on the last one. Usage only arrives if you set `stream_options={"include_usage": True}`, in a final chunk with empty `choices`.
+
+## Streaming text with the SDK
+
+The SDK's `messages.stream` helper accumulates state for you and still exposes raw events:
+
+```python
+import asyncio
+from collections.abc import AsyncIterator
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+async def stream_answer(prompt: str, idle_timeout: float = 20.0) -> AsyncIterator[str]:
+    async with client.messages.stream(
+        model="claude-sonnet-5-5",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        it = stream.text_stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=idle_timeout)
+            except StopAsyncIteration:
+                break
+            yield chunk
+        final = await stream.get_final_message()
+        log_usage(final.model, final.usage, final.stop_reason)
+
+def log_usage(model, usage, stop_reason) -> None:
+    print(f"\n[{model}] in={usage.input_tokens} out={usage.output_tokens} stop={stop_reason}")
+```
+
+Two timeouts matter in streaming, and neither is the plain request timeout:
+
+- **TTFT timeout**: how long you wait for the first token before giving up or failing over.
+- **Idle (inter-chunk) timeout**: maximum silence between chunks. A stream that stalls for 20 seconds mid-answer is broken, even if the connection is open.
+
+The `wait_for` above implements the idle timeout. Leaving the `async with` block (normally, by exception or by cancellation) closes the HTTP connection, which stops generation.
+
+## Streaming tool calls and partial JSON
+
+When the model calls a tool while streaming, the input arrives as `input_json_delta` events, each with a `partial_json` string fragment. Fragments are **not** valid JSON on their own:
+
+```text
+{"order_   id": "A-1   0023"}
+```
+
+Rules:
+
+1. Concatenate fragments per content block `index`.
+2. Parse only after `content_block_stop` for that block, then validate with Pydantic.
+3. If you need progressive UI (e.g. show fields as they fill in), use a tolerant parser, and treat the result as a **preview**, never as validated data.
+
+```python
+from pydantic_core import from_json
+
+buffers: dict[int, str] = {}
+
+def on_event(event) -> None:
+    if event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+        buffers[event.index] = buffers.get(event.index, "") + event.delta.partial_json
+        preview = from_json(buffers[event.index], allow_partial=True)  # best-effort dict
+        render_preview(preview)
+    elif event.type == "content_block_stop" and event.index in buffers:
+        args = GetOrderInput.model_validate_json(buffers.pop(event.index))
+        schedule_tool(args)
+```
+
+Also check `stop_reason` at the end: a `max_tokens` stop during a tool call means the JSON is truncated. Do not execute it.
+
+## Backpressure
+
+Backpressure is what happens when the producer (the LLM) is faster than the consumer (a slow mobile client, a database writer, a TTS engine). Three patterns:
+
+- **Pull-based async generators** (as above) give natural backpressure: the next chunk is not read from the socket until the consumer asks for it. The TCP window fills and the provider's side slows down or buffers.
+- **Bounded queues** between producer and consumer tasks: `asyncio.Queue(maxsize=100)`. `await queue.put(...)` blocks when full. An unbounded queue is a memory leak waiting for a slow client.
+- **Coalescing**: for UIs, batch tiny deltas into frames every 30–50 ms. You send fewer SSE messages without hurting perceived speed.
+
+And always propagate **cancellation**: if your client disconnects, cancel the task that reads from the provider. In FastAPI/Starlette, a disconnected client raises `asyncio.CancelledError` in the generator; let it propagate so the `async with` closes the upstream stream.
+
+## Errors mid-stream
+
+A stream can start with `200 OK` and fail later: an `error` event (for example `overloaded_error`), a dropped connection, or your idle timeout. Retrying is only safe **before** you have forwarded anything to the user. After that, you either restart the whole answer with a visible "retrying" state, or you return a partial answer clearly marked as incomplete. Decide this policy up front and test it with a fake provider that fails after N chunks.
+
+## Common mistakes
+
+- Using only a total request timeout. Streams need TTFT and idle timeouts.
+- Parsing `partial_json` fragments as they arrive and acting on them.
+- Forgetting `stream_options={"include_usage": True}` on OpenAI, so cost logging silently records zero.
+- Retrying after tokens already reached the user, producing duplicated text.
+- Swallowing `CancelledError`, which keeps generating (and billing) after the client left.
+- Unbounded buffering between a fast stream and a slow consumer.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you stream an LLM response to a browser and still log accurate cost?" level="mid">
+
+The backend consumes the provider stream with the SDK helper and re-emits text deltas to the browser over SSE, coalescing small deltas. Usage comes from the stream itself: input tokens in `message_start` and cumulative output tokens in `message_delta` for Anthropic, or the final usage chunk for OpenAI when `include_usage` is set. After the stream ends I take the final message, compute cost from the usage and the model's price table, and log it with the request id. If the client disconnects I cancel the upstream stream and log the partial usage, since those tokens are billed too.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A streamed answer sometimes freezes halfway for 30+ seconds. What do you do?" level="senior">
+
+First, measure: log TTFT, inter-chunk gaps and where stalls happen, per provider and model. Add an idle timeout between chunks so a stalled stream fails fast instead of hanging. Decide the recovery policy: if nothing was forwarded yet, retry or fail over to another model; if partial text was shown, either restart with a visible retry state or end with a clear incomplete marker. Check for backpressure in my own pipeline (an unbounded queue or a slow consumer blocking the reader) and for proxies buffering SSE (disable buffering, send keepalive comments). Then put stall rate and p95 inter-chunk gap on a dashboard with alerts.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Anthropic, streaming messages: https://docs.anthropic.com/en/docs/build-with-claude/streaming
+- OpenAI, streaming API responses: https://platform.openai.com/docs/guides/streaming-responses
+- MDN, Server-sent events: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+- Python docs, asyncio queues: https://docs.python.org/3/library/asyncio-queue.html
+- Pydantic core, partial JSON parsing: https://docs.pydantic.dev/latest/concepts/json/

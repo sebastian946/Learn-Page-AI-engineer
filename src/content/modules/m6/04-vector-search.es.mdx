@@ -1,0 +1,170 @@
+# Mosaic AI Vector Search: endpoints e índices Delta Sync
+
+En el Módulo 2 operaste pgvector tú mismo: calculaste embeddings, los escribiste en una tabla, construiste un índice HNSW y lo mantuviste sincronizado con tus documentos. Mosaic AI Vector Search es la versión administrada de ese trabajo en Databricks. Su idea principal: **el índice se deriva de una tabla Delta y se mantiene sincronizado automáticamente**, y está gobernado por Unity Catalog como todo lo demás.
+
+<Callout type="warning" title="Revisa la documentación actual">
+
+El cliente Python de Vector Search y sus parámetros han cambiado entre versiones (por ejemplo, los tipos de endpoint y las opciones de búsqueda híbrida). Los patrones de abajo siguen la API documentada al momento de escribir esto. Verifica nombres y argumentos en docs.databricks.com antes de ejecutarlos.
+
+</Callout>
+
+## Dos objetos: endpoints e índices
+
+- Un **endpoint de Vector Search** es el cómputo que aloja y sirve los índices. Lo creas una vez y pones varios índices en él. Cuesta dinero mientras exista, lo consultes o no.
+- Un **índice de Vector Search** es la estructura consultable. Es un objeto de Unity Catalog (`catalog.schema.index_name`) con sus propios permisos.
+
+Piensa en "servidor de base de datos" vs "tabla". Un endpoint, muchos índices.
+
+## Tipos de índice
+
+| | Delta Sync Index | Direct Vector Access Index |
+|---|---|---|
+| Fuente de verdad | Una tabla Delta | Tu aplicación |
+| Cómo entran los datos | Sincronización automática desde la tabla | Haces upsert/delete de vectores vía API |
+| Embeddings | Administrados (Databricks los calcula) o propios (columna de vectores) | Siempre propios |
+| Uso típico | RAG sobre documentos que ya están en Delta | Escrituras en tiempo real desde una app, datos fuera de Delta |
+
+**Delta Sync con embeddings administrados** es la respuesta por defecto para "RAG sobre documentos en el lakehouse". Apuntas a una columna de texto y a un endpoint de serving de un modelo de embeddings; Databricks genera los embeddings de las filas nuevas y modificadas por ti.
+
+**Los embeddings propios (self-managed)** tienen sentido cuando ya calculas vectores en el pipeline (un modelo de embeddings personalizado o con fine-tuning, o embeddings multimodales). Indicas la columna de vectores y su dimensión.
+
+**Direct Vector Access** es lo más parecido a operar pgvector tú mismo: tú te encargas de la sincronización y los borrados.
+
+### Requisitos de un índice Delta Sync
+
+- La tabla fuente debe tener **Change Data Feed activado** (`delta.enableChangeDataFeed = true`).
+- El índice necesita una columna de **primary key**, única por fila (tu `chunk_id` determinista).
+- Para embeddings administrados debe existir un **endpoint de modelo de embeddings** (por ejemplo un endpoint de embeddings de Foundation Model API como `databricks-gte-large-en`; los nombres varían por región, revisa tu workspace).
+
+### Modos de sincronización
+
+- **TRIGGERED**: el índice se actualiza cuando llamas a `sync()` (o lo hace un job). Más barato y predecible. Bueno cuando los documentos cambian por lotes.
+- **CONTINUOUS**: el índice sigue a la tabla con una latencia de segundos a minutos. Mantiene un pipeline de streaming corriendo, así que cuesta más. Úsalo cuando la frescura sea un requisito de negocio.
+
+Al examen le gusta este trade-off. "Las políticas se actualizan una vez por semana" significa TRIGGERED. "Los artículos de soporte deben poder buscarse un minuto después de publicarse" significa CONTINUOUS.
+
+## Crear un endpoint y un índice
+
+```python
+from databricks.vector_search.client import VectorSearchClient
+
+vsc = VectorSearchClient()  # uses notebook auth or DATABRICKS_HOST / token env vars
+
+ENDPOINT = "claims-vs-endpoint"
+SOURCE = "main.claims.chunks"
+INDEX = "main.claims.chunks_index"
+
+if ENDPOINT not in [e["name"] for e in vsc.list_endpoints().get("endpoints", [])]:
+    vsc.create_endpoint(name=ENDPOINT, endpoint_type="STANDARD")
+
+index = vsc.create_delta_sync_index(
+    endpoint_name=ENDPOINT,
+    source_table_name=SOURCE,
+    index_name=INDEX,
+    pipeline_type="TRIGGERED",
+    primary_key="chunk_id",
+    embedding_source_column="content",
+    embedding_model_endpoint_name="databricks-gte-large-en",
+)
+```
+
+Para embeddings propios, reemplaza los dos últimos argumentos por `embedding_vector_column="embedding"` y `embedding_dimension=1024` (según tu modelo).
+
+Después, cuando el pipeline agrega chunks nuevos:
+
+```python
+index = vsc.get_index(endpoint_name=ENDPOINT, index_name=INDEX)
+index.sync()  # TRIGGERED mode: pick up changes from the Change Data Feed
+```
+
+## Consultar
+
+```python
+results = index.similarity_search(
+    query_text="Is water damage from a burst pipe covered under the HO-3 policy?",
+    columns=["chunk_id", "doc_id", "page", "content", "doc_type"],
+    num_results=5,
+    filters={"doc_type": "policy"},
+    query_type="HYBRID",
+)
+for row in results["result"]["data_array"]:
+    print(row)
+```
+
+Notas:
+
+- `columns` decide qué se devuelve. Devuelve columnas de lineage (`doc_id`, `page`) para poder citar.
+- `filters` aplica filtrado por metadata. Úsalo para tipo de documento, tenant o etiquetas de acceso. La sintaxis de filtros soporta operadores en endpoints estándar; revisa la documentación para la gramática exacta.
+- `query_type="HYBRID"` combina búsqueda por palabras clave y vectorial, como la fusión BM25 + vector que construiste en el Módulo 2. Por defecto solo usa vecinos más cercanos aproximados (ANN).
+- Con embeddings administrados pasas `query_text` y Databricks lo convierte con el mismo modelo. Con embeddings propios pasas `query_vector` calculado por tu modelo, y **debe** ser el mismo modelo usado para los documentos.
+
+## Usarlo desde LangChain
+
+El paquete `databricks-langchain` envuelve el índice como un vector store, así tus cadenas del Módulo 2 siguen funcionando:
+
+```python
+from databricks_langchain import DatabricksVectorSearch
+
+store = DatabricksVectorSearch(
+    index_name="main.claims.chunks_index",
+    columns=["chunk_id", "doc_id", "page"],
+)
+retriever = store.as_retriever(search_kwargs={"k": 5, "filter": {"doc_type": "policy"}})
+docs = retriever.invoke("What is the deductible for wind damage?")
+```
+
+En un agente declaras este índice como un **resource** al registrar el modelo (lección 7), así el endpoint desplegado obtiene credenciales para consultarlo automáticamente.
+
+## Decisiones de diseño que evalúa el examen
+
+**Tamaño de chunk vs contexto del modelo de embeddings.** Todo modelo de embeddings tiene una longitud máxima de entrada. El texto que la supera se trunca en silencio, así que el final de un chunk grande nunca se convierte en embedding. Revisa el límite del modelo y mantén los chunks bastante por debajo. Los chunks pequeños dan un retrieval preciso pero pierden contexto; los grandes llevan contexto pero diluyen la similitud. Mide con recall@k sobre consultas etiquetadas, como hiciste en el Módulo 2.
+
+**Elegir el modelo de embeddings.** Elige uno entrenado en tu idioma y dominio. Cambiar de modelo significa volver a generar todos los embeddings; planea un índice nuevo, no un reemplazo en el lugar.
+
+**Metadata para filtrar.** Agrega a la tabla fuente las columnas por las que vas a filtrar (tipo de documento, fecha de vigencia, tenant, grupo de acceso) antes de crear el índice. Agregarlas después implica re-sincronizar.
+
+**Control de acceso.** Los usuarios del índice necesitan `SELECT` sobre el objeto índice. Para restricciones por fila (documentos por equipo), filtra por una columna de acceso usando la identidad de quien llama: el índice no aplica por ti los filtros de fila de la tabla fuente, así que diséñalo.
+
+## Equivalencias con el stack local
+
+| Databricks | Equivalente local |
+|---|---|
+| Tabla Delta con CDF | Tabla de Postgres o archivo Parquet |
+| Índice Delta Sync (embeddings administrados) | Tu job de ingesta genera embeddings y hace upsert en pgvector o Chroma |
+| `index.sync()` | Volver a ejecutar el job idempotente de upsert |
+| `filters={...}` | Cláusula `WHERE` (pgvector) o `where=` (Chroma) |
+| `query_type="HYBRID"` | BM25 + vector con reciprocal rank fusion |
+| Permisos de UC sobre el índice | Roles de la base de datos |
+
+El ejercicio de la lección 10 usa estas equivalencias para que lo completes con o sin workspace.
+
+## Errores comunes
+
+- **Dejar endpoints encendidos** después de experimentar. Facturan de forma continua. Borra lo que no uses.
+- **Sin CDF o sin primary key** en la tabla fuente.
+- **Modelos de embeddings distintos** para indexar y consultar (caso de embeddings propios).
+- **Chunks más largos que el límite de entrada del modelo de embeddings**, así el contenido se trunca.
+- **Sincronización CONTINUOUS por defecto** cuando los datos cambian cada semana.
+- **No devolver columnas de lineage** y luego no poder citar fuentes.
+- **Asumir que los filtros son seguridad.** Los filtros son tan seguros como el código que los construye; derívalos de la identidad autenticada, nunca de la entrada del usuario.
+
+## Cómo aparece esto en entrevistas y en el examen
+
+<InterviewQuestion question="Un equipo guarda manuales de producto como chunks en una tabla Delta que se actualiza cada noche. Quieren una capa de retrieval de bajo mantenimiento. ¿Qué configuración de Vector Search recomiendas?" level="mid">
+
+Un índice Delta Sync con embeddings administrados en un endpoint estándar, en modo TRIGGERED. Activa Change Data Feed en la tabla de chunks y usa un `chunk_id` determinista como primary key. El job nocturno de ingesta llama a `index.sync()` después de escribir, así solo se recalculan los embeddings de las filas modificadas. Los embeddings administrados eliminan la necesidad de operar un job de embeddings, y el índice es un objeto de UC, así que el acceso se otorga como en cualquier tabla. CONTINUOUS costaría más sin beneficio para actualizaciones nocturnas; Direct Vector Access agregaría código de sincronización que el equipo no necesita.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuándo elegirías embeddings propios o un índice Direct Vector Access?" level="senior">
+
+Embeddings propios cuando el modelo de embeddings no está disponible como endpoint de serving, cuando usas un modelo con fine-tuning o multimodal, o cuando los embeddings ya se calculan antes en el pipeline y se reutilizan en otro lado. Sigues teniendo sincronización automática desde Delta. Direct Vector Access cuando la fuente de verdad no es una tabla Delta, por ejemplo una aplicación que escribe vectores en tiempo real, y aceptas encargarte tú de upserts, borrados y consistencia. En ambos casos la consulta debe usar exactamente el mismo modelo que los documentos.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Mosaic AI Vector Search: https://docs.databricks.com/en/generative-ai/vector-search.html
+- Crear y consultar un índice de vector search: https://docs.databricks.com/en/generative-ai/create-query-vector-search.html
+- Integración de Databricks con LangChain: https://docs.databricks.com/en/generative-ai/agent-framework/langchain-uc-integration.html
+- pgvector (equivalente local): https://github.com/pgvector/pgvector

@@ -1,0 +1,37 @@
+{
+  "id": "m2",
+  "order": 2,
+  "days": 6,
+  "hours": 36,
+  "title": { "en": "RAG from scratch to production", "es": "RAG desde cero hasta producción" },
+  "summary": {
+    "en": "Ingestion, chunking, embeddings, pgvector, hybrid search, re-ranking, citations, evaluation and caching. Build with LangChain, then rebuild the core without a framework.",
+    "es": "Ingesta, chunking, embeddings, pgvector, búsqueda híbrida, re-ranking, citas, evaluación y caché. Construye con LangChain y luego reconstruye el núcleo sin framework."
+  },
+  "lessons": [
+    { "slug": "01-rag-architecture", "type": "concept", "minutes": 45, "title": { "en": "RAG architecture and your first pipeline with LangChain", "es": "Arquitectura RAG y tu primer pipeline con LangChain" } },
+    { "slug": "02-ingestion-cleaning", "type": "concept", "minutes": 40, "title": { "en": "Ingestion and cleaning: PDFs, HTML and policies", "es": "Ingesta y limpieza: PDFs, HTML y políticas" } },
+    { "slug": "03-ex-ingestion", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: build a document ingestion pipeline", "es": "Ejercicio: construye un pipeline de ingesta de documentos" } },
+    { "slug": "04-chunking-strategies", "type": "concept", "minutes": 45, "title": { "en": "Chunking strategies: fixed, recursive, semantic, document-aware", "es": "Estrategias de chunking: fijo, recursivo, semántico y consciente del documento" } },
+    { "slug": "05-ex-chunking", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: compare chunking strategies with retrieval metrics", "es": "Ejercicio: compara estrategias de chunking con métricas de retrieval" } },
+    { "slug": "06-embeddings", "type": "concept", "minutes": 40, "title": { "en": "Embeddings: choosing models, dimensions and cost", "es": "Embeddings: elegir modelos, dimensiones y costo" } },
+    { "slug": "07-vector-stores", "type": "concept", "minutes": 50, "title": { "en": "Vector stores: pgvector first, then Chroma and Qdrant", "es": "Vector stores: primero pgvector, luego Chroma y Qdrant" } },
+    { "slug": "08-ex-pgvector", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: index and query documents in pgvector", "es": "Ejercicio: indexa y consulta documentos en pgvector" } },
+    { "slug": "09-hybrid-search", "type": "concept", "minutes": 45, "title": { "en": "Hybrid search (BM25 + vector) and metadata filtering", "es": "Búsqueda híbrida (BM25 + vector) y filtrado por metadata" } },
+    { "slug": "10-ex-hybrid-search", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: hybrid retrieval with reciprocal rank fusion", "es": "Ejercicio: retrieval híbrido con reciprocal rank fusion" } },
+    { "slug": "11-reranking-query-rewriting", "type": "concept", "minutes": 45, "title": { "en": "Re-ranking and query rewriting", "es": "Re-ranking y reescritura de consultas" } },
+    { "slug": "12-ex-reranking", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: add a cross-encoder re-ranker and query rewriting", "es": "Ejercicio: agrega un re-ranker cross-encoder y reescritura de consultas" } },
+    { "slug": "13-citations-failure-modes", "type": "concept", "minutes": 45, "title": { "en": "Citations, grounding and RAG failure modes", "es": "Citas, grounding y modos de falla de RAG" } },
+    { "slug": "14-rag-evaluation", "type": "concept", "minutes": 50, "title": { "en": "RAG evaluation: faithfulness, relevance, context precision and recall", "es": "Evaluación de RAG: faithfulness, relevancia, precisión y recall de contexto" } },
+    { "slug": "15-ex-rag-eval", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: build a golden dataset and evaluate with Ragas", "es": "Ejercicio: crea un golden dataset y evalúa con Ragas" } },
+    { "slug": "16-caching-cost", "type": "concept", "minutes": 35, "title": { "en": "Caching and cost control for RAG", "es": "Caché y control de costos en RAG" } },
+    { "slug": "17-rag-without-framework", "type": "concept", "minutes": 45, "title": { "en": "Rebuilding the RAG core without a framework", "es": "Reconstruyendo el núcleo de RAG sin framework" } },
+    { "slug": "18-ex-rag-from-scratch", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: framework-free RAG in under 300 lines", "es": "Ejercicio: RAG sin framework en menos de 300 líneas" } },
+    { "slug": "19-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 2 exam", "es": "Examen del módulo 2" } },
+    { "slug": "20-capstone-knowledge-assistant", "type": "project", "minutes": 1800, "title": { "en": "Capstone: internal knowledge assistant for a mortgage lender", "es": "Proyecto final: asistente de conocimiento interno para un prestamista hipotecario" } }
+  ],
+  "repos": [
+    { "id": "m2-rag-lab", "name": "rag-lab", "description": { "en": "One folder per RAG technique: ingestion, chunking, pgvector, hybrid search, re-ranking, evals, framework-free RAG.", "es": "Una carpeta por técnica de RAG: ingesta, chunking, pgvector, búsqueda híbrida, re-ranking, evals, RAG sin framework." } },
+    { "id": "m2-knowledge-assistant", "name": "mortgage-knowledge-assistant", "description": { "en": "Capstone: cited, hybrid-retrieval assistant over mortgage PDFs and policies with a 50+ pair eval suite and latency/cost dashboard.", "es": "Proyecto final: asistente con citas y retrieval híbrido sobre PDFs y políticas hipotecarias, con suite de evals de 50+ pares y dashboard de latencia/costo." } }
+  ]
+}

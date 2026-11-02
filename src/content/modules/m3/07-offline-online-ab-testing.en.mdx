@@ -1,0 +1,207 @@
+## Two places to measure quality
+
+Your eval gate from the last exercise is an **offline eval**. It runs before deploy, on a fixed golden dataset, with known reference answers. It is your pre-merge regression suite.
+
+An **online eval** runs after deploy, on real traffic. There are no reference answers. Users ask things your golden set never imagined. Documents change. The provider updates a model behind the same name.
+
+You need both, for the same reason you run both CI tests and production monitoring with canaries:
+
+| QA / release practice | LLM equivalent |
+|---|---|
+| Pre-merge regression suite | Offline evals on the golden set |
+| Staging soak test | Shadow traffic: new prompt runs on real requests, output not shown |
+| Canary release | Feature-flagged prompt version on 5% of traffic with online evals |
+| Production synthetic checks | Scheduled golden-subset runs against the live endpoint |
+| Bug reports from users | Feedback signals: thumbs down, edits, escalations |
+| A/B test of a UI change | A/B test of two prompt or retrieval variants |
+
+<Diagram caption="Offline and online evals feed each other" chart={`flowchart LR
+  G["Golden dataset"] --> O["Offline evals (CI gate)"]
+  O --> D["Deploy behind flag"]
+  D --> S["Shadow / canary"]
+  S --> A["A/B test"]
+  A --> P["Production"]
+  P --> F["Online evals + feedback"]
+  F -->|"failures become new golden items"| G`} />
+
+The loop at the bottom is the key idea. Every production failure you find online becomes a new golden item offline. That is the same habit as "every escaped bug gets a regression test".
+
+## Offline evals: strengths and blind spots
+
+Offline evals are reproducible, cheap to re-run with caching, and can use reference answers. That makes metrics like correctness and context recall possible.
+
+Blind spots:
+
+- **Distribution mismatch.** Your 200 questions are not your users' 20,000. Real users write "can i get loan w 640 credit + 1099 income??".
+- **Stale references.** A policy changed last month. The golden answer is now wrong.
+- **No behavioral signal.** Offline you can't see whether users trusted the answer, copied it, or escalated to a human.
+
+## Online evals: what you can measure without a reference
+
+On live traffic you score with **reference-free** metrics and with **behavioral signals**.
+
+Reference-free, model-graded (sampled):
+
+- Faithfulness to retrieved contexts (you have the contexts in the trace).
+- Answer relevance to the question.
+- Policy compliance: no financial advice beyond scope, no PII echoed back.
+- Refusal correctness: did it refuse when the context had no answer?
+
+Behavioral signals (free, noisy, delayed):
+
+- Thumbs up / down rate.
+- Edit distance when an agent edits the draft before sending it.
+- Escalation rate to a human loan officer.
+- Follow-up rephrase rate: the user asks the same thing again within 60 seconds.
+- Copy or click-through on citations.
+
+Don't judge 100% of traffic. Sample. Two percent of 50,000 daily requests is 1,000 judge calls a day, which is plenty for a stable daily trend. Oversample risky segments: thumbs-down conversations, long answers, answers with zero citations.
+
+```python
+# app/online_eval.py
+import asyncio
+import random
+
+from anthropic import AsyncAnthropic
+
+from app.models import RagResult
+from harness.judges import judge_faithfulness  # same judge as offline: one ruler
+
+SAMPLE_RATE = 0.02
+client = AsyncAnthropic()
+
+
+def should_sample(result: RagResult, feedback: str | None) -> bool:
+    if feedback == "thumbs_down" or not result.citations:
+        return True  # always look at risky interactions
+    return random.random() < SAMPLE_RATE
+
+
+async def score_online(trace_id: str, result: RagResult, feedback: str | None, sink) -> None:
+    if not should_sample(result, feedback):
+        return
+    verdict = await judge_faithfulness(client, result.answer, result.contexts)
+    await sink.write_score(trace_id=trace_id, name="faithfulness", value=verdict.score,
+                           comment="online-sampled", judge_version="faithfulness-v1")
+
+
+def fire_and_forget(trace_id: str, result: RagResult, feedback: str | None, sink) -> None:
+    # never block the user response on an eval
+    asyncio.create_task(score_online(trace_id, result, feedback, sink))
+```
+
+Use the same judge and rubric version offline and online. Then a drop online is comparable with your offline baseline. In production, push this to a queue worker instead of `create_task`, so evals survive restarts and you can rate-limit them.
+
+## Shadow traffic and canaries
+
+**Shadow mode**: the new prompt version runs on a copy of real requests. Its output is stored and judged, never shown. You get real distribution with zero user risk. Cost: you pay for double generation on shadowed requests, so shadow a sample.
+
+**Canary**: a feature flag routes a small slice of users (for example 5%) to the new version. You watch online eval scores, latency p95, cost per request and error rate. Roll back automatically if faithfulness drops below a threshold. This is the same flow you know from progressive delivery, with quality metrics added to the health checks.
+
+A canary tells you "nothing is on fire". It does not tell you "B is better than A". For that you need an A/B test.
+
+## A/B testing prompts
+
+### Unit of randomization
+
+Randomize by **user** (or account), not by request. If one user sees prompt A, then B, then A, their experience is inconsistent and their feedback is contaminated. Hash a stable id into a bucket:
+
+```python
+import hashlib
+
+
+def assign_variant(user_id: str, experiment: str, split: float = 0.5) -> str:
+    h = int(hashlib.sha256(f"{experiment}:{user_id}".encode()).hexdigest()[:8], 16)
+    return "B" if (h / 0xFFFFFFFF) < split else "A"
+```
+
+Including the experiment name in the hash keeps assignments independent across experiments.
+
+### Metrics: primary and guardrails
+
+Pick **one primary metric** before you start. Example: thumbs-up rate, or escalation rate. Then define **guardrail metrics** that must not get worse: faithfulness (online judge), p95 latency, cost per request, refusal rate. Variant B "wins" only if the primary improves significantly and no guardrail regresses.
+
+Why one primary? With ten metrics at a 5% significance level, you will find a "significant" improvement by chance about 40% of the time.
+
+### Sample size
+
+Compute it before launch. For a binary metric (thumbs up yes/no), per variant:
+
+```text
+n = (z_alpha/2 + z_beta)^2 * (p1(1 - p1) + p2(1 - p2)) / (p2 - p1)^2
+```
+
+Baseline thumbs-up 0.70, you want to detect 0.73, alpha 0.05 (z = 1.96), power 0.8 (z = 0.84):
+
+```text
+n = (2.80)^2 * (0.21 + 0.197) / 0.0009 = 7.84 * 0.407 / 0.0009 ≈ 3,550 per variant
+```
+
+So about 7,100 rated interactions in total. If only 10% of users click thumbs at all, you need about 71,000 conversations. That number decides whether this test is feasible on your traffic. Often the answer is "use a judge-scored metric instead, because every request gets a score".
+
+```python
+from statsmodels.stats.power import NormalIndPower
+from statsmodels.stats.proportion import proportion_effectsize, proportions_ztest
+
+effect = proportion_effectsize(0.73, 0.70)  # Cohen's h
+n_per_arm = NormalIndPower().solve_power(effect_size=effect, alpha=0.05, power=0.8, ratio=1.0)
+print(f"need ~{n_per_arm:,.0f} rated interactions per variant")
+
+# After the test (fixed horizon reached):
+successes = [2540, 2650]  # thumbs up in A, B
+trials = [3600, 3600]
+stat, p_value = proportions_ztest(successes, trials)
+print(f"A={successes[0]/trials[0]:.3f} B={successes[1]/trials[1]:.3f} p={p_value:.4f}")
+```
+
+### The peeking problem
+
+If you check the p-value every day and stop the first time it dips below 0.05, your real false positive rate is much higher than 5%. It's the statistical version of re-running a flaky test until it passes. Two honest options:
+
+- **Fixed horizon**: compute n, run until you reach it, look once.
+- **Sequential testing**: methods designed for continuous monitoring (for example group sequential designs or always-valid p-values) that many experimentation platforms implement. Use them if you need to stop early.
+
+### Novelty and other traps
+
+- **Novelty effect.** A new answer style gets more thumbs up in week one because it's different. Run at least one to two full weeks and compare week 1 vs week 2 effect size. If it shrinks, be careful.
+- **Weekly seasonality.** Mortgage questions on Monday morning differ from Saturday night. Cover full weeks.
+- **Sample ratio mismatch.** You planned 50/50 and got 52/48. Something in assignment or logging is broken. Investigate before reading results.
+- **Cost as a hidden variable.** B is better but uses 40% more output tokens. Report the trade-off; let the product owner decide.
+
+## Common mistakes
+
+- **Treating offline scores as production quality.** A 0.92 offline faithfulness says nothing about questions you never collected.
+- **Judging online with a different rubric than offline.** You lose comparability. One ruler.
+- **Blocking the response on an online eval.** Evals are async, sampled and best-effort.
+- **Randomizing per request.** Inconsistent UX and correlated samples.
+- **No pre-registered primary metric.** You will cherry-pick the metric that looks good.
+- **Stopping the test when it looks significant.** That's peeking. Use a fixed horizon or a sequential method.
+- **Never feeding online failures back into the golden set.** Your offline suite slowly stops representing reality.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="What is the difference between offline and online evals, and why do you need both?" level="mid">
+
+Offline evals run before deploy on a fixed, versioned golden dataset with reference answers. They are reproducible and act as a regression gate in CI. Online evals run on production traffic with no references. I use sampled, reference-free judges (faithfulness to retrieved contexts, relevance, policy compliance) plus behavioral signals like thumbs down, edits and escalations. Offline catches regressions you can anticipate. Online catches distribution shift, stale documents and provider changes. The two connect: every online failure I triage becomes a new golden item, just like every escaped bug gets a regression test.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Product wants to A/B test a new system prompt. How do you design it?" level="senior">
+
+First, a pre-registered primary metric, for example escalation rate or thumbs-up rate, plus guardrails: online faithfulness, p95 latency, cost per request. I randomize by user with a hashed bucket so each user sees one variant. I compute sample size up front; for a 3-point lift from 70% on a binary metric that is roughly 3,500 rated interactions per arm, so I check feedback volume and may switch to a judge-scored primary metric if thumbs are too sparse. I run at least two full weeks for novelty and weekly seasonality, check for sample ratio mismatch, and either look once at the fixed horizon or use a sequential method. Before any of this, B must pass the offline gate and a short canary.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Connect it to release engineering">
+
+Say it in your own language: "Offline evals are my regression suite, shadow traffic is my staging soak, canaries are my progressive delivery, and the A/B test is the only step that proves B is actually better." Interviewers hiring for AI quality love candidates who already think in release gates.
+
+</Callout>
+
+## Further reading
+
+- Langfuse, scores and online evaluation: https://langfuse.com/docs/scores/overview
+- LangSmith, online evaluators: https://docs.smith.langchain.com/
+- statsmodels power and proportion tests: https://www.statsmodels.org/stable/stats.html
+- Kohavi, Tang, Xu, "Trustworthy Online Controlled Experiments" (book, Cambridge University Press)
+- Anthropic, define success criteria and build evaluations: https://docs.anthropic.com/en/docs/test-and-evaluate/define-success

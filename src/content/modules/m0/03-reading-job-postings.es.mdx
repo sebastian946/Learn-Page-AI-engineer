@@ -1,0 +1,208 @@
+# Cómo leer una oferta de empleo de AI Engineer
+
+Una oferta de empleo es un documento de requisitos escrito por varias personas con objetivos distintos: el hiring manager, el equipo, Recursos Humanos y a veces un reclutador que copió la mitad de otra oferta. Tu trabajo es el mismo que cuando recibes una historia de usuario vaga: extraer los requisitos reales, separar lo imprescindible del ruido y detectar los riesgos.
+
+Esta lección te da un método repetible y recorre una oferta ficticia de principio a fin.
+
+## El método de las cuatro pasadas
+
+Lee cada oferta cuatro veces, rápido, buscando una sola cosa en cada pasada.
+
+### Pasada 1 — ¿A qué familia pertenece?
+
+Usa la lección anterior. ¿Es AI-first, AI-support o ML? Mira las tres primeras responsabilidades, no el título. Si claramente es un rol de entrenamiento de ML, detente aquí.
+
+### Pasada 2 — ¿Qué vas a hacer realmente cada día?
+
+Reescribe las responsabilidades como verbos y objetos. "Impulsar la innovación en IA generativa" no significa nada. "Construir pipelines de retrieval sobre documentos internos de políticas" significa mucho. Quédate solo con las concretas. Te dicen qué proyecto de tu portafolio mostrar.
+
+### Pasada 3 — Imprescindible vs deseable
+
+Las ofertas mezclan requisitos duros con listas de deseos. Señales de que algo es **imprescindible** (must-have):
+
+- Aparece tanto en las responsabilidades como en los requisitos.
+- Está al principio de "Requirements" o "What you bring".
+- Usa palabras fuertes: "required", "proven experience", "you have shipped".
+- Está ligado al producto: si la oferta es para un producto de RAG y menciona búsqueda vectorial, va en serio.
+
+Señales de que algo es **deseable** (nice-to-have):
+
+- Está bajo "Bonus", "Preferred", "Nice to have", "Plus".
+- Es un elemento dentro de una larga lista de herramientas: "LangChain, LlamaIndex, Haystack, DSPy, CrewAI...". Quieren una, no todas.
+- Es una palabra de moda sin ninguna responsabilidad asociada.
+
+Una regla práctica: si cumples aproximadamente entre el 60 y el 70 % de los imprescindibles y puedes contar una historia creíble para lo que te falta, aplica. Las ofertas describen un candidato ideal que rara vez existe.
+
+### Pasada 4 — Señales de alerta y preguntas
+
+Anota todo lo que te preocupe. Lo vas a convertir en preguntas para la entrevista.
+
+## Decodificar las palabras clave
+
+Las ofertas usan abreviaturas. Esto es lo que suelen significar en la práctica las frases comunes.
+
+| La oferta dice | Normalmente significa |
+|---|---|
+| "LLM integration" | Llamar a las APIs de proveedores desde un backend: streaming, reintentos, manejo de costos y rate limits |
+| "Prompt engineering" | System prompts, salidas estructuradas, few-shot, versionado y pruebas de prompts |
+| "RAG experience" | Chunking, embeddings, búsqueda vectorial, re-ranking, citas, evals de retrieval |
+| "Agentic workflows" | Tool calling, LangGraph o similar, tareas de varios pasos, human-in-the-loop |
+| "Evaluate model performance" | Golden datasets, LLM-as-judge, métricas, pruebas de regresión en CI |
+| "Productionize" | Docker, CI/CD, deploy en la nube, monitoreo, SLOs |
+| "Responsible AI" / "guardrails" | Filtrado de contenido, manejo de PII, defensa contra prompt injection, logs de auditoría |
+| "Fast-paced environment" | Equipo pequeño, especificaciones sueltas, cambios frecuentes de prioridad |
+| "Full-stack AI engineer" | Backend más algo de frontend, normalmente React o Next.js |
+| "Experience with LLMOps" | Tracing, versionado de prompts y modelos, pipelines de evals, dashboards de costos |
+
+## Señales de alerta
+
+No toda mala señal descarta una oferta. Pero cada una merece una pregunta.
+
+- **El título dice AI Engineer y los requisitos piden doctorado y conocimientos internos de PyTorch.** Desajuste. Es un rol de investigación en ML.
+- **Exigen todas las herramientas de IA que existen.** Nadie tiene cinco años de LangGraph. El equipo todavía no sabe qué necesita.
+- **No se menciona evaluación, testing ni calidad en ninguna parte.** Quizás están lanzando demos. Puede ser una oportunidad para ti o puede ser un caos.
+- **"Construir nuestra estrategia de IA" para un solo ingeniero sin equipo.** Serías todo el departamento de IA. Sábelo antes de aceptar.
+- **Años de experiencia irreales.** "Más de 5 años de experiencia con LLM" en un campo tan joven indica requisitos copiados.
+- **No hay historia sobre el acceso a los datos.** Un rol de "asistente de conocimiento interno" sin mencionar dónde viven los datos suele significar meses de trabajo bloqueado.
+
+## Ejemplo resuelto
+
+Esta es una oferta ficticia. Léela una vez antes de mirar el análisis. Se deja en inglés porque así la vas a encontrar en el mercado objetivo.
+
+```text
+Senior AI Engineer — Brightpath Lending (Remote, US/LatAm)
+
+Brightpath is a digital mortgage lender. We are adding AI to our loan
+origination platform to help underwriters and support agents.
+
+What you will do
+- Design and build a retrieval-augmented assistant over our policy
+  manuals, underwriting guidelines and product docs.
+- Integrate LLMs (Anthropic, OpenAI via AWS Bedrock) into our Python
+  services with streaming responses.
+- Build evaluation pipelines to measure answer accuracy and catch
+  regressions before release.
+- Deploy and operate services on AWS (ECS, Lambda) with Docker and
+  GitHub Actions.
+- Partner with compliance to make sure answers are traceable and cited.
+
+What you bring
+- 5+ years of software engineering, mostly Python.
+- Hands-on experience building RAG systems in production.
+- Experience with vector databases (pgvector, OpenSearch or similar).
+- Strong testing mindset; experience with automated testing and CI/CD.
+- Familiarity with LLM evaluation (Ragas, DeepEval or custom metrics).
+
+Nice to have
+- LangGraph or other agent frameworks.
+- Experience in financial services or another regulated industry.
+- Fine-tuning experience.
+- Databricks.
+```
+
+### Análisis
+
+**Pasada 1 — Familia.** AI-support. Un prestamista establecido que agrega IA a una plataforma existente. Buen encaje.
+
+**Pasada 2 — Trabajo diario.** Construir un asistente de RAG sobre PDFs de políticas. Integrar modelos de Bedrock en servicios Python. Construir pipelines de evals. Desplegar en AWS. Trabajar con cumplimiento normativo en las citas.
+
+**Pasada 3 — Imprescindibles.**
+
+1. Ingeniería de backend en Python. En ambas secciones. Lo tienes.
+2. RAG en producción. En ambas secciones. El capstone del Módulo 2 (`mortgage-knowledge-assistant`) es casi una copia de este trabajo.
+3. Bases de datos vectoriales. Nombran pgvector. Módulo 2.
+4. Mentalidad de testing, CI/CD. Tu fortaleza principal. Empieza por ahí.
+5. Evaluación de LLM. Nombran Ragas y DeepEval. Módulo 3.
+6. Deploy en AWS con Docker y GitHub Actions. Módulo 5.
+
+Deseables: LangGraph (Módulo 4), industria regulada (tu trabajo de QA en cualquier dominio regulado cuenta), fine-tuning y Databricks (Módulo 6). Ninguno es obligatorio.
+
+**Pasada 4 — Señales de alerta y preguntas.** "Más de 5 años de ingeniería de software" es razonable, no "5 años de LLM". No hay señales de alerta importantes. Preguntas para hacer: ¿Dónde viven los documentos de políticas y con qué frecuencia cambian? ¿Quién es dueño del dataset de evaluación? ¿Cuál es el objetivo de latencia para los underwriters? ¿Cómo se hace hoy la aprobación de cumplimiento?
+
+**Veredicto.** Muy buen encaje. Las piezas del portafolio a mostrar: el capstone del Módulo 2 y el harness de evals del Módulo 3. La historia: "Construí un asistente de RAG con citas sobre políticas hipotecarias, con un golden set de más de 50 preguntas que bloquea cada PR".
+
+## Automatiza la primera pasada
+
+Cuando lees 30 ofertas por semana, una extracción estructurada ayuda. Abajo, Claude extrae imprescindibles y deseables en un modelo Pydantic usando tool use forzado, y luego tú lo comparas con tus propias habilidades. Trata la salida como un primer borrador: la pasada 4 la sigues haciendo tú.
+
+```python
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.AsyncAnthropic()
+
+
+class PostingAnalysis(BaseModel):
+    role_family: str = Field(description="ai-first | ai-support | ml")
+    daily_work: list[str] = Field(description="Concrete verb + object tasks")
+    must_have: list[str]
+    nice_to_have: list[str]
+    red_flags: list[str]
+
+
+MY_SKILLS = {"python", "rag", "evals", "ci/cd", "docker", "aws", "pgvector"}
+
+
+async def analyze(posting: str) -> PostingAnalysis:
+    msg = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=1500,
+        system="You analyze AI Engineer job postings for a senior SDET. Be literal; do not invent requirements.",
+        tools=[{
+            "name": "record_analysis",
+            "description": "Record the structured analysis of a job posting.",
+            "input_schema": PostingAnalysis.model_json_schema(),
+        }],
+        tool_choice={"type": "tool", "name": "record_analysis"},
+        messages=[{"role": "user", "content": posting}],
+    )
+    tool_use = next(b for b in msg.content if b.type == "tool_use")
+    return PostingAnalysis.model_validate(tool_use.input)
+
+
+async def main() -> None:
+    result = await analyze(Path("postings/brightpath.txt").read_text(encoding="utf-8"))
+    gaps = [m for m in result.must_have if not any(s in m.lower() for s in MY_SKILLS)]
+    print(result.model_dump_json(indent=2))
+    print("Possible gaps:", gaps)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+La comparación de brechas es deliberadamente ingenua: coincidencia de subcadenas. Es un disparador para tu propio criterio, no un veredicto.
+
+## Errores comunes
+
+- **No aplicar porque te falta un imprescindible.** Si cubres la mayoría y puedes aprender el resto, aplica.
+- **Aplicar a todo lo que tenga "AI" en el título.** Filtra primero por familia. Una postulación enfocada con un proyecto que encaja vale más que diez genéricas.
+- **Leer solo los requisitos.** Las responsabilidades te dicen qué te van a preguntar en la entrevista. Los requisitos te dicen qué revisa el filtro de CV.
+- **Ignorar el dominio.** Una oferta de fintech se preocupa por el cumplimiento normativo y las citas. Una plataforma de soporte se preocupa por la latencia y el costo por ticket. Adapta tus ejemplos.
+- **Confiar ciegamente en la extracción automática.** Un modelo puede mezclar "nice to have" con "must have". Revisa siempre el original.
+
+## Cómo aparece esto en las entrevistas
+
+<InterviewQuestion question="¿Por qué te interesa específicamente este rol?" level="mid">
+
+Conecta la respuesta con las pasadas 2 y 3. Ejemplo para la oferta de Brightpath: "Tres cosas de la oferta coinciden con lo que he estado construyendo. Necesitan un asistente de RAG con citas sobre documentos de políticas; yo construí uno sobre políticas hipotecarias con retrieval híbrido y citas. Quieren pipelines de evaluación que detecten regresiones antes del release; ese es mi background como SDET, y mi proyecto tiene un golden set de más de 50 preguntas que corre en GitHub Actions. Y despliegan en AWS con Docker y CI/CD, algo que hago desde hace años del lado de testing. También me gusta que sea un dominio regulado: la trazabilidad y la evidencia de pruebas importan, y ahí es donde soy más fuerte."
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Convierte las señales de alerta en buenas preguntas">
+
+"¿Cómo miden hoy la calidad de las respuestas?" es una forma educada de explorar la falta de evals. "¿Quién más trabaja en funcionalidades de IA?" explora el riesgo de ser un departamento de IA de una sola persona. Los entrevistadores recuerdan a los candidatos que hacen preguntas precisas.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- [Documentación de Anthropic — Tool use overview](https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview)
+- [Documentación de Pydantic — JSON Schema](https://docs.pydantic.dev/latest/concepts/json_schema/)
+- [Documentación de Ragas](https://docs.ragas.io/)
+- [Documentación de AWS — What is Amazon Bedrock?](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html)

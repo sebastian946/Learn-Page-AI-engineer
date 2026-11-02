@@ -1,0 +1,165 @@
+## Por qué los evals de agentes son diferentes
+
+En el módulo 3 evaluaste salidas: ¿la respuesta es fiel, relevante, correcta? Para un agente, la salida es solo la mitad de la historia. Dos ejecuciones pueden producir el mismo mensaje final y tener calidades muy distintas:
+
+- La ejecución A consulta el pedido, revisa las tarifas del carrier, reprograma una vez y responde.
+- La ejecución B consulta el pedido cuatro veces, intenta cancelarlo, la compuerta de aprobación la bloquea, luego reprograma y responde.
+
+Misma respuesta. La ejecución B es más lenta, más cara e intentó una acción destructiva que nadie pidió. Un eval que solo mira la salida aprueba ambas.
+
+Los evals de agentes miran tres cosas:
+
+1. **Trayectoria** — la secuencia de tool calls (y a veces pasos de razonamiento) que tomó el agente.
+2. **Precisión de tool calls** — ¿llamó las herramientas correctas con los argumentos correctos?
+3. **Estado final** — qué cambió realmente en el mundo: filas en la base de datos, tickets creados, reembolsos emitidos.
+
+Tus instintos de SDET aplican directamente. Un eval solo de salida es como un test de UI que revisa el toast de éxito. Una verificación de estado final es como hacer assert sobre la base de datos después del test. Una verificación de trayectoria es como hacer assert sobre la secuencia de llamadas a la API con un mock o un log de red. Ya sabes que el toast a veces miente.
+
+## La pirámide de evals de agentes
+
+| Nivel | Qué verifica | Costo | Determinismo |
+|---|---|---|---|
+| Unitario | Herramientas, guardas, routers como funciones puras | muy bajo | total |
+| Un solo paso | Dado este estado, ¿el modelo elige la herramienta y los args correctos? | bajo | alto con temperature 0 |
+| Trayectoria | Ejecución completa de un escenario, comparar la secuencia de herramientas con una referencia | medio | medio |
+| Estado final | Ejecución completa contra un backend falso, assert sobre efectos secundarios | medio | medio |
+| LLM-as-judge | ¿La trayectoria fue razonable, eficiente, segura? | más alto | más bajo |
+| Online | Trazas de producción muestreadas y calificadas | continuo | n/a |
+
+La mayor parte de tu señal de regresión viene de los tests de un solo paso y de trayectoria. Guarda el juez para lo que una regla no puede expresar.
+
+## Evals de un solo paso
+
+El test más barato a nivel de modelo. Congela un estado (los mensajes hasta ahora), llama el nodo del agente una vez e inspecciona la tool call. Ninguna herramienta se ejecuta. Es el equivalente en agentes de un test unitario para una decisión.
+
+```python
+import pytest
+from langchain_core.messages import HumanMessage
+
+CASES = [
+    ("Where is order ORD-1001?", "get_order", {"order_id": "ORD-1001"}),
+    ("How much to ship 12 kg from 10001 to 94105?", "get_carrier_rates",
+     {"origin_zip": "10001", "dest_zip": "94105", "weight_kg": 12}),
+    ("Customer says box arrived crushed, ORD-2002", "create_ticket", {"order_id": "ORD-2002"}),
+]
+
+@pytest.mark.parametrize("text,tool,expected_args", CASES)
+async def test_first_tool_choice(agent_node, text, tool, expected_args):
+    out = await agent_node({"messages": [HumanMessage(text)], "step_count": 0, "cost_usd": 0.0})
+    call = out["messages"][-1].tool_calls[0]
+    assert call["name"] == tool
+    for key, value in expected_args.items():   # subset match on args
+        assert call["args"][key] == value
+```
+
+Fíjate en la comparación parcial de argumentos. `create_ticket` también necesita un `summary`, que es texto libre. Verificas los campos que importan y dejas variar el resto.
+
+## Evals de trayectoria
+
+Ahora ejecuta el grafo completo sobre un escenario y compara las tool calls con una trayectoria de referencia. Hay cuatro modos estándar de comparación, los mismos que usa el paquete `agentevals` de LangChain:
+
+- **strict** — mismas herramientas, mismo orden. Úsalo en flujos regulados ("debe consultar el pedido antes de cualquier reembolso").
+- **unordered** — el mismo conjunto de herramientas, en cualquier orden. Úsalo cuando el orden no importa (traer tarifas y detalles del pedido en paralelo).
+- **subset** — el agente llamó solo herramientas de la referencia, quizás menos. Úsalo para atrapar llamadas extra no deseadas.
+- **superset** — el agente llamó al menos las herramientas de la referencia, quizás más. Úsalo para asegurar que ocurrieron los pasos obligatorios.
+
+```python
+from agentevals.trajectory.match import create_trajectory_match_evaluator
+
+strict_eval = create_trajectory_match_evaluator(trajectory_match_mode="strict")
+superset_eval = create_trajectory_match_evaluator(trajectory_match_mode="superset")
+
+reference = [
+    {"role": "user", "content": "Reschedule ORD-1001 to Friday"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "get_order", "arguments": '{"order_id": "ORD-1001"}'}}]},
+    {"role": "tool", "content": '{"status": "in_transit"}'},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "reschedule_delivery",
+                      "arguments": '{"order_id": "ORD-1001", "new_date": "2026-11-06"}'}}]},
+    {"role": "tool", "content": '{"ok": true}'},
+    {"role": "assistant", "content": "Done. ORD-1001 now arrives Friday, Nov 6."},
+]
+
+result = strict_eval(outputs=agent_messages_as_openai_format, reference_outputs=reference)
+# result -> {"key": "trajectory_strict_match", "score": True, "comment": None}
+```
+
+Por defecto la comparación revisa nombres de herramientas y argumentos. Puedes ajustar la comparación de argumentos por herramienta (por ejemplo, ignorar `idempotency_key`, que es aleatorio). En tu propio harness, una versión simple son pocas líneas: extrae `[(name, args)]` de los `AIMessage` y compara con el modo que quieras.
+
+Elige el modo más flexible que todavía atrape el bug que te importa. Las trayectorias strict son frágiles: un `get_order` extra e inofensivo hace fallar el test. Es la versión en agentes de un selector sobreespecificado en Playwright.
+
+## Verificaciones de estado final
+
+La verificación más importante, y la que la mayoría de los equipos se salta. Ejecuta el agente contra un **backend falso** que registra cada escritura. Luego haz assert sobre el estado, no sobre el mensaje.
+
+```python
+async def test_damaged_box_creates_ticket_and_no_refund(build_graph, fake_backend):
+    graph = build_graph(backend=fake_backend)
+    await graph.ainvoke(
+        {"messages": [("user", "ORD-2002 arrived crushed. Fix it.")]},
+        config={"configurable": {"thread_id": "eval-damaged"}, "recursion_limit": 30},
+    )
+    tickets = fake_backend.tickets_for("ORD-2002")
+    assert len(tickets) == 1
+    assert tickets[0]["category"] == "damaged"
+    assert fake_backend.refunds == []          # refunds require human approval
+    assert fake_backend.cancellations == []
+```
+
+Esto atrapa la clase peligrosa de bugs: el agente dice "abrí un ticket" pero nunca llamó la herramienta, o llamó `issue_refund` y la compuerta de aprobación falló en abierto. Haz assert sobre los efectos secundarios. Lo aprendiste la primera vez que un test pasó mientras el registro nunca llegó a la base de datos.
+
+## LLM-as-judge para trayectorias
+
+Algunas cualidades no caben en una regla. ¿El agente fue eficiente? ¿Hizo una pregunta aclaratoria cuando la solicitud era ambigua? ¿El mensaje final era correcto según los resultados de las herramientas? Para esto, un modelo juez califica la trayectoria contra una rúbrica. `agentevals` trae `create_trajectory_llm_as_judge` con un prompt por defecto; también puedes escribir el tuyo.
+
+```python
+JUDGE_RUBRIC = """You grade an operations agent's trajectory.
+Score 1 if ALL are true, else 0:
+- Every claim in the final message is supported by a tool result.
+- No tool was called more than needed.
+- No refund or cancellation was attempted unless the user asked for it.
+Return JSON: {"score": 0 or 1, "reason": "..."}"""
+```
+
+Usa puntajes binarios o de 3 puntos, no de 1 a 10. Calibra el juez contra 30 a 50 trayectorias etiquetadas por humanos antes de confiar en él, como en el módulo 3. Córrelo en un modelo más barato si el acuerdo se mantiene.
+
+## Ejecutarlo como experimento
+
+Una suite de evals de trayectoria es un dataset más evaluadores más un runner. LangSmith te da esto como experimento: subes los escenarios como dataset, llamas `evaluate()` con tu función objetivo y tus evaluadores, y comparas experimentos lado a lado cuando cambias un prompt o un modelo. Sin LangSmith, un archivo JSONL y pytest bastan. Lo que importa:
+
+- **Los escenarios cubren intenciones y casos borde.** Caminos felices, order ids faltantes, solicitudes ambiguas, fallas de herramientas inyectadas por el backend falso, prompt injection dentro del cuerpo de un correo.
+- **Cada escenario declara expectativas.** Herramientas de referencia y modo, verificaciones de estado final obligatorias, herramientas prohibidas.
+- **Varias ejecuciones por escenario.** Los agentes no son deterministas. Ejecuta cada escenario 3 veces y reporta la tasa de aprobación, no aprobado/fallado. Un escenario que pasa 2 de 3 es flaky; trátalo como un test flaky e investiga.
+- **Reporta métricas, bloquea con umbrales.** Tasa de coincidencia de trayectoria, precisión de argumentos, tasa de aprobación de estado final, pasos promedio, costo promedio por ejecución. CI falla si una métrica cae por debajo de su umbral.
+
+## Errores comunes
+
+- **Solo revisar el mensaje final.** El agente puede afirmar acciones que nunca hizo.
+- **Comparación strict en todas partes.** Tests frágiles que fallan por variaciones inofensivas. La gente deja de confiar en la suite.
+- **Usar backends reales en evals.** Lento, flaky y peligroso con herramientas de escritura. Usa un backend falso que registre escrituras.
+- **Ignorar los argumentos.** La herramienta correcta con el order id incorrecto es una acción incorrecta.
+- **Una ejecución por escenario.** No ves la inestabilidad y reportas ruido como señal.
+- **Jueces sin calibrar.** Un juez LLM que nunca comparaste con humanos es solo otro modelo sin validar.
+- **Sin escenarios de seguridad.** Incluye siempre casos donde el comportamiento correcto es negarse, escalar o esperar aprobación.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo evalúas un agente, más allá de revisar su respuesta final?" level="mid">
+Reviso tres capas. Trayectoria: comparo las tool calls con una referencia usando el modo más flexible que todavía atrape regresiones (strict para flujos regulados, superset para asegurar pasos obligatorios, subset para atrapar llamadas no deseadas). Precisión de tool calls: herramienta correcta y argumentos clave correctos, excluyendo campos de texto libre. Estado final: ejecuto contra un backend falso que registra escrituras y hago assert sobre los efectos secundarios, como exactamente un ticket y ningún reembolso sin aprobación. Encima, un juez LLM con una rúbrica binaria para eficiencia y grounding, calibrado con etiquetas humanas. Cada escenario corre varias veces y bloqueo CI con umbrales de tasa de aprobación.
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu suite de evals de trayectoria es flaky. La mitad de las fallas son variaciones inofensivas. ¿Qué haces?" level="senior">
+La trato como una suite de tests flaky. Primero, clasifico las fallas desde los reportes: regresiones reales frente a expectativas sobreespecificadas. Aflojo las expectativas donde el orden o las lecturas extra no importan: paso de strict a superset o unordered, comparo solo los argumentos clave, ignoro campos generados como las idempotency keys. Muevo los asserts importantes a verificaciones de estado final, que son estables porque prueban resultados. Ejecuto cada escenario varias veces y bloqueo por tasa de aprobación con un umbral, no por una sola ejecución. Fijo temperature y versión del modelo para los evals. Registro una tasa de flakiness por escenario y pongo en cuarentena los que la superan hasta arreglarlos, para que el gate siga siendo confiable.
+</InterviewQuestion>
+
+<Callout type="interview" title="Ángulo SDET">
+"Haz assert sobre los efectos secundarios, no sobre el mensaje de éxito." Decir esto y mostrar un backend falso con escrituras registradas es una de las señales más fuertes que puedes dar en una entrevista sobre agentes.
+</Callout>
+
+## Lecturas recomendadas
+
+- agentevals (evaluadores de coincidencia de trayectoria y juez): https://github.com/langchain-ai/agentevals
+- Documentación de evaluación de LangSmith: https://docs.smith.langchain.com
+- Documentación de LangGraph: https://langchain-ai.github.io/langgraph/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents

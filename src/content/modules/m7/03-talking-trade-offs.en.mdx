@@ -1,0 +1,141 @@
+## Why trade-offs are the real interview
+
+Junior candidates describe what they built. Senior candidates explain what they gave up, and why that was the right price. Every AI system design question is a trade-off question in disguise. "Which vector store?" means "what do you optimize for, and what do you accept?"
+
+You already do this as an SDET. You chose not to automate some tests because the maintenance cost beat the value. You accepted a 2% flaky rate in a smoke suite to keep it under 5 minutes. Same muscle, new domain.
+
+## The triangle: latency, quality, cost
+
+In LLM systems these three pull against each other. You can usually pick two.
+
+| Lever | Quality | Latency | Cost |
+|---|---|---|---|
+| Bigger model | Up | Up (slower) | Up |
+| Re-ranker on top-50 | Up | Up (+ re-rank time) | Up slightly |
+| More chunks in context | Up, then down (noise) | Up | Up |
+| Semantic cache | Same or slightly down (stale or wrong hits) | Way down on hits | Way down on hits |
+| Smaller model with routing | Down on hard queries | Down | Down |
+| Streaming | Same | Perceived latency down | Same |
+| Query rewriting step | Up on vague queries | Up (extra LLM call) | Up |
+| Prompt caching of a long system prompt | Same | Down | Down |
+
+A good answer names the lever, its direction on each axis, and how you would **measure** it. "Adding a cross-encoder re-ranker raised context precision from 0.71 to 0.84 on our golden set and added about 120 ms at p95. Worth it for legal questions, not for the FAQ bot." Use your own measured numbers from Modules 2 and 3.
+
+## Make the trade-off explicit in code
+
+The strongest move is to show that a trade-off is a configurable policy, not a hard-coded opinion. Here is a router that picks a model tier per request, with the policy visible:
+
+```python
+from pydantic import BaseModel
+from typing import Literal
+
+Tier = Literal["fast", "balanced", "best"]
+
+class RoutingPolicy(BaseModel):
+    # Each tier maps to a model id from config. Example ids; check the current model list.
+    models: dict[Tier, str] = {
+        "fast": "claude-haiku-5-5",
+        "balanced": "claude-sonnet-5-5",
+        "best": "claude-opus-5-5",
+    }
+    max_p95_ms: int = 2500
+    hard_query_threshold: float = 0.6   # from a cheap classifier
+    budget_state: Literal["ok", "degrade"] = "ok"
+
+def choose_tier(policy: RoutingPolicy, difficulty: float, needs_tools: bool, plan: str) -> Tier:
+    if policy.budget_state == "degrade":
+        return "fast"
+    if plan == "enterprise" and (difficulty >= policy.hard_query_threshold or needs_tools):
+        return "best"
+    if difficulty >= policy.hard_query_threshold or needs_tools:
+        return "balanced"
+    return "fast"
+```
+
+Then you test the policy offline: run the golden set through each tier, record quality, p95 and cost per 1k, and pick the threshold that hits your targets. That is the SDET way: a trade-off backed by a test report.
+
+## Build vs buy
+
+Typical choices in the capstone: managed vector DB vs pgvector, Langfuse self-hosted vs a SaaS tracer, a hosted re-ranker API vs a local cross-encoder, Bedrock vs a direct provider API.
+
+Ask five questions, in this order:
+
+1. **Is it core to our differentiation?** Retrieval quality on legal documents might be. Tracing UI is not.
+2. **Data constraints.** Can tenant data leave our VPC or region? This often decides it.
+3. **Total cost of ownership.** Vendor fee vs engineer-hours to run, patch, back up and scale. One engineer-week is not free.
+4. **Lock-in and exit cost.** Can we swap it behind an interface in a week?
+5. **Time to value.** A demo in 2 weeks favors buy.
+
+A strong answer: "We already run PostgreSQL, data must stay in our VPC, and we have under 10 million chunks, so pgvector. If we pass about 50 million chunks or need sub-50 ms p99 at high QPS, I would revisit Qdrant or a managed service. The repository interface makes that a one-adapter change."
+
+## Framework vs custom
+
+You built RAG with LangChain and then without a framework in Module 2. You used LangGraph for agents in Module 4. Now articulate the trade-off:
+
+- **Framework (LangChain, LangGraph, LlamaIndex):** faster start, integrations, built-in checkpointing and HITL (LangGraph), common vocabulary for the team. Costs: abstraction churn between versions, harder debugging, hidden prompts, extra dependencies.
+- **Custom:** full control of prompts, tokens and latency, easy to trace, small surface. Costs: you write retries, streaming, state persistence and tool loops yourself.
+
+A defensible middle path, and a good capstone choice: LangGraph for the agent's state machine and checkpointing (hard to rebuild well), plain Python for retrieval and prompt assembly (simple, performance-critical, and you want to see every token).
+
+## A trade-off vocabulary
+
+Use precise words. They signal experience.
+
+- **Blast radius:** how far a failure spreads.
+- **Reversible vs one-way door:** can we undo this cheaply? Spend time only on one-way doors.
+- **Hot path vs cold path:** request-time work vs offline work. Move work to the cold path when you can (pre-compute summaries, embeddings, metadata).
+- **Tail latency (p95, p99):** averages hide the slow users.
+- **Graceful degradation:** what the user gets when a dependency fails (cached answer, smaller model, "search only" mode).
+- **Consistency window:** how long until a newly uploaded document is searchable.
+- **Unit economics:** cost per request, per tenant, per plan vs price.
+- **Operational burden:** on-call load, number of moving parts.
+- **Eval coverage:** what your test set does and does not represent.
+
+## STAR stories from your capstones
+
+Behavioral rounds and project deep-dives both reward short, structured stories. Use STAR: Situation, Task, Action, Result. Add a final "L" for what you learned. Keep each story under 2 minutes.
+
+Example built from Module 2:
+
+- **Situation:** The mortgage knowledge assistant answered policy questions but sometimes cited the wrong policy version.
+- **Task:** Raise faithfulness above 0.90 without pushing p95 past 2 seconds.
+- **Action:** Built a 60-question golden set, found most failures came from outdated chunks ranking high on keywords. Added an `effective_date` metadata filter, hybrid search with RRF, and a cross-encoder re-ranker on the top 30.
+- **Result:** Faithfulness from 0.81 to 0.92 on the golden set (example numbers; use your own), p95 rose by about 150 ms, still under target. Added the eval to CI so it cannot regress.
+- **Learned:** Metadata filtering fixed more than model changes did. Measure before swapping models.
+
+Prepare one story per capstone, each showing a different trade-off: quality vs latency (M2), automation vs reliability (M3), autonomy vs control with HITL (M4), cost vs availability (M5), build vs buy on Databricks (M6), isolation vs cost (M7).
+
+## Common mistakes
+
+- "It depends" without saying on what. Always follow with the two or three factors and your default.
+- Presenting one option only. Interviewers want at least two alternatives considered.
+- Numbers without a source. Say "on my golden set of 120 questions" or "I would measure this with".
+- Choosing the most complex option to sound senior. Simple, measured and reversible beats clever.
+- Ignoring cost until asked. Raise unit economics yourself.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your RAG answers are good but p95 latency is 6 seconds. The target is 2.5. What do you do?" level="senior">
+
+First, break down the latency from traces: retrieval, re-rank, LLM time to first token, generation length. Usually generation dominates. Then work the levers, cheapest first: stream the response so perceived latency drops; cap output tokens and tighten the prompt; cache frequent queries per tenant; prompt-cache the static system prompt; reduce context from 10 chunks to 5 after re-ranking; route easy queries to a smaller model. Each change is tested against the golden set so I know the quality cost. If retrieval is the problem, check HNSW parameters and filtered search. I would present the result as a table of change, p95 delta, quality delta, cost delta, and recommend the combination that hits 2.5 s with the smallest quality drop.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Why did you use LangGraph instead of writing your own agent loop?" level="mid">
+
+The agent needed persistent state, checkpoints to resume after human approval, and conditional edges for retries. LangGraph gives those, and rebuilding checkpointing correctly is a lot of work. I kept retrieval and prompt assembly in plain Python because that code is performance-critical and I wanted full visibility of tokens. The trade-off is a dependency that changes fast, so I pinned versions and kept tools behind my own interfaces.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="The three-sentence trade-off formula">
+
+"I chose X over Y because of A and B. The cost is C, which I mitigated with D. I would revisit it if E happens." Practice saying it for every ADR in your capstone.
+
+</Callout>
+
+## Further reading
+
+- AWS Well-Architected Framework (pillars and trade-offs): https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html
+- Anthropic docs on choosing a model: https://docs.anthropic.com/en/docs/about-claude/models
+- Anthropic prompt caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- LangGraph concepts: https://langchain-ai.github.io/langgraph/concepts/

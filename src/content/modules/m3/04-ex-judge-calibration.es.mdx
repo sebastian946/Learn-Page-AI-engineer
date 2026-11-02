@@ -1,0 +1,157 @@
+## Objetivo
+
+Antes de dejar que un juez bloquee pull requests (ejercicio 06), demuestras que coincide con los humanos. En este ejercicio construyes un pequeño flujo de calibración en tu repo `llm-eval-harness`:
+
+1. Un set etiquetado por humanos de unas 30 salidas RAG de tu asistente hipotecario del módulo 2.
+2. Un juez de faithfulness con una rúbrica versionada.
+3. Un script que corre el juez, calcula acuerdo, kappa de Cohen y una matriz de confusión, y lista cada desacuerdo.
+4. Al menos una iteración de la rúbrica, medida en una partición reservada, con los resultados escritos en un reporte de calibración.
+
+Es el equivalente en QA a validar un nuevo oráculo de prueba antes de confiar en él dentro del pipeline.
+
+## Contexto
+
+Tú mismo crearás el set etiquetado. Pasa 30 preguntas golden por `mortgage-knowledge-assistant` (o reutiliza salidas guardadas del módulo 2) y guarda, por caso: la pregunta, los contextos recuperados y la respuesta. Luego etiqueta cada una **como lo haría un experto del dominio**: `faithful` o `unfaithful`, con una nota de una línea. Para tener suficientes fallas, produce algunas salidas malas a propósito: reduce `top_k` a 1, elimina la instrucción "responde solo con el contexto" o edita algunas respuestas a mano para cambiar un número. Apunta a que entre 30% y 40% de los casos sean unfaithful. Un set con 2 fallas no puede medir nada.
+
+Etiqueta **antes** de correr el juez, para que sus veredictos no te condicionen. Si un amigo o colega puede etiquetar 10 casos de forma independiente, calcula también el kappa humano-humano. Ese es tu techo.
+
+Usa este formato de fila en `calibration/human_labels.jsonl`:
+
+```json
+{"id": "cal-007", "question": "Is PMI required on a conventional loan with 15% down?", "contexts": ["Conventional loans with less than 20% down require private mortgage insurance (PMI)..."], "answer": "Yes. With 15% down, PMI is required until you reach 20% equity.", "human_label": "faithful", "labeler": "jd", "note": "Matches policy 4.2"}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `calibration/human_labels.jsonl` tiene al menos 30 filas, cada una validada por un modelo Pydantic, con al menos 9 etiquetas `unfaithful`
+- [ ] Las etiquetas se crearon antes de correr el juez (decláralo en el README)
+- [ ] La rúbrica vive en un archivo versionado (`calibration/rubrics/faithfulness_v1.md`, `faithfulness_v2.md`) y el script la carga, no está escrita en el código
+- [ ] El set etiquetado se divide en una partición dev (unas 20 filas) y una reservada (unas 10 filas) con una semilla aleatoria fija
+- [ ] `calibrate.py` reporta acuerdo bruto, kappa de Cohen, la matriz de confusión, la tasa de falsos faithful y la lista de desacuerdos con el razonamiento del juez
+- [ ] Las llamadas al juez se cachean en disco con una clave de (modelo, hash de la rúbrica, id del caso), así que repetir la corrida es gratis
+- [ ] Iteraste la rúbrica al menos una vez sobre la partición dev y reportas el kappa de v1 vs v2 sobre la partición reservada
+- [ ] `calibration/REPORT.md` registra el modelo juez, la versión de la rúbrica, el kappa, la tasa de falsos faithful, la fecha y una decisión go/no-go para usar el juez como gate de CI (meta: kappa de al menos 0.6 y tasa de falsos faithful de máximo 10%)
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# calibration/calibrate.py
+import argparse
+import asyncio
+import hashlib
+import json
+import random
+from pathlib import Path
+from typing import Literal
+
+import anthropic
+from pydantic import BaseModel
+from sklearn.metrics import cohen_kappa_score, confusion_matrix
+
+Label = Literal["faithful", "unfaithful"]
+CACHE_DIR = Path("calibration/.cache")
+client = anthropic.AsyncAnthropic()
+
+
+class LabeledCase(BaseModel):
+    id: str
+    question: str
+    contexts: list[str]
+    answer: str
+    human_label: Label
+    labeler: str
+    note: str = ""
+
+
+class Verdict(BaseModel):
+    reasoning: str
+    verdict: Label
+
+
+def load_cases(path: Path) -> list[LabeledCase]:
+    return [LabeledCase.model_validate_json(l) for l in path.read_text("utf-8").splitlines() if l.strip()]
+
+
+def split(cases: list[LabeledCase], seed: int = 42, holdout: int = 10) -> tuple[list[LabeledCase], list[LabeledCase]]:
+    shuffled = cases[:]
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[holdout:], shuffled[:holdout]
+
+
+async def judge(case: LabeledCase, rubric: str, model: str) -> Verdict:
+    key = hashlib.sha256(f"{model}|{rubric}|{case.id}".encode()).hexdigest()[:16]
+    cached = CACHE_DIR / f"{key}.json"
+    # TODO(you): return the cached Verdict if the file exists
+    # TODO(you): call client.messages.create(model=model, system=rubric, temperature=0, ...)
+    #            with question, numbered contexts and the answer wrapped in <answer> tags
+    # TODO(you): validate with Verdict.model_validate_json, write to cache, return it
+    raise NotImplementedError
+
+
+def metrics(human: list[str], judge_labels: list[str]) -> dict:
+    # TODO(you): agreement, kappa, confusion matrix (labels order: faithful, unfaithful)
+    # TODO(you): false_faithful_rate = judge said faithful when human said unfaithful / human unfaithful count
+    raise NotImplementedError
+
+
+async def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--rubric", default="calibration/rubrics/faithfulness_v1.md")
+    p.add_argument("--model", default="claude-sonnet-5-5")
+    p.add_argument("--split", choices=["dev", "holdout", "all"], default="dev")
+    args = p.parse_args()
+    # TODO(you): load, split, judge concurrently (asyncio.Semaphore(5)), print metrics and disagreements
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Primero asegura los datos. Veinte minutos creando respuestas unfaithful realistas (un porcentaje equivocado, una comisión inventada, una afirmación que el contexto nunca hace) valen más que cualquier ajuste de rúbrica. Varía los tipos de falla, o tu kappa solo medirá un tipo de error.</Hint>
+  <Hint>Usa `asyncio.Semaphore(5)` alrededor de la llamada al juez y `asyncio.gather` sobre los casos. Escribe el archivo de caché solo después de que `Verdict.model_validate_json` tenga éxito, para que una respuesta malformada se reintente en la siguiente corrida en lugar de quedar cacheada.</Hint>
+  <Hint>Para la tasa de falsos faithful, la matriz de confusión con `labels=["faithful", "unfaithful"]` pone las filas como humano y las columnas como juez. La celda peligrosa es la fila "unfaithful", columna "faithful": `cm[1][0] / cm[1].sum()`.</Hint>
+  <Hint>Fallas típicas de la v1: el juez perdona afirmaciones "razonables" que no están en el contexto, o castiga rechazos correctos. Arreglos típicos de la v2: declarar que las afirmaciones plausibles pero sin respaldo son unfaithful, declarar que "los documentos no cubren esto" es faithful, pedir una lista afirmación por afirmación antes del veredicto y agregar un ejemplo resuelto corto que no esté en tu partición reservada.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-harness">
+
+```text
+llm-eval-harness/
+  README.md
+  pyproject.toml
+  calibration/
+    human_labels.jsonl
+    calibrate.py
+    rubrics/
+      faithfulness_v1.md
+      faithfulness_v2.md
+    REPORT.md
+    .cache/            # gitignored
+  harness/             # filled in exercise 06
+  tests/
+    test_calibration_data.py
+```
+
+Esquema de la sección del README (agrega una sección "Judge calibration"):
+
+- Por qué calibrar: el juez es un oráculo de prueba que necesita validación
+- Cómo se construyó el set etiquetado (fuentes, inyección de fallas, etiquetado antes de juzgar, etiquetadores)
+- Cómo correrlo: `python calibration/calibrate.py --rubric calibration/rubrics/faithfulness_v2.md --split holdout`
+- Tabla de resultados: versión de rúbrica, partición, acuerdo, kappa, tasa de falsos faithful
+- Decisión: go/no-go para el gate de CI y cuándo recalibrar
+
+Commits sugeridos:
+
+- `feat(calibration): add 30 human-labeled faithfulness cases`
+- `feat(calibration): judge runner with disk cache and agreement metrics`
+- `feat(calibration): rubric v2 with claim-level checks`
+- `docs(calibration): calibration report with kappa and go/no-go decision`
+
+</CommitBox>
+
+<Checklist id="m3-04-review" title="Autorrevisión" items={["Mi set etiquetado tiene suficientes casos unfaithful (al menos 30%) y tipos de falla variados", "Etiqueté antes de correr el juez", "La rúbrica está versionada y su hash es parte de la clave de caché", "Reporto kappa y tasa de falsos faithful, no solo acuerdo bruto", "La rúbrica v2 se ajustó en dev y se midió en la partición reservada", "REPORT.md declara una decisión go/no-go clara con los umbrales usados"]} />

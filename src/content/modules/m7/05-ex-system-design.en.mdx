@@ -1,0 +1,153 @@
+## Goal
+
+Run two timed mock system-design interviews on yourself and publish the write-ups in a new repo, `system-design-notes`. This repo becomes a reference you reread before every onsite, and a portfolio signal that you can reason about AI systems at the architecture level.
+
+- **Prompt A (45 min):** "Design a RAG system for 10,000 users." Do it without looking at the previous lesson. Then compare.
+- **Prompt B (45 min):** "Design an agent platform for customer support. Agents answer tickets for 50 B2B customers, can look up orders and issue refunds up to a limit, and escalate to humans."
+
+Timebox strictly: set a 45-minute timer per prompt. Stop when it rings, even mid-sentence. Then spend 10 minutes self-grading with the rubric from lesson 04, and 10 minutes writing "what I missed".
+
+Why timed? In a real round, running out of time before covering evals or failure modes costs more than a slightly worse diagram. Your QA instinct for test coverage applies: cover every area shallowly first, then go deep.
+
+For Prompt B, these are the areas a strong answer covers that Prompt A does not:
+
+- **Tool design:** idempotent refund tool with an idempotency key, a per-tenant refund limit enforced in the tool, not in the prompt.
+- **Human-in-the-loop:** approval step for refunds above the limit, using LangGraph interrupts and checkpoints.
+- **Loop guards and cost caps:** max steps per ticket, max tokens per ticket, and a kill switch per tenant.
+- **Trajectory evals:** did the agent call the right tools in the right order with the right arguments, not only "was the final reply good".
+- **Multi-tenancy:** each B2B customer has its own knowledge base, tone guide, tool credentials and policies.
+- **Escalation:** confidence and sentiment thresholds, plus a clean handoff that includes a summary for the human agent.
+- **Audit:** every tool call logged with inputs, outputs and the approving human, if any.
+
+<AcceptanceCriteria>
+
+- [ ] Repo `system-design-notes` exists with one folder per prompt.
+- [ ] Each write-up follows the template: requirements, estimates, architecture diagram (Mermaid), data model, deep dives, scaling, failure modes table, cost, summary.
+- [ ] Each write-up has a capacity estimate with every assumption stated and the implication of each number written next to it.
+- [ ] Prompt B covers tool design, HITL approval, loop guards, trajectory evals and per-tenant policies.
+- [ ] Each write-up ends with a filled rubric (10 areas, 0-3 each) and a "what I missed" section of at least 5 bullets.
+- [ ] A `estimates.py` script reproduces the numbers in both write-ups.
+- [ ] Total time per prompt recorded honestly (start and end time in the file).
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```markdown
+# Prompt: <title>
+Started: 2026-11-05 09:00  Ended: 09:45  (timer, no notes)
+
+## 1. Requirements
+Functional:
+-
+Non-functional (with numbers):
+-
+Out of scope:
+-
+
+## 2. Estimates
+| Quantity | Value | Assumption | Implication |
+|---|---|---|---|
+| Peak QPS | | | |
+| Concurrent LLM streams | | | |
+| Tokens per month (in / out) | | | |
+| Corpus size (chunks, GB) | | | |
+| LLM cost per month | | example prices from config | |
+
+## 3. Architecture
+(mermaid flowchart: cold path + hot path)
+
+## 4. Data model
+## 5. Deep dives (pick 2)
+## 6. Scaling
+## 7. Failure modes
+| Failure | Detection | Mitigation |
+|---|---|---|
+
+## 8. Cost and levers
+## 9. Summary (30 seconds)
+
+## Self-grade (0-3 each)
+| Area | Score | Why |
+|---|---|---|
+
+## What I missed
+-
+```
+
+```python
+"""estimates.py - reproduce the capacity numbers for each prompt."""
+from dataclasses import dataclass
+
+@dataclass
+class Assumptions:
+    users: int
+    dau_ratio: float
+    queries_per_dau: float
+    active_hours: float
+    peak_factor: float
+    seconds_per_answer: float
+    in_tokens: int
+    out_tokens: int
+    days_per_month: int
+    price_in_per_m: float    # example value; read current pricing
+    price_out_per_m: float   # example value; read current pricing
+
+def estimate(a: Assumptions) -> dict[str, float]:
+    qpd = a.users * a.dau_ratio * a.queries_per_dau
+    peak_qps = qpd / (a.active_hours * 3600) * a.peak_factor
+    # TODO: concurrent streams, monthly tokens, monthly cost
+    return {"queries_per_day": qpd, "peak_qps": round(peak_qps, 2)}
+
+if __name__ == "__main__":
+    rag = Assumptions(10_000, 0.4, 10, 8, 4, 6, 4_000, 400, 22, 3.0, 15.0)
+    print("RAG:", estimate(rag))
+    # TODO: Prompt B - tickets per day per customer, steps per ticket, tokens per step
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Before the timer starts, write the six phase headings and their minute marks at the top of the page. Glance at them every few minutes. If you are at minute 20 and still on requirements, cut and move on.</Hint>
+  <Hint>For Prompt B, estimate per ticket, not per message: tickets per day x agent steps per ticket x tokens per step. An agent with 6 steps at 3k input tokens each costs far more than a single RAG answer. That number should drive your loop guard and routing decisions.</Hint>
+  <Hint>For the refund tool, write its contract in the doc: `issue_refund(order_id, amount, reason, idempotency_key)`, returns a typed result or a typed error (`LIMIT_EXCEEDED`, `ORDER_NOT_FOUND`, `ALREADY_REFUNDED`). Tenant id and limits come from runtime context. Amounts above the limit route to an approval node that calls `interrupt()` and waits.</Hint>
+  <Hint>For trajectory evals in Prompt B, describe 3 concrete test cases with expected tool sequences, for example "late delivery, order exists, amount under limit" expects `lookup_order` then `issue_refund` then `reply`. Score exact match on tool names and a tolerance on arguments, like you scored agents in Module 4.</Hint>
+</Hints>
+
+<CommitBox repo="system-design-notes">
+
+```text
+system-design-notes/
+  README.md                         # index of prompts, scores over time
+  estimates.py
+  01-rag-10k-users/
+    writeup.md
+    diagram.mmd
+    self-grade.md
+  02-support-agent-platform/
+    writeup.md
+    diagram.mmd
+    self-grade.md
+  templates/
+    writeup-template.md
+    rubric.md
+```
+
+README outline:
+
+1. Purpose: timed mock system-design interviews for AI systems.
+2. How I run them (45-minute timer, no notes, self-grade after).
+3. Table: prompt, date, score out of 30, top lesson learned.
+4. Rubric link.
+5. Reusable patterns I keep using (permission-aware retrieval, eval gates, model routing, HITL approvals).
+
+Suggested commits:
+
+- `chore: scaffold system-design-notes with template and rubric`
+- `docs(rag-10k): timed write-up and capacity estimates`
+- `docs(support-agents): timed write-up with HITL and trajectory evals`
+- `docs: self-grades and lessons learned`
+
+</CommitBox>
+
+<Checklist id="m7-05-review" title="Self-review" items={["I kept to 45 minutes per prompt and recorded the times honestly", "Every estimate has an assumption and an implication written next to it", "I raised permissions or tenant isolation myself, before being asked", "Prompt B has an idempotent refund tool contract with typed errors", "Prompt B includes a HITL approval step and loop guards with numbers", "Both write-ups include an eval strategy: offline, CI gate and online", "Failure modes are a table with detection and mitigation", "I scored myself strictly and wrote at least 5 things I missed per prompt"]} />

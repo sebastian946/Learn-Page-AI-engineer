@@ -1,0 +1,170 @@
+## Objetivo
+
+Construye un servidor MCP con forma de producción para una empresa de logística ficticia, **Northstar Freight**. Expone datos de pedidos e inventario a cualquier cliente MCP: Claude Desktop, el MCP Inspector o el agente LangGraph que construirás en el ejercicio 08.
+
+Vas a entregar:
+
+- **3 tools**: `get_order` (lectura), `check_stock` (lectura), `reschedule_delivery` (escritura, idempotente).
+- **1 resource**: `inventory://warehouses`, la lista de bodegas con sus horarios de corte.
+- Un **contrato de error estructurado** en cada tool (lección 03).
+- Tests con **pytest** que pasan por una sesión real de cliente MCP, no solo llamadas directas a funciones.
+- Notas y una captura de pantalla de una sesión manual en el **MCP Inspector**.
+
+Esto vive en el repo `mcp-servers-lab`, carpeta `orders_server/`. Tiempo límite: 90 minutos.
+
+Los datos pueden estar en memoria o en SQLite. Mantén el almacenamiento detrás de una clase pequeña para que los tests puedan reiniciarlo entre ejecuciones, igual que aíslas fixtures en Playwright.
+
+<AcceptanceCriteria>
+
+- [ ] `uv run python -m orders_server` (o `python -m orders_server`) inicia el servidor sobre stdio; `--http` lo inicia con `transport="streamable-http"` en `127.0.0.1:8000`.
+- [ ] `get_order(order_id)` valida el formato del id `ORD-` seguido de 6 dígitos y devuelve `order_id`, `status`, `carrier`, `promised_date`, `warehouse_id`.
+- [ ] `check_stock(sku, warehouse_id)` devuelve las cantidades `available` y `reserved`; `warehouse_id` es opcional y, si se omite, devuelve totales por bodega.
+- [ ] `reschedule_delivery(order_id, new_date, idempotency_key)` rechaza pedidos entregados o cancelados, rechaza fines de semana y fechas a más de 14 días, y devuelve el resultado guardado ante un `idempotency_key` repetido con `"replayed": true`.
+- [ ] Cada error de negocio usa la forma `{"error": {"code", "message", "retryable", "hint"}}` con al menos estos códigos: `INVALID_ORDER_ID`, `ORDER_NOT_FOUND`, `ALREADY_DELIVERED`, `INVALID_DATE`, `UNKNOWN_SKU`.
+- [ ] El resource `inventory://warehouses` devuelve JSON con al menos 3 bodegas (`id`, `city`, `cutoff_local`).
+- [ ] Los docstrings de los tools dicen qué hace el tool, cuándo usarlo, qué devuelve y si cambia estado.
+- [ ] Nada se imprime a stdout; los logs van a stderr o a `ctx.info`.
+- [ ] `pytest` pasa con al menos 8 tests, incluyendo uno que lista los tools a través de una sesión de cliente y uno que demuestra el replay idempotente.
+- [ ] El README incluye una captura del Inspector y el comando exacto para reproducirla.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# orders_server/server.py
+import json
+import logging
+import re
+import sys
+from datetime import date, timedelta
+from mcp.server.fastmcp import FastMCP, Context
+
+from .store import Store
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+log = logging.getLogger("orders_server")
+
+mcp = FastMCP("northstar-orders")
+store = Store.seeded()
+ORDER_ID = re.compile(r"^ORD-[0-9]{6}$")
+
+
+def tool_error(code: str, message: str, *, retryable: bool, hint: str) -> dict:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+
+
+@mcp.tool()
+async def get_order(order_id: str) -> dict:
+    """Look up ONE order by id (format ORD-123456). Read-only.
+    Returns order_id, status, carrier, promised_date and warehouse_id.
+    Call this before reschedule_delivery."""
+    # TODO: validate format -> INVALID_ORDER_ID, look up -> ORDER_NOT_FOUND
+    raise NotImplementedError
+
+
+@mcp.tool()
+async def check_stock(sku: str, warehouse_id: str | None = None) -> dict:
+    """Check available and reserved stock for a SKU. Read-only.
+    Omit warehouse_id to get one entry per warehouse."""
+    # TODO
+    raise NotImplementedError
+
+
+@mcp.tool()
+async def reschedule_delivery(order_id: str, new_date: date, idempotency_key: str, ctx: Context) -> dict:
+    """Move delivery of ONE undelivered order to a new business day within 14 days.
+    CHANGES STATE. Safe to retry with the same idempotency_key."""
+    # TODO: replay check first, then business rules, then write + store response
+    raise NotImplementedError
+
+
+@mcp.resource("inventory://warehouses")
+def warehouses() -> str:
+    """All warehouses with city and daily cut-off time (local)."""
+    return json.dumps(store.warehouses())
+```
+
+```python
+# tests/test_server.py
+import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
+from orders_server import server
+
+
+@pytest.fixture(autouse=True)
+def fresh_store(monkeypatch):
+    monkeypatch.setattr(server, "store", server.Store.seeded())
+
+
+@pytest.mark.anyio
+async def test_lists_three_tools():
+    async with create_connected_server_and_client_session(server.mcp._mcp_server) as client:
+        tools = await client.list_tools()
+        assert {t.name for t in tools.tools} == {"get_order", "check_stock", "reschedule_delivery"}
+
+
+@pytest.mark.anyio
+async def test_unknown_order_returns_contract():
+    result = await server.get_order("ORD-000000")
+    assert result["error"]["code"] == "ORDER_NOT_FOUND"
+    assert result["error"]["retryable"] is False
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Empieza con la clase `Store`: diccionarios para pedidos, stock y un mapa `idempotency` de llave a respuesta. Dale un classmethod `seeded()` con 5 pedidos en distintos estados (pending, in_transit, delayed, delivered, cancelled). Los tests se vuelven triviales cuando los datos son predecibles.</Hint>
+
+<Hint>En `reschedule_delivery`, revisa el mapa de idempotencia **antes** de cualquier validación. Un replay de una llamada exitosa debe tener éxito aunque el estado del pedido haya cambiado desde entonces (por ejemplo, ahora está "rescheduled"). Guarda solo respuestas exitosas, no errores.</Hint>
+
+<Hint>Verificación de fin de semana y ventana: `new_date.weekday() >= 5` es fin de semana; compara contra `date.today() + timedelta(days=14)`. Inyecta "hoy" a través del store (`store.today`) para que los tests no se rompan los viernes. Es la versión del mundo de agentes de congelar el tiempo en un test E2E flaky.</Hint>
+
+<Hint>`create_connected_server_and_client_session` recibe el servidor de bajo nivel, que FastMCP expone como `mcp._mcp_server`. `call_tool` devuelve un `CallToolResult`; el JSON está en `result.content[0].text` (y en `result.structuredContent` en versiones recientes del SDK). Agrega `anyio` a las dependencias de desarrollo y usa `@pytest.mark.anyio`. Para probar el resource, llama `client.read_resource("inventory://warehouses")`.</Hint>
+
+</Hints>
+
+<CommitBox repo="mcp-servers-lab">
+
+Estructura de carpetas:
+
+```text
+mcp-servers-lab/
+  README.md
+  pyproject.toml
+  orders_server/
+    __init__.py
+    __main__.py        # argparse: --http flag, calls mcp.run(...)
+    server.py          # FastMCP tools + resource
+    store.py           # in-memory store, seeded data, idempotency map
+  tests/
+    conftest.py
+    test_tools.py      # direct calls: happy paths + every error code
+    test_session.py    # in-memory client session: list_tools, call_tool, read_resource
+  docs/
+    inspector.png
+  .github/workflows/ci.yml   # ruff + pytest
+```
+
+Esquema del README:
+
+1. Qué hace este servidor (un párrafo, el escenario de Northstar Freight).
+2. Tools, resource y códigos de error (tabla).
+3. Cómo ejecutarlo: stdio, streamable HTTP, comando del MCP Inspector, snippet de configuración para Claude Desktop.
+4. Decisiones de diseño: estrategia de idempotencia, por qué las bodegas son un resource y no un tool, contrato de error.
+5. Tests y CI.
+6. Notas de seguridad: tools de lectura vs escritura, enlazar a localhost.
+
+Commits sugeridos:
+
+- `feat(orders): seeded in-memory store with orders, stock, warehouses`
+- `feat(orders): get_order and check_stock tools with error contract`
+- `feat(orders): idempotent reschedule_delivery with business rules`
+- `feat(orders): inventory://warehouses resource and HTTP transport flag`
+- `test(orders): session-level tests for tools and resource`
+- `docs: README with Inspector screenshot and design decisions`
+
+</CommitBox>
+
+<Checklist id="m4-05-review" title="Autorrevisión" items={["Cada docstring de tool dice qué hace, cuándo usarlo, qué devuelve y sus efectos secundarios", "Todos los errores de negocio usan la misma forma code/message/retryable/hint", "Un idempotency_key repetido devuelve la respuesta guardada con replayed=true", "No hay llamadas a print(); el logging va a stderr o a ctx", "Los tests reinician el store y congelan 'hoy'", "Al menos un test pasa por una sesión real de cliente", "La captura del Inspector y el comando para reproducirla están en el README", "El transporte HTTP se enlaza a 127.0.0.1, no a 0.0.0.0"]} />

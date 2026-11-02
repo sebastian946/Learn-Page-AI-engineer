@@ -1,0 +1,164 @@
+## From "is it good?" to "what exactly are we measuring?"
+
+In Module 3 you built an eval harness: a golden dataset, an LLM judge, a CI gate. In Module 2 you measured RAG with Ragas and DeepEval. In Module 4 you scored agent trajectories. Those tools answer "did quality drop?". This module answers harder questions. Is model B *really* better than model A? Can we trust these labels? Will this metric move when the business metric moves?
+
+It starts with eval design. As an SDET you never wrote "test the app". You wrote a test strategy: which risks, which levels, which oracles, which coverage. Eval design is the same discipline. Before you pick a metric, write down four things:
+
+1. **The decision the eval supports.** "Ship prompt v7", "migrate to a cheaper model", "release to enterprise tenants". An eval without a decision becomes a dashboard nobody reads.
+2. **The unit of analysis.** A single response, a whole conversation, a document, a user session. Your sample size counts these units, not tokens or turns.
+3. **The oracle.** Exact reference, set of acceptable answers, rubric, human judgment, or a downstream signal like "ticket reopened".
+4. **The failure cost.** A missed liability cap in a contract costs more than a clumsy sentence. Weight your metrics, or at least report the expensive errors separately.
+
+## A metrics taxonomy
+
+Most LLM features fall into a few task shapes. Each shape has metrics that fit it. Using a generic "quality score 1–5" for all of them is the most common design mistake.
+
+| Task shape | Example | Primary metrics | Oracle |
+|---|---|---|---|
+| Classification / routing | Ticket router, intent detection | Precision, recall, F1 per class, macro-F1, confusion matrix | Gold label |
+| Extraction | Contract fields, invoice parsing | Field-level precision/recall/F1, exact match after normalization | Gold record |
+| Short-answer QA | "What is the notice period?" | Exact match (normalized), token F1, semantic equivalence | Reference answer(s) |
+| Long-form generation | Summaries, emails, explanations | Rubric scores (coverage, accuracy, concision), pairwise preference | Rubric + optional reference |
+| Grounded generation (RAG) | Knowledge assistant | Faithfulness, answer relevance, citation accuracy (Module 2) | Retrieved context |
+| Multi-step / agentic | Ops agent | Task success, tool-call correctness, steps, cost (Modules 4 and this one, lesson 10) | End state + trajectory |
+
+### Classification: stop reporting accuracy alone
+
+A router that sends 90% of tickets to "general" scores 90% accuracy on a dataset where 90% of tickets are general. It is useless. Report per-class precision and recall and look at the confusion matrix. Precision answers "when the model says *refund*, how often is it right?". Recall answers "of all real refund tickets, how many did we catch?".
+
+Choose the averaging on purpose. **Micro-F1** pools all decisions and is dominated by frequent classes. **Macro-F1** averages per-class F1 and treats a rare class as equally important. If the rare class is "fraud" or "legal threat", you want macro-F1, plus a dedicated recall target for that class.
+
+### Extraction: field-level, not document-level
+
+"Document fully correct" is too strict. One wrong date marks a 20-field record as a failure and hides which fields break. Score each field:
+
+- **TP**: gold has a value and the prediction matches it after normalization.
+- **FP**: the prediction has a value that is wrong, or the gold has no value (hallucinated field).
+- **FN**: the gold has a value and the prediction is empty or wrong.
+
+A wrong value counts as both an FP and an FN. That is the standard convention, and it punishes confident errors more than abstentions. That matches most business costs: an empty field goes to a human, a wrong field goes to the customer.
+
+Normalization is part of the metric. "30 days", "thirty (30) days" and "30 calendar days" may all be the same answer. Write the normalizers as code, test them like any other code, and version them with the dataset.
+
+### Exact match vs semantic similarity
+
+Exact match is cheap, deterministic and brittle. Embedding cosine similarity is flexible and dangerously lenient: "The cap is $1M" and "The cap is $10M" are very similar embeddings and opposite answers. Use this ladder:
+
+1. Normalize and exact-match when the answer space is small (numbers, dates, enums, IDs).
+2. Accept a set of references when a few phrasings are valid.
+3. Use an LLM judge with a reference ("is the candidate equivalent to the reference for this question?") when phrasing varies a lot.
+4. Use embedding similarity only as a cheap pre-filter or a drift signal, never as the pass/fail oracle for facts.
+
+### Summarization and long-form
+
+ROUGE and BLEU measure n-gram overlap with a reference. They correlate weakly with human judgment for modern LLM outputs and reward copying. Decompose instead: **coverage** (did it include the key points from a checklist?), **accuracy** (are all claims supported by the source?), **concision** (length within budget), and **format**. Coverage and accuracy can be checked claim by claim. That makes the metric explainable, which matters when a stakeholder asks "why did this score 3?".
+
+## Reference-based vs reference-free
+
+**Reference-based** metrics compare to a gold answer: exact match, field F1, "equivalent to reference" judges. They are precise and stable, but references cost money and age when policies change.
+
+**Reference-free** metrics judge the output on its own or against the input: faithfulness to context, rubric adherence, toxicity, JSON validity, length. They scale to production traffic, where you have no gold answers. They are noisier and need calibration (lesson 5).
+
+A mature suite uses both. Reference-based on a curated offline set for release decisions. Reference-free on sampled production traffic for monitoring. Think of it as the difference between assertions against a fixture and invariant checks in production.
+
+## Metrics that track business outcomes
+
+A metric is useful only if moving it moves something the business cares about. Validate that link explicitly:
+
+- **Map metric to outcome.** Router macro-F1 maps to misrouted tickets, which map to handling time. Extraction recall on "auto-renewal" maps to missed renewal deadlines.
+- **Check the correlation once.** Take 100–200 historical cases with a known outcome (ticket reopened, user edited the draft, lawyer corrected the field). Does your metric separate good from bad outcomes? If not, it is a vanity metric.
+- **Prefer a small set.** One or two primary metrics that gate decisions, a few secondary metrics you watch, and guardrail metrics that must not regress (safety, latency, cost). More than that and every release has "mixed results".
+
+<Callout type="tip" title="SDET lens">
+
+This is the test-oracle problem you already know. A test with a weak oracle (status code 200) passes while the feature is broken. A metric with a weak oracle (embedding similarity) passes while the facts are wrong. Pick the strongest oracle you can afford per task shape.
+
+</Callout>
+
+## Code: classification and field-level extraction metrics
+
+```python
+from collections import Counter
+from datetime import date
+import re
+
+from sklearn.metrics import classification_report, confusion_matrix
+
+def classification_metrics(gold: list[str], pred: list[str], labels: list[str]) -> None:
+    print(classification_report(gold, pred, labels=labels, digits=3, zero_division=0))
+    print(confusion_matrix(gold, pred, labels=labels))  # rows = gold, cols = pred
+
+def normalize(field: str, value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    v = value.strip().lower()
+    if field == "notice_days":
+        m = re.search(r"\d+", v)
+        return m.group() if m else v
+    if field == "governing_law":
+        return re.sub(r"^(the )?(state of |laws of )", "", v)
+    if field == "effective_date":
+        try:
+            return date.fromisoformat(v).isoformat()
+        except ValueError:
+            return v
+    return re.sub(r"\s+", " ", v)
+
+def field_f1(gold: list[dict], pred: list[dict], fields: list[str]) -> dict[str, dict[str, float]]:
+    counts: dict[str, Counter] = {f: Counter() for f in fields}
+    for g, p in zip(gold, pred, strict=True):
+        for f in fields:
+            gv, pv = normalize(f, g.get(f)), normalize(f, p.get(f))
+            if gv is not None and pv == gv:
+                counts[f]["tp"] += 1
+                continue
+            if pv is not None:
+                counts[f]["fp"] += 1  # wrong value or hallucinated field
+            if gv is not None:
+                counts[f]["fn"] += 1  # missed or wrong value
+    out = {}
+    for f, c in counts.items():
+        prec = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        rec = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+        out[f] = {"precision": prec, "recall": rec, "f1": f1, "support": c["tp"] + c["fn"]}
+    return out
+```
+
+Report `support` next to every number. An F1 of 1.0 on a field with 3 gold values is not evidence of anything.
+
+## Common mistakes
+
+- **One generic 1–5 "quality" score for every task.** It hides which dimension failed and is hard to calibrate. Decompose by task shape.
+- **Accuracy on imbalanced classes.** Always show per-class recall and the confusion matrix.
+- **Embedding similarity as a fact oracle.** Numbers and negations barely move embeddings.
+- **Normalizers that live in a notebook.** They are part of the metric. Version and unit-test them.
+- **Counting turns or tokens as samples.** Your sample is the unit of analysis. Ten turns from one conversation are not ten independent samples.
+- **No link to outcomes.** If nobody can say which business number a metric protects, it should not gate a release.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="You are asked to evaluate a contract-extraction feature. Which metrics do you choose and why?" level="mid">
+
+I score at the field level, not the document level. For each field I compute precision, recall and F1 after normalization, with support counts. A wrong value counts as both a false positive and a false negative, because a confident wrong value is worse than an empty field that goes to review. I add exact match per field for enums and dates. I report critical fields like liability cap and auto-renewal separately with their own recall target, because their error cost is much higher. Normalizers are versioned code with unit tests. Finally I check that the metric correlates with real corrections made by lawyers on historical documents.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="When would you use a reference-free metric instead of a reference-based one?" level="senior">
+
+Reference-based metrics are my choice for release decisions on a curated offline set: they are stable and explainable. But references are expensive and do not exist for production traffic. So for monitoring I use reference-free checks on sampled traffic: faithfulness to retrieved context, rubric adherence, format validity, safety. Those are noisier, so I calibrate them against human labels and alert on sustained trends rather than single points. I also use reference-free metrics when the answer space is open, like summaries, but decompose them into checkable claims so they stay explainable.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Signal of seniority">
+
+Start your answer with the decision the eval supports and the cost of each error type. Then name metrics. Candidates who start with "I'd use Ragas" sound like tool users. Candidates who start with "the decision is X, the expensive error is Y" sound like owners.
+
+</Callout>
+
+## Further reading
+
+- scikit-learn, model evaluation guide: https://scikit-learn.org/stable/modules/model_evaluation.html
+- Ribeiro et al., "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList" (ACL 2020): https://arxiv.org/abs/2005.04118
+- Ragas metrics overview: https://docs.ragas.io
+- DeepEval metrics: https://docs.confident-ai.com

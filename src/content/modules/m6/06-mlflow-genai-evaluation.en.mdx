@@ -1,0 +1,205 @@
+# MLflow for LLM evaluation: tracing, scorers and LLM judges
+
+In Module 3 you built an eval harness and wired it into CI. MLflow gives you the same building blocks as a platform: **traces** for every call, **datasets** of examples, **scorers** (code checks and LLM judges), and **runs** that store results so you can compare versions. On Databricks, MLflow is built in and is the evaluation engine behind the Agent Framework. It is open source, so everything in this lesson also runs locally.
+
+<Callout type="warning" title="MLflow 2 vs MLflow 3">
+
+MLflow's GenAI APIs changed significantly in MLflow 3: `mlflow.genai.evaluate` with scorers replaces the older `mlflow.evaluate(..., model_type="databricks-agent")` path. You will see both in tutorials, older code and possibly exam questions, so this lesson explains both. Check mlflow.org/docs and docs.databricks.com for the version you use.
+
+</Callout>
+
+## Tracing: observability first
+
+A trace is a tree of spans: the request, the retrieval, the LLM call, any tool calls. You saw this with LangSmith and Langfuse. MLflow tracing captures the same thing and stores it in an experiment.
+
+Two ways to get traces:
+
+**Autolog** for supported libraries — one line:
+
+```python
+import mlflow
+
+mlflow.set_experiment("/Shared/claims-rag")      # locally: any name, e.g. "claims-rag"
+mlflow.langchain.autolog()     # LangChain / LangGraph
+mlflow.openai.autolog()        # OpenAI SDK (also Databricks endpoints via the OpenAI client)
+mlflow.anthropic.autolog()     # Anthropic SDK
+```
+
+**Manual instrumentation** for your own code:
+
+```python
+import mlflow
+from mlflow.entities import SpanType
+
+@mlflow.trace(span_type=SpanType.RETRIEVER)
+def retrieve(question: str, k: int = 5) -> list[dict]:
+    hits = index.similarity_search(query_text=question, num_results=k,
+                                   columns=["chunk_id", "doc_id", "content"])
+    return [{"page_content": r[2], "metadata": {"doc_uri": r[1], "chunk_id": r[0]}}
+            for r in hits["result"]["data_array"]]
+
+@mlflow.trace
+def answer(question: str) -> str:
+    docs = retrieve(question)
+    with mlflow.start_span(name="build_prompt") as span:
+        prompt = build_prompt(question, docs)
+        span.set_attributes({"num_docs": len(docs)})
+    return call_llm(prompt)
+```
+
+Marking the retriever span as `RETRIEVER` matters: retrieval-aware judges find the retrieved context in the trace by that span type. Without it, groundedness scorers have nothing to check against.
+
+## The MLflow 3 evaluation loop
+
+`mlflow.genai.evaluate` takes three things:
+
+1. **`data`**: a list of records, a DataFrame, or a managed evaluation dataset. Each record has `inputs` and optionally `expectations`.
+2. **`predict_fn`**: your app. MLflow calls it with each record's `inputs` unpacked as keyword arguments and traces the call.
+3. **`scorers`**: what to measure.
+
+```python
+import mlflow
+from mlflow.genai.scorers import (
+    Correctness, Guidelines, RelevanceToQuery, RetrievalGroundedness, Safety,
+)
+
+eval_data = [
+    {
+        "inputs": {"question": "What is the deductible for wind damage on policy HO-3?"},
+        "expectations": {
+            "expected_facts": ["The wind deductible is 2% of dwelling coverage",
+                               "It applies per occurrence"],
+        },
+    },
+    {
+        "inputs": {"question": "Can I file a claim for a stolen bicycle?"},
+        "expectations": {"expected_response": "Yes, under personal property coverage, subject to the deductible."},
+    },
+]
+
+def predict_fn(question: str) -> str:
+    return answer(question)
+
+results = mlflow.genai.evaluate(
+    data=eval_data,
+    predict_fn=predict_fn,
+    scorers=[
+        Correctness(),                # compares to expected_facts / expected_response
+        RelevanceToQuery(),           # does the answer address the question?
+        RetrievalGroundedness(),      # is the answer supported by retrieved context?
+        Safety(),
+        Guidelines(name="cites_sources",
+                   guidelines="The answer must cite at least one policy section or document."),
+    ],
+)
+print(results.metrics)
+```
+
+Each evaluation creates an MLflow run with aggregate metrics, plus per-row traces with each scorer's value and **rationale**. Read rationales. They are how you learn whether a judge is right.
+
+If you already have outputs (for example from production inference tables), skip `predict_fn` and pass records with `outputs` (and optionally `trace`) already filled in.
+
+### Built-in judges at a glance
+
+| Scorer | Needs | Answers |
+|---|---|---|
+| `Correctness` | `expectations` | Does the answer match expected facts or response? |
+| `RelevanceToQuery` | inputs, outputs | Does it address the question? |
+| `RetrievalGroundedness` | trace with retriever span | Is the answer supported by retrieved docs? (faithfulness) |
+| `RetrievalRelevance` | trace with retriever span | Are the retrieved docs relevant? (context precision) |
+| `Safety` | outputs | Is it free of harmful content? |
+| `Guidelines` | your natural-language rule | Does it follow a rule you define? |
+
+These map directly to the Ragas metrics from Module 2: groundedness is faithfulness, retrieval relevance is context precision, correctness with expected facts is close to answer correctness.
+
+### Custom code scorers
+
+Not everything needs an LLM judge. Deterministic checks are cheaper, faster and never flaky — the same reason you prefer unit tests to end-to-end tests.
+
+```python
+import re
+from mlflow.genai.scorers import scorer
+from mlflow.entities import Feedback
+
+@scorer
+def has_citation(outputs: str) -> bool:
+    return bool(re.search(r"\[(doc|section)[^\]]*\]", outputs, re.IGNORECASE))
+
+@scorer
+def latency_budget(trace) -> Feedback:
+    ms = trace.info.execution_time_ms
+    return Feedback(value=ms <= 3000, rationale=f"{ms} ms against a 3000 ms budget")
+```
+
+A scorer can accept `inputs`, `outputs`, `expectations` and `trace`; MLflow passes what the function signature asks for.
+
+### Choosing the judge model
+
+Built-in judges use a default judge model on Databricks. Locally, or to pin a specific model, pass `model` with a provider URI, for example `Correctness(model="anthropic:/claude-sonnet-5-5")` or an OpenAI model name read from config. The URI format and supported providers depend on the MLflow version — check the docs. Pin the judge model and record it in run params: changing the judge changes the metric.
+
+## The legacy path: `mlflow.evaluate` with Agent Evaluation
+
+Older Databricks code and parts of the exam material use MLflow 2 with Mosaic AI Agent Evaluation:
+
+```python
+import mlflow
+import pandas as pd
+
+eval_df = pd.DataFrame([
+    {
+        "request": "What is the deductible for wind damage on policy HO-3?",
+        "response": "The wind deductible is 2% of dwelling coverage [section 4.2].",
+        "retrieved_context": [{"content": "Wind deductible: 2% of Coverage A...", "doc_uri": "ho3.pdf"}],
+        "expected_response": "2% of dwelling coverage, per occurrence.",
+    }
+])
+
+with mlflow.start_run(run_name="legacy-agent-eval"):
+    result = mlflow.evaluate(data=eval_df, model_type="databricks-agent")
+    print(result.metrics)
+```
+
+The column names (`request`, `response`, `retrieved_context`, `expected_response`) are the legacy schema; you can also pass `model=` to have it generate responses. The built-in judges cover correctness, groundedness, relevance, chunk relevance and safety — the same ideas as the MLflow 3 scorers. If you meet this on the exam, recognize it as "Agent Evaluation with LLM judges".
+
+## Beyond offline evaluation
+
+- **Evaluation datasets as tables.** On Databricks, eval datasets can live in Unity Catalog, versioned like any table (lesson 3) and built from production traces and SME labels (lesson 7).
+- **Production monitoring.** The same scorers can run on a sample of production traces or inference-table rows on a schedule. That is your online eval from Module 3.
+- **Human feedback.** Review App labels and end-user feedback are stored with traces and become new expectations.
+
+## LLM-judge pitfalls (again, because they matter)
+
+- **Uncalibrated judges.** Before trusting a judge, label 30–50 examples by hand and measure agreement. If the judge disagrees with humans often, fix the guideline or use a stronger judge model.
+- **Self-preference.** A judge from the same model family as the app may be lenient. Use a different family or a stronger tier where possible.
+- **Vague guidelines.** "Be helpful" produces noise. "Must cite at least one section number" produces signal.
+- **Comparing across judge changes.** New judge model or prompt means a new baseline.
+- **Over-reliance.** Use code scorers for anything checkable by code: format, citations, latency, forbidden strings.
+
+## Common mistakes
+
+- Not marking the retriever span, so groundedness and retrieval scorers return nothing useful.
+- Using production answers as `expected_response` without review.
+- Ignoring rationales and only reading the aggregate.
+- Not recording dataset version, prompt version and judge model in the run.
+- Mixing MLflow 2 and 3 APIs in the same project without noticing.
+
+## How this shows up in interviews and on the exam
+
+<InterviewQuestion question="How would you evaluate a RAG application on Databricks before deploying a new prompt version?" level="mid">
+
+Trace the app (autolog or `@mlflow.trace`, with the retriever span typed as RETRIEVER). Run `mlflow.genai.evaluate` on a versioned evaluation dataset with expectations, using Correctness, RetrievalGroundedness, RetrievalRelevance, RelevanceToQuery, Safety, a Guidelines scorer for domain rules, and code scorers for citations and latency. Run it for the current and the candidate prompt as two MLflow runs and compare per-metric and per-row, reading rationales on regressions. Gate deployment on thresholds, then monitor the same scorers on production traces.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="When do you use an LLM judge versus a code-based scorer?" level="senior">
+
+Code scorers for anything deterministic: schema validity, required citations, forbidden content, latency and cost budgets, exact field matches in extraction. They are cheap and stable, so they can run on every commit. LLM judges for semantic qualities — correctness against expected facts, groundedness, relevance, tone — where code can't decide. Judges must be calibrated against human labels, pinned to a model version, and treated as noisy: compare distributions and look at rationales instead of trusting small deltas.
+
+</InterviewQuestion>
+
+## Further reading
+
+- MLflow GenAI evaluation: https://mlflow.org/docs/latest/genai/eval-monitor/
+- MLflow tracing: https://mlflow.org/docs/latest/genai/tracing/
+- Databricks: evaluate and monitor GenAI apps: https://docs.databricks.com/en/mlflow3/genai/eval-monitor/index.html
+- Mosaic AI Agent Evaluation (legacy): https://docs.databricks.com/en/generative-ai/agent-evaluation/index.html

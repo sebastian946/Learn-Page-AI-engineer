@@ -1,0 +1,199 @@
+## Por qué el retrieval de primera etapa no alcanza
+
+La búsqueda híbrida (lección 09) te da una buena lista de candidatos. No te da un buen *orden*. Los embeddings bi-encoder comprimen un chunk entero en un solo vector antes de ver la pregunta. BM25 cuenta términos y no sabe nada de significado. Ambos son rápidos porque puntúan cada documento sin considerar el contexto completo de la consulta.
+
+Ese trade-off aparece en producción como un reporte de bug conocido: "el párrafo correcto sí se recuperó, pero era el chunk #14 y solo mandamos los 5 primeros al LLM". En términos de QA, tu retriever tiene un **recall** decente pero una **precisión en el top** débil.
+
+Dos técnicas atacan el problema desde lados opuestos:
+
+- **Re-ranking** (reordenamiento) corrige la *salida* del retrieval. Traes una red amplia (por ejemplo 50 candidatos) y los vuelves a puntuar con un modelo más lento y más preciso.
+- **Query rewriting** (reescritura de consultas) corrige la *entrada* del retrieval. Transformas la pregunta del usuario en una o más consultas que se parecen a cómo están escritos tus documentos.
+
+La mayoría de los sistemas RAG en producción usan ambas. El patrón es: reescribir → recuperar amplio → re-rankear → quedarte con el top-k → generar.
+
+<Diagram caption="Retrieval en dos etapas con reescritura de consultas" chart={`flowchart LR
+  Q[Pregunta del usuario] --> RW["Reescritor de consultas (LLM)"]
+  RW --> H["Retrieval híbrido (top 50)"]
+  H --> RR["Re-ranker cross-encoder"]
+  RR --> K["Top 5 chunks"]
+  K --> G["Respuesta del LLM con citas"]`} />
+
+## Bi-encoders vs cross-encoders
+
+Un **bi-encoder** genera el embedding de la consulta y del documento por separado, y luego compara vectores con similitud coseno. Los vectores de los documentos se precalculan, así que buscar sobre millones de chunks toma milisegundos.
+
+Un **cross-encoder** recibe el par `(query, document)` como una sola entrada y devuelve un único score de relevancia. El transformer presta atención a ambos textos a la vez, así que puede notar que "¿Puedo usar fondos de regalo para el enganche de una propiedad de inversión?" y un chunk que dice "Los fondos de regalo solo se permiten para residencias principales" son una coincidencia fuerte (con respuesta negativa). Un bi-encoder suele rankear ese chunk por debajo de un párrafo genérico tipo "Acerca de los fondos de regalo".
+
+El costo: un cross-encoder debe correr una vez por candidato, en tiempo de consulta. Nada se precalcula. Por eso es una *segunda* etapa, nunca la primera.
+
+| | Bi-encoder | Cross-encoder |
+|---|---|---|
+| Entrada | consulta y documento codificados por separado | el par `(query, doc)` junto |
+| ¿Precalcula documentos? | Sí | No |
+| Uso típico | retrieval de primera etapa sobre todo el corpus | re-puntuar 20–100 candidatos |
+| Precisión al rankear | buena | notablemente mejor en la mayoría de benchmarks |
+| Latencia | milisegundos para millones de documentos | crece linealmente con el número de candidatos |
+
+### Cross-encoder local con sentence-transformers
+
+`cross-encoder/ms-marco-MiniLM-L-6-v2` es un modelo pequeño entrenado en ranking de pasajes de MS MARCO. Corre en CPU, lo que lo hace un buen default para un laboratorio y para muchas cargas en producción.
+
+```python
+from dataclasses import dataclass
+from sentence_transformers import CrossEncoder
+
+
+@dataclass
+class Candidate:
+    chunk_id: str
+    text: str
+    source: str
+    score: float = 0.0
+
+
+class LocalReranker:
+    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2") -> None:
+        # max_length truncates long chunks; keep it aligned with your chunk size
+        self.model = CrossEncoder(model_name, max_length=512)
+
+    def rerank(self, query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
+        if not candidates:
+            return []
+        pairs = [(query, c.text) for c in candidates]
+        scores = self.model.predict(pairs, batch_size=32)
+        for c, s in zip(candidates, scores):
+            c.score = float(s)
+        return sorted(candidates, key=lambda c: c.score, reverse=True)[:top_k]
+```
+
+Dos detalles importan. Primero, los scores son logits crudos, no probabilidades. No los compares entre modelos y no trates `0.0` como un umbral universal. Segundo, `predict` es síncrono y usa CPU. En un servicio FastAPI, córrelo en un thread pool (`await asyncio.to_thread(reranker.rerank, ...)`) para no bloquear el event loop.
+
+### Re-ranking hospedado con Cohere Rerank
+
+Si no quieres hospedar un modelo, Cohere Rerank es una API que hace el mismo trabajo. Envías la consulta y una lista de documentos; te devuelve índices con scores de relevancia.
+
+```python
+import os
+import cohere
+
+co = cohere.ClientV2(api_key=os.environ["COHERE_API_KEY"])
+RERANK_MODEL = os.environ.get("COHERE_RERANK_MODEL", "rerank-v3.5")  # example — check Cohere's current model list
+
+
+def cohere_rerank(query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
+    resp = co.rerank(
+        model=RERANK_MODEL,
+        query=query,
+        documents=[c.text for c in candidates],
+        top_n=top_k,
+    )
+    out: list[Candidate] = []
+    for r in resp.results:
+        c = candidates[r.index]
+        c.score = r.relevance_score  # normalized 0..1, unlike raw cross-encoder logits
+        out.append(c)
+    return out
+```
+
+Elegir entre los dos es una decisión de ingeniería, no un concurso de calidad:
+
+- **Cross-encoder local:** sin costo por llamada, los datos se quedan en tu VPC (importante para expedientes de crédito con PII), pero tú administras la capacidad de CPU/GPU y los cold starts.
+- **Rerank hospedado:** modelos multilingües fuertes, cero infraestructura, pero agrega un salto de red, un costo por búsqueda y un acuerdo de procesamiento de datos que revisar.
+
+Pon el re-ranker detrás de una interfaz pequeña (`rerank(query, candidates, top_k)`) para poder intercambiarlos y hacer A/B con tu suite de evals de la lección 14.
+
+### ¿Cuántos candidatos re-rankear?
+
+La latencia crece linealmente con los candidatos. Un punto de partida razonable: recupera 30–50, re-rankea y quédate con 4–8. Luego mide. Si el recall@50 es alto pero el recall@5 después del re-ranking no se mueve, tu re-ranker no está ayudando y debes revisar truncamiento o desajuste de dominio. Si el recall@50 en sí es bajo, el re-ranking no te va a salvar; arregla primero el chunking o el retrieval.
+
+## Reescritura de consultas
+
+Los usuarios no escriben como están escritos los documentos de políticas. Un solicitante pregunta "¿mi mamá me puede ayudar a pagar la casa?". La guía de underwriting dice "fondos de regalo de un donante aceptable". Reescribir cierra esa brecha de vocabulario.
+
+### 1. Multi-query
+
+Pide a un LLM 3–5 paráfrasis, recupera para cada una y combina las listas con reciprocal rank fusion (ya construiste RRF en la lección 10). Esto sube el recall cuando la pregunta es ambigua o usa términos coloquiales.
+
+### 2. HyDE (Hypothetical Document Embeddings)
+
+Pide al LLM que escriba un párrafo de *respuesta hipotética* y luego genera el embedding de ese párrafo en lugar de la pregunta. La respuesta falsa se parece a un documento de política, así que cae más cerca de los chunks reales en el espacio vectorial. HyDE ayuda al retrieval denso en preguntas cortas o vagas. Puede perjudicar cuando el modelo alucina detalles (un límite de DTI incorrecto atrae los chunks equivocados), así que mantén también la consulta original.
+
+### 3. Step-back prompting
+
+Primero genera una pregunta más general. "¿Una bancarrota Chapter 7 de 2019 es un problema para un préstamo FHA que cierra el próximo mes?" retrocede a "¿Cuáles son los periodos de espera de FHA después de una bancarrota?". Recupera para ambas. La consulta general trae la regla; la específica trae el caso borde.
+
+### 4. Condensación de la conversación
+
+En un chat, las preguntas de seguimiento no son independientes: "¿y para condominios?" no le dice nada a un retriever. Condensa el historial más el nuevo turno en una consulta autocontenida antes del retrieval. Esta es la reescritura más importante para cualquier RAG conversacional.
+
+```python
+import json
+from anthropic import AsyncAnthropic
+from pydantic import BaseModel, Field
+
+client = AsyncAnthropic()
+
+REWRITE_SYSTEM = """You rewrite user questions for a mortgage policy search engine.
+Return JSON only: {"standalone": str, "variants": [str, ...], "step_back": str}.
+- standalone: the last user turn rewritten to be self-contained, using the chat history.
+- variants: 3 paraphrases using underwriting vocabulary (DTI, LTV, gift funds, reserves).
+- step_back: a more general question about the underlying policy.
+Never answer the question."""
+
+
+class Rewrite(BaseModel):
+    standalone: str
+    variants: list[str] = Field(max_length=5)
+    step_back: str
+
+
+async def rewrite_query(history: list[dict], question: str) -> Rewrite:
+    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    msg = await client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=400,
+        system=REWRITE_SYSTEM,
+        messages=[{"role": "user", "content": f"History:\n{transcript}\n\nLast question: {question}"}],
+    )
+    return Rewrite.model_validate(json.loads(msg.content[0].text))
+```
+
+Usa un modelo pequeño y rápido para reescribir. Agrega un viaje de ida y vuelta al LLM antes del retrieval, así que impacta directamente tu time-to-first-token. Cachea las reescrituras para claves idénticas `(history_hash, question)` (lección 16).
+
+## Errores comunes
+
+- **Re-rankear muy pocos candidatos.** Reordenar el top 5 en otro top 5 casi no cambia nada. La idea es subir el elemento #23 al top 5.
+- **Truncar chunks en silencio.** Los cross-encoders MiniLM tienen un tope de 512 tokens. Si tus chunks miden 1,000 tokens, el re-ranker solo ve la primera mitad. Ajusta el tamaño de chunk al re-ranker, o re-rankea sobre un campo de resumen.
+- **Poner umbrales sobre logits crudos.** Un corte ajustado para un modelo se rompe cuando cambias de modelo. Usa top-k, o calibra un umbral por modelo con tu golden set.
+- **Dejar que HyDE reemplace la consulta real.** Siempre fusiona los resultados de HyDE con los de la consulta original.
+- **Reescribir sin loguear.** Si no registras las consultas reescritas, no puedes depurar una mala respuesta. Traza la reescritura como su propio span.
+- **Olvidar el presupuesto de latencia.** Reescritura (300–800 ms) + retrieval + re-rank (50–300 ms en CPU para 50 chunks cortos) se acumula. Mide el p95, no promedios.
+- **No evaluar antes y después.** Agregar un re-ranker "porque todos lo hacen" sin medir context precision es cargo culting. La lección 15 te da el arnés.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Por qué no usar un cross-encoder para todo el paso de retrieval?" level="mid">
+
+Un cross-encoder puntúa cada par `(query, document)` en conjunto, así que nada se puede precalcular. Puntuar un millón de chunks por consulta tomaría minutos. Los bi-encoders precalculan los vectores de documentos y usan un índice ANN, así que la búsqueda de primera etapa toma milisegundos. El diseño estándar es de dos etapas: retrieval barato y con alto recall (híbrido BM25 + vectores) para 30–100 candidatos, y luego un cross-encoder preciso que corrige el orden y deja los mejores. Dimensionaría el número de candidatos midiendo recall@N y la latencia p95 del re-ranker.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Un bot RAG conversacional responde mal las preguntas de seguimiento. ¿Qué revisas?" level="senior">
+
+Primero miro los traces: qué consulta llegó realmente al retriever. Lo más común es que el seguimiento ("¿y para condominios?") se envíe tal cual, y el retrieval devuelve ruido. La solución es un paso de condensación que reescribe historial más último turno en una consulta autocontenida, registrando la consulta reescrita como su propio span. Después reviso si la ventana de historial es muy corta o muy larga, si el modelo de reescritura pierde entidades clave (tipo de préstamo, estado) y agrego preguntas de seguimiento al golden dataset para que la regresión se detecte en CI.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Habla en trade-offs">
+
+Cuando menciones un re-ranker, acompáñalo de números: candidatos re-rankeados, latencia p95 agregada y el cambio en context precision sobre tu golden set. "Re-rankeamos 40 candidatos con un cross-encoder MiniLM, agrega unos 120 ms en CPU y subió la context precision de 0.61 a 0.78 en 80 preguntas golden" es una respuesta senior. Usa tus propios números medidos.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Sentence Transformers — Cross-Encoders: https://www.sbert.net/docs/cross_encoder/usage/usage.html
+- Documentación de Cohere Rerank: https://docs.cohere.com/docs/rerank-overview
+- Paper de HyDE, "Precise Zero-Shot Dense Retrieval without Relevance Labels": https://arxiv.org/abs/2212.10496
+- Paper de step-back prompting: https://arxiv.org/abs/2310.06117
+- Retrievers de LangChain (MultiQueryRetriever, contextual compression): https://python.langchain.com/docs/how_to/#retrievers

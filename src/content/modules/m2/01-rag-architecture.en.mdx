@@ -1,0 +1,203 @@
+## Why RAG exists
+
+A large language model knows what was in its training data, frozen at a cutoff date. It does not know your lender's current loan policy, last week's underwriting memo, or the FAQ page that marketing changed yesterday. You have three ways to give it that knowledge:
+
+1. **Put everything in the prompt.** Works for a 20-page handbook. Fails for 4,000 policy PDFs: you blow the context window, pay for every token on every request, and the model gets worse at finding the one relevant paragraph in a sea of text.
+2. **Fine-tune the model.** Expensive, slow to update, and it teaches style and format far better than facts. You cannot cite a fine-tuned weight.
+3. **Retrieve, then generate (RAG).** At query time, find the handful of passages that matter and put only those in the prompt. Knowledge stays in a database you control, updates in minutes, and every answer can point to its source.
+
+For an internal knowledge assistant at a mortgage lender, option 3 wins on every axis that matters: freshness (policies change monthly), auditability (compliance wants a citation for every claim), and cost (you send 3–6 chunks, not 4,000 documents).
+
+This module follows one running example: a corpus of **loan policy PDFs, underwriting guidelines and FAQ HTML pages** for a fictional lender. By lesson 20 you will ship it as `mortgage-knowledge-assistant`.
+
+## The two pipelines
+
+Every RAG system is really two pipelines that share a store.
+
+<Diagram caption="Offline indexing and online query pipelines share the vector store" chart={`flowchart LR
+  subgraph Offline["Indexing (batch, offline)"]
+    A["Load (PDF, HTML)"] --> B[Clean]
+    B --> C[Chunk]
+    C --> D["Embed (batch)"]
+    D --> E[(Vector store)]
+  end
+  subgraph Online["Query (per request)"]
+    Q[User question] --> R["Embed query"]
+    R --> S["Retrieve top-k"]
+    E --> S
+    S --> T["Build prompt with context"]
+    T --> U[LLM]
+    U --> V["Answer + citations"]
+  end`} />
+
+**Indexing (offline).** Load raw documents, clean them, split them into chunks, embed each chunk into a vector, and write vectors plus metadata to a store. This runs in a batch job or on a document-changed event. Latency here barely matters; correctness and repeatability matter a lot.
+
+**Query (online).** Embed the user's question with the *same* embedding model, find the nearest chunks, stuff them into a prompt with instructions, and call the LLM. This runs on every request, so latency and cost per request matter.
+
+As an SDET you already know this split: it is like test data setup (fixtures) versus the test run. Bugs in setup show up as confusing failures in the run. In RAG, most "the model hallucinated" bugs are actually indexing bugs: the right passage was never retrievable.
+
+## Components and their knobs
+
+| Component | Main knob | Typical starting value | What goes wrong |
+|---|---|---|---|
+| Loader | parser per file type | `pypdf` for text PDFs, BeautifulSoup for HTML | headers, footers and tables become noise |
+| Chunker | size and overlap | 800 chars, 100 overlap | chunks cut sections in half |
+| Embedder | model and dimensions | a small, cheap model from your provider | query and documents embedded with different models |
+| Vector store | index type, distance | HNSW, cosine | no metadata, so no filtering |
+| Retriever | k, filters, hybrid | k = 4, vector only | right doc ranked 9th |
+| Prompt | grounding instructions | "answer only from context, cite sources" | model answers from memory |
+| LLM | model, temperature | mid-tier model, temperature 0 | verbose, uncited answers |
+
+Each row gets its own lesson in this module. Today you wire all of them together with sensible defaults so you have a baseline to improve and measure against.
+
+## Your first pipeline with LangChain
+
+The course spec is deliberate: build with LangChain first to get a working system fast, then in lesson 17 rebuild the core without a framework so you understand every line. LangChain gives you loaders, splitters, vector store adapters and a uniform chat model interface.
+
+Install the pieces (pin versions in your `pyproject.toml`):
+
+```bash
+pip install langchain-core langchain-community langchain-text-splitters \
+  langchain-anthropic langchain-openai pypdf
+```
+
+Anthropic does not ship an embeddings endpoint, so we pair Claude for generation with an embedding model from another provider. The model name comes from config. The default below is an example — check the provider's current list and pricing.
+
+```python
+# rag_v0.py — baseline RAG over mortgage policy PDFs
+import os
+from pathlib import Path
+
+from langchain_anthropic import ChatAnthropic
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")  # example
+CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-sonnet-5-5")
+
+
+def load_corpus(folder: Path) -> list[Document]:
+    docs: list[Document] = []
+    for pdf in sorted(folder.glob("*.pdf")):
+        docs.extend(PyPDFLoader(str(pdf)).load())  # one Document per page
+    return docs
+
+
+def build_index(docs: list[Document]) -> InMemoryVectorStore:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    store = InMemoryVectorStore(OpenAIEmbeddings(model=EMBED_MODEL))
+    store.add_documents(chunks)
+    print(f"indexed {len(chunks)} chunks from {len(docs)} pages")
+    return store
+
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You answer questions for loan officers using ONLY the context below. "
+     "If the context does not contain the answer, say you don't know. "
+     "Cite sources as [source p.page] after each claim.\n\n{context}"),
+    ("human", "{question}"),
+])
+
+
+def format_context(chunks: list[Document]) -> str:
+    return "\n\n".join(
+        f"[{Path(c.metadata['source']).name} p.{c.metadata.get('page', 0) + 1}]\n{c.page_content}"
+        for c in chunks
+    )
+
+
+def answer(store: InMemoryVectorStore, question: str, k: int = 4) -> str:
+    chunks = store.similarity_search(question, k=k)
+    llm = ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    messages = PROMPT.invoke({"context": format_context(chunks), "question": question})
+    return llm.invoke(messages).content
+
+
+if __name__ == "__main__":
+    store = build_index(load_corpus(Path("data/policies")))
+    print(answer(store, "What is the maximum DTI for a conventional loan with manual underwriting?"))
+```
+
+That is a complete RAG system in about 50 lines. It has every stage from the diagram: load, chunk, embed, store, retrieve, prompt, generate. It is also naive in at least six ways, and the rest of this module fixes them one by one:
+
+- `PyPDFLoader` keeps running headers like "Northwind Mortgage — Confidential — Rev. 2026-03" on every page (lesson 2).
+- Fixed-size chunks split tables and numbered policy sections (lesson 4).
+- The embedding model was picked by default, not measured (lesson 6).
+- The in-memory store disappears on restart and has no filters (lessons 7–8).
+- Pure vector search misses exact terms like "Form 1003" or "LTV 97%" (lesson 9).
+- There is no evaluation, so you cannot tell whether a change helped (lesson 14).
+
+### The same pipeline as an LCEL chain
+
+LangChain Expression Language composes runnables with `|`. Production code often uses this form because it gives you streaming, batching and tracing for free.
+
+```python
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+retriever = store.as_retriever(search_kwargs={"k": 4})
+
+chain = (
+    {"context": retriever | RunnableLambda(format_context),
+     "question": RunnablePassthrough()}
+    | PROMPT
+    | ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    | StrOutputParser()
+)
+
+for token in chain.stream("Can gift funds cover the full down payment on an FHA loan?"):
+    print(token, end="", flush=True)
+```
+
+Both forms are fine. The explicit function version is easier to debug and test; the LCEL version is easier to stream and trace. Pick one per codebase and stay consistent.
+
+## Where the time and money go
+
+Rough latency budget for one query in this baseline (your numbers will differ; measure them):
+
+- Embed the query: one small API call, usually tens of milliseconds.
+- Vector search: in-memory or pgvector with an index, a few milliseconds for a corpus this size.
+- LLM generation: dominated by output tokens; often 1–4 seconds for a cited paragraph.
+
+Generation dominates. That is why later lessons on caching (lesson 16) and on sending fewer, better chunks (lessons 9–11) have the biggest payoff. Cost follows the same pattern: input tokens grow linearly with `k` times chunk size, so `k = 4` with 800-character chunks is roughly 800–1,000 input tokens of context per question.
+
+## Common mistakes
+
+- **Treating RAG as a model problem.** When answers are wrong, teams swap the LLM first. Check retrieval first: print the retrieved chunks for the failing question. If the answer is not in them, no model can fix it.
+- **Different embedding models at index and query time.** Vectors from two models live in different spaces. Similarity scores become meaningless and nothing errors. Store the model name with the index and assert it at query time.
+- **No source metadata.** If chunks do not carry `source`, `page` and later `section`, you cannot cite. Adding it later means re-indexing everything.
+- **Ungrounded prompt.** Without "answer only from context" and "say you don't know", the model happily fills gaps from training data. In a regulated domain that is a compliance incident.
+- **Skipping the baseline.** Building hybrid search and re-ranking before you have a measured baseline means you cannot prove any of it helped.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Walk me through the architecture of a RAG system you would build for internal policy documents." level="mid">
+
+Split it into two pipelines. **Indexing:** load PDFs and HTML, clean boilerplate, chunk with a structure-aware splitter, embed in batches, and store vectors with metadata (source, page, section, doc type, effective date) in a vector store such as pgvector. **Query:** embed the question with the same model, run hybrid retrieval (vector plus keyword) with metadata filters, optionally re-rank, build a grounded prompt that requires citations, and generate. Then name what you would measure: retrieval recall@k on a golden set, faithfulness of answers, p95 latency and cost per query. Close with the main risk: most failures are retrieval failures, so you evaluate retrieval separately from generation.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="When would you choose RAG over fine-tuning, and when would you combine them?" level="senior">
+
+RAG when knowledge changes often, must be cited, or is access-controlled per user: you update a database, not weights, and you can filter by permissions at retrieval time. Fine-tuning when you need a consistent output format, tone, or domain-specific reasoning pattern that prompting cannot reliably produce, or to make a smaller model good enough to cut cost. Combine them when a fine-tuned small model is the generator over retrieved context, for example to follow a strict citation format cheaply. Fine-tuning alone is a poor way to inject facts: it is hard to update, hard to audit, and it can still hallucinate confidently.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Show the baseline mindset">
+
+Interviewers like candidates who say "I'd ship the simplest pipeline first, build a golden set of 30–50 questions, and only then add hybrid search or re-ranking if the metrics justify it." It is the same instinct as writing a failing test before the fix.
+
+</Callout>
+
+## Further reading
+
+- [LangChain — Build a RAG app (tutorial)](https://python.langchain.com/docs/tutorials/rag/)
+- [Anthropic — Embeddings (which providers to pair with Claude)](https://docs.anthropic.com/en/docs/build-with-claude/embeddings)
+- [Lewis et al., Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (arXiv:2005.11401)](https://arxiv.org/abs/2005.11401)
+- [OpenAI — Embeddings guide](https://platform.openai.com/docs/guides/embeddings)

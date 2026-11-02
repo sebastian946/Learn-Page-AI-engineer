@@ -1,0 +1,172 @@
+# Tu sistema de aprendizaje
+
+El curso tiene unos 32 días de contenido. El contenido no es lo difícil. La constancia sí. Esta lección explica cómo funciona la plataforma, propone un ritmo diario y establece los hábitos que convierten la lectura en habilidades listas para el trabajo: repaso espaciado, práctica de entrevistas y entregas a GitHub.
+
+## Cómo funciona esta plataforma
+
+### Módulos y lecciones
+
+Hay ocho módulos, de `m0` a `m7`. Cada uno tiene cuatro tipos de lecciones:
+
+- **Concepto** — explicación, código, errores comunes, enfoque de entrevista, lecturas recomendadas. Haz clic en "Marcar como completada" al terminar.
+- **Ejercicio** — de 30 a 90 minutos de trabajo práctico con criterios de aceptación, código inicial, pistas progresivas y un checklist de autorrevisión. Sube el resultado al repo indicado en el recuadro "Qué subir a GitHub".
+- **Examen** — de 12 a 20 preguntas, con tiempo. Se completa automáticamente cuando obtienes 70 % o más.
+- **Capstone** — un brief de cliente realista. Normalmente de 3 a 5 días de trabajo. Produce las piezas más fuertes de tu portafolio.
+
+### El gate del examen
+
+El siguiente módulo se desbloquea cuando tu mejor puntaje en el examen del módulo actual es de al menos 70 %. Hay un botón "Desbloquear de todos modos". Úsalo solo cuando ya conoces bien el contenido de un módulo, por ejemplo si quieres revisar el Módulo 6 antes de tiempo para una entrevista de Databricks. Saltarte los gates porque un examen te parece difícil anula su propósito.
+
+Los reintentos mezclan las preguntas y las opciones. Lee todas las explicaciones después de cada intento, incluso las de las preguntas que acertaste. Adivinar con suerte no es conocimiento.
+
+### Pistas, checklists y progreso
+
+- **Las pistas** se revelan de a una, de la más suave a la más específica. Intenta al menos 10 minutos antes de abrir la primera. Es lo mismo que depurar un test que falla antes de preguntarle a un colega.
+- **Los checklists** guardan su estado. El checklist de autorrevisión al final de cada ejercicio es tu Definition of Done.
+- **El progreso vive en tu navegador** (localStorage). Usa "Exportar progreso" en el panel cada semana y guarda el archivo JSON en un lugar seguro, por ejemplo en un gist privado. Si borras los datos del navegador o cambias de máquina sin exportar, todo se reinicia.
+
+### Panel
+
+El panel muestra el progreso general, tu **racha de días**, el módulo actual, la siguiente acción recomendada y el **seguimiento del portafolio**. La racha cuenta los días consecutivos con al menos una lección completada. El seguimiento del portafolio lista cada repo que el curso espera que publiques. Pega la URL real de GitHub cuando el repo sea público. Ver cómo se llena esa lista motiva, y es exactamente la lista que le vas a enviar a los reclutadores.
+
+### Entrevistas y glosario
+
+La página de **Entrevistas** reúne preguntas de todos los módulos, etiquetadas por módulo y seniority (mid o senior), cada una con una respuesta modelo. Puedes buscar y filtrar por módulo y nivel. El **Glosario** contiene cada término clave en inglés y español. Ambos están disponibles en cualquier momento, no solo después de un módulo.
+
+### Idioma
+
+Cada lección existe en inglés y en español. Cambia cuando quieras; el progreso de los checklists se comparte. Como tu mercado objetivo habla inglés, una buena regla es: lee en el idioma que te resulte más rápido, pero **practica las respuestas de entrevista en inglés y en voz alta**.
+
+## Un ritmo diario
+
+Elige el plan que encaje con tu vida. Los dos funcionan. Lo que no funciona es "estudiaré cuando tenga tiempo".
+
+### Plan de tiempo completo (unas 6 horas al día)
+
+| Bloque | Tiempo | Qué |
+|---|---|---|
+| Calentamiento | 20 min | Repaso espaciado: 5 preguntas de entrevista en voz alta, releer las notas de ayer |
+| Trabajo profundo 1 | 2 h | Lecciones de concepto, escribe tú mismo cada ejemplo de código |
+| Trabajo profundo 2 | 2,5 h | Ejercicio o capstone, al menos dos commits |
+| Cierre | 30 min | Actualizar el README, escribir 3 notas breves, planificar la primera tarea de mañana |
+
+A este ritmo un día del curso equivale a un día de calendario, así que el curso completo lleva unas 6 o 7 semanas.
+
+### Plan de medio tiempo (unas 2 horas entre semana, 4 o 5 horas un día del fin de semana)
+
+| Día | Qué |
+|---|---|
+| Lun–Jue | 15 min de repaso + 1 lección o medio ejercicio + 1 commit |
+| Vie | 15 min de repaso + práctica de examen o ponerse al día |
+| Sáb o Dom | Un bloque largo para ejercicios y capstones |
+
+A este ritmo un día del curso lleva unos tres días de calendario. Cuenta con cuatro o cinco meses. Está bien. La constancia le gana a la intensidad.
+
+<Callout type="tip" title="Haz un commit cada día de trabajo">
+
+Haz al menos un commit con sentido en cada día de estudio. Mantiene la racha honesta, construye el historial de commits que miran los revisores y te obliga a terminar unidades pequeñas de trabajo.
+
+</Callout>
+
+## Repaso espaciado
+
+Vas a olvidar la mayor parte de lo que lees en pocas semanas si no lo vuelves a ver. La repetición espaciada lo resuelve: repasa un elemento justo antes de olvidarlo y aumenta el intervalo cada vez que lo recuerdas.
+
+La versión más simple es una caja de Leitner. Cada pregunta de entrevista o concepto vive en una caja. Cuando lo respondes bien, pasa a la siguiente caja, que se repasa con menos frecuencia. Cuando fallas, vuelve a la caja 1. Este es un script mínimo que programa tus repasos a partir de un archivo JSON. Pega los ids de preguntas de la página de Entrevistas.
+
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from datetime import date, timedelta
+from pathlib import Path
+
+# Box number -> days until next review.
+INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}
+STATE = Path("review.json")
+
+
+@dataclass
+class Card:
+    id: str
+    box: int = 1
+    due: str = date.today().isoformat()
+
+
+def load() -> dict[str, Card]:
+    if not STATE.exists():
+        return {}
+    return {c["id"]: Card(**c) for c in json.loads(STATE.read_text(encoding="utf-8"))}
+
+
+def save(cards: dict[str, Card]) -> None:
+    STATE.write_text(json.dumps([asdict(c) for c in cards.values()], indent=2), encoding="utf-8")
+
+
+def due_today(cards: dict[str, Card]) -> list[Card]:
+    today = date.today().isoformat()
+    return sorted((c for c in cards.values() if c.due <= today), key=lambda c: c.box)
+
+
+def grade(card: Card, remembered: bool) -> None:
+    card.box = min(card.box + 1, 5) if remembered else 1
+    card.due = (date.today() + timedelta(days=INTERVALS[card.box])).isoformat()
+
+
+if __name__ == "__main__":
+    cards = load()
+    for card in due_today(cards):
+        answer = input(f"[box {card.box}] {card.id} — answered well? (y/n) ")
+        grade(card, answer.strip().lower() == "y")
+    save(cards)
+```
+
+Agrega nuevos ids editando `review.json`, o extiende el script con un comando `add` como ejercicio de calentamiento. Si prefieres una app, Anki hace lo mismo con un algoritmo mejor. La herramienta importa menos que hacerlo a diario.
+
+## Cómo usar el banco de entrevistas
+
+El banco de entrevistas no es material de lectura. Es material de práctica.
+
+1. **Responde antes de leer.** Mira la pregunta, responde en voz alta, idealmente grabándote. Después abre la respuesta modelo.
+2. **Compara la estructura, no las palabras.** ¿Dijiste primero la idea principal? ¿Diste un ejemplo concreto? ¿Mencionaste un trade-off?
+3. **Reescríbela con tu propia historia.** Las respuestas modelo son plantillas. Reemplaza el ejemplo con tu propio proyecto y tus propios números.
+4. **Mide el tiempo.** La mayoría de las respuestas debería durar entre 60 y 120 segundos. Las respuestas más largas pierden al entrevistador.
+5. **Agrega las preguntas falladas a tu mazo de repaso.** Todo lo que no pudiste responder bien va a la caja 1.
+
+Al final de cada módulo haz una sesión de simulacro: 5 preguntas al azar de ese módulo más 2 de módulos anteriores.
+
+## Lleva un registro de aprendizaje
+
+Crea un `LEARNING_LOG.md` en el hub de tu portafolio. Una entrada por día de estudio, tres viñetas: qué aprendí, qué me confundió, qué entregué. Lleva dos minutos. Después de un mes se convierte en una fuente de historias para entrevistas ("el día que descubrí que mi chunker partía las tablas por la mitad") y en un registro que te mantiene motivado.
+
+## Errores comunes
+
+- **Leer sin programar.** Escribe cada ejemplo de código. Cambia algo. Rómpelo. Se aprende haciendo, igual que al aprender un nuevo framework de pruebas.
+- **Saltarte ejercicios para "ahorrar tiempo".** Los ejercicios construyen el portafolio. Saltarlos ahorra tiempo hoy y te cuesta entrevistas mañana.
+- **Atracón y luego pausa.** Diez horas el sábado y nada durante dos semanas desperdicia la mayor parte del valor. Las sesiones cortas y diarias ganan.
+- **No exportar nunca el progreso.** Un solo borrado de caché del navegador puede borrar semanas de progreso. Exporta cada semana.
+- **Practicar las respuestas de entrevista en silencio.** Las respuestas que suenan bien en tu cabeza muchas veces se desarman en voz alta. Dilas.
+- **Perfeccionismo en el primer proyecto.** Entrega una versión que funcione y luego mejórala. Un historial de commits que muestra iteración es una fortaleza.
+
+## Cómo aparece esto en las entrevistas
+
+Los entrevistadores preguntan cómo aprendes porque el campo cambia cada pocos meses.
+
+<InterviewQuestion question="¿Por qué te estás pasando de QA a ingeniería de IA?" level="mid">
+
+Mantén la respuesta positiva y mirando hacia adelante; nunca "me cansé de testear". Ejemplo: "En los últimos años, los problemas de calidad más interesantes que vi estaban en funcionalidades con LLM: ¿cómo pruebas algo no determinista?, ¿cómo detectas una regresión en la calidad de las respuestas? Me di cuenta de que lo más difícil de la ingeniería de IA es justamente aquello en lo que soy bueno: definir qué significa correcto, construir el harness y condicionar los releases a él. Así que profundicé de forma deliberada. Construí un asistente de RAG con citas, un harness de evals que corre en CI y un agente con human-in-the-loop, todo en mi GitHub. No dejo atrás la calidad; la llevo al lugar donde más se necesita hoy, y sumo las habilidades de ingeniería para construir yo mismo los sistemas."
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo te mantienes al día en un campo que cambia tan rápido?" level="senior">
+
+Separo la señal del ruido con un sistema fijo. Sigo unas pocas fuentes primarias: la documentación y los changelogs de los proveedores y un puñado de blogs de ingeniería, en lugar del hype de redes sociales. Cuando algo nuevo parece relevante, lo pruebo contra un set de evals que ya tengo, así lo juzgo por resultados medidos en mi propia tarea y no por benchmarks. Por ejemplo, cuando sale una nueva versión de un modelo, corro mi golden dataset sobre ella y comparo calidad, latencia y costo antes de recomendar un cambio. También llevo un registro de aprendizaje y un mazo de repaso espaciado para que los conceptos se queden. Es la misma disciplina que usaba en QA para evaluar herramientas nuevas.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- [Anki — tarjetas de repetición espaciada](https://apps.ankiweb.net/)
+- [Documentación de Anthropic — Models overview](https://docs.anthropic.com/en/docs/about-claude/models/overview)
+- [Documentación de GitHub — Managing your profile README](https://docs.github.com/en/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme)

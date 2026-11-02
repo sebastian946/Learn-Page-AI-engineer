@@ -1,0 +1,196 @@
+## Los agentes fallan de formas nuevas
+
+Un servicio normal falla de forma ruidosa. Lanza una excepción, devuelve un 500 y tu alerta se dispara. Un agente falla en silencio. Llama la misma herramienta ocho veces. Se disculpa en bucle. Reintenta un reembolso que ya se ejecutó. Quema 400k tokens en una pregunta que necesitaba 4k. Cada una de esas ejecuciones puede terminar con HTTP 200.
+
+Como SDET ya conoces la cura para las fallas silenciosas: hacerlas ruidosas, acotarlas y hacerlas observables. Esta lección cubre las tres capas que necesitas en todo agente de producción:
+
+1. **Manejo de fallas a nivel de herramienta** — errores que el modelo puede leer y sobre los que puede actuar.
+2. **Guardas de bucle (loop guards)** — límites duros de pasos y detección de acciones repetidas.
+3. **Límites de costo y presupuestos** — un techo de gasto por ejecución y por tenant.
+
+## La taxonomía de fallas
+
+Agrupa las fallas del agente según quién puede arreglarlas. Eso te dice dónde va el código de manejo.
+
+| Falla | Ejemplo | Quién la arregla | Dónde manejarla |
+|---|---|---|---|
+| Infra transitoria | timeout de la API del carrier, 429 | tu código | retry con backoff dentro de la herramienta |
+| Entrada mala del modelo | `get_order("ORD 123")` con un espacio | el modelo | devolver un contrato de error con una pista |
+| Regla de negocio | reembolso mayor que el total del pedido | el modelo o un humano | contrato de error, o escalar |
+| Falla del modelo | tool call malformada, nombre de herramienta inventado | tu código | validar, devolver un mensaje de corrección |
+| Bucle desbocado | misma llamada repetida, sin progreso | tu código | loop guard, detenerse con gracia |
+| Presupuesto agotado | costo sobre el límite por ejecución | tu código | guarda de costo, detenerse con gracia |
+
+La regla clave: **no dejes que el modelo maneje lo que tu código puede manejar**. Un 429 de la API del carrier nunca debe llegar al modelo. La herramienta lo reintenta. El modelo solo debe ver errores sobre los que puede hacer algo.
+
+## Capa 1: manejo a nivel de herramienta
+
+Los retries viven dentro de la herramienta, cerca de la llamada de red. Usa el contrato de error de la lección 3 para todo lo que suba.
+
+```python
+import asyncio
+import httpx
+from typing import Any
+
+RETRYABLE_STATUS = {429, 502, 503, 504}
+
+def tool_error(code: str, message: str, retryable: bool, hint: str) -> dict[str, Any]:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+
+async def get_carrier_rates(origin_zip: str, dest_zip: str, weight_kg: float) -> dict[str, Any]:
+    if weight_kg <= 0 or weight_kg > 1000:
+        return tool_error("INVALID_WEIGHT", f"weight_kg={weight_kg} out of range",
+                          False, "Use a weight between 0.1 and 1000 kg.")
+    delay = 0.5
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        for attempt in range(3):
+            try:
+                r = await client.get("https://rates.internal/v1/quote", params={
+                    "from": origin_zip, "to": dest_zip, "kg": weight_kg})
+                if r.status_code in RETRYABLE_STATUS:
+                    raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+                r.raise_for_status()
+                return {"rates": r.json()["rates"][:5]}  # cap payload size
+            except (httpx.TimeoutException, httpx.HTTPStatusError):
+                if attempt == 2:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
+    return tool_error("CARRIER_UNAVAILABLE", "Rate service did not respond after 3 attempts",
+                      True, "Tell the user rates are temporarily unavailable. Do not retry now.")
+```
+
+Fíjate en la pista del error final: "Do not retry now." `retryable: true` significa que la operación es segura de reintentar más tarde. No significa que el modelo deba martillarla en la misma ejecución. Sé explícito. Los modelos siguen las instrucciones que vienen en los resultados de herramientas.
+
+También atrapa los errores del modelo antes de que lleguen a tu backend. Si el modelo llama una herramienta que no existe o pasa argumentos que fallan la validación de Pydantic, devuelve una corrección corta en lugar de lanzar una excepción. `ToolNode` en LangGraph hace esto por defecto con `handle_tool_errors=True`: convierte las excepciones en un `ToolMessage` con el texto del error. Eso está bien para desarrollo. En producción, prefiere tu propio contrato para que el mensaje sea corto y accionable, y para que un stack trace nunca se filtre al contexto.
+
+## Capa 2: loop guards
+
+LangGraph ya trae una guarda: `recursion_limit`. Cada super-step cuenta. Cuando el grafo supera el límite, lanza `GraphRecursionError`.
+
+```python
+from langgraph.errors import GraphRecursionError
+
+try:
+    result = await graph.ainvoke(inputs, config={"recursion_limit": 25,
+                                                 "configurable": {"thread_id": tid}})
+except GraphRecursionError:
+    result = {"final": "I could not finish this request. A ticket was opened for a human."}
+```
+
+Eso es un respaldo, no una estrategia. Se dispara tarde, lanza una excepción en vez de producir una respuesta útil y no te dice *por qué*. Agrega guardas dentro del grafo para que el agente se detenga a propósito, con un mensaje.
+
+**Máximo de pasos.** Guarda `step_count` en el estado. Increméntalo en el nodo del agente. Enruta a un nodo `stop` cuando llegue al límite. Elige el límite con datos: mira el p95 de pasos en las trazas exitosas y agrega margen. Para un agente de soporte suele estar entre 6 y 10 tool calls.
+
+**Detección de acciones repetidas.** Calcula un hash de cada tool call: nombre de la herramienta más el JSON canónico de los argumentos. Si el mismo hash aparece N veces en una ejecución (N = 2 o 3), el agente está atascado. El modelo no recibe información nueva, así que otra llamada no va a ayudar.
+
+**Detección de falta de progreso.** Más difícil, pero útil: si los últimos K resultados de herramienta son errores idénticos, detente. El modelo sigue probando variaciones que fallan de la misma forma.
+
+```python
+import hashlib
+import json
+from langchain_core.messages import AIMessage
+
+def call_signature(name: str, args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{name}:{canonical}".encode()).hexdigest()[:16]
+
+def repeated_calls(messages: list, threshold: int = 3) -> str | None:
+    counts: dict[str, int] = {}
+    for m in messages:
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls:
+                sig = call_signature(tc["name"], tc["args"])
+                counts[sig] = counts.get(sig, 0) + 1
+                if counts[sig] >= threshold:
+                    return tc["name"]
+    return None
+
+def guard_router(state: dict) -> str:
+    if state["step_count"] >= MAX_STEPS:
+        return "stop"
+    if repeated_calls(state["messages"]):
+        return "stop"
+    if state["cost_usd"] >= MAX_COST_USD:
+        return "stop"
+    last = state["messages"][-1]
+    return "tools" if isinstance(last, AIMessage) and last.tool_calls else END
+```
+
+El nodo `stop` debe hacer algo útil. Escribe un mensaje final al usuario ("No pude completar esto. Un compañero hará seguimiento."), abre un ticket con el trace id y llena un campo `stop_reason` en el estado. Ese campo vale oro para evals y dashboards.
+
+## Capa 3: límites de costo y presupuestos
+
+Los tokens son tu factura de nube. Un agente que entra en bucle con un contexto de 50k tokens cuesta dinero real por cada paso extra, porque cada paso reenvía todo el historial. Cuando el contexto se acumula, el costo crece aproximadamente con el cuadrado del número de pasos.
+
+Registra el costo por ejecución a partir de `usage_metadata` en cada `AIMessage`. Carga los precios desde configuración, nunca los fijes en la lógica.
+
+```python
+# config/pricing.yaml — example values, check the provider's current pricing
+# claude-sonnet-5-5: { input_per_mtok: 3.00, output_per_mtok: 15.00 }
+
+def message_cost(msg: AIMessage, prices: dict[str, float]) -> float:
+    usage = msg.usage_metadata or {}
+    return (usage.get("input_tokens", 0) * prices["input_per_mtok"]
+            + usage.get("output_tokens", 0) * prices["output_per_mtok"]) / 1_000_000
+
+async def agent_node(state: AgentState) -> dict:
+    response = await llm_with_tools.ainvoke(state["messages"])
+    return {
+        "messages": [response],
+        "step_count": state["step_count"] + 1,
+        "cost_usd": state["cost_usd"] + message_cost(response, PRICES),
+    }
+```
+
+Usa tres niveles de presupuesto:
+
+- **Por ejecución.** Límite duro, por ejemplo 0.25 USD para una solicitud de soporte. Lo revisa el router antes de cada llamada al modelo.
+- **Por tenant por día.** Guardado en Redis con un `INCRBYFLOAT` atómico y un TTL. Al superarlo, degrada: cambia a un modelo más barato o encola para un humano.
+- **Global.** Un circuit breaker sobre el gasto total por hora. Te protege de un deploy malo que hace que todas las ejecuciones entren en bucle.
+
+Revisa el presupuesto *antes* de la llamada cara, no después. Una estimación previa es simple: tokens del contexto actual por el precio de entrada, más `max_tokens` por el precio de salida. Si la estimación empujaría la ejecución por encima del presupuesto, detente ahora.
+
+También limita las entradas que disparan el costo: trunca los resultados grandes de herramientas, define `max_tokens` en cada llamada y resume el historial después de N turnos (lección 9).
+
+## Degradación elegante
+
+Cuando una guarda se dispara, el usuario igual debe recibir un resultado decente:
+
+1. Dile al usuario qué pasó, sin detalles internos.
+2. Preserva el trabajo hecho hasta ahora (el checkpointer ya lo tiene).
+3. Haz el traspaso: crea un ticket o enruta a una cola humana con el thread id.
+4. Registra `stop_reason` (`max_steps`, `repeated_action`, `budget`, `tool_unavailable`) y emite una métrica.
+
+Alerta sobre la tasa de disparos de guardas, no sobre disparos individuales. Un salto repentino de `repeated_action` después de un cambio de prompt es una regresión. Trátalo como un pico de tests flaky en CI: algo cambió, encuéntralo.
+
+## Errores comunes
+
+- **Depender solo de `recursion_limit`.** Lanza una excepción, no da razón ni mensaje al usuario.
+- **Reintentar herramientas no idempotentes.** Un `issue_refund` reintentado sin idempotency key paga dos veces. Reintenta solo lecturas, o escrituras con llaves.
+- **Dejar que los errores transitorios lleguen al modelo.** El modelo "reintentará" llamando una y otra vez. Maneja los 429 y timeouts en código.
+- **Errores vagos.** `"Error occurred"` no le da nada al modelo. Devuelve un código, una razón y una pista.
+- **Contar el costo después.** Cuando lo registras, el dinero ya se gastó. Revisa antes de cada llamada.
+- **Sin `stop_reason`.** Sin él no puedes distinguir una parada correcta de un crash en tus dashboards o evals.
+- **Los mismos límites para todas las tareas.** Un agente de investigación necesita más pasos que una consulta de pedido. Define límites por grafo o por intención.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Tu agente a veces se queda atascado llamando la misma herramienta una y otra vez. ¿Cómo lo arreglas?" level="mid">
+Primero, averigua por qué con las trazas: ¿la herramienta devuelve un error sobre el que el modelo no puede actuar, o un resultado que el modelo malinterpreta? Arregla la causa raíz, normalmente un mensaje de error vago o una pista que falta. Luego agrega guardas de todas formas: un contador de pasos en el estado, detección de llamadas repetidas con un hash del nombre de la herramienta más los argumentos canónicos, y un nodo stop que responde al usuario, abre un ticket y registra `stop_reason`. Mantén `recursion_limit` como último respaldo. Por último, agrega el escenario atascado al set de evals de trayectoria para que no vuelva.
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo mantendrías bajo control el costo de LLM de un agente en producción?" level="senior">
+Por capas. Por ejecución: registra el costo con la usage metadata de cada respuesta del modelo y compara una estimación previa con un límite antes de cada paso. Por tenant: un contador diario en Redis con incrementos atómicos, degradando a un modelo más barato o a una cola humana al superarlo. Global: un circuit breaker de gasto que atrapa un deploy malo. Reduce el costo en la fuente también: `max_tokens` en cada llamada, resultados de herramientas truncados, resumen del historial, prompt caching para el system prompt estable y las definiciones de herramientas, y un modelo más barato para el enrutamiento. Los precios vienen de configuración para que sea fácil actualizarlos. Los dashboards muestran costo por ejecución p50/p95 y tasas de disparo de guardas.
+</InterviewQuestion>
+
+<Callout type="interview" title="Dilo así">
+"Un 200 de un agente no significa éxito. Mido stop reasons, número de pasos y costo por ejecución, y alerto sobre cambios en esas distribuciones."
+</Callout>
+
+## Lecturas recomendadas
+
+- Documentación de LangGraph, recursion limit y manejo de errores: https://langchain-ai.github.io/langgraph/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- Documentación de Anthropic, tool use y conteo de tokens: https://docs.anthropic.com
+- OWASP Top 10 para aplicaciones LLM (Excessive Agency, Unbounded Consumption): https://owasp.org/www-project-top-10-for-large-language-model-applications/

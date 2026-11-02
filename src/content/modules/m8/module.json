@@ -1,0 +1,45 @@
+{
+  "id": "m8",
+  "order": 8,
+  "days": 4,
+  "hours": 24,
+  "title": { "en": "Advanced LLM deployment & LLMOps", "es": "Despliegue avanzado de LLMs y LLMOps" },
+  "summary": {
+    "en": "An advanced deep-dive after the main course: canary and shadow releases gated by online eval signals, Kubernetes for streaming LLM services, self-hosted serving with vLLM on GPUs, AI gateways with budgets and fallbacks, Terraform for LLM apps on AWS, Amazon Bedrock in production, model and prompt release management, and reliability and compliance for regulated clients.",
+    "es": "Una profundización avanzada después del curso principal: releases canary y shadow controlados por señales de evaluación online, Kubernetes para servicios LLM con streaming, serving autoalojado con vLLM en GPUs, AI gateways con presupuestos y fallbacks, Terraform para apps LLM en AWS, Amazon Bedrock en producción, gestión de releases de modelos y prompts, y confiabilidad y cumplimiento para clientes regulados."
+  },
+  "lessons": [
+    { "slug": "01-release-strategies", "type": "concept", "minutes": 50, "title": { "en": "Release strategies for LLM apps: blue/green, canary and shadow traffic", "es": "Estrategias de release para apps LLM: blue/green, canary y shadow traffic" } },
+    { "slug": "02-kubernetes-llm-services", "type": "concept", "minutes": 50, "title": { "en": "Kubernetes for LLM services: custom-metric autoscaling, KEDA and stream-safe shutdown", "es": "Kubernetes para servicios LLM: autoscaling con métricas custom, KEDA y apagado seguro de streams" } },
+    { "slug": "03-self-hosted-serving", "type": "concept", "minutes": 55, "title": { "en": "Self-hosted model serving: vLLM, KServe, quantization and GPU sizing", "es": "Serving autoalojado de modelos: vLLM, KServe, cuantización y dimensionamiento de GPUs" } },
+    { "slug": "04-ex-canary-rollback", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: canary-release a prompt change with automatic rollback", "es": "Ejercicio: release canary de un cambio de prompt con rollback automático" } },
+    { "slug": "05-ai-gateways", "type": "concept", "minutes": 45, "title": { "en": "AI gateways: LiteLLM proxy, routing, fallbacks and per-team budgets", "es": "AI gateways: proxy LiteLLM, ruteo, fallbacks y presupuestos por equipo" } },
+    { "slug": "06-ex-litellm-gateway", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: a LiteLLM gateway with fallback and budgets in docker-compose", "es": "Ejercicio: un gateway LiteLLM con fallback y presupuestos en docker-compose" } },
+    { "slug": "07-terraform-llm-aws", "type": "concept", "minutes": 50, "title": { "en": "Infrastructure as code for LLM apps on AWS with Terraform", "es": "Infraestructura como código para apps LLM en AWS con Terraform" } },
+    { "slug": "08-bedrock-production", "type": "concept", "minutes": 45, "title": { "en": "Amazon Bedrock in production: IAM, throughput, cross-region inference and Guardrails", "es": "Amazon Bedrock en producción: IAM, throughput, inferencia cross-region y Guardrails" } },
+    { "slug": "09-ex-terraform-ecs-bedrock", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: a Terraform module for an ECS LLM service with a Bedrock VPC endpoint", "es": "Ejercicio: un módulo de Terraform para un servicio LLM en ECS con VPC endpoint de Bedrock" } },
+    { "slug": "10-model-prompt-release-management", "type": "concept", "minutes": 45, "title": { "en": "Model and prompt release management: registries, promotion and deprecation", "es": "Gestión de releases de modelos y prompts: registros, promoción y deprecación" } },
+    { "slug": "11-reliability-compliance", "type": "concept", "minutes": 50, "title": { "en": "Reliability and compliance: multi-region, DR, PII, retention and audit logs", "es": "Confiabilidad y cumplimiento: multi-región, DR, PII, retención y logs de auditoría" } },
+    { "slug": "12-ex-vllm-load-test", "type": "exercise", "minutes": 75, "title": { "en": "Exercise (optional): serve a small model with vLLM and load test it", "es": "Ejercicio (opcional): sirve un modelo pequeño con vLLM y hazle una prueba de carga" } },
+    { "slug": "13-exam", "type": "exam", "minutes": 35, "title": { "en": "Module 8 exam", "es": "Examen del módulo 8" } },
+    { "slug": "14-capstone-llm-gateway-platform", "type": "project", "minutes": 1440, "title": { "en": "Capstone: multi-model LLM platform rollout for a health insurer", "es": "Proyecto final: rollout de una plataforma LLM multimodelo para una aseguradora de salud" } }
+  ],
+  "repos": [
+    {
+      "id": "m8-deploy-lab",
+      "name": "llm-deploy-lab",
+      "description": {
+        "en": "Exercises: Argo Rollouts canary with eval-gated automatic rollback, a LiteLLM gateway with fallbacks and budgets, a tested Terraform module for an ECS LLM service with a Bedrock VPC endpoint, and a vLLM load test.",
+        "es": "Ejercicios: canary con Argo Rollouts y rollback automático controlado por evals, un gateway LiteLLM con fallbacks y presupuestos, un módulo de Terraform probado para un servicio LLM en ECS con VPC endpoint de Bedrock, y una prueba de carga de vLLM."
+      }
+    },
+    {
+      "id": "m8-gateway-platform",
+      "name": "llm-gateway-platform",
+      "description": {
+        "en": "Capstone: a multi-team AI gateway platform for a regulated health insurer, with canary releases, per-team budgets, a self-hosted model for PII workloads, Terraform IaC, dashboards, a DR plan and a rollback runbook.",
+        "es": "Proyecto final: una plataforma de AI gateway multiequipo para una aseguradora de salud regulada, con releases canary, presupuestos por equipo, un modelo autoalojado para cargas con PII, IaC con Terraform, dashboards, un plan de DR y un runbook de rollback."
+      }
+    }
+  ]
+}

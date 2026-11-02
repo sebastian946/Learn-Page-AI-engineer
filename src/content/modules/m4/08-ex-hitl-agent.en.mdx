@@ -1,0 +1,224 @@
+## Goal
+
+Build a LangGraph support agent for a logistics company that can look up orders, reschedule deliveries and issue refunds. Refunds move money, so **no refund runs without a human decision**. The operator can approve, reject, or edit the arguments (for example lower the amount) before the tool executes.
+
+This is the first commit of the `langgraph-hitl-agent` repo. Lesson 12 adds loop guards and cost caps to it, and lesson 14 adds a trajectory eval suite, so keep the structure clean.
+
+You will practice:
+
+- Typed state with `add_messages`, a custom router, and `Command` routing.
+- `interrupt()` and `Command(resume=...)` with a checkpointer.
+- Replacing an AI message by id to apply an edit.
+- Testing an agent **without calling the API**, using a scripted fake model. This is the agent version of mocking a backend in Playwright: deterministic, fast, free.
+
+Time box: 60 to 90 minutes.
+
+## Requirements
+
+Tools (in `tools.py`, decorated with `@tool` from `langchain_core.tools`, backed by an in-memory dict of orders):
+
+- `get_order(order_id)`: returns status, carrier, delivery date and total in cents, or the error contract `{"error": {"code": "ORDER_NOT_FOUND", ...}}`.
+- `reschedule_delivery(order_id, new_date, idempotency_key)`: rejects past dates with `INVALID_DATE`. Same key twice returns the first result instead of rescheduling again.
+- `issue_refund(order_id, amount_cents, reason, idempotency_key)`: refuses amounts above the order total with `AMOUNT_EXCEEDS_TOTAL`. Idempotent by key.
+
+Policy:
+
+- Any AI message containing `issue_refund` goes to an `approval` node that calls `interrupt()`.
+- Decisions: `{"action": "approve"}`, `{"action": "reject", "reason": "..."}`, `{"action": "edit", "args": {...}}`.
+- Reject produces a `ToolMessage` with error code `REJECTED_BY_HUMAN` for **every** pending tool call, then returns to the agent.
+- Every executed tool call is appended to an audit list in state (`tool_log`) with the tool name, args and result code.
+
+<AcceptanceCriteria>
+
+- [ ] `build_graph(llm, checkpointer)` returns a compiled graph; the model is injected so tests can pass a fake.
+- [ ] `get_order` and `reschedule_delivery` run without any interrupt.
+- [ ] A refund request pauses the run: the result contains `__interrupt__` with tool name, args and tool call id, and `graph.get_state(config).next == ("approval",)`.
+- [ ] Approve: the refund executes exactly once, and the final AI message confirms it.
+- [ ] Edit: the refund executes with the edited `amount_cents`, and the stored AI message shows the edited args (same message id, no duplicate).
+- [ ] Reject: no refund executes; the agent receives a `REJECTED_BY_HUMAN` tool result and replies to the customer.
+- [ ] Resuming twice with the same idempotency key never creates two refunds.
+- [ ] `python -m hitl_agent.cli` runs a conversation and prompts the operator in the terminal (approve / reject / edit).
+- [ ] `pytest` passes with no network access and no `ANTHROPIC_API_KEY` set.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# src/hitl_agent/state.py
+import operator
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], add_messages]
+    step_count: int
+    cost_usd: float
+    tool_log: Annotated[list[dict], operator.add]
+```
+
+```python
+# src/hitl_agent/tools.py
+import json
+from datetime import date
+from langchain_core.tools import tool
+
+ORDERS: dict[str, dict] = {
+    "ORD-1042": {"status": "in_transit", "carrier": "FastFreight", "total_cents": 12000,
+                 "delivery_date": "2026-11-06"},
+}
+REFUNDS: dict[str, dict] = {}  # idempotency_key -> refund record
+
+
+def _error(code: str, message: str, retryable: bool = False, hint: str = "") -> str:
+    return json.dumps({"error": {"code": code, "message": message,
+                                 "retryable": retryable, "hint": hint}})
+
+
+@tool
+def get_order(order_id: str) -> str:
+    """Look up an order by id (format ORD-1234). Returns status, carrier, delivery date, total."""
+    order = ORDERS.get(order_id)
+    if order is None:
+        return _error("ORDER_NOT_FOUND", f"No order {order_id}", hint="Ask the customer to confirm the id.")
+    return json.dumps({"order_id": order_id, **order})
+
+
+@tool
+def issue_refund(order_id: str, amount_cents: int, reason: str, idempotency_key: str) -> str:
+    """Refund part or all of an order. Requires human approval. amount_cents must not exceed the total."""
+    # TODO: idempotency check, AMOUNT_EXCEEDS_TOTAL check, record the refund
+    raise NotImplementedError
+
+
+# TODO: reschedule_delivery(order_id, new_date, idempotency_key) with INVALID_DATE for past dates
+```
+
+```python
+# src/hitl_agent/graph.py
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from .state import AgentState
+from .tools import get_order, issue_refund  # , reschedule_delivery
+from .approval import approval, RISKY_TOOLS
+
+TOOLS = [get_order, issue_refund]
+SYSTEM = "You are a logistics support agent. Use tools for every fact. Refunds need a reason."
+
+
+def build_graph(llm, checkpointer):
+    """llm: anything with .invoke(messages) -> AIMessage (already bound to TOOLS)."""
+
+    def agent(state: AgentState) -> dict:
+        response = llm.invoke([("system", SYSTEM), *state["messages"]])
+        return {"messages": [response], "step_count": state.get("step_count", 0) + 1}
+
+    def route(state: AgentState) -> str:
+        # TODO: END if no tool calls, "approval" if any risky tool, else "tools"
+        raise NotImplementedError
+
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent)
+    builder.add_node("approval", approval)
+    builder.add_node("tools", ToolNode(TOOLS))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", route, ["tools", "approval", END])
+    builder.add_edge("tools", "agent")  # TODO: add an audit node between tools and agent
+    return builder.compile(checkpointer=checkpointer)
+```
+
+```python
+# tests/fakes.py
+from langchain_core.messages import AIMessage
+
+
+class ScriptedModel:
+    """Returns pre-written AIMessages in order. Records what it was called with."""
+
+    def __init__(self, responses: list[AIMessage]):
+        self.responses = list(responses)
+        self.calls: list[list] = []
+
+    def invoke(self, messages, **kwargs) -> AIMessage:
+        self.calls.append(messages)
+        return self.responses.pop(0)
+
+
+def refund_call(amount_cents: int, call_id: str = "call_1") -> AIMessage:
+    return AIMessage(content="", tool_calls=[{
+        "name": "issue_refund", "id": call_id,
+        "args": {"order_id": "ORD-1042", "amount_cents": amount_cents,
+                 "reason": "damaged", "idempotency_key": "t-1-refund"},
+    }])
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Start with the router and the approval node. The approval node should only read state and call `interrupt()`; it must not execute anything. Let `ToolNode` do the execution after the decision.</Hint>
+
+<Hint>For the edit flow, build a new `AIMessage` with the same `content`, the modified `tool_calls` and `id=last.id`. Because `add_messages` replaces by id, the old pending call disappears and `ToolNode` runs the edited one.</Hint>
+
+<Hint>In tests, use `MemorySaver()` and a fresh `thread_id` per test. The pattern is: `r = graph.invoke({"messages": [("user", "...")]}, config)`, assert `"__interrupt__" in r`, then `graph.invoke(Command(resume={"action": "edit", "args": {...}}), config)`. Script the fake model with two responses: the refund tool call, then a final text reply.</Hint>
+
+<Hint>For the audit log, add a small `audit` node between `tools` and `agent` that reads the trailing `ToolMessage`s, parses their JSON, and returns `{"tool_log": [...]}` with the tool name and `error.code` or `"OK"`. In the CLI, loop while `"__interrupt__"` is in the result, print `result["__interrupt__"][0].value`, read `a`, `r` or `e` from `input()`, and resume.</Hint>
+
+</Hints>
+
+<CommitBox repo="langgraph-hitl-agent">
+
+Folder structure:
+
+```text
+langgraph-hitl-agent/
+  pyproject.toml          # langgraph, langchain-anthropic, pytest; package in src/
+  README.md
+  .env.example            # ANTHROPIC_API_KEY=, REFUND_APPROVAL_THRESHOLD_CENTS=
+  src/hitl_agent/
+    __init__.py
+    state.py              # AgentState with reducers
+    tools.py              # get_order, reschedule_delivery, issue_refund + error contract
+    approval.py           # RISKY_TOOLS, approval node (interrupt + Command)
+    graph.py              # build_graph(llm, checkpointer)
+    cli.py                # terminal approval loop
+  tests/
+    fakes.py              # ScriptedModel
+    test_tools.py         # idempotency, error codes
+    test_router.py        # routing policy
+    test_hitl_flows.py    # approve / edit / reject end-to-end
+  evals/                  # empty for now; lesson 14 fills it
+```
+
+README outline:
+
+1. What it does (one paragraph + a Mermaid diagram of the graph).
+2. Approval policy: which tools are gated and why.
+3. How to run: `uv sync` (or `pip install -e .`), `python -m hitl_agent.cli`.
+4. How resuming works: thread ids, checkpointer, `Command(resume=...)`.
+5. Testing strategy: scripted fake model, no network, what each test proves.
+6. Limitations and next steps (loop guards, cost caps, evals, Postgres checkpointer).
+
+Suggested commits:
+
+```text
+feat: add order tools with error contract and idempotency keys
+feat: build LangGraph agent with tool routing
+feat: add approval node with interrupt for refunds
+feat: support edit and reject decisions
+test: cover approve/edit/reject flows with scripted model
+feat: add terminal approval CLI
+docs: README with graph diagram and approval policy
+```
+
+</CommitBox>
+
+## Stretch goals
+
+- Auto-approve refunds below `REFUND_APPROVAL_THRESHOLD_CENTS` (read from env) and gate only the larger ones. Test both sides of the threshold.
+- Swap `MemorySaver` for `PostgresSaver` with Docker Compose and prove that a paused thread survives a process restart.
+- Add a `pending` command to the CLI that lists every paused thread with `graph.get_state(...)`.
+
+<Checklist id="m4-08-review" title="Self-review" items={["The approval node has no side effects before interrupt()", "Every pending tool call gets a ToolMessage on reject", "Edit replaces the AI message by id; no duplicate tool calls in history", "Refund and reschedule tools are idempotent by key, with tests proving it", "Tool errors use the shared error contract with code, retryable and hint", "Tests use a scripted model and pass without network or API key", "Thread ids come from a business key, not a constant", "README explains the approval policy and how to resume a paused thread"]} />

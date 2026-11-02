@@ -1,0 +1,21 @@
+## What this exam covers
+
+This exam checks the whole of Module 4: the ReAct loop and when a workflow beats an agent, planning and reflection, tool design (schemas, idempotency, error contracts), MCP, LangGraph state and reducers, human-in-the-loop with `interrupt` and `Command`, memory, multi-agent patterns, loop guards and cost caps, and agent evals.
+
+It has 18 questions of four types:
+
+- **Single choice:** one correct answer.
+- **Multi-select:** two or more correct answers. You must pick all of them.
+- **Order the steps:** drag the items into the correct sequence.
+- **Code reading:** short LangGraph, MCP or tool snippets. Read them like a code review. Ask what the node returns and how the reducer merges it.
+
+## How to prepare
+
+- Re-read the "Common mistakes" sections of lessons 03, 06, 07 and 11. Many questions come from them.
+- Know the difference between a node's return value and the state after the reducer runs.
+- Be able to explain why a node with `interrupt()` must keep side effects idempotent.
+- Know the four trajectory match modes: strict, unordered, subset and superset.
+
+## Rules
+
+You have 30 minutes. The passing score is **70%**. Options are shuffled on every attempt. Passing unlocks Module 5. Read each explanation after you submit, even for questions you got right.

@@ -1,0 +1,153 @@
+## Objetivo
+
+Haz dos entrevistas simuladas de system design cronometradas contigo mismo y publica los write-ups en un repo nuevo, `system-design-notes`. Este repo se convierte en una referencia que relees antes de cada entrevista presencial, y en una señal de portafolio de que sabes razonar sobre sistemas de IA a nivel de arquitectura.
+
+- **Enunciado A (45 min):** "Diseña un sistema RAG para 10.000 usuarios." Hazlo sin mirar la lección anterior. Después compara.
+- **Enunciado B (45 min):** "Diseña una plataforma de agentes para soporte al cliente. Los agentes responden tickets para 50 clientes B2B, pueden consultar pedidos y emitir reembolsos hasta un límite, y escalan a humanos."
+
+Respeta el tiempo estrictamente: pon un temporizador de 45 minutos por enunciado. Detente cuando suene, aunque sea a mitad de frase. Luego dedica 10 minutos a calificarte con la rúbrica de la lección 04 y 10 minutos a escribir "qué me faltó".
+
+¿Por qué cronometrado? En una ronda real, quedarte sin tiempo antes de cubrir evals o modos de falla cuesta más que un diagrama un poco peor. Tu instinto de QA sobre cobertura de pruebas aplica: cubre cada área de forma superficial primero y luego profundiza.
+
+Para el Enunciado B, estas son las áreas que una respuesta sólida cubre y que el Enunciado A no:
+
+- **Diseño de herramientas:** herramienta de reembolso idempotente con idempotency key, y un límite de reembolso por tenant aplicado en la herramienta, no en el prompt.
+- **Human-in-the-loop:** paso de aprobación para reembolsos por encima del límite, usando interrupts y checkpoints de LangGraph.
+- **Loop guards y topes de costo:** máximo de pasos por ticket, máximo de tokens por ticket y un interruptor de apagado por tenant.
+- **Evals de trayectoria:** ¿el agente llamó las herramientas correctas en el orden correcto con los argumentos correctos?, no solo "¿la respuesta final fue buena?".
+- **Multi-tenancy:** cada cliente B2B tiene su propia base de conocimiento, guía de tono, credenciales de herramientas y políticas.
+- **Escalamiento:** umbrales de confianza y sentimiento, más un traspaso limpio que incluya un resumen para el agente humano.
+- **Auditoría:** cada llamada a herramienta registrada con entradas, salidas y el humano que aprobó, si lo hubo.
+
+<AcceptanceCriteria>
+
+- [ ] Existe el repo `system-design-notes` con una carpeta por enunciado.
+- [ ] Cada write-up sigue la plantilla: requisitos, estimaciones, diagrama de arquitectura (Mermaid), modelo de datos, profundizaciones, escalado, tabla de modos de falla, costo, resumen.
+- [ ] Cada write-up tiene una estimación de capacidad con cada supuesto explícito y la implicación de cada número escrita al lado.
+- [ ] El Enunciado B cubre diseño de herramientas, aprobación HITL, loop guards, evals de trayectoria y políticas por tenant.
+- [ ] Cada write-up termina con una rúbrica llena (10 áreas, 0-3 cada una) y una sección "qué me faltó" de al menos 5 puntos.
+- [ ] Un script `estimates.py` reproduce los números de ambos write-ups.
+- [ ] El tiempo total por enunciado está registrado con honestidad (hora de inicio y fin en el archivo).
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```markdown
+# Prompt: <title>
+Started: 2026-11-05 09:00  Ended: 09:45  (timer, no notes)
+
+## 1. Requirements
+Functional:
+-
+Non-functional (with numbers):
+-
+Out of scope:
+-
+
+## 2. Estimates
+| Quantity | Value | Assumption | Implication |
+|---|---|---|---|
+| Peak QPS | | | |
+| Concurrent LLM streams | | | |
+| Tokens per month (in / out) | | | |
+| Corpus size (chunks, GB) | | | |
+| LLM cost per month | | example prices from config | |
+
+## 3. Architecture
+(mermaid flowchart: cold path + hot path)
+
+## 4. Data model
+## 5. Deep dives (pick 2)
+## 6. Scaling
+## 7. Failure modes
+| Failure | Detection | Mitigation |
+|---|---|---|
+
+## 8. Cost and levers
+## 9. Summary (30 seconds)
+
+## Self-grade (0-3 each)
+| Area | Score | Why |
+|---|---|---|
+
+## What I missed
+-
+```
+
+```python
+"""estimates.py - reproduce the capacity numbers for each prompt."""
+from dataclasses import dataclass
+
+@dataclass
+class Assumptions:
+    users: int
+    dau_ratio: float
+    queries_per_dau: float
+    active_hours: float
+    peak_factor: float
+    seconds_per_answer: float
+    in_tokens: int
+    out_tokens: int
+    days_per_month: int
+    price_in_per_m: float    # example value; read current pricing
+    price_out_per_m: float   # example value; read current pricing
+
+def estimate(a: Assumptions) -> dict[str, float]:
+    qpd = a.users * a.dau_ratio * a.queries_per_dau
+    peak_qps = qpd / (a.active_hours * 3600) * a.peak_factor
+    # TODO: concurrent streams, monthly tokens, monthly cost
+    return {"queries_per_day": qpd, "peak_qps": round(peak_qps, 2)}
+
+if __name__ == "__main__":
+    rag = Assumptions(10_000, 0.4, 10, 8, 4, 6, 4_000, 400, 22, 3.0, 15.0)
+    print("RAG:", estimate(rag))
+    # TODO: Prompt B - tickets per day per customer, steps per ticket, tokens per step
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Antes de que empiece el temporizador, escribe arriba de la página los seis encabezados de fase con sus marcas de minuto. Míralos cada pocos minutos. Si vas en el minuto 20 y sigues en requisitos, corta y avanza.</Hint>
+  <Hint>Para el Enunciado B, estima por ticket, no por mensaje: tickets por día x pasos del agente por ticket x tokens por paso. Un agente con 6 pasos de 3k tokens de entrada cada uno cuesta mucho más que una sola respuesta de RAG. Ese número debe guiar tus decisiones de loop guards y enrutamiento.</Hint>
+  <Hint>Para la herramienta de reembolso, escribe su contrato en el documento: `issue_refund(order_id, amount, reason, idempotency_key)`, que devuelve un resultado tipado o un error tipado (`LIMIT_EXCEEDED`, `ORDER_NOT_FOUND`, `ALREADY_REFUNDED`). El tenant id y los límites vienen del contexto del runtime. Los montos por encima del límite van a un nodo de aprobación que llama `interrupt()` y espera.</Hint>
+  <Hint>Para los evals de trayectoria del Enunciado B, describe 3 casos de prueba concretos con secuencias de herramientas esperadas, por ejemplo "entrega tardía, el pedido existe, monto bajo el límite" espera `lookup_order`, luego `issue_refund`, luego `reply`. Califica coincidencia exacta en los nombres de herramientas y una tolerancia en los argumentos, como calificaste agentes en el Módulo 4.</Hint>
+</Hints>
+
+<CommitBox repo="system-design-notes">
+
+```text
+system-design-notes/
+  README.md                         # index of prompts, scores over time
+  estimates.py
+  01-rag-10k-users/
+    writeup.md
+    diagram.mmd
+    self-grade.md
+  02-support-agent-platform/
+    writeup.md
+    diagram.mmd
+    self-grade.md
+  templates/
+    writeup-template.md
+    rubric.md
+```
+
+Estructura del README:
+
+1. Propósito: entrevistas simuladas de system design de sistemas de IA, cronometradas.
+2. Cómo las hago (temporizador de 45 minutos, sin notas, autoevaluación al final).
+3. Tabla: enunciado, fecha, puntaje sobre 30, principal lección aprendida.
+4. Enlace a la rúbrica.
+5. Patrones reutilizables que sigo usando (retrieval consciente de permisos, gates de evals, enrutamiento de modelos, aprobaciones HITL).
+
+Commits sugeridos:
+
+- `chore: scaffold system-design-notes with template and rubric`
+- `docs(rag-10k): timed write-up and capacity estimates`
+- `docs(support-agents): timed write-up with HITL and trajectory evals`
+- `docs: self-grades and lessons learned`
+
+</CommitBox>
+
+<Checklist id="m7-05-review" title="Autorrevisión" items={["Respeté los 45 minutos por enunciado y registré los tiempos con honestidad", "Cada estimación tiene un supuesto y una implicación escritos al lado", "Planteé los permisos o el aislamiento por tenant yo mismo, antes de que me preguntaran", "El Enunciado B tiene un contrato de herramienta de reembolso idempotente con errores tipados", "El Enunciado B incluye un paso de aprobación HITL y loop guards con números", "Ambos write-ups incluyen una estrategia de evals: offline, gate en CI y online", "Los modos de falla están en una tabla con detección y mitigación", "Me califiqué con rigor y escribí al menos 5 cosas que me faltaron por enunciado"]} />

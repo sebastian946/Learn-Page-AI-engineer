@@ -1,0 +1,185 @@
+## Por qué los humanos siguen en el bucle
+
+Un agente que solo lee datos puede equivocarse de forma barata. Un agente que **escribe** (reembolsa dinero, cancela pedidos, envía correos a clientes, hace merge de PRs) puede equivocarse de forma cara. Human-in-the-loop (HITL, humano en el bucle) pone a una persona exactamente en los puntos donde un error es costoso o irreversible.
+
+Patrones típicos de HITL:
+
+| Patrón | Cuándo | Ejemplo |
+|---|---|---|
+| **Aprobar / rechazar** | Acción irreversible o costosa | Reembolso de más de $50, cancelación de pedido |
+| **Editar** | La acción es correcta pero los argumentos pueden estar mal | Corregir el monto del reembolso antes de ejecutarlo |
+| **Revisar la salida** | Texto que va a un cliente | Aprobar un borrador de correo de disculpa |
+| **Responder una pregunta** | Al agente le falta información | "¿A cuál de estos dos pedidos te refieres?" |
+
+La analogía de QA es una compuerta manual en un pipeline de deploy: primero corren los checks automáticos y luego un humano aprueba producción. No pones compuerta en cada paso. La pones en los pasos donde el radio de impacto es alto.
+
+## Cómo funciona `interrupt`
+
+LangGraph implementa HITL con `interrupt()` de `langgraph.types`. Llamarlo dentro de un nodo:
+
+1. Guarda el estado actual a través del checkpointer (así que un checkpointer es **obligatorio**).
+2. Detiene la ejecución y expone al llamador el payload que pasaste, bajo `__interrupt__`.
+3. Espera, sin mantener ningún proceso ni hilo abierto. La pausa puede durar segundos o días.
+
+Para continuar, el llamador invoca el grafo otra vez sobre el mismo `thread_id` con `Command(resume=valor)`. Ese valor se convierte en el valor de retorno de `interrupt()`.
+
+Un detalle guía todo el diseño: **al reanudar, el nodo que llamó a `interrupt()` se vuelve a ejecutar desde su primera línea.** LangGraph no reanuda a mitad de la función. Repite el nodo y, esta vez, `interrupt()` devuelve el valor de reanudación en lugar de pausar. Consecuencias:
+
+- El código *antes* de `interrupt()` corre dos veces. Mantenlo puro o hazlo idempotente.
+- Nunca llames a la herramienta riesgosa antes del interrupt en el mismo nodo.
+- Pon el interrupt en su propio nodo pequeño para que la repetición sea barata y obvia.
+
+## Una compuerta de aprobación para herramientas riesgosas
+
+El patrón de abajo enruta cualquier mensaje de la IA que contenga una tool call riesgosa a un nodo `approval`. El nodo le pregunta a un humano y luego deja correr la herramienta, edita los argumentos o rechaza con un mensaje sobre el que el modelo puede actuar.
+
+```python
+import json
+from typing import Literal
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Command, interrupt
+
+RISKY_TOOLS = {"issue_refund", "cancel_order"}
+
+
+def approval(state: AgentState) -> Command[Literal["tools", "agent"]]:
+    last: AIMessage = state["messages"][-1]
+    risky = [tc for tc in last.tool_calls if tc["name"] in RISKY_TOOLS]
+
+    # Pure code before interrupt(): safe to re-run on resume.
+    decision = interrupt({
+        "type": "tool_approval",
+        "question": "Approve, edit or reject the following actions",
+        "actions": [{"id": tc["id"], "tool": tc["name"], "args": tc["args"]} for tc in risky],
+    })
+
+    action = decision["action"]
+    if action == "approve":
+        return Command(goto="tools")
+
+    if action == "edit":
+        edited_calls = [
+            {**tc, "args": decision["args"]} if tc["name"] in RISKY_TOOLS else tc
+            for tc in last.tool_calls
+        ]
+        # Same message id -> add_messages replaces the message instead of appending.
+        fixed = AIMessage(content=last.content, tool_calls=edited_calls, id=last.id)
+        return Command(goto="tools", update={"messages": [fixed]})
+
+    # Reject: answer every tool call so the conversation stays valid.
+    reason = decision.get("reason", "Rejected by operator.")
+    error = json.dumps({"error": {
+        "code": "REJECTED_BY_HUMAN", "message": reason, "retryable": False,
+        "hint": "Explain to the customer or propose an alternative.",
+    }})
+    rejections = [ToolMessage(content=error, tool_call_id=tc["id"]) for tc in last.tool_calls]
+    return Command(goto="agent", update={"messages": rejections})
+```
+
+Tres detalles que vale la pena copiar:
+
+- **Editar usa el mismo id de mensaje.** `add_messages` reemplaza entonces el mensaje de la IA pendiente, así que el nodo de herramientas ejecuta los argumentos corregidos y el historial muestra lo que realmente corrió.
+- **Rechazar responde cada tool call.** Los proveedores exigen un resultado de herramienta por cada bloque `tool_use`. Si falta uno, la siguiente llamada al modelo falla.
+- **El rechazo es un contrato de error**, con la misma forma que los errores de herramientas de la lección 03. El modelo recibe un código y una pista sobre la que puede actuar, en lugar de reintentar el reembolso en silencio.
+
+Conéctalo con un router después del nodo del agente:
+
+```python
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if not getattr(last, "tool_calls", None):
+        return END
+    if any(tc["name"] in RISKY_TOOLS for tc in last.tool_calls):
+        return "approval"
+    return "tools"
+
+
+builder.add_node("approval", approval)
+builder.add_conditional_edges("agent", route_after_agent, ["tools", "approval", END])
+graph = builder.compile(checkpointer=MemorySaver())  # PostgresSaver in production
+```
+
+## Ejecutar, pausar y reanudar
+
+```python
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": "ticket-88213"}}
+result = graph.invoke(
+    {"messages": [("user", "Refund 120 USD on ORD-1042, the box arrived crushed.")]},
+    config,
+)
+
+if "__interrupt__" in result:
+    request = result["__interrupt__"][0].value
+    print(request["actions"])  # [{'id': 'toolu_..', 'tool': 'issue_refund', 'args': {...}}]
+
+    # Later, maybe from a different process or a web request:
+    result = graph.invoke(
+        Command(resume={"action": "edit", "args": {
+            "order_id": "ORD-1042", "amount_cents": 8000,
+            "reason": "damaged_in_transit", "idempotency_key": "ticket-88213-refund-1",
+        }}),
+        config,
+    )
+
+print(result["messages"][-1].content)
+```
+
+`graph.get_state(config)` te dice dónde está pausado un hilo: `snapshot.next` es `("approval",)` y `snapshot.tasks[0].interrupts` contiene el payload. Así es como una UI de aprobación lista los pendientes: consulta los hilos pausados, muestra su payload y envía la decisión de vuelta como `Command(resume=...)`.
+
+## Editar el estado directamente
+
+A veces el operador necesita cambiar el estado fuera de un interrupt pendiente, por ejemplo para corregir un id de pedido mal extraído o para inyectar una nota. `update_state` escribe en el checkpoint como si un nodo hubiera devuelto esa actualización, pasando por los mismos reducers:
+
+```python
+graph.update_state(
+    config,
+    {"messages": [("user", "Operator note: customer is VIP, prefer reshipment over refund.")]},
+)
+graph.invoke(None, config)  # continue from the updated checkpoint
+```
+
+También puedes pasar `as_node="agent"` para que la actualización parezca venir de un nodo específico, lo que cambia qué edge corre después. Úsalo con moderación y regístralo. Una edición del operador es un evento de auditoría.
+
+## Diseñar la política de aprobación
+
+No pongas compuerta a todo. Si cada paso necesita un clic, los operadores aprueban sin mirar y la compuerta se vuelve teatro. Las buenas políticas son explícitas y testeables:
+
+- **Por herramienta**: `issue_refund` y `cancel_order` siempre requieren aprobación; `get_order` nunca.
+- **Por argumento**: los reembolsos sobre un umbral (por ejemplo 50 USD) requieren aprobación; por debajo, se aprueban automáticamente y se registran.
+- **Por confianza o contexto**: clientes nuevos, cuentas marcadas o intentos repetidos van a un humano.
+- **Timeouts**: define qué pasa si nadie responde en N horas (normalmente: rechazar de forma segura y notificar).
+
+Guarda el umbral en configuración, no en el prompt, y prueba el router con casos a ambos lados del umbral.
+
+## Errores comunes
+
+- **Ejecutar efectos secundarios antes de `interrupt()` en el mismo nodo.** Al reanudar, el nodo se repite y el reembolso ocurre dos veces. Pon el efecto secundario después de la compuerta, en el nodo de herramientas, y pasa una idempotency key de todas formas.
+- **No tener checkpointer.** `interrupt()` no puede guardar el estado sin uno. En producción debe ser durable, o un deploy borra todas las aprobaciones pendientes.
+- **Perder el `thread_id`.** La reanudación debe apuntar exactamente al mismo hilo. Guárdalo junto con la solicitud de aprobación.
+- **Dejar tool calls sin respuesta al rechazar.** La siguiente llamada al modelo falla porque un bloque `tool_use` no tiene resultado correspondiente.
+- **Aprobar payloads opacos.** Muéstrale al humano la herramienta, los argumentos, el contexto del pedido y el razonamiento del agente, no solo "¿aprobar reembolso?".
+- **Varios interrupts en un nodo con orden cambiante.** Los valores de reanudación se emparejan por posición. Mantén deterministas la cantidad y el orden de las llamadas a interrupt.
+- **No registrar las decisiones.** Quién aprobó, cuándo y qué se editó son datos de cumplimiento. Escríbelos en tu log de auditoría y en tus traces.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo agregarías aprobación humana antes de que un agente emita un reembolso?" level="mid">
+
+Enrutaría cualquier mensaje de la IA con una tool call de reembolso a un nodo de aprobación dedicado, usando un conditional edge para que la política sea código y no prompt. El nodo llama a `interrupt()` con el nombre de la herramienta, los argumentos y el contexto del pedido, lo que guarda el hilo en un checkpoint y devuelve el control al llamador. Una UI o un bot de Slack muestra la solicitud. La decisión vuelve como `Command(resume=...)` sobre el mismo `thread_id`. Aprobar va al nodo de herramientas; editar reemplaza el mensaje de la IA por id con argumentos corregidos; rechazar devuelve un `ToolMessage` con un error estructurado para que el modelo pueda explicar o proponer una alternativa. El checkpointer está respaldado por Postgres y la herramienta de reembolso igual recibe una idempotency key.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Qué pasa con el código de un nodo cuando el grafo se reanuda después de un interrupt?" level="senior">
+
+El nodo se reinicia desde el principio. LangGraph no guarda una instantánea del stack de Python; vuelve a ejecutar el nodo y, esta vez, `interrupt()` devuelve el valor de reanudación en lugar de pausar. Así que todo lo que está antes del interrupt corre otra vez: las llamadas al LLM cuestan doble y los efectos secundarios pueden duplicarse. Mantengo los nodos de interrupt pequeños y puros, muevo los efectos secundarios al nodo de herramientas después de la compuerta y hago las herramientas idempotentes con claves derivadas del hilo y del id de la tool call. Si un nodo tiene varios interrupts, sus valores de reanudación se emparejan por orden, así que la cantidad y el orden de las llamadas deben ser deterministas.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Conceptos de human-in-the-loop en LangGraph: https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/
+- Persistencia en LangGraph (threads, get_state, update_state): https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Anthropic, Building effective agents (checkpoints humanos): https://www.anthropic.com/research/building-effective-agents
+- Tool use de Anthropic, manejo de resultados de herramientas: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview

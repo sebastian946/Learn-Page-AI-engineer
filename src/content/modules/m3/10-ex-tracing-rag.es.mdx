@@ -1,0 +1,184 @@
+## Objetivo
+
+Tu `mortgage-knowledge-assistant` del módulo 2 funciona, pero cuando una respuesta es incorrecta no puedes ver por qué. En este ejercicio le agregas tracing de nivel producción. Cada request debe producir un trace con un span por paso del pipeline, atributos de tokens y costo en el span del LLM, un trace id devuelto al cliente y un score de feedback vinculado al trace.
+
+Vas a instrumentar con OpenTelemetry (neutral respecto al vendor) y ver los traces en Jaeger localmente. Opcionalmente, también exportas a Langfuse (nube o self-hosted) para obtener vistas y scores específicos de LLM. Si prefieres LangSmith, la misma estructura funciona con `@traceable` y `create_feedback`; documenta tu elección en el README.
+
+Tiempo límite: 75 minutos.
+
+**Dónde va el código:** la instrumentación vive en `mortgage-knowledge-assistant` bajo `app/observability/`. Las notas, screenshots y el análisis de traces van a `llm-eval-harness/tracing/`.
+
+Recuerda el sistema bajo prueba: `async def answer(question: str) -> RagResult` con los campos `answer`, `citations`, `contexts`, `usage` (`input_tokens`, `output_tokens`) y `latency_ms`. Pasos: `rewrite_query`, luego `hybrid_retrieve`, luego `rerank`, luego `generate` con `claude-sonnet-5-5`.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] `docker compose up` levanta la app y Jaeger (OTLP en 4318, UI en 16686).
+- [ ] Un `POST /ask` produce exactamente un trace con un span raíz del servidor y spans hijos `rewrite_query`, `retrieve hybrid`, `rerank` y `chat claude-sonnet-5-5`.
+- [ ] El span del LLM lleva `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` y un atributo propio `app.cost_usd`.
+- [ ] El span de retrieval registra `rag.retrieval.top_k` y `rag.retrieval.doc_ids` (solo ids, sin texto completo de documentos).
+- [ ] La respuesta incluye un header `X-Trace-Id` y un campo `trace_id`.
+- [ ] `POST /feedback` con `trace_id` y `score` vincula el score al trace (un score de Langfuse, un feedback de LangSmith, o un evento en un span `feedback` con el mismo trace id en modo solo Jaeger).
+- [ ] Los errores de la llamada al LLM se registran con `record_exception` y status ERROR.
+- [ ] Los nombres de atributos viven en un módulo de constantes. El contenido de prompts y completions NO se captura a menos que `OTEL_CAPTURE_CONTENT=true`.
+- [ ] Un test unitario usa `InMemorySpanExporter` para verificar los nombres de spans y los atributos de tokens.
+- [ ] `tracing/README.md` en `llm-eval-harness` contiene un screenshot de un trace y un recorrido corto de "cómo depuré una mala respuesta".
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```yaml
+# docker-compose.yml (in mortgage-knowledge-assistant)
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP HTTP
+  app:
+    build: .
+    env_file: .env
+    environment:
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      ENV: local
+    ports:
+      - "8000:8000"
+    depends_on: [jaeger, db]
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+```
+
+```python
+# app/observability/attrs.py
+# GenAI semantic conventions are experimental; keep every name here.
+GEN_AI_OPERATION = "gen_ai.operation.name"
+GEN_AI_PROVIDER = "gen_ai.provider.name"
+GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+GEN_AI_INPUT_TOKENS = "gen_ai.usage.input_tokens"
+GEN_AI_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+GEN_AI_FINISH_REASONS = "gen_ai.response.finish_reasons"
+APP_COST_USD = "app.cost_usd"
+APP_PROMPT_VERSION = "app.prompt_version"
+RAG_TOP_K = "rag.retrieval.top_k"
+RAG_DOC_IDS = "rag.retrieval.doc_ids"
+```
+
+```python
+# app/observability/cost.py
+from pydantic import BaseModel
+
+class Price(BaseModel):
+    input_per_mtok: float
+    output_per_mtok: float
+
+# Example values only. Load real prices from config and check the provider's current pricing.
+PRICES: dict[str, Price] = {
+    "claude-sonnet-5-5": Price(input_per_mtok=3.0, output_per_mtok=15.0),
+}
+
+def cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    p = PRICES.get(model)
+    if p is None:
+        return 0.0
+    return (input_tokens * p.input_per_mtok + output_tokens * p.output_per_mtok) / 1_000_000
+```
+
+```python
+# tests/test_tracing.py
+import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+exporter = InMemorySpanExporter()
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))  # fine in tests
+trace.set_tracer_provider(provider)
+
+@pytest.mark.asyncio
+async def test_answer_emits_expected_spans(fake_llm, fake_retriever) -> None:
+    from app.rag import answer
+    await answer("What is the max DTI for an FHA loan?")
+    names = {s.name for s in exporter.get_finished_spans()}
+    assert {"rewrite_query", "retrieve hybrid", "rerank", "chat claude-sonnet-5-5"} <= names
+    llm = next(s for s in exporter.get_finished_spans() if s.name.startswith("chat "))
+    assert llm.attributes["gen_ai.usage.input_tokens"] > 0
+    # TODO: assert app.cost_usd and that no prompt content attribute is present
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Empieza por la configuración: crea el `TracerProvider` una sola vez al iniciar la app (lifespan de FastAPI), agrega un `BatchSpanProcessor` con el exporter OTLP HTTP y llama a `provider.shutdown()` al apagar. Luego agrega `FastAPIInstrumentor.instrument_app(app)` para que cada request tenga un span raíz gratis.</Hint>
+  <Hint>Envuelve cada función del pipeline con `tracer.start_as_current_span(...)` en lugar de pasar spans de un lado a otro. Como usas `start_as_current_span`, los spans hijos se adjuntan automáticamente al request actual, incluso a través de `await`.</Hint>
+  <Hint>Lee el trace id dentro del handler con `trace.get_current_span().get_span_context().trace_id` y formatéalo como 32 caracteres hexadecimales con `format(trace_id, "032x")`. Es el mismo id que muestra Jaeger y el que usa Langfuse para traces OTLP.</Hint>
+  <Hint>Para el feedback en modo solo Jaeger, no puedes agregar nada a un trace terminado. Crea un span nuevo llamado `feedback` y guarda el trace id original como atributo (`app.feedback.trace_id`), más un span link si tienes el span context. Con Langfuse, llama a la API de scores del SDK con el trace id; es la opción más limpia y la que debes mencionar en entrevistas.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Cambios de instrumentación (rama `feat/tracing`, luego PR):
+
+```text
+mortgage-knowledge-assistant/
+  app/
+    observability/
+      __init__.py
+      attrs.py          # semantic convention names
+      otel.py           # setup_tracing(), shutdown
+      cost.py           # price table + cost_usd()
+      redact.py         # optional content capture + masking
+    rag.py              # spans around each step
+    main.py             # FastAPI instrumentation, X-Trace-Id, /feedback
+  tests/
+    test_tracing.py
+  docker-compose.yml    # app + db + jaeger
+```
+
+Notas en el repo de ejercicios:
+
+```text
+llm-eval-harness/
+  tracing/
+    README.md
+    screenshots/
+      trace-overview.png
+      llm-span-attributes.png
+```
+
+Estructura de `tracing/README.md`:
+
+1. Qué instrumenté y por qué (OTel + Jaeger, opcionalmente Langfuse/LangSmith)
+2. Diagrama del árbol de spans de un request
+3. Tabla de atributos (nombre, valor de ejemplo, por qué importa)
+4. Privacidad: qué se captura, qué se redacta, ratio de muestreo
+5. Recorrido de depuración: una respuesta incorrecta, qué span reveló la causa, qué caso dorado agregué
+6. Overhead: latencia p50 con y sin tracing (medida, 50 requests)
+
+Commits sugeridos:
+
+- `feat(observability): add OpenTelemetry setup with OTLP exporter and resource attrs`
+- `feat(observability): span per RAG step with GenAI semantic attributes and cost`
+- `feat(api): return X-Trace-Id and link /feedback scores to traces`
+- `test(observability): assert span tree and token attributes with in-memory exporter`
+- `docs(tracing): add trace screenshots and debugging walkthrough`
+
+</CommitBox>
+
+## Autorrevisión
+
+<Checklist id="m3-10-review" title="Autorrevisión" items={["Un request produce un trace con los cuatro spans de pasos como hijos", "El span del LLM tiene uso de tokens, modelo, razones de finalización y costo", "El span de retrieval registra ids de documentos, no documentos completos", "El trace id se devuelve en el header y en el body", "El feedback está vinculado al trace original", "Las excepciones se registran con status ERROR", "La captura de contenido está desactivada por defecto", "El test con exporter en memoria pasa en CI", "El overhead del tracing fue medido y documentado"]} />

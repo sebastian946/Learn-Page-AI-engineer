@@ -1,0 +1,160 @@
+## Por qué ReAct simple no siempre alcanza
+
+Un bucle ReAct decide un paso a la vez. Eso es excelente para tareas cortas. Sufre cuando una tarea tiene muchos pasos, porque el modelo tiene que redescubrir el objetivo general en cada iteración a partir de un historial que crece. Dos síntomas aparecen en los traces:
+
+- **Deriva (drift).** Después de seis tool calls el agente olvida que el cliente también preguntó por un segundo pedido.
+- **Miopía.** Toma el paso localmente obvio (reprogramar ya) en lugar del globalmente correcto (revisar primero las tarifas de transportadoras, la más barata entrega antes).
+
+Dos familias de técnicas atacan esto: **planificación** (decidir los pasos por adelantado y luego ejecutar) y **reflexión** (criticar la salida o la trayectoria y luego revisarla).
+
+## Plan-and-execute
+
+Plan-and-execute divide al agente en dos roles:
+
+1. Una llamada **planner** produce una lista explícita de pasos a partir de la solicitud. Usa aquí un modelo fuerte, una sola vez.
+2. Un **executor** recorre los pasos uno por uno. Cada paso puede ser un pequeño bucle ReAct con un conjunto limitado de herramientas, muchas veces con un modelo más barato.
+3. Un **replanner** (opcional) mira los resultados después de cada paso y mantiene el plan, edita los pasos restantes o termina.
+
+Beneficios:
+
+- **Costo.** El razonamiento caro ocurre una vez. Los executors pueden correr en `claude-haiku-5-5` para consultas.
+- **Inspeccionabilidad.** El plan es un artefacto. Puedes registrarlo, mostrarlo a un humano para aprobación y evaluarlo por separado ("¿el plan incluyó una consulta de tarifas?").
+- **Foco.** Cada executor ve solo su paso y los resultados relevantes, no todo el historial.
+
+Costos:
+
+- **Rigidez.** Si el paso 2 revela que el pedido ya fue entregado, un plan sin replanner desperdicia los pasos restantes.
+- **Latencia extra** por la llamada de planificación.
+- **Los planes pueden estar mal.** Un plan sigue siendo una salida del modelo. Valídalo: herramientas desconocidas, demasiados pasos o acciones riesgosas deben ser rechazados por código.
+
+## Un planner estructurado
+
+Haz que el plan sea salida estructurada, no prosa. Así tu código puede validarlo como cualquier otro contrato.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+
+ALLOWED_TOOLS = {"get_order", "get_carrier_rates", "reschedule_delivery", "create_ticket"}
+
+class Step(BaseModel):
+    id: int
+    tool: Literal["get_order", "get_carrier_rates", "reschedule_delivery", "create_ticket"]
+    goal: str = Field(description="What this step must find out or change")
+    depends_on: list[int] = Field(default_factory=list)
+
+class Plan(BaseModel):
+    steps: list[Step] = Field(max_length=6)
+    risky: bool = Field(description="True if any step changes customer-visible state")
+
+planner = ChatAnthropic(model="claude-sonnet-5-5", temperature=0).with_structured_output(Plan)
+
+PLANNER_PROMPT = """You plan work for a logistics support agent.
+Tools: get_order, get_carrier_rates, reschedule_delivery, create_ticket.
+Return the minimal ordered list of steps. Do not include steps you cannot justify
+from the request. Mark risky=true if anything is rescheduled or changed."""
+
+async def make_plan(request: str) -> Plan:
+    plan: Plan = await planner.ainvoke([("system", PLANNER_PROMPT), ("user", request)])
+    for step in plan.steps:
+        if any(dep >= step.id for dep in step.depends_on):
+            raise ValueError(f"step {step.id} depends on a later step")
+    return plan
+```
+
+El tipo `Literal` significa que el modelo físicamente no puede planear una llamada a `issue_refund`. La verificación de dependencias es un invariante barato, como una aserción en un fixture de test. Si `plan.risky` es verdadero, puedes enviar el plan a un humano antes de ejecutar nada (lección 07).
+
+Luego el executor recorre `plan.steps`, ejecuta cada uno con un conjunto pequeño de herramientas, guarda los resultados en el estado indexados por id de paso y llama a un replanner cada uno o dos pasos:
+
+```python
+class Replan(BaseModel):
+    action: Literal["continue", "revise", "finish"]
+    remaining_steps: list[Step] = Field(default_factory=list)
+    final_answer: str | None = None
+```
+
+En LangGraph esto se convierte en tres nodos, `plan`, `execute_step` y `replan`, con un conditional edge desde `replan` de vuelta a `execute_step` o hacia `END`. La lección 06 muestra cómo.
+
+## Reflexión
+
+La reflexión le pide a un modelo que critique un trabajo y luego lo revise. Variantes:
+
+- **Autocrítica**: mismo modelo, segunda llamada: "Revisa esta respuesta buscando errores factuales contra los resultados de las herramientas. Lista los problemas y luego entrega una versión corregida."
+- **Evaluator-optimizer**: un prompt evaluador separado (o un modelo distinto) puntúa el borrador contra criterios; el generador revisa hasta que el puntaje pasa o se alcanza un máximo de rondas.
+- **Reflexion**: después de un intento fallido, el agente escribe una breve lección verbal ("reprogramé antes de verificar que la nueva fecha fuera día hábil") en memoria y reintenta con esa lección en contexto.
+
+La reflexión funciona mejor cuando el crítico tiene **algo concreto contra qué verificar**: resultados de herramientas, un schema, un documento de políticas, un test unitario. "¿Esto está bien?" produce elogios vagos. "¿Cada fecha de la respuesta aparece en un resultado de herramienta?" produce críticas accionables.
+
+```python
+class Critique(BaseModel):
+    grounded: bool = Field(description="Every fact in the draft appears in TOOL_RESULTS")
+    policy_ok: bool = Field(description="No promises of refunds or dates not confirmed by tools")
+    problems: list[str]
+
+critic = ChatAnthropic(model="claude-haiku-5-5", temperature=0).with_structured_output(Critique)
+
+async def reflect(draft: str, tool_results: str, max_rounds: int = 2) -> str:
+    for _ in range(max_rounds):
+        c: Critique = await critic.ainvoke(
+            f"TOOL_RESULTS:\n{tool_results}\n\nDRAFT:\n{draft}\n\nCheck the draft."
+        )
+        if c.grounded and c.policy_ok:
+            return draft
+        draft = await revise(draft, c.problems, tool_results)  # another LLM call
+    return draft  # caller should flag for review if still failing
+```
+
+Fíjate en el límite de rondas. Dos rondas capturan la mayor parte del beneficio. Más allá de eso, pagas por bucles donde el modelo discute consigo mismo.
+
+## Cómo elegir
+
+| Situación | Técnica |
+|---|---|
+| 1 a 3 tool calls, tareas cortas | ReAct simple |
+| 4 o más pasos, pasos mayormente independientes | Plan-and-execute |
+| Necesitas aprobación humana del enfoque | Plan-and-execute, muestra el plan |
+| La calidad de la salida importa más que la latencia (correo al cliente, reporte) | Reflexión con una rúbrica concreta |
+| El agente repite el mismo error entre intentos | Lecciones estilo Reflexion en memoria |
+
+Se pueden combinar. Una forma común en producción: planear una vez, ejecutar con pequeños bucles ReAct y reflexionar solo sobre el mensaje final para el cliente.
+
+## Medir si ayuda
+
+No agregues planificación ni reflexión porque lo dijo un blog. Trátalo como un cambio bajo prueba:
+
+- Ejecuta tu suite de evals de trayectoria (lección 13) antes y después.
+- Compara tasa de éxito de la tarea, pasos promedio, tokens y latencia p95.
+- Revisa la calidad del plan por separado: ¿los planes tenían pasos innecesarios? ¿Faltaban pasos?
+
+Si la reflexión sube el éxito de 82% a 84% pero duplica el costo por tarea, puede ser un mal intercambio para un caso de uso de alto volumen. Haz explícito el intercambio en tu README.
+
+## Errores comunes
+
+- **Planes en texto libre.** Si el código no puede parsear y validar el plan, no puede hacer cumplir nada.
+- **Sin replanificación.** El mundo cambia después del paso 1. Un plan estático ejecuta pasos obsoletos.
+- **Reflexión sin ground truth.** Un crítico sin nada contra qué verificar aprueba casi cualquier cosa.
+- **Bucles de crítica sin límite.** Siempre limita las rondas y escala cuando se alcanza el límite.
+- **Planificar tareas triviales.** Una llamada al planner para "¿cuál es el estado de mi pedido?" agrega latencia y costo sin ninguna ganancia.
+- **Dejar que el planner elija herramientas riesgosas libremente.** Restringe las herramientas con tipos y exige aprobación para planes marcados como riesgosos.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cuándo usarías plan-and-execute en lugar de un agente ReAct simple?" level="senior">
+
+Cuando la tarea tiene muchos pasos y el agente deriva o toma acciones localmente codiciosas. Plan-and-execute convierte la estrategia en un artefacto explícito y validado: un modelo fuerte planea una vez, executors más baratos ejecutan cada paso con un conjunto estrecho de herramientas y un replanner ajusta tras nueva evidencia. Reduce costos, permite que un humano revise el enfoque antes de que corra algo riesgoso y me deja evaluar la calidad del plan por separado de la ejecución. El costo es latencia extra y rigidez, así que agrego replanificación y no planifico tareas cortas. Confirmaría el beneficio con evals de trayectoria comparando tasa de éxito, pasos, costo y latencia.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Conéctalo con testing">
+
+"Reflexión sin ground truth es como una aserción que siempre pasa." Los entrevistadores recuerdan frases así. Menciona que le das al crítico verificaciones concretas: resultados de herramientas, schema, reglas de política.
+
+</Callout>
+
+## Lecturas adicionales
+
+- Reflexion: Language Agents with Verbal Reinforcement Learning: https://arxiv.org/abs/2303.11366
+- Plan-and-Solve Prompting: https://arxiv.org/abs/2305.04091
+- Tutorial de plan-and-execute en LangGraph: https://langchain-ai.github.io/langgraph/tutorials/plan-and-execute/plan-and-execute/
+- Anthropic — Building effective agents (patrón evaluator-optimizer): https://www.anthropic.com/research/building-effective-agents

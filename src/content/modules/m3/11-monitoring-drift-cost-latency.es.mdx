@@ -1,0 +1,178 @@
+## El monitoreo en producción es testing continuo
+
+Tus evals offline responden una pregunta: "¿Esta versión fue buena en los casos que conocemos?". Producción pregunta algo más difícil: "¿Sigue siendo buena hoy, con el tráfico que realmente recibimos?".
+
+Como SDET ya conoces esta división. Una suite de regresión en verde no prueba que producción esté sana. Por eso existen los checks sintéticos, las alertas de tasa de error y los dashboards. Las apps LLM necesitan lo mismo, más tres tipos de falla que los servicios clásicos rara vez tienen:
+
+- **Drift (deriva).** Los usuarios empiezan a hacer otras preguntas. El corpus cambia. El proveedor actualiza en silencio el alias de un modelo. La calidad baja sin ningún cambio de código.
+- **Costo.** Un cambio de prompt agrega 2,000 tokens de contexto a cada llamada. Nada se rompe. La factura se duplica.
+- **Latencia.** El p50 se ve bien. El p95 es de 14 segundos porque las respuestas largas se transmiten lento y un re-ranker hace timeout bajo carga.
+
+Piensa en el monitoreo como la suite de pruebas que corre en cada request real. Sus aserciones son métricas y umbrales. Sus fallas son alertas.
+
+## Las cuatro familias de señales
+
+Para el `mortgage-knowledge-assistant` del módulo 2, registra esto por request (tu `RagResult` ya trae casi todo: `usage`, `latency_ms`, `contexts`, `citations`):
+
+| Familia | Métricas | Por qué importa |
+|---|---|---|
+| Latencia | ms totales, time to first token (TTFT), ms de retrieval, ms de re-rank, ms del LLM | El usuario siente el TTFT; los SLOs usan p95 |
+| Costo | tokens de entrada, de salida, en caché, costo por request, costo por 1k requests | Presupuestos y unit economics |
+| Calidad | score de groundedness (muestreado), tasa de citas, tasa de rechazos, tasa de pulgar abajo | Detecta degradación silenciosa |
+| Drift | distancia del embedding de consultas a la línea base, mezcla de temas, distribución de scores de retrieval, versión del modelo | Explica por qué se movió la calidad |
+
+### Latencia: percentiles, no promedios
+
+Un promedio oculta la cola. Si 95 requests tardan 1.5 s y 5 tardan 20 s, la media es de unos 2.4 s y parece bien. El p95 es 20 s, y de eso trata el ticket de soporte enojado.
+
+Mide al menos p50, p95 y p99. Para endpoints con streaming mide dos números:
+
+- **TTFT** (time to first token): cuánto tiempo mira el usuario un spinner. Lo dominan el retrieval, el re-ranking y el tamaño del prompt.
+- **Latencia total**: la domina la longitud de la salida. Un modelo que se vuelve más verboso tras una actualización aparece aquí primero.
+
+Divide la latencia total en spans (retrieval, re-rank, LLM). Las lecciones de tracing te dieron esto gratis. Sin el desglose, una alerta de p95 te dice que algo está lento, pero no qué.
+
+### Costo: los tokens son la unidad
+
+Costo por request = tokens de entrada × precio de entrada + tokens de salida × precio de salida, menos cualquier descuento de caché. Calcúlalo al momento de registrar, desde una tabla de precios en configuración, no con una constante fija en el código. Los precios cambian.
+
+```python
+# cost.py — price table comes from config; values below are EXAMPLES only
+from pydantic import BaseModel
+
+class Price(BaseModel):
+    input_per_mtok: float   # USD per 1M input tokens (example — check provider pricing)
+    output_per_mtok: float  # USD per 1M output tokens (example — check provider pricing)
+
+PRICES: dict[str, Price] = {
+    "claude-sonnet-5-5": Price(input_per_mtok=3.0, output_per_mtok=15.0),   # example
+    "claude-haiku-5-5": Price(input_per_mtok=1.0, output_per_mtok=5.0),     # example
+}
+
+def request_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    p = PRICES[model]
+    return (input_tokens * p.input_per_mtok + output_tokens * p.output_per_mtok) / 1_000_000
+
+def cost_per_1k(costs: list[float]) -> float:
+    return 1000 * sum(costs) / max(len(costs), 1)
+```
+
+El **costo por 1k requests** es el número que entienden los stakeholders de negocio. También hace comparables los cambios: "el nuevo prompt nos movió de 4.10 a 6.80 USD por 1k" es una decisión, no una sensación.
+
+Los **presupuestos de tokens** son tu guardrail. Define un tope duro por request (por ejemplo, máximo 6,000 tokens de entrada de contexto recuperado y `max_tokens=800` para la salida). Luego define presupuestos suaves por tenant o por día y alerta al 80%. Esto se relaciona con OWASP LLM10 (Unbounded Consumption, consumo sin límites), que verás en la próxima lección.
+
+### Drift: tres tipos
+
+1. **Drift de entrada (consultas).** La distribución de preguntas se mueve. Se lanza un nuevo producto de préstamo, un cambio de tasas sale en las noticias, se incorpora un nuevo segmento de clientes. Detéctalo haciendo embeddings de una muestra diaria de consultas y comparando con una ventana base.
+2. **Drift de retrieval.** El corpus cambia o el índice se reconstruye. Observa la distribución de scores de similitud del top-1 y la tasa de "sin contexto relevante".
+3. **Drift de salida / modelo.** El proveedor actualiza un modelo detrás de un alias, o tú cambias un prompt. Observa la longitud de respuestas, la tasa de rechazos, la tasa de citas y los scores del juez muestreados. Registra siempre el id exacto de modelo que devuelve la API.
+
+Un check de drift de consultas simple y efectivo es la distancia entre centroides más la mezcla de clusters:
+
+```python
+# drift.py
+import numpy as np
+
+def centroid(vectors: np.ndarray) -> np.ndarray:
+    c = vectors.mean(axis=0)
+    return c / np.linalg.norm(c)
+
+def centroid_drift(baseline: np.ndarray, current: np.ndarray) -> float:
+    """Cosine distance between normalized centroids. 0 = same, higher = drift."""
+    return float(1 - centroid(baseline) @ centroid(current))
+
+def cluster_mix_shift(base_labels: np.ndarray, cur_labels: np.ndarray, k: int) -> float:
+    """Total variation distance between topic-cluster distributions (0..1)."""
+    p = np.bincount(base_labels, minlength=k) / len(base_labels)
+    q = np.bincount(cur_labels, minlength=k) / len(cur_labels)
+    return float(0.5 * np.abs(p - q).sum())
+
+# Daily job: embed ~500 sampled queries, assign them to clusters fit on the baseline
+# (e.g. KMeans k=12), then alert if centroid_drift > 0.05 or cluster_mix_shift > 0.15.
+# Calibrate both thresholds on a few weeks of normal traffic first.
+```
+
+La distancia entre centroides es barata y detecta cambios amplios. La mezcla de clusters te dice *qué* tema creció ("las preguntas sobre HELOC pasaron de 3% a 19%"). Esa es la parte accionable: agrega casos golden para el nuevo tema y vuelve a correr los evals offline.
+
+### Calidad en producción: muestrea y juzga
+
+No puedes correr un juez en cada request a escala. Muestrea el 1–5% del tráfico, más el 100% de las respuestas con pulgar abajo, y corre el mismo juez de groundedness que calibraste antes en este módulo. Grafica la media diaria con un intervalo de confianza. El score de un juez es una métrica ruidosa; alerta ante caídas sostenidas, no ante puntos aislados.
+
+## Alertas: primero SLOs, luego reglas
+
+Empieza por objetivos que el usuario percibe y luego escribe alertas que los protejan. SLOs de ejemplo para el asistente hipotecario:
+
+- El 95% de los requests tiene TTFT menor a 2 s, medido sobre 30 días.
+- El 99% de los requests devuelve una respuesta sin error.
+- La media de groundedness muestreada se mantiene en 0.85 o más (semanal).
+- El costo por 1k requests se mantiene bajo el presupuesto acordado.
+
+Reglas estilo Prometheus, asumiendo que exportas histogramas y contadores:
+
+```yaml
+groups:
+  - name: llm-assistant
+    rules:
+      - alert: HighTTFTp95
+        expr: histogram_quantile(0.95, sum(rate(llm_ttft_seconds_bucket[10m])) by (le)) > 2
+        for: 15m
+        labels: { severity: page }
+        annotations:
+          summary: "p95 TTFT above 2s for 15m"
+      - alert: TokenSpendBurn
+        expr: sum(increase(llm_cost_usd_total[1h])) > 1.5 * sum(increase(llm_cost_usd_total[1h] offset 1d))
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Hourly LLM spend 50% above same hour yesterday"
+      - alert: GroundednessDrop
+        expr: avg_over_time(llm_groundedness_score[6h]) < 0.85
+        for: 2h
+        labels: { severity: ticket }
+      - alert: RefusalRateSpike
+        expr: sum(rate(llm_refusals_total[30m])) / sum(rate(llm_requests_total[30m])) > 0.10
+        for: 30m
+        labels: { severity: ticket }
+```
+
+Notas sobre estas reglas:
+
+- Las ventanas `for:` evitan despertar a alguien por ruido. Las alertas flaky destruyen la confianza igual que los tests flaky.
+- Las alertas de gasto se comparan con una línea base (la misma hora de ayer) en lugar de un número fijo, así sobreviven al crecimiento normal.
+- Solo la latencia y los errores despiertan a alguien de noche. El drift de calidad y de costo abre tickets.
+
+## Dashboards que la gente sí lee
+
+Un dashboard, cuatro filas, en el mismo orden de la tabla de señales: latencia (p50/p95/p99, TTFT vs total, desglose por span), costo (costo por 1k, tokens de entrada/salida, top tenants), calidad (score del juez muestreado, tasa de citas, rechazos, feedback), drift (distancia de centroides, mezcla de clusters, id del modelo). Anota los deploys y los cambios de versión de prompt en cada panel. La mayoría de las preguntas tipo "¿qué pasó el martes?" se responden con un marcador de deploy.
+
+## Errores comunes
+
+- **Promedios en vez de percentiles.** La latencia media oculta al 5% de usuarios que se van.
+- **Precios fijos en el código.** Calcula el costo desde una tabla de precios versionada y el id exacto del modelo en la respuesta.
+- **Sin línea base para el drift.** Un score de drift sin un rango "normal" calibrado es solo un número. Junta de dos a cuatro semanas primero.
+- **Juzgar el 100% del tráfico.** Duplica tu costo. Muestrea y estratifica por tema o tenant.
+- **Alertar sobre cada métrica.** Demasiadas alertas y nadie reacciona. Ata las alertas a SLOs y presupuestos.
+- **Ignorar los alias de modelo.** Si llamas a un alias flotante, el comportamiento puede cambiar sin un deploy. Registra el id de modelo resuelto y fija versiones en producción.
+- **Sin vínculo con los evals offline.** El drift debe producir nuevos casos golden. Monitoreo y evals son un solo ciclo, no dos proyectos.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Las quejas de calidad de tu asistente RAG subieron esta semana pero no se desplegó código. ¿Cómo investigas?" level="senior">
+Empieza por lo que cambió fuera del código. Revisa el id del modelo en los logs (actualizaciones de alias del proveedor), el corpus y el índice (documentos nuevos o eliminados, jobs de re-indexado) y la mezcla de consultas (drift de centroides y clusters de temas). Compara los scores del juez muestreados y las distribuciones de scores de retrieval con la semana anterior. Segmenta por tema y tenant: muchas veces un tema nuevo, por ejemplo un nuevo producto de préstamo, no tiene cobertura en el corpus. Extrae los traces con pulgar abajo y lee 20 de ellos. Luego convierte los hallazgos en casos golden, corrige la causa raíz (agrega documentos, fija el modelo, ajusta el chunking) y confirma con la suite offline antes de cerrar.
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo monitorearías el costo de una funcionalidad con LLM?" level="mid">
+Registra tokens de entrada, de salida y en caché, más el id exacto del modelo por request. Calcula el costo desde una tabla de precios versionada. Reporta el costo por request y por 1k requests, desglosado por funcionalidad, tenant y versión de prompt. Aplica topes duros de tokens por request, presupuestos suaves por tenant con alertas al 80% y una alerta de anomalía que compare el gasto con la misma ventana de ayer. Revisa el impacto en costo como parte de cada cambio de prompt, igual que la latencia.
+</InterviewQuestion>
+
+<Callout type="interview" title="Dilo como un SDET">
+"El monitoreo es mi suite de pruebas en producción. Los SLOs son los criterios de aceptación, las alertas son aserciones que fallan y los hallazgos de drift alimentan nuevos casos en el golden dataset."
+</Callout>
+
+## Lecturas recomendadas
+
+- Convenciones semánticas de OpenTelemetry para GenAI: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+- Reglas de alertas de Prometheus: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+- Libro de SRE de Google, Service Level Objectives: https://sre.google/sre-book/service-level-objectives/
+- Seguimiento de costos y tokens en Langfuse: https://langfuse.com/docs
+- Precios y conteo de tokens de Anthropic: https://docs.anthropic.com

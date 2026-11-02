@@ -1,0 +1,185 @@
+## Why humans stay in the loop
+
+An agent that only reads data can be wrong cheaply. An agent that **writes** (refunds money, cancels orders, emails customers, merges PRs) can be wrong expensively. Human-in-the-loop (HITL) puts a person at the exact points where a mistake is costly or irreversible.
+
+Typical HITL patterns:
+
+| Pattern | When | Example |
+|---|---|---|
+| **Approve / reject** | Irreversible or costly action | Refund over $50, order cancellation |
+| **Edit** | The action is right but the arguments may be wrong | Fix the refund amount before it runs |
+| **Review output** | Text that goes to a customer | Approve an apology email draft |
+| **Answer a question** | The agent lacks information | "Which of these two orders do you mean?" |
+
+The QA analogy is a manual gate in a deploy pipeline: automated checks run first, a human approves production. You do not gate every step. You gate the steps where the blast radius is high.
+
+## How `interrupt` works
+
+LangGraph implements HITL with `interrupt()` from `langgraph.types`. Calling it inside a node:
+
+1. Saves the current state through the checkpointer (so a checkpointer is **required**).
+2. Stops the run and surfaces the payload you passed to the caller under `__interrupt__`.
+3. Waits, with no process or thread held open. The pause can last seconds or days.
+
+To continue, the caller invokes the graph again on the same `thread_id` with `Command(resume=value)`. The value becomes the return value of `interrupt()`.
+
+One detail drives the whole design: **on resume, the node that called `interrupt()` re-runs from its first line.** LangGraph does not resume mid-function. It replays the node and, this time, `interrupt()` returns the resume value instead of pausing. Consequences:
+
+- Code *before* `interrupt()` runs twice. Keep it pure, or make it idempotent.
+- Never call the risky tool before the interrupt in the same node.
+- Put the interrupt in its own small node so the replay is cheap and obvious.
+
+## An approval gate for risky tools
+
+The pattern below routes any AI message that contains a risky tool call to an `approval` node. The node asks a human, then either lets the tool run, edits the arguments, or rejects with a message the model can act on.
+
+```python
+import json
+from typing import Literal
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.types import Command, interrupt
+
+RISKY_TOOLS = {"issue_refund", "cancel_order"}
+
+
+def approval(state: AgentState) -> Command[Literal["tools", "agent"]]:
+    last: AIMessage = state["messages"][-1]
+    risky = [tc for tc in last.tool_calls if tc["name"] in RISKY_TOOLS]
+
+    # Pure code before interrupt(): safe to re-run on resume.
+    decision = interrupt({
+        "type": "tool_approval",
+        "question": "Approve, edit or reject the following actions",
+        "actions": [{"id": tc["id"], "tool": tc["name"], "args": tc["args"]} for tc in risky],
+    })
+
+    action = decision["action"]
+    if action == "approve":
+        return Command(goto="tools")
+
+    if action == "edit":
+        edited_calls = [
+            {**tc, "args": decision["args"]} if tc["name"] in RISKY_TOOLS else tc
+            for tc in last.tool_calls
+        ]
+        # Same message id -> add_messages replaces the message instead of appending.
+        fixed = AIMessage(content=last.content, tool_calls=edited_calls, id=last.id)
+        return Command(goto="tools", update={"messages": [fixed]})
+
+    # Reject: answer every tool call so the conversation stays valid.
+    reason = decision.get("reason", "Rejected by operator.")
+    error = json.dumps({"error": {
+        "code": "REJECTED_BY_HUMAN", "message": reason, "retryable": False,
+        "hint": "Explain to the customer or propose an alternative.",
+    }})
+    rejections = [ToolMessage(content=error, tool_call_id=tc["id"]) for tc in last.tool_calls]
+    return Command(goto="agent", update={"messages": rejections})
+```
+
+Three details worth copying:
+
+- **Edit uses the same message id.** `add_messages` then replaces the pending AI message, so the tool node executes the corrected arguments and the history shows what actually ran.
+- **Reject answers every tool call.** Providers require a tool result for each `tool_use` block. A missing one makes the next model call fail.
+- **The rejection is an error contract**, the same shape as tool errors from lesson 03. The model gets a code and a hint it can act on, instead of silently retrying the refund.
+
+Wire it with a router after the agent node:
+
+```python
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if not getattr(last, "tool_calls", None):
+        return END
+    if any(tc["name"] in RISKY_TOOLS for tc in last.tool_calls):
+        return "approval"
+    return "tools"
+
+
+builder.add_node("approval", approval)
+builder.add_conditional_edges("agent", route_after_agent, ["tools", "approval", END])
+graph = builder.compile(checkpointer=MemorySaver())  # PostgresSaver in production
+```
+
+## Running, pausing and resuming
+
+```python
+from langgraph.types import Command
+
+config = {"configurable": {"thread_id": "ticket-88213"}}
+result = graph.invoke(
+    {"messages": [("user", "Refund 120 USD on ORD-1042, the box arrived crushed.")]},
+    config,
+)
+
+if "__interrupt__" in result:
+    request = result["__interrupt__"][0].value
+    print(request["actions"])  # [{'id': 'toolu_..', 'tool': 'issue_refund', 'args': {...}}]
+
+    # Later, maybe from a different process or a web request:
+    result = graph.invoke(
+        Command(resume={"action": "edit", "args": {
+            "order_id": "ORD-1042", "amount_cents": 8000,
+            "reason": "damaged_in_transit", "idempotency_key": "ticket-88213-refund-1",
+        }}),
+        config,
+    )
+
+print(result["messages"][-1].content)
+```
+
+`graph.get_state(config)` tells you where a thread is paused: `snapshot.next` is `("approval",)` and `snapshot.tasks[0].interrupts` holds the payload. That is how an approval UI lists pending items: query paused threads, show their payload, post the decision back as `Command(resume=...)`.
+
+## Editing state directly
+
+Sometimes the operator needs to change the state outside a pending interrupt, for example to correct a wrongly extracted order id, or to inject a note. `update_state` writes to the checkpoint as if a node had returned that update, through the same reducers:
+
+```python
+graph.update_state(
+    config,
+    {"messages": [("user", "Operator note: customer is VIP, prefer reshipment over refund.")]},
+)
+graph.invoke(None, config)  # continue from the updated checkpoint
+```
+
+You can also pass `as_node="agent"` to make the update look like it came from a specific node, which changes which edge runs next. Use this sparingly and log it. An operator edit is an audit event.
+
+## Designing the approval policy
+
+Do not gate everything. If every step needs a click, operators rubber-stamp, and the gate becomes theater. Good policies are explicit and testable:
+
+- **By tool**: `issue_refund`, `cancel_order` always need approval; `get_order` never does.
+- **By argument**: refunds above a threshold (for example 50 USD) need approval; below it, auto-approve and log.
+- **By confidence or context**: first-time customers, flagged accounts or repeated attempts go to a human.
+- **Timeouts**: define what happens if nobody answers in N hours (usually: reject safely and notify).
+
+Keep the threshold in config, not in the prompt, and unit-test the router with cases on both sides of it.
+
+## Common mistakes
+
+- **Running side effects before `interrupt()` in the same node.** On resume the node re-runs and the refund happens twice. Put the side effect after the gate, in the tool node, and pass an idempotency key anyway.
+- **No checkpointer.** `interrupt()` cannot save state without one. In production it must be durable, or a deploy wipes every pending approval.
+- **Losing the `thread_id`.** The resume must target the exact same thread. Store it with the approval request.
+- **Leaving tool calls unanswered on reject.** The next model call fails because a `tool_use` block has no matching result.
+- **Approving opaque payloads.** Show the human the tool, the arguments, the order context and the agent's reasoning, not just "approve refund?".
+- **Multiple interrupts in one node with changing order.** Resume values are matched by position. Keep interrupt calls deterministic in number and order.
+- **Not logging decisions.** Who approved, when, and what was edited are compliance data. Write them to your audit log and traces.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you add human approval before an agent issues a refund?" level="mid">
+
+I would route any AI message with a refund tool call to a dedicated approval node, using a conditional edge so the policy is code, not prompt. The node calls `interrupt()` with the tool name, arguments and order context, which checkpoints the thread and returns control to the caller. A UI or Slack bot shows the request. The decision comes back as `Command(resume=...)` on the same `thread_id`. Approve goes to the tool node; edit replaces the AI message by id with corrected args; reject returns a structured error `ToolMessage` so the model can explain or propose an alternative. The checkpointer is Postgres-backed, and the refund tool still takes an idempotency key.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What happens to the code in a node when the graph resumes after an interrupt?" level="senior">
+
+The node restarts from the top. LangGraph does not snapshot the Python stack; it re-executes the node, and this time `interrupt()` returns the resume value instead of pausing. So anything before the interrupt runs again: LLM calls cost twice, and side effects can duplicate. I keep interrupt nodes small and pure, push side effects into the tool node after the gate, and make tools idempotent with keys derived from the thread and tool call id. If a node has several interrupts, their resume values are matched by order, so the number and order of calls must be deterministic.
+
+</InterviewQuestion>
+
+## Further reading
+
+- LangGraph human-in-the-loop concepts: https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/
+- LangGraph persistence (threads, get_state, update_state): https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Anthropic, Building effective agents (human checkpoints): https://www.anthropic.com/research/building-effective-agents
+- Anthropic tool use, handling tool results: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview

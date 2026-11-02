@@ -1,0 +1,207 @@
+## Dos lugares para medir la calidad
+
+Tu gate de evals del ejercicio anterior es un **eval offline**. Corre antes del deploy, sobre un golden dataset fijo, con respuestas de referencia conocidas. Es tu suite de regresión previa al merge.
+
+Un **eval online** corre después del deploy, sobre tráfico real. No hay respuestas de referencia. Los usuarios preguntan cosas que tu golden set nunca imaginó. Los documentos cambian. El proveedor actualiza un modelo detrás del mismo nombre.
+
+Necesitas ambos, por la misma razón por la que corres tests en CI y también monitoreo en producción con canaries:
+
+| Práctica de QA / release | Equivalente en LLM |
+|---|---|
+| Suite de regresión previa al merge | Evals offline sobre el golden set |
+| Soak test en staging | Shadow traffic: el nuevo prompt corre sobre requests reales, sin mostrar la salida |
+| Canary release | Versión de prompt detrás de un feature flag en el 5% del tráfico con evals online |
+| Synthetic checks en producción | Corridas programadas de un subconjunto golden contra el endpoint en vivo |
+| Reportes de bugs de usuarios | Señales de feedback: thumbs down, ediciones, escalamientos |
+| A/B test de un cambio de UI | A/B test de dos variantes de prompt o de retrieval |
+
+<Diagram caption="Los evals offline y online se alimentan entre sí" chart={`flowchart LR
+  G["Golden dataset"] --> O["Evals offline (gate de CI)"]
+  O --> D["Deploy detrás de flag"]
+  D --> S["Shadow / canary"]
+  S --> A["A/B test"]
+  A --> P["Producción"]
+  P --> F["Evals online + feedback"]
+  F -->|"las fallas se vuelven nuevos ítems golden"| G`} />
+
+El ciclo de abajo es la idea clave. Cada falla de producción que encuentras online se convierte en un nuevo ítem golden offline. Es el mismo hábito de "cada bug que se escapa recibe un test de regresión".
+
+## Evals offline: fortalezas y puntos ciegos
+
+Los evals offline son reproducibles, baratos de re-ejecutar con caché y pueden usar respuestas de referencia. Eso hace posibles métricas como correctness y context recall.
+
+Puntos ciegos:
+
+- **Desajuste de distribución.** Tus 200 preguntas no son las 20,000 de tus usuarios. Los usuarios reales escriben "puedo sacar prestamo con 640 de credito + ingresos 1099??".
+- **Referencias desactualizadas.** Una política cambió el mes pasado. La respuesta golden ahora está mal.
+- **Sin señal de comportamiento.** Offline no puedes ver si los usuarios confiaron en la respuesta, la copiaron o escalaron a un humano.
+
+## Evals online: qué puedes medir sin referencia
+
+Sobre tráfico en vivo calificas con métricas **sin referencia** (reference-free) y con **señales de comportamiento**.
+
+Sin referencia, evaluadas por modelo (con muestreo):
+
+- Faithfulness respecto a los contextos recuperados (tienes los contextos en el trace).
+- Relevancia de la respuesta respecto a la pregunta.
+- Cumplimiento de políticas: nada de consejo financiero fuera de alcance, no repetir PII.
+- Corrección de la negativa: ¿se negó cuando el contexto no tenía la respuesta?
+
+Señales de comportamiento (gratis, ruidosas, con retraso):
+
+- Tasa de thumbs up / down.
+- Distancia de edición cuando un agente edita el borrador antes de enviarlo.
+- Tasa de escalamiento a un oficial de crédito humano.
+- Tasa de reformulación: el usuario pregunta lo mismo otra vez en menos de 60 segundos.
+- Copia o clic en las citas.
+
+No juzgues el 100% del tráfico. Muestrea. El dos por ciento de 50,000 requests diarios son 1,000 llamadas al juez por día, suficiente para una tendencia diaria estable. Sobremuestrea los segmentos riesgosos: conversaciones con thumbs down, respuestas largas, respuestas sin citas.
+
+```python
+# app/online_eval.py
+import asyncio
+import random
+
+from anthropic import AsyncAnthropic
+
+from app.models import RagResult
+from harness.judges import judge_faithfulness  # same judge as offline: one ruler
+
+SAMPLE_RATE = 0.02
+client = AsyncAnthropic()
+
+
+def should_sample(result: RagResult, feedback: str | None) -> bool:
+    if feedback == "thumbs_down" or not result.citations:
+        return True  # always look at risky interactions
+    return random.random() < SAMPLE_RATE
+
+
+async def score_online(trace_id: str, result: RagResult, feedback: str | None, sink) -> None:
+    if not should_sample(result, feedback):
+        return
+    verdict = await judge_faithfulness(client, result.answer, result.contexts)
+    await sink.write_score(trace_id=trace_id, name="faithfulness", value=verdict.score,
+                           comment="online-sampled", judge_version="faithfulness-v1")
+
+
+def fire_and_forget(trace_id: str, result: RagResult, feedback: str | None, sink) -> None:
+    # never block the user response on an eval
+    asyncio.create_task(score_online(trace_id, result, feedback, sink))
+```
+
+Usa el mismo juez y la misma versión de rúbrica offline y online. Así una caída online es comparable con tu baseline offline. En producción, manda esto a un worker con cola en lugar de `create_task`, para que los evals sobrevivan reinicios y puedas limitarles la tasa.
+
+## Shadow traffic y canaries
+
+**Modo shadow**: la nueva versión del prompt corre sobre una copia de requests reales. Su salida se guarda y se juzga, nunca se muestra. Obtienes la distribución real con cero riesgo para el usuario. Costo: pagas generación doble en los requests en shadow, así que haz shadow de una muestra.
+
+**Canary**: un feature flag enruta una porción pequeña de usuarios (por ejemplo 5%) a la nueva versión. Observas los puntajes de evals online, la latencia p95, el costo por request y la tasa de errores. Haz rollback automático si el faithfulness cae por debajo de un umbral. Es el mismo flujo que conoces de progressive delivery, con métricas de calidad agregadas a los health checks.
+
+Un canary te dice "nada está en llamas". No te dice "B es mejor que A". Para eso necesitas un A/B test.
+
+## A/B testing de prompts
+
+### Unidad de aleatorización
+
+Aleatoriza por **usuario** (o cuenta), no por request. Si un usuario ve el prompt A, luego B, luego A, su experiencia es inconsistente y su feedback queda contaminado. Convierte un id estable en un bucket con un hash:
+
+```python
+import hashlib
+
+
+def assign_variant(user_id: str, experiment: str, split: float = 0.5) -> str:
+    h = int(hashlib.sha256(f"{experiment}:{user_id}".encode()).hexdigest()[:8], 16)
+    return "B" if (h / 0xFFFFFFFF) < split else "A"
+```
+
+Incluir el nombre del experimento en el hash mantiene las asignaciones independientes entre experimentos.
+
+### Métricas: primaria y guardrails
+
+Elige **una métrica primaria** antes de empezar. Ejemplo: tasa de thumbs up o tasa de escalamiento. Luego define **métricas guardrail** que no deben empeorar: faithfulness (juez online), latencia p95, costo por request, tasa de negativas. La variante B "gana" solo si la primaria mejora de forma significativa y ningún guardrail retrocede.
+
+¿Por qué una sola primaria? Con diez métricas a un nivel de significancia del 5%, encontrarás una mejora "significativa" por azar cerca del 40% de las veces.
+
+### Tamaño de muestra
+
+Calcúlalo antes del lanzamiento. Para una métrica binaria (thumbs up sí/no), por variante:
+
+```text
+n = (z_alpha/2 + z_beta)^2 * (p1(1 - p1) + p2(1 - p2)) / (p2 - p1)^2
+```
+
+Thumbs up base de 0.70, quieres detectar 0.73, alpha 0.05 (z = 1.96), potencia 0.8 (z = 0.84):
+
+```text
+n = (2.80)^2 * (0.21 + 0.197) / 0.0009 = 7.84 * 0.407 / 0.0009 ≈ 3,550 per variant
+```
+
+Es decir, unas 7,100 interacciones calificadas en total. Si solo el 10% de los usuarios presiona thumbs, necesitas cerca de 71,000 conversaciones. Ese número decide si el test es factible con tu tráfico. A menudo la respuesta es "usa una métrica calificada por un juez, porque cada request recibe un puntaje".
+
+```python
+from statsmodels.stats.power import NormalIndPower
+from statsmodels.stats.proportion import proportion_effectsize, proportions_ztest
+
+effect = proportion_effectsize(0.73, 0.70)  # Cohen's h
+n_per_arm = NormalIndPower().solve_power(effect_size=effect, alpha=0.05, power=0.8, ratio=1.0)
+print(f"need ~{n_per_arm:,.0f} rated interactions per variant")
+
+# After the test (fixed horizon reached):
+successes = [2540, 2650]  # thumbs up in A, B
+trials = [3600, 3600]
+stat, p_value = proportions_ztest(successes, trials)
+print(f"A={successes[0]/trials[0]:.3f} B={successes[1]/trials[1]:.3f} p={p_value:.4f}")
+```
+
+### El problema de espiar (peeking)
+
+Si revisas el p-value cada día y te detienes la primera vez que baja de 0.05, tu tasa real de falsos positivos es mucho mayor que 5%. Es la versión estadística de re-ejecutar un test flaky hasta que pasa. Dos opciones honestas:
+
+- **Horizonte fijo**: calcula n, corre hasta alcanzarlo y mira una sola vez.
+- **Testing secuencial**: métodos diseñados para monitoreo continuo (por ejemplo diseños secuenciales por grupos o p-values siempre válidos) que muchas plataformas de experimentación implementan. Úsalos si necesitas detenerte antes.
+
+### Novedad y otras trampas
+
+- **Efecto novedad.** Un nuevo estilo de respuesta recibe más thumbs up la primera semana porque es diferente. Corre al menos una o dos semanas completas y compara el tamaño del efecto de la semana 1 vs la semana 2. Si se achica, ten cuidado.
+- **Estacionalidad semanal.** Las preguntas de hipotecas del lunes en la mañana difieren de las del sábado en la noche. Cubre semanas completas.
+- **Sample ratio mismatch.** Planeaste 50/50 y obtuviste 52/48. Algo en la asignación o en el logging está roto. Investiga antes de leer resultados.
+- **El costo como variable oculta.** B es mejor pero usa 40% más tokens de salida. Reporta el trade-off; deja que el product owner decida.
+
+## Errores comunes
+
+- **Tratar los puntajes offline como calidad de producción.** Un faithfulness offline de 0.92 no dice nada sobre preguntas que nunca recolectaste.
+- **Juzgar online con una rúbrica distinta a la offline.** Pierdes comparabilidad. Una sola regla de medir.
+- **Bloquear la respuesta por un eval online.** Los evals son asíncronos, con muestreo y de mejor esfuerzo.
+- **Aleatorizar por request.** UX inconsistente y muestras correlacionadas.
+- **Sin métrica primaria pre-registrada.** Terminarás escogiendo la métrica que se ve bien.
+- **Detener el test cuando parece significativo.** Eso es peeking. Usa horizonte fijo o un método secuencial.
+- **Nunca devolver las fallas online al golden set.** Tu suite offline deja poco a poco de representar la realidad.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cuál es la diferencia entre evals offline y online, y por qué necesitas ambos?" level="mid">
+
+Los evals offline corren antes del deploy sobre un golden dataset fijo y versionado, con respuestas de referencia. Son reproducibles y funcionan como gate de regresión en CI. Los evals online corren sobre tráfico de producción sin referencias. Uso jueces sin referencia con muestreo (faithfulness respecto a los contextos recuperados, relevancia, cumplimiento de políticas) más señales de comportamiento como thumbs down, ediciones y escalamientos. Offline atrapa las regresiones que puedes anticipar. Online atrapa cambios de distribución, documentos desactualizados y cambios del proveedor. Los dos se conectan: cada falla online que clasifico se convierte en un nuevo ítem golden, igual que cada bug que se escapa recibe un test de regresión.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Producto quiere hacer un A/B test de un nuevo system prompt. ¿Cómo lo diseñas?" level="senior">
+
+Primero, una métrica primaria pre-registrada, por ejemplo tasa de escalamiento o de thumbs up, más guardrails: faithfulness online, latencia p95, costo por request. Aleatorizo por usuario con un bucket por hash, para que cada usuario vea una sola variante. Calculo el tamaño de muestra por adelantado; para una mejora de 3 puntos desde 70% en una métrica binaria son cerca de 3,500 interacciones calificadas por brazo, así que reviso el volumen de feedback y puedo cambiar a una métrica primaria calificada por un juez si los thumbs son muy escasos. Corro al menos dos semanas completas por el efecto novedad y la estacionalidad semanal, reviso sample ratio mismatch y miro una sola vez al llegar al horizonte fijo o uso un método secuencial. Antes de todo esto, B debe pasar el gate offline y un canary corto.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Conéctalo con release engineering">
+
+Dilo en tu propio lenguaje: "Los evals offline son mi suite de regresión, el shadow traffic es mi soak en staging, los canaries son mi progressive delivery y el A/B test es el único paso que prueba que B es realmente mejor". A quienes contratan para calidad de IA les encantan los candidatos que ya piensan en gates de release.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Langfuse, scores y evaluación online: https://langfuse.com/docs/scores/overview
+- LangSmith, evaluadores online: https://docs.smith.langchain.com/
+- statsmodels, pruebas de potencia y de proporciones: https://www.statsmodels.org/stable/stats.html
+- Kohavi, Tang, Xu, "Trustworthy Online Controlled Experiments" (libro, Cambridge University Press)
+- Anthropic, definir criterios de éxito y construir evaluaciones: https://docs.anthropic.com/en/docs/test-and-evaluate/define-success

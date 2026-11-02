@@ -1,0 +1,167 @@
+## Objetivo
+
+Deja de adivinar tamaños de chunk. En este ejercicio construyes un pequeño benchmark de retrieval y lo usas para comparar cuatro configuraciones de chunking sobre tu corpus hipotecario. El resultado es una tabla en tu README que justifica la estrategia de chunking que llevarás al proyecto final.
+
+Carpeta: `rag-lab/02-chunking/`. Entrada: `01-ingestion/out/documents.jsonl` del ejercicio anterior.
+
+### Qué estás midiendo
+
+Estás evaluando **solo el retrieval**, sin generación con LLM. Para cada pregunta de un golden set pequeño sabes qué sección de qué documento contiene la respuesta. Una configuración es buena si esa sección aparece cerca del inicio de los resultados.
+
+- **Hit rate@k** (también llamado recall@k cuando hay un solo elemento relevante): fracción de preguntas donde al menos un chunk de la sección esperada está en el top k.
+- **MRR** (mean reciprocal rank): promedio de `1 / rank` del primer chunk relevante; 0 si no aparece en el top k. Premia rankear primero el chunk correcto.
+- **Proxies de costo:** número de chunks, tokens promedio por chunk y tokens de contexto promedio enviados con `k = 4`.
+
+Es el equivalente en retrieval de una suite de tests con tasa de aprobación. Reutilizarás la misma idea de golden set, mucho más grande, en la lección 15 y en el Módulo 3.
+
+### Las configuraciones
+
+1. `fixed-800` — tamaño fijo, 800 caracteres, 100 de overlap.
+2. `recursive-800` — `RecursiveCharacterTextSplitter`, 800 caracteres, 100 de overlap.
+3. `recursive-tok-256` — recursivo con tamaño en tokens, 256 tokens, 32 de overlap.
+4. `structure` — consciente del documento: un chunk por sección (par FAQ, sección numerada de política), secciones largas divididas recursivamente por dentro, ruta de títulos antepuesta.
+
+Quinta opcional: `semantic` con `SemanticChunker`, si tienes tiempo y presupuesto.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] Un golden set `data/golden.jsonl` con al menos 25 preguntas, cada una con `question`, `expected_doc_id` y `expected_section` (título). Incluye al menos 5 preguntas que apunten a tablas, 5 a páginas FAQ y 3 que necesiten un término exacto como un número de formulario.
+- [ ] `python -m chunkbench run` divide el corpus con cada configuración, genera los embeddings de los chunks y evalúa todas las preguntas con k = 1, 3, 5 y 10.
+- [ ] Cada chunk lleva `doc_id`, el título de `section` y `page`, para que la relevancia se juzgue por metadata y no por coincidencia de texto.
+- [ ] Los embeddings se cachean en disco con la clave `sha256(model + text)`, de modo que una segunda ejecución hace cero llamadas a la API de embeddings.
+- [ ] La ejecución escribe `results/summary.csv` con las columnas `config, n_chunks, mean_tokens, hit@1, hit@3, hit@5, hit@10, mrr@10, ctx_tokens@4`.
+- [ ] La ejecución escribe `results/misses.md` con la lista, por configuración, de las preguntas que fallaron en k = 5 junto con los 3 títulos recuperados primero, para que puedas inspeccionar las fallas.
+- [ ] Tu README contiene la tabla de resultados, una configuración elegida y una justificación de 3–5 oraciones que mencione el costo, no solo la precisión.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```python
+# 02-chunking/chunkbench/metrics.py
+from collections.abc import Sequence
+
+
+def first_relevant_rank(retrieved: Sequence[dict], doc_id: str, section: str) -> int | None:
+    for rank, chunk in enumerate(retrieved, start=1):
+        if chunk["doc_id"] == doc_id and chunk["section"] == section:
+            return rank
+    return None
+
+
+def hit_at_k(ranks: list[int | None], k: int) -> float:
+    return sum(1 for r in ranks if r is not None and r <= k) / len(ranks)
+
+
+def mrr_at_k(ranks: list[int | None], k: int) -> float:
+    return sum(1 / r for r in ranks if r is not None and r <= k) / len(ranks)
+```
+
+```python
+# 02-chunking/chunkbench/embed_cache.py
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+from openai import OpenAI
+
+MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")  # example
+CACHE = Path(".cache/embeddings.jsonl")
+
+
+class CachedEmbedder:
+    def __init__(self) -> None:
+        self.client = OpenAI()
+        self.cache: dict[str, list[float]] = {}
+        if CACHE.exists():
+            for line in CACHE.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                self.cache[row["key"]] = row["vec"]
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha256(f"{MODEL}\n{text}".encode()).hexdigest()
+
+    def embed(self, texts: list[str], batch_size: int = 128) -> np.ndarray:
+        missing = [t for t in dict.fromkeys(texts) if self._key(t) not in self.cache]
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with CACHE.open("a", encoding="utf-8") as f:
+            for i in range(0, len(missing), batch_size):
+                batch = missing[i : i + batch_size]
+                resp = self.client.embeddings.create(model=MODEL, input=batch)
+                for text, item in zip(batch, resp.data):
+                    key = self._key(text)
+                    self.cache[key] = item.embedding
+                    f.write(json.dumps({"key": key, "vec": item.embedding}) + "\n")
+        vecs = np.array([self.cache[self._key(t)] for t in texts], dtype=np.float32)
+        return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+```
+
+```python
+# 02-chunking/chunkbench/search.py
+import numpy as np
+
+
+def top_k(query_vec: np.ndarray, chunk_vecs: np.ndarray, k: int) -> list[int]:
+    scores = chunk_vecs @ query_vec            # cosine, vectors are normalized
+    idx = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+    return idx[np.argsort(-scores[idx])].tolist()
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Escribe el golden set antes de mirar cualquier salida del chunking, igual que escribirías los resultados esperados antes de correr un test. Lee cada documento fuente, escribe una pregunta que un oficial de crédito realmente haría y registra el título de la sección donde vive la respuesta.</Hint>
+  <Hint>Para `fixed-800` y `recursive-800`, corre el splitter por sección en lugar de por documento, para que cada chunk siga conociendo el título de su sección. Un chunk que abarca dos secciones debería etiquetarse con la sección donde empieza; esto favorece un poco a las estrategias ingenuas, lo cual está bien para un benchmark.</Hint>
+  <Hint>Cuenta tokens con `tiktoken.get_encoding("cl100k_base")` en todas las configuraciones para que las columnas de costo sean comparables, aunque tu proveedor de embeddings use otro tokenizer. Repórtalo como una aproximación.</Hint>
+  <Hint>Si dos configuraciones están a una o dos preguntas de distancia en un set de 25, la diferencia es ruido. Dilo en el README y desempata por costo (menos tokens de contexto) y simplicidad. Revisa `misses.md`: las preguntas sobre tablas y de términos exactos suelen explicar la mayor parte de la brecha, y además anticipan por qué necesitas búsqueda híbrida en la lección 9.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  02-chunking/
+    README.md
+    pyproject.toml
+    data/
+      golden.jsonl
+    chunkbench/
+      __init__.py
+      __main__.py        # "run" command
+      strategies.py      # fixed, recursive, recursive_tokens, structure, semantic
+      embed_cache.py
+      search.py
+      metrics.py
+    results/
+      summary.csv
+      misses.md
+    tests/
+      test_metrics.py
+      test_strategies.py
+```
+
+**Esquema del README para `02-chunking/`:** pregunta que se responde ("¿qué estrategia de chunking para manuales de políticas y FAQs?"), descripción del golden set (tamaño, categorías, cómo se escribió), tabla de configuraciones, tabla de resultados copiada de `summary.csv`, configuración elegida con justificación, fallas notables y lo que sugieren (por ejemplo, las fallas de términos exactos llevan a la búsqueda híbrida) y limitaciones (golden set pequeño, un solo modelo de embeddings).
+
+**Commits sugeridos:**
+
+- `feat(chunking): golden set of 25 retrieval questions over mortgage corpus`
+- `feat(chunking): fixed, recursive and structure-aware strategies`
+- `feat(chunking): cached embedder and numpy top-k search`
+- `feat(chunking): hit@k and MRR benchmark with CSV and misses report`
+- `docs(chunking): results table and chosen strategy`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m2-05-review" title="Autoevaluación" items={["El golden set se escribió a partir de los documentos fuente, no de la salida del chunking", "La relevancia se juzga con la metadata doc_id y section, no por coincidencia de texto", "Una segunda ejecución usa la caché de embeddings y no hace llamadas a la API", "summary.csv incluye columnas de costo, no solo hit rate y MRR", "Leíste misses.md y describiste al menos dos patrones de falla en el README", "La configuración elegida se justifica con precisión y costo", "Los unit tests cubren hit@k y MRR con un ejemplo calculado a mano"]} />

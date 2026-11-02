@@ -1,0 +1,202 @@
+## What a vector store actually does
+
+A vector store does three jobs: it stores vectors next to their text and metadata, it finds the nearest vectors to a query vector quickly, and it filters by metadata while doing so. Exact nearest-neighbour search compares the query with every vector; that is fine for 10k chunks and too slow for 10M. So stores build **approximate nearest neighbour (ANN)** indexes that trade a little recall for a lot of speed.
+
+The course order is deliberate: **pgvector first**. You already run PostgreSQL, your team already knows how to back it up, secure it and monitor it, and your metadata already lives in tables. For most internal knowledge assistants, including our mortgage lender's, a dedicated vector database is an optimization you may never need.
+
+## pgvector in 10 minutes
+
+Run it locally with the official image:
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+volumes:
+  pgdata:
+```
+
+A schema that keeps chunks, metadata and the embedding model together:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  doc_id          text PRIMARY KEY,
+  source          text NOT NULL,
+  title           text NOT NULL,
+  doc_type        text NOT NULL,
+  jurisdiction    text,
+  effective_date  date,
+  is_current      boolean NOT NULL DEFAULT true,
+  content_hash    text NOT NULL
+);
+
+CREATE TABLE chunks (
+  chunk_id        text PRIMARY KEY,
+  doc_id          text NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+  section         text,
+  page            int,
+  content         text NOT NULL,
+  embedding_model text NOT NULL,
+  embedding       vector(1024) NOT NULL
+);
+
+-- ANN index: HNSW with cosine distance
+CREATE INDEX chunks_embedding_hnsw ON chunks
+  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX documents_filter_idx ON documents (doc_type, jurisdiction, is_current);
+```
+
+Querying: `<=>` is cosine *distance* (0 is identical), so order ascending and convert to similarity if you want to display it.
+
+```sql
+SET hnsw.ef_search = 80;   -- higher = better recall, slower; default 40
+
+SELECT c.chunk_id, d.title, c.section, c.page,
+       1 - (c.embedding <=> $1::vector) AS similarity
+FROM chunks c
+JOIN documents d USING (doc_id)
+WHERE d.is_current
+  AND d.jurisdiction IN ('US', 'US-TX')
+ORDER BY c.embedding <=> $1::vector
+LIMIT 5;
+```
+
+### HNSW vs IVFFlat
+
+| | HNSW | IVFFlat |
+|---|---|---|
+| How it works | multi-layer proximity graph | vectors clustered into `lists`; search the nearest `probes` lists |
+| Build | slower, more memory | faster, needs data present before building |
+| Query speed / recall | better trade-off in most cases | good if `lists` and `probes` are tuned |
+| Inserts after build | handled well | recall degrades as data drifts from the clusters; rebuild periodically |
+| Tuning knobs | `m`, `ef_construction`, `hnsw.ef_search` | `lists` (often rows/1000 to start), `ivfflat.probes` |
+
+Default to HNSW. Use IVFFlat when build time or memory is the constraint and the data is mostly static.
+
+### Filtering and the "too few results" trap
+
+ANN indexes find the nearest candidates first, then Postgres applies your `WHERE` clause. If the filter is selective (only 2% of chunks are Texas home-equity policies) the index may return 40 candidates of which none survive, and you get fewer than `LIMIT` rows. Fixes:
+
+- pgvector 0.8+ supports **iterative index scans**: `SET hnsw.iterative_scan = relaxed_order;` keeps scanning until enough rows pass the filter.
+- Raise `hnsw.ef_search` for filtered queries.
+- For a small number of high-value filter values, use **partial indexes** (`... WHERE doc_type = 'policy'`) or partition the table.
+- For very selective filters, exact search over the filtered subset (no ANN) is often fast enough and has perfect recall.
+
+Write a test for this: a query with a narrow filter must return `k` results when at least `k` matching chunks exist.
+
+### pgvector through LangChain
+
+```python
+import os
+from langchain_openai import OpenAIEmbeddings
+from langchain_postgres import PGVector
+
+store = PGVector(
+    embeddings=OpenAIEmbeddings(model=os.environ["EMBEDDING_MODEL"]),
+    collection_name="mortgage_policies_v1",
+    connection="postgresql+psycopg://rag:rag@localhost:5432/rag",
+    use_jsonb=True,
+)
+store.add_documents(chunks, ids=[c.metadata["chunk_id"] for c in chunks])
+hits = store.similarity_search(
+    "max LTV for cash-out refinance in Texas",
+    k=5,
+    filter={"jurisdiction": {"$in": ["US", "US-TX"]}, "is_current": True},
+)
+```
+
+The LangChain adapter manages its own tables with metadata in JSONB. That is fast to start with. Your own schema (above) gives you typed columns, foreign keys, normal indexes and full-text search in the same table, which you will need for hybrid search in lesson 9. In the exercise you will use your own schema.
+
+## Chroma: the developer-friendly embedded store
+
+Chroma runs in-process (like SQLite) or as a server. It is excellent for notebooks, prototypes and tests.
+
+```python
+import chromadb
+
+client = chromadb.PersistentClient(path=".chroma")
+col = client.get_or_create_collection("mortgage_policies", metadata={"hnsw:space": "cosine"})
+col.upsert(ids=chunk_ids, embeddings=vectors.tolist(), documents=texts, metadatas=metas)
+res = col.query(query_embeddings=[q_vec.tolist()], n_results=5,
+                where={"$and": [{"jurisdiction": "US-TX"}, {"is_current": True}]})
+```
+
+Strengths: zero infrastructure, simple API, good for unit and integration tests of retrieval logic. Weaknesses at production scale: fewer operational features than Postgres or Qdrant (backup tooling, replication, fine-grained access control), and metadata values are limited to simple types.
+
+## Qdrant: a dedicated vector database
+
+Qdrant is a purpose-built vector database written in Rust, with rich payload filtering, quantization and horizontal scaling.
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (Distance, FieldCondition, Filter, MatchAny,
+                                  MatchValue, PointStruct, VectorParams)
+
+qc = QdrantClient(url="http://localhost:6333")
+qc.create_collection("mortgage_policies",
+                     vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
+qc.upsert("mortgage_policies", points=[
+    PointStruct(id=i, vector=v.tolist(), payload=m) for i, (v, m) in enumerate(zip(vectors, metas))
+])
+hits = qc.query_points(
+    "mortgage_policies", query=q_vec.tolist(), limit=5,
+    query_filter=Filter(must=[
+        FieldCondition(key="jurisdiction", match=MatchAny(any=["US", "US-TX"])),
+        FieldCondition(key="is_current", match=MatchValue(value=True)),
+    ]),
+).points
+```
+
+Qdrant applies filters *during* graph traversal (filterable HNSW), which handles selective filters well. Create payload indexes on fields you filter by. It also supports sparse vectors natively, so hybrid search can live in one engine.
+
+## How to choose
+
+| Situation | Choice |
+|---|---|
+| You already run Postgres, corpus under a few million chunks, need joins with business data | **pgvector** |
+| Prototype, notebook, CI tests of retrieval logic | **Chroma** (embedded) |
+| Tens of millions of vectors, heavy filtered search, need quantization and sharding | **Qdrant** (or a managed equivalent) |
+| Strict per-tenant isolation at large scale | Qdrant collections/shards, or Postgres partitions with row-level security |
+
+The interview-ready answer is not "X is the best vector DB". It is "start with the store your team can operate, measure p95 latency and recall under realistic filters, and move when a measured limit is hit". Keep a thin `Retriever` interface in your code so moving is a contained change.
+
+## Common mistakes
+
+- **Index operator class does not match the query operator.** An index built with `vector_cosine_ops` is not used by an `<->` (L2) query. Check with `EXPLAIN`.
+- **No index at all.** Exact scans feel fine with 5k rows in dev and fall over in production.
+- **Ignoring filtered recall.** Results look great without filters and silently shrink with them.
+- **Metadata only in JSON blobs.** You lose types, constraints and normal B-tree indexes.
+- **Choosing a dedicated vector DB on day one** and then operating two databases, two backup strategies and two security reviews for a 100k-chunk corpus.
+- **Not storing `embedding_model`.** Makes migrations dangerous (lesson 6).
+
+## How this shows up in interviews
+
+<InterviewQuestion question="pgvector or a dedicated vector database for a new RAG product?" level="mid">
+
+Default to pgvector if the team already runs Postgres and the corpus is in the low millions of chunks: one database to operate, transactional updates of chunks and metadata, joins with permissions and business tables, and full-text search for hybrid retrieval in the same query. I would use HNSW with the operator class matching my distance, and test filtered queries for recall. I would move to Qdrant or similar when measurements show a limit: p95 latency under load with selective filters, memory at tens of millions of vectors, or the need for built-in quantization and sharding. A thin retriever interface keeps that migration small.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A filtered vector query returns only 2 results even though LIMIT is 10. Why, and how do you fix it?" level="senior">
+
+The ANN index returned its top candidates first (bounded by `ef_search`), and the `WHERE` clause removed most of them because the filter is selective. It is a post-filtering problem. Fixes: enable iterative index scans in pgvector 0.8+ so the scan continues until enough rows qualify; raise `ef_search` for these queries; add partial indexes or partitions for common high-selectivity filters; or, for very small filtered subsets, skip ANN and run an exact search on the subset. In engines with filterable HNSW like Qdrant, add payload indexes on the filter fields. Then add a regression test asserting that filtered queries return k results.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [pgvector on GitHub (indexing, filtering, iterative scans)](https://github.com/pgvector/pgvector)
+- [LangChain — PGVector integration](https://python.langchain.com/docs/integrations/vectorstores/pgvector/)
+- [Chroma documentation](https://docs.trychroma.com/)
+- [Qdrant documentation — filtering and indexing](https://qdrant.tech/documentation/)
+- [Malkov and Yashunin, HNSW (arXiv:1603.09320)](https://arxiv.org/abs/1603.09320)

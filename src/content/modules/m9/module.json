@@ -1,0 +1,31 @@
+{
+  "id": "m9",
+  "order": 9,
+  "days": 4,
+  "hours": 24,
+  "title": { "en": "Advanced LLM evaluation", "es": "Evaluación avanzada de LLMs" },
+  "summary": {
+    "en": "Go past the basics of Module 3: task-specific metrics, statistical rigor (confidence intervals, paired tests, power, non-inferiority), human evaluation programs and agreement, calibrated judge ensembles, eval frameworks compared, metamorphic and adversarial test data, multi-turn and agent evals with simulated users, and production eval loops. Ends with a decision-grade model migration evaluation.",
+    "es": "Ve más allá de lo básico del módulo 3: métricas específicas por tarea, rigor estadístico (intervalos de confianza, pruebas pareadas, potencia, no inferioridad), programas de evaluación humana y acuerdo, ensambles de jueces calibrados, frameworks de evals comparados, datos de prueba metamórficos y adversariales, evals multi-turno y de agentes con usuarios simulados, y ciclos de evaluación en producción. Termina con una evaluación de migración de modelo lista para tomar decisiones."
+  },
+  "lessons": [
+    { "slug": "01-eval-design-metrics-taxonomy", "type": "concept", "minutes": 50, "title": { "en": "Eval design and a metrics taxonomy", "es": "Diseño de evals y una taxonomía de métricas" } },
+    { "slug": "02-statistical-rigor", "type": "concept", "minutes": 60, "title": { "en": "Statistical rigor: telling a real improvement from noise", "es": "Rigor estadístico: distinguir una mejora real del ruido" } },
+    { "slug": "03-ex-bootstrap-paired-test", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: bootstrap CIs and a paired test for two prompts", "es": "Ejercicio: CIs con bootstrap y una prueba pareada para dos prompts" } },
+    { "slug": "04-human-evaluation-programs", "type": "concept", "minutes": 50, "title": { "en": "Human evaluation programs: guidelines, agreement and adjudication", "es": "Programas de evaluación humana: guías, acuerdo y adjudicación" } },
+    { "slug": "05-advanced-llm-judges", "type": "concept", "minutes": 50, "title": { "en": "Advanced LLM judges: ensembles, references, G-Eval and drift", "es": "Jueces LLM avanzados: ensambles, referencias, G-Eval y drift" } },
+    { "slug": "06-ex-annotation-agreement", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: annotation guideline, multi-rater agreement and judge-vs-human kappa", "es": "Ejercicio: guía de anotación, acuerdo multi-anotador y kappa juez vs humano" } },
+    { "slug": "07-eval-frameworks-compared", "type": "concept", "minutes": 55, "title": { "en": "Eval frameworks compared: promptfoo, DeepEval, Inspect AI, OpenAI Evals, MLflow", "es": "Frameworks de evals comparados: promptfoo, DeepEval, Inspect AI, OpenAI Evals, MLflow" } },
+    { "slug": "08-synthetic-adversarial-metamorphic", "type": "concept", "minutes": 50, "title": { "en": "Synthetic, adversarial and metamorphic eval data", "es": "Datos de eval sintéticos, adversariales y metamórficos" } },
+    { "slug": "09-ex-promptfoo-metamorphic", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: a promptfoo suite with metamorphic tests", "es": "Ejercicio: una suite de promptfoo con pruebas metamórficas" } },
+    { "slug": "10-multi-turn-agent-evals", "type": "concept", "minutes": 50, "title": { "en": "Evaluating multi-turn conversations and agents in depth", "es": "Evaluación profunda de conversaciones multi-turno y agentes" } },
+    { "slug": "11-ex-simulated-user-harness", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: a simulated-user harness for a multi-turn support bot", "es": "Ejercicio: un harness de usuarios simulados para un bot de soporte multi-turno" } },
+    { "slug": "12-production-eval-loops", "type": "concept", "minutes": 50, "title": { "en": "Production eval loops, safety evals and benchmark literacy", "es": "Ciclos de eval en producción, evals de seguridad y lectura de benchmarks" } },
+    { "slug": "13-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 9 exam", "es": "Examen del módulo 9" } },
+    { "slug": "14-capstone-model-migration", "type": "project", "minutes": 900, "title": { "en": "Capstone: model migration evaluation for a legal-tech company", "es": "Proyecto final: evaluación de migración de modelo para una empresa legal-tech" } }
+  ],
+  "repos": [
+    { "id": "m9-eval-lab", "name": "llm-eval-lab", "description": { "en": "Exercises: bootstrap confidence intervals and paired significance tests, an annotation guideline with multi-rater agreement and judge-vs-human kappa, a promptfoo suite with metamorphic tests, and a simulated-user harness for a multi-turn support bot.", "es": "Ejercicios: intervalos de confianza con bootstrap y pruebas de significancia pareadas, una guía de anotación con acuerdo multi-anotador y kappa juez vs humano, una suite de promptfoo con pruebas metamórficas y un harness de usuarios simulados para un bot de soporte multi-turno." } },
+    { "id": "m9-model-migration", "name": "model-migration-eval", "description": { "en": "Capstone: a decision-grade evaluation for moving a legal-tech contract extraction feature to a cheaper model, with task metrics, a human-labeled subset, a calibrated judge, paired statistics with confidence intervals, cost/latency comparison, segment risk analysis and a go/no-go report.", "es": "Proyecto final: una evaluación lista para decidir la migración de una funcionalidad de extracción de contratos legal-tech a un modelo más barato, con métricas de tarea, un subconjunto etiquetado por humanos, un juez calibrado, estadística pareada con intervalos de confianza, comparación de costo/latencia, análisis de riesgo por segmento y un reporte go/no-go." } }
+  ]
+}

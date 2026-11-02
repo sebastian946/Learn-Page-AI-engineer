@@ -1,0 +1,163 @@
+## Goal
+
+Rebuild your RAG pipeline with no framework: `httpx` (or the provider SDK) for embeddings, `psycopg` + `pgvector` for storage and hybrid retrieval, `numpy` where you need vector math, and the Anthropic SDK for generation. The whole core must fit in **under 300 lines** of application code (tests excluded).
+
+Then prove it is not a toy: run it against the golden dataset from `06-evals/` and compare its scores with your LangChain pipeline. Same data, same judge, two implementations. If the framework-free version scores within a few points and has fewer moving parts, you have a strong portfolio story.
+
+Folder: `rag-lab/07-from-scratch/`.
+
+**Time box:** 90 minutes. Reuse your SQL from lesson 17 and your citation validator from lesson 13. Do not re-implement the re-ranker; import the `CrossEncoderReranker` from `05-reranking/` or make it optional.
+
+## Requirements
+
+The package exposes one CLI with two commands:
+
+```bash
+uv run python -m ragcore ingest data/chunks.jsonl     # embeds and upserts chunks
+uv run python -m ragcore ask "Can gift funds be used for an investment property?" --product conventional
+```
+
+The `ask` output prints the answer, the citations (chunk ID, document, section, page) and a one-line trace summary: retrieval latency, generation latency, input and output tokens, estimated cost.
+
+<AcceptanceCriteria>
+
+- [ ] No imports from `langchain*`, `llama_index*` or similar frameworks anywhere in `07-from-scratch/ragcore/`. A test enforces this by scanning imports.
+- [ ] `ragcore/` totals under 300 lines (a test or script counts non-blank, non-comment lines).
+- [ ] Embeddings: batched, sorted by `index`, normalized, with exponential backoff on 429 and 5xx; an embedding cache keyed by `sha256(model + text)` skips unchanged chunks on re-ingest.
+- [ ] Ingestion is idempotent: running `ingest` twice yields the same row count (upsert on `chunk_id`).
+- [ ] Retrieval runs vector and full-text queries in SQL, fuses with RRF (k = 60), supports a `product` filter, and returns at most 5 chunks (after optional re-ranking).
+- [ ] `EXPLAIN ANALYZE` output in the README shows the HNSW index being used for the vector query.
+- [ ] Generation uses a system prompt you own, requires chunk-ID citations, validates them, and returns `NOT_FOUND` handling when the context is insufficient.
+- [ ] `eval_compare.py` runs both this pipeline and the LangChain one on `06-evals/data/golden.jsonl` and prints faithfulness, context recall, recall@5, p95 latency and mean cost per request for each.
+- [ ] The README has a "What LangChain was hiding" section listing at least five concrete decisions you had to make yourself.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 07-from-scratch/ragcore/pipeline.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+from .embed import embed
+from .generate import generate
+from .store import KEYWORD_SQL, VECTOR_SQL, rrf, search
+from .validate import validate_citations
+
+
+@dataclass
+class Trace:
+    question: str
+    retrieved_ids: list[str] = field(default_factory=list)
+    retrieval_ms: float = 0.0
+    generation_ms: float = 0.0
+    usage: dict = field(default_factory=dict)
+    citation_problems: list[str] = field(default_factory=list)
+
+
+async def ask(conn, question: str, product: str | None = None, reranker=None, top_k: int = 5) -> tuple[dict, Trace]:
+    trace = Trace(question=question)
+    t0 = time.perf_counter()
+
+    qvec = (await embed([question]))[0]
+    # TODO: run VECTOR_SQL and KEYWORD_SQL with k=40 and the product filter
+    # TODO: fuse with rrf(...), optionally rerank, keep top_k
+    chunks: list[dict] = []
+    trace.retrieved_ids = [c["chunk_id"] for c in chunks]
+    trace.retrieval_ms = (time.perf_counter() - t0) * 1000
+
+    t1 = time.perf_counter()
+    result = await generate(question, chunks)
+    trace.generation_ms = (time.perf_counter() - t1) * 1000
+    trace.usage = result["usage"]
+    # TODO: validate citations when result["found"]; store problems on the trace
+    return result, trace
+```
+
+```python
+# 07-from-scratch/tests/test_constraints.py
+import ast
+from pathlib import Path
+
+PKG = Path(__file__).parent.parent / "ragcore"
+BANNED = ("langchain", "llama_index", "haystack")
+
+
+def test_no_framework_imports() -> None:
+    for path in PKG.rglob("*.py"):
+        tree = ast.parse(path.read_text("utf-8"))
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            assert not any(n.startswith(BANNED) for n in names), f"{path}: framework import {names}"
+
+
+def test_under_300_lines() -> None:
+    total = 0
+    for path in PKG.rglob("*.py"):
+        lines = [l.strip() for l in path.read_text("utf-8").splitlines()]
+        total += sum(1 for l in lines if l and not l.startswith("#"))
+    assert total < 300, f"ragcore has {total} lines"
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Split `ragcore/` into small modules: `embed.py`, `store.py`, `generate.py`, `validate.py`, `pipeline.py`, `cli.py`. Each one should be readable in a single screen. If one file grows past 80 lines, you are probably building a framework.</Hint>
+  <Hint>For idempotent ingestion use `INSERT ... ON CONFLICT (chunk_id) DO UPDATE SET text = EXCLUDED.text, embedding = EXCLUDED.embedding`. For the embedding cache, a small table `embedding_cache(hash text primary key, embedding vector(N))` works and keeps everything in Postgres.</Hint>
+  <Hint>When passing the query vector to psycopg, the `pgvector` adapter accepts a numpy array once you call `register_vector(conn)`. If the planner ignores your HNSW index, check that the query uses the operator matching the index class (`<#>` for `vector_ip_ops`) and run `ANALYZE chunks;` after a bulk load.</Hint>
+  <Hint>For `eval_compare.py`, write a tiny adapter so both pipelines return the same `RunRecord` shape from `06-evals/golden.py`. Then reuse your scoring code unchanged. Same judge model, same dataset, same top-k, or the comparison is meaningless.</Hint>
+</Hints>
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  07-from-scratch/
+    README.md
+    pyproject.toml           # httpx, psycopg[binary], pgvector, numpy, anthropic
+    ragcore/
+      __init__.py
+      __main__.py
+      cli.py
+      embed.py
+      store.py
+      generate.py
+      validate.py
+      pipeline.py
+    eval_compare.py
+    sql/
+      001_schema.sql
+    tests/
+      test_constraints.py
+      test_rrf.py
+      test_validate.py
+```
+
+**README outline**
+
+1. What and why: the RAG core in under 300 lines, no framework
+2. Architecture: embed, store, retrieve (vector + full-text + RRF), generate, validate
+3. How to run: `ingest` and `ask`, with sample output
+4. `EXPLAIN ANALYZE` snippet showing the index in use
+5. Comparison table vs the LangChain pipeline (your measured numbers)
+6. What LangChain was hiding: five or more concrete decisions
+7. When I would still use a framework
+
+**Suggested commits**
+
+- `feat(07-from-scratch): add batched embedding client with backoff and cache`
+- `feat(07-from-scratch): add pgvector schema and hybrid SQL retrieval with RRF`
+- `feat(07-from-scratch): add generation with chunk-id citations and validation`
+- `test(07-from-scratch): enforce no-framework imports and 300-line budget`
+- `docs(07-from-scratch): compare against LangChain pipeline on golden set`
+
+</CommitBox>
+
+<Checklist id="m2-18-review" title="Self-review" items={["No framework imports, enforced by a test", "The core is under 300 lines and each file fits on one screen", "Embedding results are sorted by index and normalized", "Backoff handles 429 and 5xx; ingestion is idempotent", "SQL uses parameters, never f-strings", "EXPLAIN ANALYZE confirms the vector index is used", "Citations are validated before the answer is returned", "Both pipelines were evaluated with the same dataset, judge and top-k", "The README explains at least five decisions the framework used to make for me"]} />

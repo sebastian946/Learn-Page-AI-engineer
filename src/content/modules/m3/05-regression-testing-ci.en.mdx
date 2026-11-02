@@ -1,0 +1,216 @@
+## From regression suite to eval gate
+
+You already know how a regression suite works. Every PR runs the tests. A red build blocks the merge. The suite grows every time a bug escapes.
+
+LLM apps need the same discipline. The difference is the assertion. A unit test checks `assert total == 42`. An eval checks "faithfulness on the golden set is at least 0.85, and did not drop more than 0.03 versus main". You assert on **aggregate scores with tolerances**, not on exact strings.
+
+Here is the mapping:
+
+| QA concept | LLM eval equivalent |
+|---|---|
+| Regression suite | Golden dataset (`evals/datasets/golden_v3.jsonl`) |
+| Assertion | Metric threshold (absolute) or baseline delta (relative) |
+| Flaky test | Non-deterministic output: temperature, sampling, provider changes |
+| Retry on flake | Repeated sampling + confidence intervals |
+| Test fixtures / mocks | Response cache keyed on model + prompt + params |
+| Smoke vs full regression | PR subset vs nightly full suite |
+| Test impact analysis | Path filters: run evals only when prompts or retrieval change |
+| CI minutes budget | Token / dollar budget per eval run |
+
+What triggers a regression? Not only code. A prompt edit, a new chunk size, a different embedding model, a re-ranker swap, a provider-side model update, or a new document batch in the index. Your gate must run on all of them.
+
+## Two kinds of thresholds
+
+**Absolute thresholds** are product requirements. "Faithfulness must be at least 0.85" because compliance said so. They never move unless the product owner agrees.
+
+**Relative thresholds** catch regressions. You store the last accepted scores from `main` in `evals/baseline.json`. A PR fails if a metric drops by more than a tolerance.
+
+```json
+{
+  "dataset": "golden_v3",
+  "commit": "a1b2c3d",
+  "metrics": {
+    "faithfulness": 0.91,
+    "answer_relevance": 0.88,
+    "citation_accuracy": 0.95,
+    "refusal_correctness": 0.97
+  },
+  "tolerance": { "default": 0.03, "citation_accuracy": 0.02 }
+}
+```
+
+Use both. Absolute thresholds stop you from shipping something bad. Relative thresholds stop slow erosion. Without the relative check, scores can slide from 0.95 to 0.86 one "harmless" PR at a time and never trip the absolute floor.
+
+## Writing the gate with pytest
+
+Pytest is a good runner for evals. You get markers, fixtures, parametrization, JUnit XML and plugins you already use. Keep the expensive work (calling the app and the judge) in a session fixture. Keep each assertion small.
+
+```python
+# tests/test_regression.py
+import json
+from pathlib import Path
+
+import pytest
+
+from harness.runner import EvalRun, run_suite
+
+BASELINE = json.loads(Path("evals/baseline.json").read_text())
+FLOORS = {"faithfulness": 0.85, "citation_accuracy": 0.90}
+
+
+@pytest.fixture(scope="session")
+def eval_run(request: pytest.FixtureRequest) -> EvalRun:
+    subset = request.config.getoption("--subset")  # "pr" or "full"
+    return run_suite(dataset="evals/datasets/golden_v3.jsonl", subset=subset, samples=3)
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize("metric", sorted(BASELINE["metrics"]))
+def test_no_regression_vs_baseline(eval_run: EvalRun, metric: str) -> None:
+    baseline = BASELINE["metrics"][metric]
+    tol = BASELINE["tolerance"].get(metric, BASELINE["tolerance"]["default"])
+    score = eval_run.scores[metric]
+    assert score.mean >= baseline - tol, (
+        f"{metric} regressed: {score.mean:.3f} vs baseline {baseline:.3f} "
+        f"(tolerance {tol}, 95% CI {score.ci_low:.3f}-{score.ci_high:.3f})"
+    )
+
+
+@pytest.mark.eval
+@pytest.mark.parametrize("metric,floor", sorted(FLOORS.items()))
+def test_absolute_floor(eval_run: EvalRun, metric: str, floor: float) -> None:
+    assert eval_run.scores[metric].mean >= floor
+
+
+@pytest.mark.eval
+def test_cost_budget(eval_run: EvalRun) -> None:
+    assert eval_run.cost_usd <= 2.00, f"eval run cost ${eval_run.cost_usd:.2f}"
+```
+
+Register `--subset` in `conftest.py` with `parser.addoption`, and register the `eval` marker in `pyproject.toml` so `pytest -m "not eval"` keeps your fast unit tests fast.
+
+Notice the failure message. It prints the score, the baseline, the tolerance and the confidence interval. A reviewer should understand a red build without opening logs. That is the same rule you apply to Playwright assertion messages.
+
+## Non-determinism: the flaky test you can't delete
+
+With a flaky UI test, you fix the race condition. With an LLM, variance is a feature of the system. Even at `temperature=0`, outputs can change between runs because of batching and floating-point effects on the provider side. Judges add their own variance.
+
+Tactics, from cheapest to most robust:
+
+1. **Lower the temperature** of the system under test for evals, unless production uses a higher one. Then evaluate at production settings, because that is what users see.
+2. **Pin the judge.** Fixed judge model id, `temperature=0`, fixed rubric version. Changing the judge changes the ruler. Treat it as a baseline reset.
+3. **Repeated sampling.** Run each question `k` times (3 is a common start) and average. This reduces variance by roughly the square root of `k`.
+4. **Confidence intervals.** Report the mean with a bootstrap CI. If the CI of a PR overlaps the baseline heavily, the "drop" is probably noise.
+
+```python
+# harness/metrics.py
+import random
+from dataclasses import dataclass
+from statistics import mean
+
+
+@dataclass(frozen=True)
+class Score:
+    mean: float
+    ci_low: float
+    ci_high: float
+    n: int
+
+
+def bootstrap_ci(values: list[float], iters: int = 2000, alpha: float = 0.05, seed: int = 7) -> Score:
+    rng = random.Random(seed)  # seeded: the CI itself must be reproducible
+    n = len(values)
+    means = sorted(mean(rng.choices(values, k=n)) for _ in range(iters))
+    lo = means[int(alpha / 2 * iters)]
+    hi = means[int((1 - alpha / 2) * iters) - 1]
+    return Score(mean=mean(values), ci_low=lo, ci_high=hi, n=n)
+```
+
+Rule of thumb: with 50 questions and binary scores, a 95% CI is roughly plus or minus 0.1 around 0.8. That is wide. So a tolerance of 0.03 on 50 items will produce false alarms. Either grow the dataset, sample more, or widen the tolerance for small sets. Be honest in the README about how many items back each gate.
+
+## Caching: fixtures for LLM calls
+
+Re-running 200 questions times 3 samples times a judge call on every push burns money and minutes. Cache responses keyed on everything that can change the output.
+
+```python
+# harness/cache.py
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+CACHE_DIR = Path(".eval_cache")
+
+
+def cache_key(model: str, system: str, messages: list[dict[str, Any]], params: dict[str, Any], sample_idx: int) -> str:
+    payload = json.dumps(
+        {"model": model, "system": system, "messages": messages, "params": params, "sample": sample_idx},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def get(key: str) -> dict[str, Any] | None:
+    path = CACHE_DIR / f"{key}.json"
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def put(key: str, value: dict[str, Any]) -> None:
+    CACHE_DIR.mkdir(exist_ok=True)
+    (CACHE_DIR / f"{key}.json").write_text(json.dumps(value))
+```
+
+Two caches, two purposes:
+
+- **Judge cache.** Same answer, same rubric, same judge model means the same verdict. Safe to cache aggressively.
+- **System-under-test cache.** Only valid if the prompt, retrieved contexts and params are part of the key. Include `sample_idx` so repeated sampling still produces `k` distinct samples. If retrieval changed, the contexts changed, the key changed, and you get a fresh call. That is exactly the behavior you want.
+
+Cache hits on unchanged questions make a PR that only touches one prompt cost cents. Add a `--no-cache` flag for the nightly job so provider-side drift still shows up.
+
+## Cost control and test selection
+
+Treat tokens like CI minutes.
+
+- **Path filters.** Run the eval workflow only when `prompts/**`, `app/retrieval/**`, `app/generation/**`, `evals/**` or the model config change. A README typo should not cost an eval run.
+- **PR subset vs nightly full.** On PRs run a stratified subset (for example 60 items covering every tag). Nightly, run all items with `samples=3` and no cache. Weekly, add the expensive human-review sample.
+- **Cheap judge first.** Use `claude-haiku-5-5` for easy binary checks (did it cite? did it refuse?) and `claude-sonnet-5-5` for faithfulness.
+- **Hard budget.** Track tokens per call. Abort the run if the projected cost passes the budget. A runaway loop in a judge prompt should fail fast, not at the end of the month.
+- **Deterministic checks first.** Schema validation, citation-id existence, banned phrases and length limits cost nothing. Fail fast on them before spending tokens on model-graded metrics. That is the eval pyramid in practice.
+
+## Common mistakes
+
+- **Exact-match assertions on free text.** They fail on every rephrasing. Assert on metrics, schemas or extracted fields.
+- **One sample, tight tolerance.** You built a flaky test. Measure the run-to-run variance first, then set the tolerance above it.
+- **Changing the judge and the prompt in the same PR.** You cannot tell which one moved the score.
+- **Baseline updated from the PR branch.** Baselines must only be written from `main` after merge, or anyone can lower the bar by committing a new baseline.
+- **Cache key missing the contexts or the params.** You will serve stale answers and get green builds on broken retrieval.
+- **No cost visibility.** The first sign of trouble is the invoice. Print cost per run in the job summary.
+- **Hiding per-item failures behind an average.** Always publish the worst 10 items. Averages hide the one answer that gives wrong loan-limit advice.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you stop a prompt change from silently degrading a RAG system?" level="mid">
+
+Treat prompts as code with a regression suite. I keep a versioned golden dataset and a pytest-based eval gate in CI. It runs when prompts, retrieval code or model config change. It checks deterministic things first (schema, citation ids exist), then model-graded metrics like faithfulness with a pinned judge. Each metric has an absolute floor from the product requirement and a relative tolerance against a baseline stored from `main`. The PR fails if faithfulness drops more than 0.03. I cache judge calls so a small PR costs cents, and I run the full suite nightly without cache to catch provider drift.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your eval gate fails randomly about one run in five. What do you do?" level="senior">
+
+That is a flaky test, so I diagnose before I retry. First I measure variance: run the same commit ten times and look at the spread of each metric. If the spread is larger than my tolerance, the gate is mis-specified. Fixes: pin the judge model and set its temperature to 0, sample each question 3 times and average, report bootstrap confidence intervals, and grow the dataset so the CI narrows. Then I set the tolerance from the measured noise, not from a guess. I also check for real non-determinism sources like retrieval ties or unstable sort orders. A blind "retry on failure" just hides regressions.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Say the numbers">
+
+Interviewers like concrete gates: "200 golden items, 60-item stratified subset on PRs, 3 samples each, faithfulness floor 0.85, tolerance 0.03, run cost under two dollars thanks to the judge cache." That sounds like someone who has run it, not read about it.
+
+</Callout>
+
+## Further reading
+
+- pytest docs, markers and fixtures: https://docs.pytest.org/en/stable/
+- DeepEval, unit-testing LLM outputs with pytest: https://docs.confident-ai.com/
+- Ragas metrics reference: https://docs.ragas.io/
+- Anthropic, create strong empirical evaluations: https://docs.anthropic.com/en/docs/test-and-evaluate/develop-tests
+- GitHub Actions, workflow syntax and path filters: https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions

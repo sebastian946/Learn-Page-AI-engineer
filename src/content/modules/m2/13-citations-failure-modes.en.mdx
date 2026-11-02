@@ -1,0 +1,159 @@
+## Why citations are a product requirement, not a nice-to-have
+
+In a mortgage lender, a loan officer who acts on a wrong answer can mis-price a loan or approve a file that fails a post-close audit. "The assistant said so" is not a defense. "The assistant cited Underwriting Guide §4.2, page 37, and here is the paragraph" is something a human can verify in ten seconds.
+
+Citations do three jobs:
+
+1. **Verification.** Users can check the source instead of trusting the model.
+2. **Grounding pressure.** Asking the model to cite each claim pushes it to stay inside the provided context.
+3. **Testability.** A citation is a machine-checkable artifact. You can assert that every cited chunk was actually retrieved and that the quoted text exists. That turns a fuzzy "is this answer right?" into a contract test.
+
+**Grounding** means the answer is supported by the retrieved context, not by the model's training data. A grounded answer can still be wrong if the source document is outdated, but then the bug is in your corpus, which you can fix.
+
+## Designing a citation contract
+
+Treat citations like an API contract between the generator and the rest of your system. The cleanest approach: give every chunk a short, stable ID in the prompt, ask for structured output, and validate it.
+
+```python
+from pydantic import BaseModel, Field
+
+
+class Claim(BaseModel):
+    text: str = Field(description="One factual sentence of the answer")
+    chunk_ids: list[str] = Field(min_length=1, description="IDs of chunks that support this sentence")
+    quote: str = Field(description="Short verbatim span from the cited chunk")
+
+
+class CitedAnswer(BaseModel):
+    answer_found: bool
+    claims: list[Claim]
+    follow_up: str | None = None
+
+
+def format_context(chunks: list[dict]) -> str:
+    # Stable, short IDs keep the prompt compact and easy to validate
+    return "\n\n".join(
+        f'<chunk id="{c["chunk_id"]}" source="{c["source"]}" page="{c["page"]}">\n{c["text"]}\n</chunk>'
+        for c in chunks
+    )
+
+
+SYSTEM = """You answer questions for loan officers using ONLY the chunks provided.
+Rules:
+- Every claim must cite at least one chunk id and include a short verbatim quote from it.
+- If the chunks do not contain the answer, set answer_found=false and return no claims.
+- Never use outside knowledge about mortgage rules; policies differ per lender.
+- If chunks conflict, say so and cite both."""
+```
+
+Then validate after generation. This is the part most tutorials skip:
+
+```python
+def validate_citations(answer: CitedAnswer, chunks: list[dict]) -> list[str]:
+    by_id = {c["chunk_id"]: c["text"] for c in chunks}
+    problems: list[str] = []
+    for i, claim in enumerate(answer.claims):
+        unknown = [cid for cid in claim.chunk_ids if cid not in by_id]
+        if unknown:
+            problems.append(f"claim {i}: cites unknown chunk(s) {unknown}")
+            continue
+        normalized_quote = " ".join(claim.quote.split()).lower()
+        if not any(normalized_quote in " ".join(by_id[cid].split()).lower() for cid in claim.chunk_ids):
+            problems.append(f"claim {i}: quote not found in cited chunk(s)")
+    if not answer.answer_found and answer.claims:
+        problems.append("answer_found=false but claims were returned")
+    return problems
+```
+
+What you do with `problems` is a product decision. Options, from strictest to most lenient: refuse and show "I could not find a verified answer"; retry once with the problems fed back to the model; or drop unverified claims and show the rest. For regulated content, log every failure and alert when the rate rises.
+
+Anthropic's API also offers a native **citations** feature: you pass documents as content blocks with citations enabled, and the response includes cited spans with character or page locations. It removes the need for quote matching on your side. Whichever you choose, keep the validation step in your tests.
+
+### Rendering citations
+
+Show citations inline (`[1]`, `[2]`) with a hover or side panel that shows the source title, section, page and the quoted span. Link to the original PDF page when you can. Users trust citations they can open.
+
+## RAG failure modes
+
+A RAG answer passes through many stages. Each can fail independently, and the symptom ("wrong answer") looks the same from the outside. Your job is to locate the failing stage. The table below is your debugging map.
+
+| # | Failure mode | Stage | Symptom | First fix to try |
+|---|---|---|---|---|
+| 1 | Missing content | Corpus | Answer is "not found" or hallucinated; nothing relevant exists | Add the document; make "I don't know" the expected answer |
+| 2 | Bad extraction | Ingestion | Tables garbled, headers mixed into body text | Better PDF parser, table-aware extraction |
+| 3 | Bad chunk boundaries | Chunking | Rule split from its exception ("...except for condos" in the next chunk) | Structure-aware chunking, overlap, parent-document retrieval |
+| 4 | Missed top-k | Retrieval | Right chunk exists but ranks below the cut | Hybrid search, re-ranking, query rewriting |
+| 5 | Wrong filter | Retrieval | Results from wrong product, state or expired version | Metadata filters, effective-date fields |
+| 6 | Context overload | Prompt | Right chunk is retrieved but buried among 20 others | Fewer, better chunks; order best-first |
+| 7 | Not extracted | Generation | Answer is in context, model ignores it | Clearer instructions, claim-level citation |
+| 8 | Hallucination | Generation | Claims not in any chunk | Citation validation, faithfulness evals |
+| 9 | Wrong format or incomplete | Generation | Lists only 2 of 4 conditions | Structured output, completeness checks |
+| 10 | Stale or conflicting sources | Corpus | Answer cites a superseded policy | Versioning, `effective_from` and `superseded_by` metadata |
+
+Several of these are adapted from the paper "Seven Failure Points When Engineering a Retrieval Augmented Generation System" (Barnett et al., 2024), plus a few that show up constantly in regulated domains.
+
+### Diagnose by stage, like a flaky test
+
+When a test fails intermittently, you do not rewrite the app; you isolate the layer. Same here:
+
+1. **Is the answer in the corpus?** Search the raw documents with grep. If not, failure #1.
+2. **Is it in any chunk, intact?** Look up the chunk table. If the sentence is split or garbled, #2 or #3.
+3. **Is that chunk in the retrieved top-k?** Check the trace. If it is at rank 23 of 50, #4. If it is filtered out, #5.
+4. **Is it in the final prompt?** If yes and the answer is still wrong, it is a generation problem: #6–#9.
+
+<Diagram caption="Locate the failing stage before you fix anything" chart={`flowchart TD
+  A[Wrong answer reported] --> B{"Answer in raw documents?"}
+  B -- No --> F1["Missing content: add doc or expect 'not found'"]
+  B -- Yes --> C{"Intact in a chunk?"}
+  C -- No --> F2["Fix extraction or chunking"]
+  C -- Yes --> D{"Chunk in retrieved top-k?"}
+  D -- No --> F3["Fix retrieval: hybrid, filters, re-rank, rewrite"]
+  D -- Yes --> E{"Answer uses that chunk?"}
+  E -- No --> F4["Fix generation: prompt, citations, fewer chunks"]
+  E -- Yes --> F5["Source itself is stale or wrong"]`} />
+
+This only works if you **trace every request**: the original query, rewritten queries, retrieved chunk IDs with scores, the final prompt, the raw output and citation validation results. Module 3 turns this into full observability with LangSmith/Langfuse; for now a JSONL log per request is enough.
+
+### "I don't know" is a feature
+
+The most damaging failure in a lending context is a confident answer to a question your corpus does not cover. Design for abstention:
+
+- Instruct the model to return `answer_found=false` when context is insufficient.
+- Add **unanswerable questions** to your golden dataset (about 10–20% of it) and score abstention correctly.
+- Consider a retrieval-score floor: if the best re-ranker score is below a threshold calibrated on your data, skip generation and answer "not found" with links to the closest documents.
+
+## Common mistakes
+
+- **Citing documents, not chunks.** "Source: Underwriting Guide (212 pages)" is not verifiable. Cite section and page.
+- **Trusting citations without checking.** Models can invent plausible chunk IDs or misquote. Validate every one.
+- **Using unstable IDs.** If chunk IDs change on every re-index, old traces and golden datasets break. Derive IDs from document ID + section + content hash.
+- **No unanswerable questions in tests.** Your system will look great until a real user asks something off-corpus.
+- **Ignoring document versions.** Policies change. Without `effective_from` metadata, the retriever happily mixes 2023 and 2026 rules.
+- **Fixing generation when retrieval is broken.** Prompt tweaking cannot surface a chunk that was never retrieved. Diagnose first.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you make sure a RAG system's citations are real?" level="mid">
+
+I give each chunk a stable ID in the prompt and require structured output where every claim lists chunk IDs and a short verbatim quote. After generation I validate: every cited ID must be in the retrieved set, and every quote must appear (after whitespace normalization) in the cited chunk. Failures trigger a retry or a refusal, and they are logged and counted. In tests, I assert citation validity on the golden dataset and track faithfulness alongside it. If the provider has native citations, I use them, but I keep the validation in CI.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Users say the assistant gives wrong answers. Walk me through your debugging process." level="senior">
+
+I get concrete examples, then use traces to locate the stage. Is the answer in the raw corpus? Is it intact in a chunk? Is that chunk in the retrieved top-k, and at what rank? Did it make it into the prompt? Did the model use it? Each "no" points to a different fix: content gaps, extraction or chunking, retrieval (hybrid, filters, re-ranking, query rewriting), or generation. I add each failing case to the golden dataset so the fix is protected by a regression test, and I track the distribution of failure types to decide where to invest.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Name the failure modes">
+
+Interviewers love candidates who can list failure points by stage and say how they would detect each one in production. Map them to metrics: retrieval failures show up in context recall, generation failures in faithfulness. That sets you up for the next lesson.
+
+</Callout>
+
+## Further reading
+
+- Barnett et al., "Seven Failure Points When Engineering a Retrieval Augmented Generation System": https://arxiv.org/abs/2401.05856
+- Anthropic docs — Citations: https://docs.anthropic.com/en/docs/build-with-claude/citations
+- Liu et al., "Lost in the Middle: How Language Models Use Long Contexts": https://arxiv.org/abs/2307.03172
+- LangChain — how to return citations: https://python.langchain.com/docs/how_to/qa_citations/

@@ -1,0 +1,172 @@
+## From strings to contracts
+
+A chat UI can show whatever text the model returns. A backend cannot. Your router needs a `category`, your CRM needs an `order_id`, your analytics pipeline needs a `sentiment` from a fixed set. **Structured output** is how you turn a probabilistic text generator into a component with a typed interface.
+
+For an SDET this is familiar ground: it is contract testing. The JSON Schema is the contract. Pydantic is the consumer-side validator. The repair loop is your retry-on-contract-violation policy.
+
+## Four levels of "give me JSON"
+
+| Level | How | Guarantee |
+|---|---|---|
+| 1. Prompt only | "Reply with JSON matching this example." | None. Works most of the time, fails in production at scale. |
+| 2. JSON mode | Provider flag that forces syntactically valid JSON | Valid JSON, but any shape. |
+| 3. Schema-constrained decoding | Send a JSON Schema; the provider constrains generation | Output matches the schema's structure. |
+| 4. Schema + semantic validation | Level 3 plus Pydantic validators and business rules in your code | Structure *and* meaning are checked. |
+
+Production systems use level 3 where available and **always** add level 4. Constrained decoding guarantees that `priority` is one of `"low" | "medium" | "high"`. It does not guarantee the model picked the right one, that `refund_amount` is not larger than the order total, or that `order_id` matches your ID format.
+
+### Provider support at a glance
+
+- **Anthropic:** `output_config={"format": {"type": "json_schema", "schema": ...}}` on `messages.create`, or the `messages.parse(..., output_format=MyModel)` helper that returns a validated Pydantic object in `response.parsed_output`. Tools can also set `"strict": True` so tool inputs match their schema.
+- **OpenAI:** `response_format={"type": "json_schema", "json_schema": {"name": ..., "schema": ..., "strict": True}}`, and SDK helpers that accept a Pydantic model. Function tools accept `"strict": True` too.
+- **Bedrock / open models:** support varies by model. Fall back to tool-based extraction or level 1 + validation + repair.
+
+Constrained decoding supports a **subset** of JSON Schema. Keep schemas flat and boring: objects, strings, numbers, booleans, enums, arrays, `required`, `additionalProperties: false`. Check the provider docs before using advanced keywords such as complex `oneOf` or regex patterns.
+
+## Pydantic v2 as the single source of truth
+
+Define the schema once, in Python. Generate the JSON Schema from it. Validate responses against the same class.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+Category = Literal[
+    "order_status", "shipping_delay", "return_refund",
+    "damaged_item", "billing", "account_access", "other",
+]
+
+class TicketTriage(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # -> additionalProperties: false
+
+    category: Category
+    priority: Literal["low", "medium", "high", "urgent"]
+    order_id: str | None = Field(
+        default=None, description="Order id like A-12345, if present"
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+    summary: str = Field(max_length=280)
+
+    @field_validator("order_id")
+    @classmethod
+    def order_id_format(cls, v: str | None) -> str | None:
+        if v is not None and not (v.startswith("A-") and v[2:].isdigit()):
+            raise ValueError("order_id must look like A-12345")
+        return v
+
+schema = TicketTriage.model_json_schema()
+```
+
+Key Pydantic v2 APIs you will use constantly:
+
+- `Model.model_json_schema()` – JSON Schema for the provider.
+- `Model.model_validate_json(raw)` – parse and validate a JSON string in one step (fast, Rust core).
+- `Model.model_validate(dict_obj)` – validate an already-parsed dict (e.g. a tool input).
+- `ValidationError.errors()` – structured list of what failed, perfect to feed back to the model.
+
+Field `description`s end up in the schema. The model reads them. Treat them as part of the prompt.
+
+## Calling with a schema
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+async def triage(ticket: str) -> TicketTriage:
+    response = await client.messages.parse(
+        model="claude-haiku-5-5",
+        max_tokens=1024,
+        system="You triage support tickets for an online store.",
+        messages=[{"role": "user", "content": ticket}],
+        output_format=TicketTriage,
+    )
+    if response.stop_reason in ("max_tokens", "refusal"):
+        raise RuntimeError(f"unusable response: {response.stop_reason}")
+    return response.parsed_output
+```
+
+The equivalent with a raw schema is `messages.create(..., output_config={"format": {"type": "json_schema", "schema": schema}})`, then `TicketTriage.model_validate_json(text_block.text)`. Use the raw form inside a provider abstraction, where you want one code path for all vendors.
+
+## Validation + repair loops
+
+Even with constrained decoding, your **semantic** validators can fail. Without constrained decoding (older models, some Bedrock models, local models), syntax can fail too. The pattern is a bounded repair loop:
+
+1. Call the model.
+2. Validate with Pydantic.
+3. On failure, append the model's bad output and the validation errors as a new user turn: "Your previous answer failed validation: ... Return corrected JSON only."
+4. Retry, at most N times (1–2 is typical).
+5. If still invalid, **fail loudly** to a fallback path: stronger model, default value, or human queue. Never silently return garbage.
+
+```python
+import json
+from pydantic import BaseModel, ValidationError
+
+async def extract_with_repair(
+    llm, model_cls: type[BaseModel], messages: list[dict], max_repairs: int = 2
+) -> BaseModel:
+    history = list(messages)
+    last_error: ValidationError | None = None
+    for attempt in range(max_repairs + 1):
+        raw = await llm.complete_json(history, schema=model_cls.model_json_schema())
+        try:
+            return model_cls.model_validate_json(raw)
+        except ValidationError as exc:
+            last_error = exc
+            errors = json.dumps(exc.errors(include_url=False), default=str)
+            history += [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f"Your answer failed validation: {errors}. "
+                    "Return only corrected JSON that satisfies the schema."
+                )},
+            ]
+    raise ExtractionFailed(attempts=max_repairs + 1) from last_error
+
+class ExtractionFailed(Exception):
+    def __init__(self, attempts: int) -> None:
+        super().__init__(f"invalid after {attempts} attempts")
+        self.attempts = attempts
+```
+
+Track the **repair rate** as a metric. If 8% of calls need a repair, that is 8% extra cost and latency, and a signal that your schema or prompt is unclear. A healthy route with constrained decoding should be well under 1%.
+
+### Repair vs. retry
+
+A *retry* resends the same request (useful for network errors and 5xx). A *repair* sends a **different** request that includes the error. Do not mix them up: retrying a validation failure with the same input often produces the same failure.
+
+### Partial results and "unknown"
+
+Give the model a legal way to say "I don't know". If `order_id` is required and non-nullable, a model with no order id in the text will invent one. Make it `str | None`, or add an `"other"` / `"unknown"` category. **Forcing a field forces a hallucination.**
+
+## Common mistakes
+
+- **Trusting structure as correctness.** A schema-valid answer can still be wrong. Validate business rules and measure accuracy with evals.
+- **Two sources of truth.** A hand-written JSON Schema and a separate Pydantic model drift apart. Generate one from the other.
+- **Unbounded repair loops.** Always cap attempts and log each repair with the error type.
+- **No escape hatch.** Required fields with no "unknown" option cause fabricated values.
+- **Huge, deeply nested schemas.** They cost tokens on every call and reduce accuracy. Split into two calls if needed.
+- **Ignoring `stop_reason`.** Truncated output (`max_tokens`) is the most common cause of invalid JSON. Fix the cap, don't repair forever.
+- **Parsing with regex.** Use `json.loads` / `model_validate_json`. Escaping varies between models.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="The provider guarantees schema-valid JSON. Why do you still validate with Pydantic?" level="mid">
+
+Because schema validity is structure, not meaning. Constrained decoding ensures types and enums, but not business rules: an `order_id` in the wrong format, a refund larger than the order total, a date in the past, cross-field consistency like `priority = urgent` only for certain categories. Pydantic validators encode those rules in one place, give typed objects to the rest of the code, and produce structured errors I can feed into a repair loop. It also protects me when I switch to a provider or model that lacks constrained decoding, and it keeps the validation identical across vendors.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Design an extraction step that must never return invalid data downstream." level="senior">
+
+Single Pydantic model as source of truth; JSON Schema generated from it; schema-constrained decoding where the provider supports it; semantic validators for business rules; nullable fields or an explicit unknown value so the model is never forced to invent. A bounded repair loop (one or two attempts) that sends back the validation errors. If that fails, escalate: a stronger model, then a dead-letter or human queue, with the raw output stored for debugging. Metrics on validation failure rate, repair rate and escalation rate per prompt version, plus an eval set that measures field-level accuracy, not just schema validity.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Anthropic, structured outputs: https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+- OpenAI, structured outputs: https://platform.openai.com/docs/guides/structured-outputs
+- Pydantic v2 docs, models and validators: https://docs.pydantic.dev/latest/concepts/models/
+- Pydantic, JSON Schema generation: https://docs.pydantic.dev/latest/concepts/json_schema/
+- JSON Schema reference: https://json-schema.org/understanding-json-schema/

@@ -1,0 +1,189 @@
+## Objetivo
+
+Tu `mortgage-knowledge-assistant` ya tiene un workflow de CI del módulo 3: tests unitarios más un eval gate que bloquea un PR si baja el faithfulness. En este ejercicio lo extiendes a un **pipeline de CI/CD** completo. Cada merge a `main` construye una imagen, la despliega en **staging**, ejecuta un smoke test y luego espera aprobación antes de desplegar **la misma imagen** en **producción** sobre ECS Fargate.
+
+¿No tienes cuenta de AWS o no quieres pagar un ALB? Sigue el **camino Fly.io** al final. Los criterios de aceptación son los mismos, excepto los específicos de AWS.
+
+Piénsalo como el pipeline de release de un framework de pruebas que ya mantienes. Construye una vez, promueve el artefacto, pon un gate en cada etapa y falla de forma ruidosa.
+
+El flujo que vas a construir:
+
+```text
+PR:    lint -> unit tests -> eval gate (mock + small real sample)
+main:  tests -> build image (tag = git SHA) -> push to ECR (OIDC)
+       -> deploy staging -> smoke test -> [manual approval] -> deploy prod -> smoke test
+```
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] Los PRs ejecutan lint, tests unitarios y el eval gate del módulo 3. Ningún job de deploy corre en PRs.
+- [ ] En push a `main`, la imagen se construye **una sola vez**, se etiqueta con `github.sha` y se sube a ECR.
+- [ ] La autenticación con AWS usa **GitHub OIDC** (`aws-actions/configure-aws-credentials` con `role-to-assume`). No existen llaves de AWS de larga duración en los secretos de GitHub.
+- [ ] La task definition vive en `infra/taskdef.json`. CI le inyecta la imagen con `aws-actions/amazon-ecs-render-task-definition`.
+- [ ] El deploy usa `aws-actions/amazon-ecs-deploy-task-definition` con `wait-for-service-stability: true`.
+- [ ] Existen dos **environments** de GitHub: `staging` y `production`. `production` requiere un reviewer.
+- [ ] Producción despliega exactamente el digest de imagen que pasó staging. No reconstruye.
+- [ ] Un smoke test corre después de cada deploy: `/healthz` devuelve 200, y una llamada a `/v1/chat/stream` devuelve al menos un evento `token` y un evento `done`.
+- [ ] El servicio ECS tiene el deployment circuit breaker con rollback activado.
+- [ ] `concurrency` impide que dos deploys al mismo environment corran a la vez.
+- [ ] El README tiene una sección "Deployment" con el diagrama del pipeline y cómo hacer rollback manual.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+La parte de deploy del workflow. Tu trabajo es completar los huecos, agregar los jobs de PR que ya tienes y configurar el rol de IAM.
+
+<StarterCode>
+
+```yaml
+# .github/workflows/deploy.yml
+name: deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: mortgage-knowledge-assistant
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+      # TODO: configure AWS credentials (staging role)
+      # TODO: render infra/taskdef.json with needs.build.outputs.image
+      # TODO: deploy to cluster/service from environment vars, wait for stability
+      # TODO: run scripts/smoke_test.py against vars.BASE_URL
+
+  deploy-production:
+    needs: [build, deploy-staging]
+    # TODO: same steps, environment: production (with required reviewer)
+```
+
+```python
+# scripts/smoke_test.py
+import json
+import sys
+
+import httpx
+
+
+def main(base_url: str) -> int:
+    with httpx.Client(base_url=base_url, timeout=30) as client:
+        r = client.get("/healthz")
+        assert r.status_code == 200, f"healthz returned {r.status_code}"
+
+        events: list[str] = []
+        payload = {"question": "What is the maximum DTI for a conforming loan?"}
+        headers = {"X-Tenant-ID": "smoke-test"}
+        with client.stream("POST", "/v1/chat/stream", json=payload, headers=headers) as resp:
+            assert resp.status_code == 200, f"stream returned {resp.status_code}"
+            for line in resp.iter_lines():
+                if line.startswith("event:"):
+                    events.append(line.split(":", 1)[1].strip())
+                # TODO: stop after "done" or "error"; fail on "error"
+
+    # TODO: assert at least one "token" and exactly one "done"
+    print(json.dumps({"ok": True, "events": len(events)}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))
+```
+
+</StarterCode>
+
+### Camino Fly.io
+
+Si eliges Fly.io, reemplaza los pasos de ECR/ECS por `superfly/flyctl-actions/setup-flyctl` y dos apps (`mka-staging`, `mka-prod`). Construye una vez con `fly deploy --build-only --push --image-label $GITHUB_SHA` contra staging. Luego despliega ambas apps con `fly deploy --image registry.fly.io/<app>:<sha>`. Guarda `FLY_API_TOKEN` como **secreto de environment**, con alcance por environment. OIDC no aplica, pero las reglas de protección de environments sí.
+
+## Pistas
+
+<Hints>
+  <Hint>Empieza por IAM, no por el YAML. Crea un identity provider OIDC de IAM para `token.actions.githubusercontent.com`. Luego crea un rol cuya trust policy restrinja el claim `sub` a tu repo y environment, por ejemplo `repo:<tu-usuario>/mortgage-knowledge-assistant:environment:production`.</Hint>
+  <Hint>El rol de deploy necesita push a ECR y `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeServices`. También necesita `iam:PassRole` sobre el task execution role y el task role. Que falte `PassRole` es la falla más común en el paso de registro.</Hint>
+  <Hint>El render son dos pasos. `amazon-ecs-render-task-definition` recibe `task-definition: infra/taskdef.json`, `container-name: api` e `image`. Su output `task-definition` alimenta `amazon-ecs-deploy-task-definition` junto con `service`, `cluster` y `wait-for-service-stability: true`. Guarda los nombres de cluster y servicio en variables de environment (`vars.ECS_CLUSTER`, `vars.ECS_SERVICE`) para que el mismo job sirva en ambos environments.</Hint>
+  <Hint>Para promover el mismo artefacto, pasa `needs.build.outputs.image` a ambos jobs de deploy. Para ser estricto, saca el digest de `build-push-action` (`steps.<id>.outputs.digest`) y despliega `repo@sha256:...`. Staging y prod suelen vivir en cuentas distintas. En ese caso, da a la cuenta de prod acceso de pull al repo de ECR con una repository policy, o replica la imagen.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Rama: `m5/cicd-deploy`
+
+```text
+mortgage-knowledge-assistant/
+  .github/
+    workflows/
+      ci.yml              # PR: lint, tests, eval gate (from Module 3)
+      deploy.yml          # main: build -> staging -> approval -> prod
+  infra/
+    taskdef.json          # image placeholder, secrets by ARN
+    terraform/            # optional: ECS service, ALB, OIDC role
+      main.tf
+      iam_github_oidc.tf
+  scripts/
+    smoke_test.py
+  fly.staging.toml        # only if you take the Fly.io path
+  fly.prod.toml
+  README.md
+```
+
+Esquema de la sección "Deployment" del README:
+
+1. Diagrama del pipeline (Mermaid): checks de PR, build, staging, aprobación, prod.
+2. Tabla de environments: URL, cuenta de AWS o app de Fly, quién aprueba.
+3. Cómo llegan los secretos a la tarea (ARNs de Secrets Manager en `taskdef.json`; nada en la imagen).
+4. Cómo hacer rollback: volver a ejecutar el job de deploy para un SHA anterior, o `aws ecs update-service --task-definition <revisión-anterior>`.
+5. Límites conocidos: idle timeout del ALB, `stopTimeout`, tareas máximas vs rate limit del proveedor.
+
+Commits sugeridos:
+
+- `ci: split PR checks and deploy workflow`
+- `infra: add ECS task definition with secrets from Secrets Manager`
+- `ci: build once and push to ECR via OIDC`
+- `ci: deploy to staging with smoke test`
+- `ci: gated production deploy promoting the staging image`
+- `docs: document deployment and rollback`
+
+</CommitBox>
+
+## Autorrevisión
+
+<Checklist id="m5-10-review" title="Autorrevisión" items={["grep no encuentra ninguna llave de AWS ni API key del proveedor en el repo ni en los workflows", "La trust policy de OIDC restringe el claim sub a este repo (y al environment en prod)", "La imagen se construye una vez; prod despliega el mismo tag o digest que staging", "wait-for-service-stability está en true y un deploy fallido pone el job en rojo", "El smoke test falla ante un evento SSE error, no solo por el status HTTP", "El environment production tiene un reviewer obligatorio y sus propias variables", "Los jobs de deploy tienen grupos de concurrency para que dos merges no desplieguen a la vez", "Probé un rollback una vez y escribí el comando exacto en el README"]} />

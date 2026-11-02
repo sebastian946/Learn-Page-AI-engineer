@@ -1,0 +1,219 @@
+## Why rebuild what already works?
+
+In lesson 01 you built a RAG pipeline in about 30 lines of LangChain. It worked. So why spend a lesson rebuilding it with plain libraries?
+
+Because frameworks hide decisions, and interviews, outages and cost reviews are all about those decisions. When a senior engineer asks "what SQL does your retriever run?" or "what happens when the embedding API returns a 429 halfway through ingestion?", "LangChain handles it" is not an answer.
+
+It is the same reason you once wrote a raw HTTP test before trusting a Playwright helper: you need to know what the abstraction does so you can debug it when it leaks.
+
+The goal is not to abandon frameworks. LangChain and LangGraph are fine choices in production. The goal is to be able to choose, and to drop down a level when you need to.
+
+## What LangChain was doing for you
+
+Here is the lesson 01 pipeline, mapped to what each abstraction hides.
+
+| LangChain piece | What it actually does | Decisions it made for you |
+|---|---|---|
+| `Document` | A dict with `page_content` and `metadata` | Metadata schema (none enforced) |
+| `RecursiveCharacterTextSplitter` | Splits on `\n\n`, `\n`, space, then characters | Separators, size in characters not tokens, overlap |
+| `OpenAIEmbeddings` / other embedding wrappers | Batches texts, calls the API, retries | Batch size, retry policy, no caching by default |
+| `PGVector` vector store | Creates tables, inserts rows, runs a distance query | Table schema, distance operator, index type (or none) |
+| `as_retriever(search_kwargs=...)` | Calls `similarity_search(k=...)` | Fixed k, no filters unless passed, no hybrid |
+| `ChatPromptTemplate` | String formatting into messages | Where context goes, how chunks are delimited |
+| LCEL pipe (the bar operator) | Composes callables, adds streaming and batching | Execution order, concurrency |
+| `StrOutputParser` | Takes `.content` of the message | No validation, no citations |
+| Callbacks | Hooks for tracing | What is logged and where |
+
+None of this is magic. It is maybe 200 lines of glue. Writing it yourself makes every decision visible and testable.
+
+## The core in four functions
+
+You need exactly four things: embed, store, retrieve, generate. Everything else (rewriting, re-ranking, caching) plugs in between.
+
+### 1. Embed: plain httpx with batching and retries
+
+Calling the embedding endpoint directly shows you the real contract: a list of strings in, a list of float arrays out, with limits on batch size and tokens.
+
+```python
+import asyncio
+import os
+
+import httpx
+import numpy as np
+
+EMBED_URL = os.environ.get("EMBED_URL", "https://api.openai.com/v1/embeddings")
+EMBED_MODEL = os.environ["EMBED_MODEL"]  # example: text-embedding-3-small — check provider's list
+BATCH = 64
+
+
+async def _post_with_retry(client: httpx.AsyncClient, payload: dict, attempts: int = 5) -> dict:
+    for i in range(attempts):
+        resp = await client.post(EMBED_URL, json=payload)
+        if resp.status_code in (429, 500, 502, 503):
+            await asyncio.sleep(min(2**i, 30))  # exponential backoff
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError(f"embedding failed after {attempts} attempts")
+
+
+async def embed(texts: list[str]) -> np.ndarray:
+    headers = {"Authorization": f"Bearer {os.environ['EMBED_API_KEY']}"}
+    out: list[list[float]] = []
+    async with httpx.AsyncClient(headers=headers, timeout=60) as client:
+        for start in range(0, len(texts), BATCH):
+            data = await _post_with_retry(client, {"model": EMBED_MODEL, "input": texts[start : start + BATCH]})
+            # sort by index: the API contract says results map to inputs by "index"
+            out.extend(d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"]))
+    vecs = np.asarray(out, dtype=np.float32)
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)  # normalize once, cosine == dot
+```
+
+Normalizing at write time means cosine similarity becomes a dot product. That matters when you do in-memory search with numpy, and it lets you use pgvector's inner-product operator.
+
+### 2. Store and 3. Retrieve: SQL you can read
+
+With psycopg 3 and the `pgvector` adapter, the store is a table and the retriever is a query. You see the distance operator, the filters and the index that will be used.
+
+```python
+import numpy as np
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
+
+DDL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS chunks (
+  chunk_id   text PRIMARY KEY,
+  doc_id     text NOT NULL,
+  section    text,
+  page       int,
+  product    text,            -- metadata used for filtering, e.g. 'fha', 'conventional'
+  text       text NOT NULL,
+  embedding  vector(1536) NOT NULL,  -- must match your embedding model's dimension
+  tsv        tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED
+);
+CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw (embedding vector_ip_ops);
+CREATE INDEX IF NOT EXISTS chunks_tsv ON chunks USING gin (tsv);
+"""
+
+VECTOR_SQL = """
+SELECT chunk_id, doc_id, section, page, text, -(embedding <#> %(q)s) AS score
+FROM chunks
+WHERE (%(product)s::text IS NULL OR product = %(product)s)
+ORDER BY embedding <#> %(q)s
+LIMIT %(k)s
+"""
+
+KEYWORD_SQL = """
+SELECT chunk_id, doc_id, section, page, text, ts_rank_cd(tsv, query) AS score
+FROM chunks, websearch_to_tsquery('english', %(text)s) AS query
+WHERE tsv @@ query AND (%(product)s::text IS NULL OR product = %(product)s)
+ORDER BY score DESC
+LIMIT %(k)s
+"""
+
+
+def connect(dsn: str) -> psycopg.Connection:
+    conn = psycopg.connect(dsn, autocommit=True)
+    register_vector(conn)
+    return conn
+
+
+def search(conn, sql: str, params: dict) -> list[dict]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def rrf(*ranked_lists: list[dict], k: int = 60) -> list[dict]:
+    scores: dict[str, float] = {}
+    rows: dict[str, dict] = {}
+    for lst in ranked_lists:
+        for rank, row in enumerate(lst, start=1):
+            scores[row["chunk_id"]] = scores.get(row["chunk_id"], 0.0) + 1.0 / (k + rank)
+            rows[row["chunk_id"]] = row
+    return [rows[cid] for cid in sorted(scores, key=scores.get, reverse=True)]
+```
+
+`<#>` is pgvector's *negative* inner product, so ascending order means most similar first, and we negate it for a readable score. With normalized vectors this ranks exactly like cosine. The HNSW index uses the matching operator class (`vector_ip_ops`); if the operator in the query does not match the index's operator class, Postgres silently falls back to a sequential scan. A framework would not tell you that.
+
+### 4. Generate: the SDK, a prompt you own, and validation
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+SYSTEM = """Answer using ONLY the chunks. Cite chunk ids in square brackets after each sentence,
+like [uw-4.2-a1f3]. If the chunks do not contain the answer, reply exactly: NOT_FOUND."""
+
+
+async def generate(question: str, chunks: list[dict]) -> dict:
+    context = "\n\n".join(f'<chunk id="{c["chunk_id"]}">\n{c["text"]}\n</chunk>' for c in chunks)
+    msg = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=700,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"{context}\n\nQuestion: {question}"}],
+    )
+    text = msg.content[0].text.strip()
+    return {"answer": text, "found": text != "NOT_FOUND", "usage": msg.usage.model_dump()}
+```
+
+Wiring it together is a plain async function: embed the query, run both SQL searches, fuse with `rrf`, optionally re-rank, take the top 5, generate, validate citations (lesson 13), log a trace. No hidden state.
+
+## What you gain and what you lose
+
+**You gain:**
+
+- Every SQL query, prompt and retry policy is visible in a diff and in code review.
+- Fewer dependencies and faster cold starts (relevant for Lambda in Module 5).
+- Precise control: token-based chunking, custom filters, the exact citation format you want.
+- Stack traces that point to your code, not to five layers of `Runnable`.
+
+**You lose:**
+
+- Ready-made integrations (dozens of loaders, vector stores, model providers).
+- Built-in streaming and batching across a chain, and tracing hooks that LangSmith reads automatically.
+- Community patterns and examples that assume the framework.
+
+A pragmatic stance many teams take: write the core retrieval and generation path yourself (it is small and business-critical), and use framework pieces at the edges (document loaders, agent orchestration with LangGraph) where they save real time.
+
+## Common mistakes
+
+- **Forgetting to sort embedding results by index.** Most APIs return them in order, but the contract is the `index` field. Relying on order is a latent bug.
+- **Dimension mismatches.** The `vector(N)` column must match the model's output dimension. Switching models means a new column or table, plus re-embedding.
+- **Operator and index mismatch.** Using `<=>` (cosine distance) in the query with an index built for `vector_ip_ops` skips the index. Check with `EXPLAIN ANALYZE`.
+- **No retries or backoff.** Ingestion of 10,000 chunks will hit a 429. Without backoff, you get partial indexes.
+- **Rebuilding a framework.** If your "no framework" code grows plugin registries and abstract base classes, stop. Keep it boring.
+- **String-building SQL.** Always use parameters (`%(q)s`), never f-strings, even for internal tools.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="What does LangChain actually do in a basic RAG chain, and when would you not use it?" level="mid">
+
+It wraps four steps: splitting documents, calling an embeddings API in batches, storing and querying vectors through a vector-store class, and formatting a prompt then calling a chat model. LCEL composes those steps and adds streaming and tracing hooks. I would skip it for the core path when I need full control over SQL, filters, chunking by tokens, citation formats, or when I want minimal dependencies and cold-start time, for example on Lambda. I would still use it, or LangGraph, at the edges where integrations save time.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your pgvector query got 50x slower after a change. What do you check?" level="senior">
+
+I run `EXPLAIN ANALYZE` to see whether the HNSW or IVFFlat index is used. Common causes: the distance operator in the query no longer matches the index operator class (cosine vs inner product), a new metadata filter that makes the planner choose a sequential scan, or a missing index after a migration. For filtered ANN queries I check selectivity; very selective filters can make the index return too few rows, so I may raise `hnsw.ef_search`, enable iterative index scans in recent pgvector versions, or use partial indexes per product.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Show you can go one level down">
+
+A strong signal: "I built it with LangChain first, then rewrote the core in about 250 lines with httpx, psycopg and the Anthropic SDK. That made the SQL and the prompts reviewable and cut our dependency tree." Have that repo folder ready to show.
+
+</Callout>
+
+## Further reading
+
+- pgvector README (operators, indexes, filtering): https://github.com/pgvector/pgvector
+- pgvector-python (psycopg adapter): https://github.com/pgvector/pgvector-python
+- psycopg 3 documentation: https://www.psycopg.org/psycopg3/docs/
+- HTTPX async client: https://www.python-httpx.org/async/
+- Anthropic Python SDK: https://docs.anthropic.com/en/api/client-sdks
+- PostgreSQL full-text search: https://www.postgresql.org/docs/current/textsearch.html

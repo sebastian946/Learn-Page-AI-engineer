@@ -1,0 +1,218 @@
+## The prompt
+
+> "Design a RAG system that lets 10,000 employees of a company ask questions over internal documents. You have 45 minutes."
+
+This is the most common AI system design prompt right now, with variations (customer-facing, multi-tenant, voice). Below is a full worked walkthrough, paced like a real 45-minute round. Read it once, then do it yourself in the exercise without looking.
+
+**Pacing plan:**
+
+| Minutes | Phase |
+|---|---|
+| 0-5 | Clarify requirements |
+| 5-10 | Capacity estimates |
+| 10-20 | High-level architecture |
+| 20-35 | Deep dives: data model, retrieval, evals |
+| 35-42 | Scaling, failure modes, cost |
+| 42-45 | Summary and what you would do next |
+
+## 1. Requirements (minutes 0-5)
+
+Ask questions. Write the answers down where the interviewer can see them. Assume reasonable values when they say "you decide".
+
+**Functional:**
+
+- Employees ask natural-language questions and get answers with citations to source documents.
+- Sources: Confluence, Google Drive, PDFs of policies, a ticketing system. Around 200k documents.
+- **Permissions:** users must only see answers from documents they can access in the source system. This is the requirement candidates most often miss.
+- Multi-turn chat with follow-up questions.
+- Admins can see usage, cost and quality dashboards.
+
+**Non-functional:**
+
+- Latency: first token under 1.5 s at p95, full answer under 6 s at p95.
+- Freshness: new or edited documents searchable within 15 minutes.
+- Quality: faithfulness of 0.9 or higher on a golden set; "I don't know" preferred over guessing.
+- Availability: 99.9% during business hours.
+- Security: SSO, data stays in the company's cloud account, audit log of queries.
+- Cost: a budget per month, which we will estimate.
+
+**Out of scope (say it):** fine-tuning, voice, writing back to source systems.
+
+## 2. Capacity estimates (minutes 5-10)
+
+Do the math out loud. Round aggressively. The point is orders of magnitude.
+
+```python
+# Back-of-envelope; every input is an assumption you state out loud.
+users = 10_000
+dau_ratio = 0.4                 # 4,000 daily active users
+queries_per_dau = 10
+work_seconds = 8 * 3600
+peak_factor = 4
+
+queries_per_day = users * dau_ratio * queries_per_dau           # 40,000
+avg_qps = queries_per_day / work_seconds                         # ~1.4
+peak_qps = avg_qps * peak_factor                                 # ~5.6
+concurrent_streams = peak_qps * 6                                # ~34 (6 s per answer)
+
+in_tokens, out_tokens = 4_000, 400                               # 5 chunks x 500 + prompt + history
+monthly_in = queries_per_day * 22 * in_tokens                    # ~3.5B
+monthly_out = queries_per_day * 22 * out_tokens                  # ~350M
+
+docs, tokens_per_doc, chunk_tokens = 200_000, 5_000, 500
+chunks = docs * tokens_per_doc // chunk_tokens                   # 2M chunks
+vector_bytes = chunks * 1024 * 4                                 # 1024-dim float32: ~8 GB
+index_bytes = vector_bytes * 2                                   # HNSW overhead: ~16 GB
+```
+
+Say what the numbers mean:
+
+- **QPS is small.** About 6 QPS at peak. The API layer is not the hard part.
+- **The LLM is the bottleneck and the cost center.** 34 concurrent streams and about 3.5 billion input tokens a month. Provider rate limits (tokens per minute) matter more than CPU.
+- **The vector index fits on one machine.** 2 million chunks, about 16 GB with the index. pgvector on a 64 GB instance is fine. No need for a distributed vector DB.
+- **LLM cost estimate:** with example prices of $3 per 1M input tokens and $15 per 1M output tokens (example only; check current pricing), that is about $10.5k input plus $5.3k output, roughly $16k a month before caching and routing. That number drives several later decisions.
+
+## 3. High-level architecture (minutes 10-20)
+
+Draw two paths: ingestion (cold path) and query (hot path).
+
+<Diagram caption="RAG for 10k employees: ingestion and query paths" chart={`flowchart TB
+  subgraph Ingestion
+    SRC["Connectors: Confluence, Drive, PDFs, tickets"] --> SYNC["Sync scheduler (webhooks + 15 min poll)"]
+    SYNC --> QU["Queue"]
+    QU --> PARSE["Parse + clean + chunk"]
+    PARSE --> EMB["Embed (batch)"]
+    EMB --> DB[("PostgreSQL + pgvector + FTS")]
+    SYNC --> ACL["ACL sync (who can read what)"]
+    ACL --> DB
+  end
+  subgraph Query
+    U["Employee (SSO)"] --> API["Chat API (FastAPI, streaming SSE)"]
+    API --> CACHE[("Redis: cache, rate limits, sessions")]
+    API --> RW["Query rewrite (small model)"]
+    RW --> HYB["Hybrid retrieval with ACL filter"]
+    HYB --> DB
+    HYB --> RR["Re-rank top 50 to top 5"]
+    RR --> GEN["Generate with citations"]
+    GEN --> LLM["LLM provider (regional)"]
+  end
+  API --> OBS["Tracing + metrics + usage events"]
+  OBS --> EVAL["Online eval sampler + dashboards"]`} />
+
+Narrate the query path in one breath: SSO identifies the user and their groups; the API checks the cache and rate limit; a small model rewrites the follow-up question into a standalone query; hybrid retrieval runs BM25 and vector search filtered by the user's ACL groups; RRF merges them; a cross-encoder re-ranks the top 50 to 5; the LLM answers with citations, streamed over SSE; every step emits a trace span and a usage event.
+
+## 4. Deep dives (minutes 20-35)
+
+The interviewer will pick one or two. Have all three ready.
+
+### Data model
+
+```sql
+CREATE TABLE documents (
+  id uuid PRIMARY KEY, source text, source_id text, title text, url text,
+  updated_at timestamptz, content_hash text, UNIQUE (source, source_id)
+);
+CREATE TABLE chunks (
+  id bigserial PRIMARY KEY, doc_id uuid REFERENCES documents ON DELETE CASCADE,
+  ord int, content text, section_path text, embedding vector(1024),
+  acl_groups text[] NOT NULL,  -- denormalized from the source system
+  tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+CREATE INDEX ON chunks USING gin (acl_groups);
+CREATE TABLE usage_events (
+  ts timestamptz, user_id text, request_id uuid, model text, prompt_version text,
+  in_tokens int, out_tokens int, cached_tokens int, cost_usd numeric(12,6), latency_ms int
+);
+```
+
+Key points: `content_hash` skips re-embedding unchanged documents. `acl_groups` is denormalized onto chunks so filtering happens inside the search query. When a document's permissions change, the ACL sync updates the array; it does not re-embed.
+
+### Retrieval
+
+- Chunking: document-aware (headings for Confluence, sections for policies), about 500 tokens, 10% overlap, `section_path` stored for citations.
+- Hybrid: BM25 catches exact terms (policy numbers, product codes), vectors catch paraphrases. Merge with reciprocal rank fusion.
+- **Permission filter before ranking**: `WHERE acl_groups && $user_groups`. Never filter after generation.
+- Re-rank top 50 to 5 with a cross-encoder. Budget about 100-150 ms.
+- Generation: system prompt requires citing chunk ids, and answering "I don't have enough information" when context is insufficient.
+
+### Evals
+
+- **Offline:** golden set of 150-300 questions written with subject-matter experts, covering each source and each permission level, including questions that should be refused. Metrics: context recall and precision, faithfulness, answer relevance, citation accuracy.
+- **CI gate:** any change to prompts, chunking, models or retrieval runs the suite. Block the merge if faithfulness drops more than 2 points.
+- **Online:** sample 2% of traffic for an LLM judge on faithfulness, collect thumbs up and down, track "no answer" rate. Weekly human review of 50 low-scoring traces, which feed new golden examples.
+- **Permission tests:** users from group A must never get citations from group-B-only documents. Zero tolerance.
+
+## 5. Scaling, failure modes, cost (minutes 35-42)
+
+**Scaling:** the API is stateless and autoscales on concurrent connections, not CPU. The real limit is the provider's tokens-per-minute quota; request a quota increase, spread load across two regions or two providers behind the provider abstraction from Module 1. The database gets a read replica for retrieval. Ingestion workers scale on queue depth, separately from the API.
+
+**Failure modes:**
+
+| Failure | Detection | Mitigation |
+|---|---|---|
+| LLM provider outage or 429s | Error rate, latency alerts | Retry with backoff, fail over to secondary model or region, "search results only" mode |
+| Stale or wrong permissions | ACL sync lag metric | Sync on webhook, fail closed if ACL data older than threshold |
+| Bad chunking after a parser change | Offline eval drop in CI | Version the pipeline, re-index into a new table, swap with an alias |
+| Hallucinated answer | Online judge, user feedback | Strict grounding prompt, abstain path, citation validation |
+| Prompt injection inside a document | Red-team suite | Treat retrieved text as data, no tools with side effects in this flow |
+| Cost spike | Daily cost per user alert | Per-user rate limits, routing to a smaller model, caching |
+
+**Cost:** from the estimate, about $16k a month on LLM at list example prices. Levers: route simple questions to a small model, prompt-cache the static system prompt, semantic cache per permission set (cache key includes the ACL group hash, or you leak), and trim context from 5 chunks to 3 when the re-ranker is confident. Infrastructure is small by comparison: one database instance, a few containers, Redis.
+
+## 6. Summary (minutes 42-45)
+
+Restate in 30 seconds: a two-path design, permissions enforced in retrieval, quality protected by evals in CI and online sampling, cost dominated by the LLM with clear levers. Then name what you would do next: an agentic path for multi-step questions, per-department dashboards, and a load test with k6 against the streaming endpoint.
+
+## Self-graded rubric
+
+Score yourself after the exercise. Be strict. 3 points each, 30 total. Aim for 24 or more.
+
+| Area | 0 | 1-2 | 3 |
+|---|---|---|---|
+| Requirements | Jumped to boxes | Some questions | Functional, non-functional, out of scope, permissions raised by you |
+| Estimates | None | Partial numbers | QPS, concurrency, tokens, storage, cost, and what each implies |
+| Architecture | One blob | Query path only | Ingestion and query paths, clear components |
+| Data model | Not mentioned | Tables listed | Fields that support dedup, ACLs, citations, cost |
+| Retrieval | "Vector search" | Hybrid or re-rank | Chunking, hybrid, ACL filter before ranking, re-rank, citations |
+| Evals | Not mentioned | "We'd test it" | Offline set, CI gate, online sampling, permission tests |
+| Scaling | Generic autoscaling | Some bottlenecks | Identified the LLM quota as the bottleneck with mitigations |
+| Failure modes | None | 1-2 | Table with detection and mitigation |
+| Cost | None | Mentioned | Estimated with stated assumptions, levers ranked |
+| Communication | Silent drawing | Some narration | Paced, checked in with the interviewer, summarized |
+
+## Common mistakes
+
+- Drawing a vector DB first and asking questions later.
+- Forgetting document permissions. In enterprise RAG it is usually the deciding factor.
+- Proposing a distributed vector database for 2 million chunks.
+- Treating QPS as the scaling problem when the LLM quota and cost are.
+- No evals, or evals only offline.
+- Filtering permissions after retrieval, so the top-k is mostly forbidden chunks and quality collapses.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you handle document-level permissions in enterprise RAG?" level="senior">
+
+Sync ACLs from each source system and denormalize allowed groups onto every chunk. At query time, resolve the user's groups from SSO and filter inside the retrieval query, before ranking, so top-k only contains allowed chunks. Cache keys include a hash of the group set. Permission changes update the ACL array without re-embedding. If ACL data is stale beyond a threshold, fail closed. Test it with users from different groups in the eval suite, with zero tolerance for leaks.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your estimate says LLM cost is the biggest line item. How do you cut it by half?" level="mid">
+
+Measure first: token breakdown per request from traces. Then: route easy questions to a smaller model after checking quality on the golden set, prompt-cache the static system prompt, add a per-permission-set semantic cache for repeated questions, reduce retrieved chunks when the re-ranker score is high, and cap output length. Each change is gated by evals so quality does not silently drop.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Check in every 10 minutes">
+
+Ask "Do you want me to go deeper on retrieval or on evals?" It lets the interviewer steer to what they grade, and it shows you manage time.
+
+</Callout>
+
+## Further reading
+
+- pgvector filtering and HNSW tuning: https://github.com/pgvector/pgvector
+- Ragas metrics: https://docs.ragas.io
+- OpenTelemetry semantic conventions for generative AI: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+- k6 documentation: https://k6.io/docs/
+- Anthropic docs on rate limits: https://docs.anthropic.com/en/api/rate-limits

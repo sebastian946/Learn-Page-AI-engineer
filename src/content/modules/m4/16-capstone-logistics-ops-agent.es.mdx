@@ -1,0 +1,161 @@
+<ClientBrief company="Harborline Freight" industry="Logística / Logística tercerizada (3PL)" duration="5 días" />
+
+## Contexto de la empresa
+
+Harborline Freight es una empresa ficticia de logística tercerizada (3PL) de tamaño mediano. Opera cuatro bodegas en el Medio Oeste y la Costa Este de Estados Unidos y despacha unos 18,000 pedidos al día para 140 marcas de e-commerce. No tiene camiones propios. Reserva capacidad de paquetería y LTL con seis carriers y la revende a sus clientes.
+
+El equipo de operaciones de clientes tiene 22 agentes. Trabajan una bandeja de entrada compartida y un sistema de tickets. La mayor parte de su día es repetitiva: "¿Dónde está mi pedido?", "¿Pueden entregar el viernes en vez de hoy?", "La caja llegó dañada", "Por favor cancelen este pedido antes de que salga", "¿Cuánto costaría enviar este pallet a Denver?". Cada solicitud necesita de dos a cinco consultas entre el sistema de gestión de pedidos (OMS), las APIs de los carriers y la herramienta de tickets.
+
+El tiempo promedio de atención es de 9 minutos por correo. La temporada alta duplica el volumen. El noviembre pasado el backlog llegó a 3 días y dos clientes grandes amenazaron con irse. La dirección quiere un agente que resuelva el trabajo rutinario de punta a punta y prepare el trabajo riesgoso para que un humano lo apruebe con un clic.
+
+## Stakeholders
+
+| Persona | Rol | Qué le importa |
+|---|---|---|
+| Dana Okafor | VP de Operaciones de Clientes (sponsor) | Backlog por debajo de 4 horas en temporada alta, tiempo de atención reducido a la mitad |
+| Luis Ferreira | Líder del equipo de operaciones | Que los agentes confíen en la herramienta, aprobaciones rápidas, cero reembolsos sorpresa |
+| Priya Raman | Head of Engineering | Que encaje en el stack actual (Python, Postgres, AWS), observable, testeable |
+| Marcus Lee | Controller de finanzas | Cada reembolso y cancelación aprobado y auditable |
+| Aiko Tanaka | Seguridad y cumplimiento | Sin fugas de PII a los logs, mínimo privilegio en herramientas, prompt injection controlado |
+
+## Objetivo de negocio
+
+Automatizar los cinco tipos de solicitud más comunes para que al menos el 60% de los correos de operaciones entrantes se resuelvan sin que un humano los toque, y el resto llegue a la cola ya investigado, con una acción propuesta y una aprobación de un clic. Cada acción debe quedar registrada y ser explicable para Finanzas y para el cliente.
+
+## Requisitos funcionales
+
+1. **Intake (recepción).** Leer correos nuevos desde un fixture de buzón (archivos JSON o `.eml`) y eventos de pedidos nuevos desde un fixture de cola. Extraer intención, order ids y customer id. Ignorar respuestas automáticas y newsletters.
+2. **Herramientas.** Implementar y exponer estas herramientas con schemas tipados y el contrato de error estándar (`code`, `message`, `retryable`, `hint`):
+   - `get_order(order_id)` y `list_orders(customer_id, status, cursor, limit)` (paginada)
+   - `get_carrier_rates(origin_zip, dest_zip, weight_kg)`
+   - `reschedule_delivery(order_id, new_date, idempotency_key)`
+   - `create_ticket(order_id, category, summary)`
+   - `issue_refund(order_id, amount_cents, reason, idempotency_key)`
+   - `cancel_order(order_id, reason, idempotency_key)`
+3. **Agente.** Un `StateGraph` de LangGraph con estado tipado, un nodo de herramientas, enrutamiento condicional y un checkpointer de Postgres o SQLite para que las ejecuciones sobrevivan reinicios.
+4. **Human-in-the-loop.** `issue_refund` y `cancel_order` siempre se pausan con `interrupt()` y le muestran al aprobador la llamada propuesta, los detalles del pedido y un resumen del razonamiento del agente. El aprobador puede aprobar, rechazar o editar los argumentos (por ejemplo, bajar el monto del reembolso). La ejecución se reanuda con `Command(resume=...)`. Los reembolsos de más de 500 USD además requieren un código de razón.
+5. **Redacción de respuestas.** Para las solicitudes resueltas, el agente redacta una respuesta al cliente basada en los resultados de las herramientas. En este capstone las respuestas se escriben en una carpeta outbox, no se envían.
+6. **Registro de pasos.** Cada ejecución de nodo y cada tool call emite una línea de log JSON estructurada: `run_id`, `thread_id`, `step`, `node`, `tool`, `args` (con PII enmascarada), `result_code`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`. Las trazas van a LangSmith o Langfuse.
+7. **Guardas.** Máximo de pasos por ejecución, detección de acciones repetidas, límite de costo por ejecución y un presupuesto diario por cliente. Cada parada define `stop_reason` y abre un ticket para un humano.
+8. **Suite de evals de trayectoria.** Al menos 30 escenarios, ejecutados en CI, cubriendo cada intención, HITL con aprobar/rechazar/editar, fallas de herramientas, datos faltantes y prompt injection en el cuerpo de los correos.
+9. **Opcional.** Servir las herramientas de pedidos y carriers desde un servidor MCP, reutilizando tu trabajo de `mcp-servers-lab`, y hacer que el agente las cargue a través de un adaptador de cliente MCP.
+
+## Requisitos no funcionales
+
+| Área | Meta |
+|---|---|
+| Latencia | Solicitud totalmente automatizada: p95 por debajo de 25 s de punta a punta. Primera tool call por debajo de 4 s. |
+| Preparación de aprobación | La solicitud riesgosa llega a la cola de aprobación en menos de 30 s, p95. |
+| Costo | Menos de 25 USD por cada 1,000 solicitudes con los precios de modelo que configures (indica los precios que asumiste y etiquétalos como ejemplos). Límite duro por ejecución de 0.20 USD. |
+| Precisión | Tasa de aprobación de estado final de al menos 95% en la suite de evals. Tasa de coincidencia de trayectoria de al menos 85%. Cero llamadas a herramientas prohibidas (reembolso o cancelación sin aprobación). |
+| Confiabilidad | Errores transitorios de herramientas reintentados en código. Una caída del carrier degrada a "tarifas no disponibles" más un ticket, nunca a un crash. |
+| Auditabilidad | Cada reembolso y cancelación tiene id del aprobador, timestamp y argumentos originales y editados en una tabla de auditoría. |
+| Seguridad | PII (correos, teléfonos, direcciones) enmascarada en los logs. Las herramientas corren con una cuenta de servicio de mínimo privilegio. El cuerpo de los correos se trata como dato no confiable. |
+
+## Fuera de alcance
+
+- Enviar correos reales o integrar un buzón real. Usa fixtures.
+- Integraciones reales con carriers u OMS. Usa servicios falsos con datos y latencias realistas.
+- Una UI de aprobación de producción. Basta con un CLI o un endpoint mínimo de FastAPI.
+- Soporte multilenguaje. Solo inglés.
+- Deploy en AWS. Eso es el módulo 5.
+
+## Entregables
+
+1. Repo `logistics-ops-agent` con código, tests, suite de evals y workflow de CI.
+2. README con diagrama de arquitectura, catálogo de herramientas, límites de las guardas, análisis de costo y últimos resultados de evals.
+3. `docs/runbook.md`: qué hacer cuando se disparan las guardas, cuando una herramienta está caída y cómo reproducir un hilo.
+4. Un GIF o video demo de 3 minutos: una reprogramación automatizada, un reembolso aprobado con monto editado y un correo con prompt injection manejado de forma segura.
+5. Un reporte de evals (`evals/report.md`) generado por CI en main.
+
+## Criterios de aceptación
+
+- Ejecutar `make demo` procesa los 20 correos de fixture, escribe respuestas en `outbox/`, encola las acciones riesgosas e imprime una tabla resumen.
+- Aprobar, rechazar y editar un reembolso encolado funcionan desde el CLI y quedan registrados en la tabla de auditoría.
+- Reiniciar el proceso a mitad de una aprobación y luego aprobar reanuda el mismo hilo sin repetir tool calls anteriores.
+- Cada ejecución produce líneas de log JSON y un enlace a la traza. Ningún correo o teléfono en crudo aparece en los logs.
+- Las guardas están cubiertas por tests con un modelo falso que entra en bucle.
+- CI corre los tests unitarios en cada push y la suite de trayectoria en los PRs, y bloquea el merge por debajo de las metas de precisión de arriba.
+- El análisis de costo muestra los tokens medidos por tipo de solicitud y el costo por cada 1,000 solicitudes, con los precios asumidos etiquetados como ejemplos.
+
+## Arquitectura sugerida
+
+<Diagram caption="Agente de operaciones de Harborline: intake, agente LangGraph con guardas y HITL, herramientas, logging y evals" chart={`flowchart LR
+  subgraph Intake
+    M["Fixtures de buzón"] --> P["Parser y extractor de intención"]
+    Q["Cola de eventos de pedidos"] --> P
+  end
+  P --> G["Agente LangGraph"]
+  subgraph Agent["StateGraph de LangGraph"]
+    G --> R{"Router de guardas"}
+    R -->|tool calls| T["Nodo de herramientas"]
+    R -->|herramienta riesgosa| A["Nodo de aprobación (interrupt)"]
+    R -->|límite alcanzado| S["Nodo stop"]
+    R -->|terminado| D["Redactor de respuesta"]
+    A -->|aprobado o editado| T
+    A -->|rechazado| D
+    T --> G
+  end
+  T --> MCP["Servidor MCP o herramientas locales"]
+  MCP --> OMS["OMS falso"]
+  MCP --> CR["Tarifas de carrier falsas"]
+  MCP --> TK["Ticketing falso"]
+  A --> UI["CLI del aprobador"]
+  G -.-> CP[("Checkpointer: Postgres")]
+  G -.-> LOG["Logs JSON y trazas"]
+  D --> OUT["Outbox"]
+  S --> TK
+  EV["Suite de evals de trayectoria en CI"] -.-> G`} />
+
+Decisiones de diseño clave que debes justificar en tu README:
+
+- **Un agente, no un sistema multi-agente.** Cinco intenciones y siete herramientas caben en un agente con buen prompt. Explica por qué un supervisor agregaría latencia y costo sin beneficio aquí (lección 10).
+- **Intake determinista.** Extraer order ids con una regex y un clasificador pequeño es más barato y más testeable que dejar que el agente los descubra.
+- **La aprobación como nodo del grafo.** El HITL vive en el grafo, no en la herramienta, así la decisión queda en el checkpoint y es auditable.
+- **Backends falsos como código de primera clase.** Los mismos fakes alimentan los tests unitarios, los evals y el demo.
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Excelente (5) | Aceptable (3) | Débil (1) |
+|---|---|---|---|---|
+| Diseño de herramientas | 15% | Schemas tipados, descripciones claras, idempotency keys en escrituras, contrato de error accionable, paginación | Schemas y errores presentes, algunos vagos | Herramientas sin tipos, excepciones crudas llegan al modelo |
+| Grafo y HITL | 20% | Aprobaciones con checkpoint con aprobar, rechazar y editar, sobreviven reinicios, tabla de auditoría | Aprobar y rechazar funcionan, sin edición ni reinicio | La aprobación es solo una instrucción en el prompt |
+| Guardas y costo | 15% | Todas las guardas probadas, costo por solicitud medido y bajo la meta, stop reasons en dashboards | Las guardas existen, tests parciales | Solo `recursion_limit` |
+| Observabilidad | 15% | Logs estructurados por paso, PII enmascarada, enlaces a trazas, runbook | Hay logs, campos inconsistentes | Print statements |
+| Evals | 25% | 30+ escenarios, 3 ejecuciones cada uno, trayectoria, argumentos, herramientas prohibidas y estado final, gate de CI | 15+ escenarios, verificaciones de estado final, ejecución manual | Solo verificaciones de salida |
+| Comunicación | 10% | El README explica trade-offs, modelo de costo y resultados con honestidad | El README cubre setup y funcionalidades | README mínimo |
+
+## Cronograma sugerido
+
+| Día | Foco | Checkpoint al final del día |
+|---|---|---|
+| 1 | Backends falsos, schemas de herramientas, contrato de error, parser de intake, tests unitarios | Todas las herramientas se pueden llamar desde pytest con fixtures |
+| 2 | Agente LangGraph, nodo de herramientas, checkpointer, redacción de respuestas, logging estructurado | `make demo` resuelve los correos del camino feliz de punta a punta |
+| 3 | HITL para reembolsos y cancelaciones (aprobar, rechazar, editar), tabla de auditoría, test de reinicio | El flujo de reembolso funciona a través de un reinicio del proceso |
+| 4 | Guardas, registro de costo, presupuestos, suite de evals de trayectoria con 30+ escenarios | Reporte de evals generado localmente |
+| 5 | Gate de CI, análisis de costo, runbook, README, grabación del demo, servidor MCP opcional | Todos los criterios de aceptación en verde, repo público |
+
+## Definition of Done
+
+<Checklist id="m4-16-dod" title="Definition of Done" items={["Las siete herramientas tienen schemas tipados, descripciones y el contrato de error estándar", "Las herramientas de escritura requieren idempotency keys y son seguras de reintentar", "Reembolsos y cancelaciones siempre se pausan para aprobación; aprobar, rechazar y editar funcionan", "Las aprobaciones sobreviven a un reinicio del proceso y se escriben en una tabla de auditoría", "Cada paso emite una línea de log JSON estructurada con PII enmascarada, más una traza", "Máximo de pasos, detección de acciones repetidas, límite de costo por ejecución y presupuesto por cliente están probados", "La suite de evals de trayectoria tiene al menos 30 escenarios, incluyendo prompt injection y fallas de herramientas", "CI bloquea merges por debajo de 95% de estado final, 85% de coincidencia de trayectoria o ante cualquier llamada prohibida", "El costo por cada 1,000 solicitudes está medido y documentado con precios etiquetados como ejemplos", "El README tiene diagrama de arquitectura, catálogo de herramientas, límites de guardas, resultados de evals y trade-offs", "El runbook cubre disparos de guardas, caídas de herramientas y reproducción de hilos", "El GIF demo muestra una solicitud automatizada, una aprobación de reembolso editada y un intento de injection"]} />
+
+## Cómo presentar esto en una entrevista
+
+Usa una estructura de 4 minutos. Los entrevistadores recuerdan historias con números.
+
+**1. El problema (30 segundos).** "Un 3PL con 22 agentes de operaciones, 9 minutos por correo y un backlog de 3 días en temporada alta. El objetivo era automatizar las solicitudes rutinarias de punta a punta y convertir las riesgosas en aprobaciones de un clic."
+
+**2. La arquitectura (60 segundos).** Muestra el diagrama. Explica por qué es un agente y no cinco: "Siete herramientas y cinco intenciones caben en un agente. Un supervisor agregaría una llamada al modelo por solicitud y otro lugar donde fallar." Señala el nodo de aprobación: "Los reembolsos se pausan dentro del grafo con `interrupt()`. El estado queda en un checkpoint en Postgres, así que una aprobación puede llegar horas después, tras un deploy, y la ejecución se reanuda exactamente donde se detuvo."
+
+**3. Seguridad y costo (60 segundos).** "Traté al agente como un servicio no confiable. Las escrituras necesitan idempotency keys. Reembolsos y cancelaciones no se ejecutan sin un humano. Las guardas detienen los bucles por número de pasos, llamadas repetidas y costo. Cada parada tiene una razón y abre un ticket." Da tus números medidos: costo por cada 1,000 solicitudes, latencia p95, tasa de disparo de guardas.
+
+**4. Evals, el ángulo SDET (60 segundos).** "Las verificaciones solo de salida no ven los bugs peligrosos, como que el agente diga que abrió un ticket cuando no lo hizo. Mi suite ejecuta 30+ escenarios tres veces cada uno contra un backend falso y hace assert sobre las escrituras registradas. Revisa trayectorias con el modo de comparación más flexible que todavía atrapa el bug, y hace fallar CI ante cualquier llamada prohibida." Menciona una regresión que la suite atrapó durante el desarrollo.
+
+**5. Trade-offs y próximos pasos (30 segundos).** Qué cambiarías para producción: integración con un buzón real, una UI de aprobación, evaluación online sobre trazas muestreadas, variantes de prompt por cliente detrás de feature flags, deploy en ECS (módulo 5).
+
+Prepárate para preguntas de seguimiento:
+
+- "¿Qué pasa si el aprobador edita el reembolso a un monto inválido?" (Validación en la herramienta, contrato de error, el agente lo explica y lo vuelve a encolar.)
+- "¿Cómo evitas que un correo malicioso dispare un reembolso?" (Entrada no confiable, reembolsos bloqueados por humanos, escenarios de injection en los evals, herramientas de mínimo privilegio.)
+- "¿Cómo elegiste el límite de pasos?" (p95 de las trazas exitosas más un margen.)
+- "¿Por qué no simplemente un workflow?" (El intake y las aprobaciones son tipo workflow y deterministas; solo el paso de investigación y resolución es agéntico. Muestra dónde trazaste la línea.)

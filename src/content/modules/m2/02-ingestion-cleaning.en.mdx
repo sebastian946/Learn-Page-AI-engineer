@@ -1,0 +1,212 @@
+## Garbage in, confident garbage out
+
+Retrieval can only return what ingestion put in the store. If a running header like "Northwind Mortgage — Internal Use Only — Page 7 of 112" lands in every chunk, every chunk looks a little similar to every other chunk. If a rate table is flattened into a stream of numbers, the model will read "80 97 620 680" and guess. If the 2024 version of the FHA policy and the 2026 version are both indexed with no date, the assistant will cite whichever one embeds closer to the question.
+
+Ingestion is the least glamorous part of RAG and the one with the highest payoff. Treat it like a data pipeline with tests, not a script you run once.
+
+## The ingestion stages
+
+<Diagram caption="Ingestion stages for the mortgage corpus" chart={`flowchart LR
+  A["Discover files"] --> B["Detect type"]
+  B --> C["Parse (PDF / HTML)"]
+  C --> D["Clean and normalize"]
+  D --> E["Extract metadata"]
+  E --> F["Deduplicate and version"]
+  F --> G["Emit normalized documents (JSONL)"]`} />
+
+The output of ingestion is not chunks. It is **clean, normalized documents with metadata**, written to a stable format such as JSONL. Chunking is a separate step (lesson 4). Keeping them separate lets you try five chunking strategies without re-parsing 4,000 PDFs each time.
+
+A normalized document for our corpus:
+
+```python
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, Field
+
+DocType = Literal["policy", "underwriting_guideline", "faq", "rate_sheet"]
+
+class Section(BaseModel):
+    heading: str            # e.g. "4.2 Debt-to-Income Limits"
+    level: int              # 1 = top-level heading
+    text: str
+
+class NormalizedDoc(BaseModel):
+    doc_id: str             # stable hash of source path + version
+    source: str             # relative path or URL
+    title: str
+    doc_type: DocType
+    jurisdiction: str | None = None      # "US-TX", "US-CA", "US" ...
+    effective_date: date | None = None
+    version: str | None = None
+    content_hash: str                    # sha256 of cleaned text
+    sections: list[Section] = Field(default_factory=list)
+    page_map: list[int] = Field(default_factory=list)  # section index -> first page
+```
+
+Notice what is in there: sections with headings (so chunking can respect structure and citations can say "§4.2"), `effective_date` and `jurisdiction` (so retrieval can filter, lesson 9), and `content_hash` (so you only re-embed what changed).
+
+## Parsing PDFs
+
+PDFs are a page-description format, not a document format. There is no "paragraph" in a PDF, only positioned glyphs. Your options, from cheap to expensive:
+
+| Tool | Good for | Weak at |
+|---|---|---|
+| `pypdf` | text PDFs, fast, pure Python | layout, tables, reading order in columns |
+| `pdfplumber` | tables, word positions, cropping headers by coordinates | speed on large corpora |
+| PyMuPDF (`fitz`) | speed, blocks with font size (detect headings) | AGPL license — check before commercial use |
+| `unstructured` | mixed corpora, element types (Title, Table, ListItem) | heavy dependencies, slower |
+| OCR (Tesseract, cloud document AI) | scanned documents | cost, latency, character errors |
+
+Rule of thumb: start with a fast text extractor, measure how many pages come back empty or garbled, and route only those to a heavier parser or OCR. In a lender's corpus, signed scanned addenda are common; the policy manuals are usually born-digital.
+
+Using font size to recover headings with PyMuPDF:
+
+```python
+import fitz  # PyMuPDF
+
+def extract_blocks(path: str) -> list[dict]:
+    """Return text spans with page number and font size, in reading order."""
+    out: list[dict] = []
+    with fitz.open(path) as pdf:
+        for page_no, page in enumerate(pdf, start=1):
+            for block in page.get_text("dict")["blocks"]:
+                for line in block.get("lines", []):
+                    text = "".join(s["text"] for s in line["spans"]).strip()
+                    if not text:
+                        continue
+                    size = max(s["size"] for s in line["spans"])
+                    out.append({"page": page_no, "text": text, "size": round(size, 1),
+                                "y": line["bbox"][1]})
+    return out
+```
+
+Lines with a font size clearly larger than the body size are heading candidates. Combine that with a regex for numbered sections (`^\d+(\.\d+)*\s+[A-Z]`) and you recover most of the structure of a policy manual.
+
+## Parsing HTML FAQ pages
+
+HTML gives you structure for free, if you throw away the chrome. Navigation menus, cookie banners and footers appear on every page and poison retrieval exactly like PDF headers.
+
+```python
+from bs4 import BeautifulSoup
+
+BOILERPLATE = ["nav", "header", "footer", "script", "style", "form", "aside"]
+
+def parse_faq(html: str) -> list[tuple[str, str]]:
+    """Return (question, answer) pairs from a FAQ page."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(BOILERPLATE):
+        tag.decompose()
+    for tag in soup.select("[class*=cookie], [id*=cookie], .breadcrumb"):
+        tag.decompose()
+    main = soup.find("main") or soup.body or soup
+    pairs: list[tuple[str, str]] = []
+    for h in main.find_all(["h2", "h3"]):
+        answer_parts = []
+        for sib in h.find_next_siblings():
+            if sib.name in ("h2", "h3"):
+                break
+            answer_parts.append(sib.get_text(" ", strip=True))
+        answer = " ".join(p for p in answer_parts if p)
+        if answer:
+            pairs.append((h.get_text(" ", strip=True), answer))
+    return pairs
+```
+
+Each question-answer pair is a natural retrieval unit. Keep the question text in the chunk: users phrase queries like questions, so the question itself is a strong match signal.
+
+## Cleaning and normalization
+
+A cleaning pass should be a list of small, named, individually testable functions. That is your SDET advantage: each rule gets a unit test with a fixture taken from a real document.
+
+```python
+import re
+import unicodedata
+from collections import Counter
+
+def normalize_unicode(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)          # ligatures: "ﬁ" -> "fi"
+    return text.replace("­", "").replace("​", "")  # soft hyphen, zero-width
+
+def fix_hyphenation(text: str) -> str:
+    return re.sub(r"(\w)-\n(\w)", r"\1\2", text)           # "under-\nwriting" -> "underwriting"
+
+def collapse_whitespace(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+def find_repeated_lines(pages: list[str], min_ratio: float = 0.6) -> set[str]:
+    """Lines that appear on most pages are headers/footers."""
+    counts: Counter[str] = Counter()
+    for page in pages:
+        lines = {re.sub(r"\d+", "#", ln.strip()) for ln in page.splitlines() if ln.strip()}
+        counts.update(lines)
+    return {ln for ln, c in counts.items() if c / max(len(pages), 1) >= min_ratio}
+
+def strip_repeated(page: str, repeated: set[str]) -> str:
+    keep = [ln for ln in page.splitlines()
+            if re.sub(r"\d+", "#", ln.strip()) not in repeated]
+    return "\n".join(keep)
+```
+
+The `find_repeated_lines` trick replaces digits with `#` before counting, so "Page 7 of 112" and "Page 8 of 112" count as the same line. It removes headers and footers without hard-coding any lender's template.
+
+What **not** to clean away: section numbers, defined terms in capitals ("Qualified Mortgage"), percentages, form numbers, dates. Those are exactly what users search for.
+
+## Metadata extraction
+
+Metadata drives filtering, citations and freshness. Sources, from most to least reliable:
+
+1. **The system of record.** A document management system usually knows doc type, owner, version and effective date. Use it when you can.
+2. **File path conventions.** `policies/TX/fha-gift-funds_v3_2026-01-15.pdf` encodes jurisdiction, version and date.
+3. **Document text.** "Effective Date: January 15, 2026" on page 1. Regex works for most templates.
+4. **An LLM extraction call.** For messy documents, a cheap model with a Pydantic schema can extract `effective_date` and `jurisdiction` from the first page. Validate the output and log failures; do not trust it blindly.
+
+```python
+from datetime import datetime
+
+EFFECTIVE = re.compile(r"Effective\s+Date:?\s*([A-Z][a-z]+ \d{1,2}, \d{4})")
+
+def extract_effective_date(first_page: str) -> date | None:
+    m = EFFECTIVE.search(first_page)
+    return datetime.strptime(m.group(1), "%B %d, %Y").date() if m else None
+```
+
+## Deduplication and versioning
+
+Lenders keep old versions around. If both "FHA Gift Funds v2 (2024)" and "v3 (2026)" are retrievable with no distinction, you will eventually cite a superseded rule. Options:
+
+- **Exact duplicates:** compare `content_hash` of cleaned text; keep one.
+- **Near duplicates** (same doc re-exported with a different footer): MinHash or simple shingle Jaccard similarity above about 0.9.
+- **Versions:** keep all versions but mark `is_current` and filter on it by default. Auditors sometimes need the old one, so do not delete.
+
+Incremental ingestion falls out of the hash: on each run, skip documents whose `content_hash` is unchanged. Re-embedding the whole corpus every night is the most common source of surprise embedding bills.
+
+## Common mistakes
+
+- **Parsing and chunking in one step.** You lose the ability to compare chunking strategies cheaply and to debug which step broke.
+- **Not measuring parse quality.** Count empty pages, average characters per page and the ratio of non-alphabetic characters. A scanned page shows up as 0 characters; a broken encoding shows up as a high symbol ratio.
+- **Hard-coding header strings.** Templates change. Detect repeated lines statistically.
+- **Dropping tables.** Rate and LTV tables carry the answers to the most common questions. Extract them to Markdown or one-row-per-line text ("Credit score 620–679, max LTV 95%") instead of losing them.
+- **No effective date.** Without it you cannot filter superseded policies, and the assistant will mix rules from different years.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your RAG assistant keeps citing an outdated policy. How do you diagnose and fix it?" level="mid">
+
+First reproduce: run the failing question and print retrieved chunks with their metadata. Usually both the old and new versions are in the index, and the old one ranks higher because its wording matches the query. Fixes, in order: add `effective_date`, `version` and `is_current` at ingestion time; filter `is_current = true` by default at retrieval; for "what was the rule in 2024" questions, filter by date range instead. Then add a regression test: a golden question whose correct answer only exists in the new version. Finally make ingestion incremental with content hashes so a new version replaces the old one automatically.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How would you handle a corpus where 15% of PDFs are scanned images?" level="senior">
+
+Detect them instead of guessing: after fast text extraction, flag pages with almost no characters or a high symbol ratio. Route only those to OCR (Tesseract for cost, a cloud document AI for accuracy on forms and tables). Store `extraction_method` and an OCR confidence in metadata so you can down-rank or exclude low-confidence chunks and report coverage. Budget it: OCR is far slower and costlier per page than text extraction, so run it once and cache by content hash. And sample-check OCR output by hand for numbers, because a misread "95%" as "65%" is worse than a missing page in a lending context.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [LangChain — Document loaders](https://python.langchain.com/docs/concepts/document_loaders/)
+- [pypdf documentation](https://pypdf.readthedocs.io/)
+- [pdfplumber on GitHub](https://github.com/jsvine/pdfplumber)
+- [Beautiful Soup documentation](https://www.crummy.com/software/BeautifulSoup/bs4/doc/)
+- [Unstructured documentation](https://docs.unstructured.io/)

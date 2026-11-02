@@ -1,0 +1,201 @@
+## Why load testing LLM endpoints is different
+
+You have run load tests before. The usual recipe: hammer an endpoint, watch p95 latency and error rate, find the knee. With LLM endpoints that recipe gives misleading numbers, for four reasons.
+
+1. **Latency is dominated by someone else.** 90%+ of a request is the model provider generating tokens. If you load test against the real provider, you mostly measure the provider and your rate limit, not your service.
+2. **"Latency" is not one number.** Users feel **TTFT** (time to first token) far more than total time. A 12-second answer that starts in 600 ms feels fast. A 4-second answer that starts after 3.5 seconds feels broken. You also care about **tokens per second** during the stream.
+3. **Load tests cost real money.** 10,000 requests at a few thousand tokens each is a real invoice. A careless soak test can burn a month of budget in an afternoon.
+4. **Streaming breaks naive tooling.** Most HTTP load tools, k6 included, read the whole response body before handing it to your script. They don't see individual SSE events as they arrive.
+
+The fix is to split the problem. **Test your service in isolation** with a mocked provider at high load. Then run a **small, budgeted test against the real provider** to confirm the end-to-end numbers.
+
+## Isolate your service: the mock provider
+
+In the `mortgage-knowledge-assistant` conventions, `app/llm.py` supports `LLM_PROVIDER=mock`. The mock streams fixed tokens with a configurable delay before the first token and a configurable rate:
+
+```python
+# app/llm.py (excerpt)
+import asyncio
+from collections.abc import AsyncIterator
+
+from app.settings import settings
+
+MOCK_TEXT = (
+    "Per the 2025 underwriting policy, the maximum debt-to-income ratio for a "
+    "conforming loan is 45%, with exceptions up to 50% under documented "
+    "compensating factors [policy-underwriting.pdf p.12]."
+).split(" ")
+
+
+async def stream_mock(prompt: str) -> AsyncIterator[str]:
+    await asyncio.sleep(settings.mock_ttft_ms / 1000)
+    delay = 1 / settings.mock_tokens_per_sec
+    for word in MOCK_TEXT:
+        yield word + " "
+        await asyncio.sleep(delay)
+```
+
+With `MOCK_TTFT_MS=800` and `MOCK_TOKENS_PER_SEC=60`, your service behaves as if it called a realistic model. Everything else stays real: FastAPI, auth, rate limiting, the Redis cache, pgvector retrieval, re-ranking, logging. Now the test measures **your** overhead and **your** bottlenecks: event loop blocking, DB pool exhaustion, a slow re-ranker, a synchronous call hiding in an `async def`.
+
+This is the same idea as stubbing a third-party API in an integration test. You would never let a flaky payment sandbox decide whether your checkout tests pass.
+
+## Measuring TTFT with k6: be honest about the limits
+
+k6's standard `http` module gives you `res.timings.waiting`, the time to the first byte of the response. It is tempting to call that TTFT. Often it is not.
+
+Starlette's `StreamingResponse` sends the status line and headers **before** it pulls the first item from your generator. So the first byte reaches k6 as soon as the request is accepted, long before the model produces a token. `timings.waiting` then measures "time to headers", not "time to first token".
+
+You have three honest options:
+
+| Approach | What you get | Cost |
+|---|---|---|
+| **Server-reported timings.** The `done` event includes `ttft_ms` and `output_tokens`, measured in the app. k6 parses the full body after completion. | Accurate server-side TTFT and tokens/sec. Excludes network to the client. | Trivial. Works with stock k6. |
+| **`timings.waiting` as a proxy**, if the server delays headers until the first token (for example by priming the generator before returning the response). | Client-side TTFB that matches TTFT. | Changes app code. Error handling gets harder because the status code is already committed. |
+| **An SSE extension** such as the community `xk6-sse`, built with `xk6`. | Per-event callbacks with client-side timestamps. Closest to what a browser sees. | Custom k6 binary to build and maintain. |
+
+For CI and most analyses, **server-reported timings** are the pragmatic choice. Your app already measures TTFT for observability (Module 3), so the load test reuses the same number your dashboards show. Use an SSE extension when you need to prove client-perceived TTFT, for example when a CDN or proxy might be buffering.
+
+## A k6 script for an SSE endpoint
+
+```javascript
+// loadtest/chat_stream.js
+import http from 'k6/http';
+import { check } from 'k6';
+import { Trend, Rate, Counter } from 'k6/metrics';
+
+const ttft = new Trend('ttft_ms', true);
+const tps = new Trend('tokens_per_sec');
+const sseErrors = new Rate('sse_error_rate');
+const outputTokens = new Counter('output_tokens');
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+const QUESTIONS = JSON.parse(open('./questions.json'));
+
+export const options = {
+  scenarios: {
+    chat: {
+      executor: 'ramping-arrival-rate',
+      startRate: 1,
+      timeUnit: '1s',
+      preAllocatedVUs: 50,
+      maxVUs: 400,
+      stages: [
+        { target: 5, duration: '1m' },
+        { target: 20, duration: '3m' },
+        { target: 20, duration: '3m' },
+        { target: 0, duration: '30s' },
+      ],
+    },
+  },
+  thresholds: {
+    http_req_failed: ['rate<0.01'],
+    http_req_duration: ['p(95)<15000'],
+    ttft_ms: ['p(95)<1500'],
+    sse_error_rate: ['rate<0.01'],
+  },
+};
+
+function parseSse(body) {
+  const events = [];
+  for (const block of body.split('\n\n')) {
+    const ev = /^event: (.+)$/m.exec(block);
+    const data = /^data: (.+)$/m.exec(block);
+    if (ev) events.push({ event: ev[1], data: data ? data[1] : '' });
+  }
+  return events;
+}
+
+export default function () {
+  const q = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
+  const res = http.post(`${BASE_URL}/v1/chat/stream`, JSON.stringify({ question: q }), {
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': `load-${__VU % 10}` },
+    timeout: '60s',
+  });
+  const events = parseSse(res.body || '');
+  const done = events.find((e) => e.event === 'done');
+  const hasError = events.some((e) => e.event === 'error');
+  sseErrors.add(hasError || !done);
+
+  check(res, { 'status 200': (r) => r.status === 200, 'got done': () => !!done });
+  if (done) {
+    const meta = JSON.parse(done.data);
+    ttft.add(meta.ttft_ms);
+    outputTokens.add(meta.output_tokens);
+    const genSeconds = (res.timings.duration - meta.ttft_ms) / 1000;
+    if (genSeconds > 0) tps.add(meta.output_tokens / genSeconds);
+  }
+}
+```
+
+Key choices in this script:
+
+- **`ramping-arrival-rate`, not VUs.** A VU-based test is a closed model. When your service slows down, VUs wait, so the request rate drops and the test quietly goes easier on you. Real users don't wait for each other. An arrival-rate executor keeps sending N requests per second regardless, which is an open model. `maxVUs` must be high enough to hold all in-flight streams.
+- **SSE errors count as failures.** A stream can return HTTP 200 and then emit `event: error` halfway through. `http_req_failed` won't catch that. The custom `sse_error_rate` does.
+- **Varied questions.** A single repeated question hits your exact-match cache every time and gives fantasy numbers. Use 50–200 realistic questions, or run once with the cache on and once with it off.
+- **Tenant spread.** `X-Tenant-ID` rotates across 10 tenants so per-tenant rate limits behave as they would in production.
+
+Run it with the mock first:
+
+```bash
+LLM_PROVIDER=mock MOCK_TTFT_MS=800 MOCK_TOKENS_PER_SEC=60 docker compose up -d
+k6 run --summary-export=loadtest/results/summary.json loadtest/chat_stream.js
+```
+
+## The budgeted real-provider run
+
+After the mock run, do one short run against the real model. Its purpose is to confirm, not to explore:
+
+- Low and fixed: for example 2 requests per second for 3 minutes, roughly 360 requests.
+- Estimate the cost **before** you run it: requests × average tokens × price. Use the provider's current pricing page; prices change.
+- Use a separate API key with its own spend limit and a dedicated tenant id, so you can find the traffic in your traces.
+- Compare TTFT and tokens/sec against the mock settings. If the real TTFT p95 is 2.4 s and your mock used 800 ms, rerun the mock test with the realistic value.
+
+## Interpreting results: Little's law
+
+Little's law ties the numbers together:
+
+```text
+concurrent requests in flight = arrival rate x average time in system
+L = lambda x W
+```
+
+At 20 requests per second with an average stream time of 9 seconds, you hold **180 concurrent streams**. That number, not RPS, sizes your system:
+
+- With 4 Fargate tasks, each holds about 45 open streams. Is your uvicorn worker count and event loop fine with that? Usually yes for async I/O. A blocking call in the path will break it.
+- Each stream that queries pgvector needs a DB connection for retrieval, but not for the whole stream. If you hold a connection for the full generation, a pool of 20 per task is exhausted at 20 concurrent streams.
+- The provider sees 20 requests per second. Check that against your tokens-per-minute limit.
+
+When latency rises, find **where** the extra time goes. Compare server-side spans from tracing (retrieval, re-rank, LLM TTFT) against the k6 totals. If server TTFT stays flat but client duration rises, the queue is in front of your app: ALB, too few tasks, or a uvicorn backlog. If retrieval time rises with load, look at the DB pool and index.
+
+## Common mistakes
+
+- **Load testing the real provider at full scale.** You measure their latency and your rate limit, and you pay for the privilege.
+- **Calling `timings.waiting` TTFT** without checking when your server sends headers.
+- **Closed-model tests (fixed VUs)** that hide saturation by slowing down with the system.
+- **One prompt on repeat**, which turns the test into a cache benchmark.
+- **Ignoring in-stream errors**, so a 200 with `event: error` counts as success.
+- **No thresholds.** A load test without pass/fail thresholds is a chart, not a test. It can't gate anything.
+- **Testing from a laptop over home Wi-Fi** against a cloud endpoint. Run k6 from the same region, or from a CI runner, and record where it ran.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you load test a streaming LLM endpoint without spending thousands of dollars?" level="mid">
+Split it into two tests. First, run the service with a **mock provider** that streams canned tokens with a realistic TTFT and tokens/sec. Everything else stays real: retrieval, re-ranking, cache, rate limits. Load test that at target and above-target rates with an **arrival-rate** executor. Set thresholds on p95 TTFT, p95 duration and error rate, counting in-stream SSE errors. That finds my bottlenecks for free.
+
+Second, run a **short, low-rate test against the real provider**. I estimate its cost first and use a separate key with a spend cap. That test validates the mock's assumptions. If real TTFT is slower, I update the mock and rerun. For TTFT I rely on server-reported timings in the `done` event, or an SSE-aware k6 extension, because plain `timings.waiting` usually measures time to headers.
+</InterviewQuestion>
+
+<InterviewQuestion question="Your service handles 20 RPS with an average stream of 9 seconds. How many concurrent connections do you need to support, and what breaks first?" level="senior">
+Little's law: 20 × 9 = **180 concurrent streams** in steady state, more during bursts. So I size for 250+ with headroom.
+
+What breaks first is usually not CPU. Candidates, in order: the **DB connection pool**, if a connection is held for the whole stream instead of only during retrieval. The **provider rate limit**: 20 RPS times average tokens against tokens-per-minute. **Blocking calls** in async handlers, such as a sync re-ranker or a sync Redis client, which stall every stream on that worker. **Proxy limits**: ALB idle timeout, or Fly's hard concurrency limit. I would confirm with the mock load test plus tracing spans, and scale on in-flight requests per task rather than CPU.
+</InterviewQuestion>
+
+## Further reading
+
+- [k6 documentation](https://k6.io/docs/)
+- [k6 scenarios and executors (open vs closed models)](https://k6.io/docs/using-k6/scenarios/)
+- [k6 thresholds](https://k6.io/docs/using-k6/thresholds/)
+- [k6 custom metrics](https://k6.io/docs/using-k6/metrics/create-custom-metrics/)
+- [FastAPI: custom responses and StreamingResponse](https://fastapi.tiangolo.com/advanced/custom-response/)
+- [Anthropic: streaming messages](https://docs.anthropic.com/en/docs/build-with-claude/streaming)

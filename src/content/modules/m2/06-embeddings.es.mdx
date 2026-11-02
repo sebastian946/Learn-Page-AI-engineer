@@ -1,0 +1,172 @@
+## Qué es un embedding, en términos operativos
+
+Un modelo de embeddings convierte un fragmento de texto en un vector de longitud fija de números flotantes, por ejemplo 1,024 números. Los textos con significado similar quedan cerca unos de otros. "Maximum debt-to-income ratio for conventional loans" y "What's the highest DTI we accept on a conforming loan?" comparten pocas palabras, pero producen vectores con alta similitud coseno.
+
+Para RAG necesitas conocer cinco hechos operativos, no las matemáticas de los transformers:
+
+1. **El mismo modelo en ambos lados.** Los documentos y las consultas deben pasar por el mismo modelo (y las mismas dimensiones). Los vectores de modelos distintos no son comparables.
+2. **La similitud es relativa.** Un puntaje coseno de 0.62 no significa nada por sí solo. Solo importa el ranking entre candidatos, y las distribuciones de puntajes difieren por modelo. No codifiques "relevante si supera 0.8" sin calibrarlo con tus datos.
+3. **Las entradas tienen un límite de longitud.** El texto que supera el máximo de tokens de entrada del modelo se trunca o se rechaza. Compáralo con tus tamaños de chunk.
+4. **Algunos modelos son asimétricos.** Varios proveedores te piden marcar las entradas como `query` o `document` (o agregarles un prefijo). Equivocarte aquí baja el recall sin avisar.
+5. **Cambiar de modelo significa volver a generar todos los embeddings.** Planéalo desde el primer día.
+
+## Métricas de distancia
+
+| Métrica | Idea de la fórmula | Cuándo |
+|---|---|---|
+| Similitud coseno | ángulo entre vectores | valor por defecto para texto; insensible a la longitud del vector |
+| Producto punto | coseno por las longitudes | igual al coseno cuando los vectores están normalizados L2; el más rápido |
+| Euclidiana (L2) | distancia en línea recta | mismo ranking que el coseno con vectores normalizados |
+
+La mayoría de los modelos de embeddings alojados devuelven vectores normalizados, y en ese caso las tres dan el mismo ranking. Normaliza de todas formas si no estás seguro; no cuesta nada y hace seguro el producto punto. En pgvector los operadores son `<=>` (distancia coseno), `<#>` (producto interno negativo) y `<->` (L2), y el índice debe construirse con la clase de operador correspondiente (lección 7).
+
+## Elegir un modelo
+
+No existe un único mejor modelo de embeddings. Elige con esta checklist y luego confírmalo con tu propio golden set:
+
+- **Calidad de retrieval en tu dominio.** Los leaderboards públicos como MTEB son un filtro inicial, no una decisión. Un modelo que encabeza un benchmark general puede ser mediocre con la jerga hipotecaria ("50(a)(6)", "non-QM", "DTI back-end ratio"). Corre el benchmark de chunking del ejercicio anterior con dos o tres modelos candidatos.
+- **Idiomas.** Muchos prestamistas en EE. UU. atienden a prestatarios hispanohablantes. Si las páginas FAQ existen en ambos idiomas, o los oficiales de crédito preguntan en español sobre políticas en inglés, necesitas un modelo multilingüe y un caso de prueba cross-lingual en el golden set.
+- **Longitud máxima de entrada.** Debe superar con holgura tu chunk más grande.
+- **Dimensiones.** Determinan el almacenamiento, la memoria y la velocidad de búsqueda (ver abajo).
+- **Hosting y residencia de datos.** API alojada (OpenAI, Voyage, Cohere, Google, modelos alojados en Bedrock) frente a modelos open-weights autoalojados (por ejemplo con `sentence-transformers`). Los prestamistas regulados suelen exigir que el texto de los documentos permanezca en una cuenta o región de nube específica, lo que puede descartar o habilitar opciones antes de siquiera considerar la calidad.
+- **Costo y throughput.** El costo al indexar es único por versión del corpus; el costo por consulta es por request pero diminuto, porque las consultas son cortas.
+
+Anthropic no ofrece su propio modelo de embeddings; su documentación apunta a proveedores asociados. Una combinación común en producción es Claude para la generación más un proveedor de embeddings separado, con ambos nombres de modelo en la configuración.
+
+## Dimensiones, almacenamiento y embeddings Matryoshka
+
+El almacenamiento por vector es `dimensions × bytes per value`. Con flotantes de 4 bytes:
+
+| Dimensiones | Bytes por vector | 1M de chunks (solo vectores) |
+|---|---|---|
+| 384 | 1.5 KB | ~1.5 GB |
+| 1,024 | 4 KB | ~4 GB |
+| 1,536 | 6 KB | ~6 GB |
+| 3,072 | 12 KB | ~12 GB |
+
+Los índices HNSW agregan más encima y quieren vivir en RAM para tener buena latencia. Para el corpus de nuestro prestamista (miles de documentos, quizás 50k–200k chunks) cualquiera de estos cabe sin problema. Con decenas de millones de chunks, las dimensiones se vuelven un costo real de infraestructura.
+
+Muchos modelos recientes se entrenan con **Matryoshka representation learning**: las primeras N dimensiones son por sí mismas un embedding útil. Puedes pedir un vector más corto (el parámetro `dimensions` de OpenAI, `output_dimension` de Voyage, o truncar y renormalizar tú mismo donde el modelo lo soporte) y cambiar un poco de calidad por mucho almacenamiento. Mide el trade-off en tu golden set; no lo asumas.
+
+También puedes reducir cada valor: pgvector soporta `halfvec` (flotantes de 2 bytes, la mitad del almacenamiento, normalmente con pérdida de calidad despreciable) y cuantización binaria para corpus muy grandes, típicamente seguida de un re-scoring de los mejores candidatos con vectores de precisión completa.
+
+## Un embedder independiente del proveedor
+
+Esconde al proveedor detrás de una interfaz pequeña para poder comparar modelos y cambiarlos sin tocar el pipeline. Esto replica la abstracción de proveedores que construiste en el Módulo 1.
+
+```python
+import asyncio
+import os
+from typing import Literal, Protocol
+
+import numpy as np
+
+InputType = Literal["query", "document"]
+
+
+class Embedder(Protocol):
+    model: str
+    dimensions: int
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray: ...
+
+
+class OpenAIEmbedder:
+    def __init__(self, model: str | None = None, dimensions: int | None = None) -> None:
+        from openai import AsyncOpenAI
+        self.client = AsyncOpenAI()
+        self.model = model or os.environ["EMBEDDING_MODEL"]
+        self.dimensions = dimensions or int(os.getenv("EMBEDDING_DIM", "1536"))
+
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray:
+        # OpenAI models are symmetric; input_type is accepted for interface parity
+        resp = await self.client.embeddings.create(
+            model=self.model, input=texts, dimensions=self.dimensions)
+        return normalize(np.array([d.embedding for d in resp.data], dtype=np.float32))
+
+
+class VoyageEmbedder:
+    def __init__(self, model: str | None = None, dimensions: int | None = None) -> None:
+        import voyageai
+        self.client = voyageai.AsyncClient()
+        self.model = model or os.environ["EMBEDDING_MODEL"]
+        self.dimensions = dimensions or int(os.getenv("EMBEDDING_DIM", "1024"))
+
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray:
+        resp = await self.client.embed(texts, model=self.model, input_type=input_type,
+                                       output_dimension=self.dimensions)
+        return normalize(np.array(resp.embeddings, dtype=np.float32))
+
+
+def normalize(v: np.ndarray) -> np.ndarray:
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+async def embed_corpus(embedder: Embedder, texts: list[str],
+                       batch_size: int = 128, concurrency: int = 4) -> np.ndarray:
+    sem = asyncio.Semaphore(concurrency)
+    async def one(batch: list[str]) -> np.ndarray:
+        async with sem:
+            return await embedder.embed(batch, "document")
+    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+    return np.vstack(await asyncio.gather(*(one(b) for b in batches)))
+```
+
+Agrega el wrapper de reintentos con backoff del Módulo 1 alrededor de `embed`: la indexación masiva es justo donde chocas con los rate limits. Revisa el tamaño máximo de batch y de tokens por request de cada proveedor; los valores de arriba son marcadores de posición.
+
+## Estimar el costo
+
+El costo al indexar es fácil de estimar antes de gastar nada. Lee el precio de la página de precios actual de tu proveedor y ponlo en la configuración; nunca lo codifiques a mano.
+
+```python
+import tiktoken
+
+def estimate_index_cost(chunks: list[str], usd_per_million_tokens: float) -> dict:
+    enc = tiktoken.get_encoding("cl100k_base")   # approximation; providers tokenize differently
+    tokens = sum(len(enc.encode(c)) for c in chunks)
+    return {"chunks": len(chunks), "tokens": tokens,
+            "usd": round(tokens / 1_000_000 * usd_per_million_tokens, 4)}
+```
+
+Para un corpus de 5,000 páginas a unos 500 tokens por página, son aproximadamente 2.5 millones de tokens por pasada completa de embeddings, más el overlap. Con modelos de embeddings pequeños esto suele ser una partida pequeña comparada con la generación del LLM. El error caro es volver a generar los embeddings de todo el corpus en cada deploy o cada noche. Los hashes de contenido de la lección 2 lo evitan.
+
+## Versionado y migración
+
+Guarda el modelo de embeddings y las dimensiones con cada vector (una columna, o una tabla o colección separada por modelo). Cuando cambies de modelo:
+
+1. Crea una tabla o colección nueva para el modelo nuevo.
+2. Rellénala en segundo plano a partir de tus documentos normalizados.
+3. Corre el benchmark del golden set contra ambas.
+4. Cambia las lecturas con un flag de configuración; conserva el índice viejo para hacer rollback hasta que el nuevo esté probado.
+
+Es un deploy blue-green para tu índice. Los equipos que guardan vectores sin el nombre del modelo terminan con índices de modelos mezclados y resultados misteriosamente malos.
+
+## Errores comunes
+
+- **Mezclar modelos o dimensiones** en un mismo índice, a menudo tras un cambio de configuración "inofensivo".
+- **Ignorar `input_type`** en modelos asimétricos, generando el embedding de las consultas como si fueran documentos.
+- **Elegir solo por leaderboard** en lugar de por tu propio benchmark de retrieval.
+- **Chunks más largos que el límite de entrada del modelo**, truncados en silencio.
+- **Usar umbrales sobre la similitud cruda** ("solo usar chunks por encima de 0.75") sin calibración por modelo. Prefiere top-k más un re-ranker (lección 11).
+- **Generar embeddings de documentos en tiempo de request.** Indexa offline; solo las consultas se procesan online.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo elegirías un modelo de embeddings para un asistente de conocimiento hipotecario?" level="mid">
+
+Preselecciono dos o tres modelos usando benchmarks públicos más restricciones: idiomas (inglés y español), longitud máxima de entrada frente a mis tamaños de chunk, requisitos de residencia de datos y costo. Luego decido con mi propio benchmark de retrieval: un golden set de preguntas reales de oficiales de crédito etiquetadas con la sección correcta, midiendo recall@k y MRR para cada modelo con las dimensiones que realmente desplegaría. También incluiría preguntas de términos exactos y cross-lingual. Gane el que gane, guardo el nombre del modelo y la dimensión junto a los vectores para que un cambio futuro sea una reindexación controlada y no una mezcla silenciosa.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu índice creció a 50 millones de chunks y los costos de memoria son altos. ¿Qué opciones tienes?" level="senior">
+
+Reducir los bytes por vector antes de agregar hardware. Opciones: pedir menos dimensiones a un modelo entrenado con Matryoshka; guardar `halfvec` en lugar de flotantes de 32 bits; usar cuantización binaria o de producto para la primera pasada y hacer re-scoring de los primeros cientos de candidatos con vectores de precisión completa. También reducir la cantidad de vectores: sacar del índice caliente las versiones reemplazadas de documentos, recortar el overlap entre chunks y deduplicar chunks casi idénticos. Particionar por tenant o tipo de documento para que cada consulta busque en un índice más chico. Cada cambio se valida en el golden set por pérdida de recall y en una prueba de carga por latencia p95.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- [OpenAI — Guía de embeddings](https://platform.openai.com/docs/guides/embeddings)
+- [Anthropic — Embeddings](https://docs.anthropic.com/en/docs/build-with-claude/embeddings)
+- [Leaderboard MTEB (Hugging Face)](https://huggingface.co/spaces/mteb/leaderboard)
+- [Kusupati et al., Matryoshka Representation Learning (arXiv:2205.13147)](https://arxiv.org/abs/2205.13147)
+- [pgvector — halfvec y cuantización](https://github.com/pgvector/pgvector)

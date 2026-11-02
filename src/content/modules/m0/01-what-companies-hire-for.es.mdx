@@ -1,0 +1,174 @@
+# Para qué contratan las empresas a un AI Engineer
+
+No estás aprendiendo "IA" en general. Estás aprendiendo el conjunto concreto de habilidades que las empresas ponen en sus ofertas de empleo y evalúan en las entrevistas. Este curso se diseñó al revés, partiendo de esa lista.
+
+El currículo se basa en un análisis de aproximadamente 900 ofertas de AI Engineer recopiladas en enero de 2026. El objetivo de esta lección es darte un mapa: qué habilidades aparecen casi en todas partes, cuáles distinguen a los candidatos fuertes y cuáles son un plus. Cada módulo posterior corresponde a una parte de este mapa.
+
+<Callout type="info" title="Sobre los números">
+
+Esta lección describe la demanda en **niveles**, no en porcentajes exactos. Los conteos de ofertas cambian cada mes y distintos análisis dan números distintos. Lo que se mantiene estable es el ranking: qué habilidades son casi universales y cuáles son de nicho. Usa los niveles para planificar, no para citarlos en una entrevista.
+
+</Callout>
+
+## El mapa de demanda
+
+Piensa en las habilidades en tres niveles.
+
+### Nivel 1 — Casi universales (aparecen en la mayoría de las ofertas)
+
+- **RAG (retrieval-augmented generation, generación aumentada con recuperación).** La habilidad individual más pedida. Las empresas tienen documentos, tickets, políticas y código. Quieren un LLM que responda a partir de *sus* datos, con citas. Por eso el Módulo 2 es el más largo del curso.
+- **Prompt engineering.** No son "palabras mágicas". En las ofertas significa: diseñar system prompts como contratos, salidas estructuradas, ejemplos few-shot, versionado y pruebas de prompts. Módulo 1.
+- **Integración de LLM.** Llamar a las APIs de los proveedores (Anthropic, OpenAI, Bedrock, Azure OpenAI) desde servicios reales: streaming, reintentos, rate limits, tool calling, control de costos. Módulos 1 y 5.
+- **Python.** El lenguaje por defecto del rol. Muchas ofertas también aceptan TypeScript en equipos de producto, pero Python es la apuesta segura.
+
+### Nivel 2 — Muy comunes (separan "sabe hacer una demo" de "sabe llevarlo a producción")
+
+- **Agentes y uso de herramientas.** LangGraph, function calling, servidores MCP, human-in-the-loop. Crece rápido. Módulo 4.
+- **Evaluación.** Golden datasets, LLM-as-judge, pruebas de regresión de prompts, tracing. Las ofertas suelen decir "experiencia midiendo y mejorando la calidad de las salidas de un LLM". Aquí tu experiencia como SDET es una ventaja real. Módulo 3.
+- **APIs y servicios.** FastAPI (lo más común), Python asíncrono, respuestas en streaming. Módulo 5.
+- **Docker y CI/CD.** Servicios en contenedores, pipelines de GitHub Actions, pruebas automáticas antes del deploy. Ya los conoces; el curso muestra cómo se aplican a apps con LLM.
+- **Nube, sobre todo AWS.** Lambda o ECS, S3, Bedrock, conceptos básicos de IAM. Aparecen GCP y Azure, pero AWS lidera. Módulo 5.
+- **Bases de datos vectoriales.** pgvector, Pinecone, Qdrant, Weaviate, Chroma. A las ofertas rara vez les importa cuál; les importa que entiendas indexación, filtrado y búsqueda híbrida. Módulo 2.
+
+### Nivel 3 — Secundarias (un plus, o específicas del rol)
+
+- **Fine-tuning** (LoRA, QLoRA, instruction tuning). Aparece, pero mucho menos que RAG. La mayoría de los equipos hace fine-tuning solo cuando el prompting y el retrieval llegan a un techo. El Módulo 6 cubre cuándo *no* hacerlo.
+- **Plataformas de datos** (Databricks, Snowflake, Spark). Comunes en empresas grandes y con muchos datos. Módulo 6.
+- **Modelos self-hosted** (vLLM, TGI, Ollama). Relevantes para equipos sensibles a la privacidad o al costo.
+- **ML clásico** (scikit-learn, ciclos de entrenamiento en PyTorch). Aparece en roles híbridos. Rara vez es el núcleo de un puesto de AI Engineer.
+
+<Diagram caption="Niveles de demanda mapeados a los módulos del curso" chart={`flowchart TB
+  subgraph T1["Nivel 1: casi universales"]
+    RAG["RAG (M2)"]
+    PE["Prompt engineering (M1)"]
+    INT["Integración de LLM (M1, M5)"]
+    PY[Python]
+  end
+  subgraph T2["Nivel 2: muy comunes"]
+    AG["Agentes y herramientas (M4)"]
+    EV["Evals y tracing (M3)"]
+    API["FastAPI, Docker, CI/CD, AWS (M5)"]
+    VDB["Bases vectoriales (M2)"]
+  end
+  subgraph T3["Nivel 3: secundarias"]
+    FT["Fine-tuning (M6)"]
+    DP["Databricks y datos (M6)"]
+  end
+  T1 --> T2 --> T3`} />
+
+## Qué significan los niveles para ti
+
+Los niveles te dicen dónde invertir tu tiempo.
+
+1. **Profundiza en el Nivel 1.** El entrevistador va a asumir que sabes construir un pipeline de RAG e integrar una API de LLM de forma limpia. Si fallas aquí, lo demás no importa.
+2. **Sé fuerte en al menos dos habilidades del Nivel 2.** Evals es la obvia para ti. Combínala con agentes o con serving en producción. Esa combinación es más escasa de lo que crees.
+3. **Conoce el Nivel 3 lo suficiente para discutir trade-offs.** Debes poder decir "aquí no deberíamos hacer fine-tuning, porque..." y explicar LoRA en dos frases. No necesitas haber entrenado un modelo de 7B.
+
+Una trampa común es el orden inverso. Hay quien pasa semanas en tutoriales de fine-tuning porque se siente como "IA de verdad" y luego no sabe explicar estrategias de chunking ni cómo probaría una respuesta de RAG. Las ofertas premian las habilidades aburridas y orientadas a producción.
+
+## El requisito oculto: pensar en producción
+
+Si lees suficientes ofertas aparece un segundo patrón. Además de herramientas concretas, las empresas piden rasgos como:
+
+- "Ha llevado funcionalidades con LLM a producción."
+- "Se siente cómodo con la ambigüedad y con sistemas no deterministas."
+- "Experiencia con monitoreo, observabilidad y gestión de costos."
+- "Fundamentos sólidos de ingeniería de software."
+
+Son señales de que el equipo ya sufrió prototipos que nunca salieron a producción. Quieren ingenieros que piensen en latencia, costo por request, modos de falla y regresiones. Así piensa exactamente un SDET senior. Ya te preguntas "¿cómo se va a romper esto?" y "¿cómo sabemos que sigue funcionando después del próximo cambio?". Sigue preguntándolo.
+
+## Construye tu propio rastreador de keywords
+
+Vas a leer muchas ofertas durante este curso. Regístralas. El script de abajo cuenta con qué frecuencia aparece cada habilidad en las ofertas que guardaste como archivos de texto. Es un simple conteo de palabras clave, no NLP, y está bien: el objetivo es ver *tu* mercado objetivo, no publicar una investigación.
+
+```python
+from __future__ import annotations
+
+import re
+from collections import Counter
+from pathlib import Path
+
+# Each skill maps to the regex patterns that count as a mention.
+SKILLS: dict[str, list[str]] = {
+    "rag": [r"\brag\b", r"retrieval[- ]augmented"],
+    "prompt_engineering": [r"prompt engineering", r"\bprompting\b"],
+    "llm_integration": [r"openai api", r"anthropic", r"\bbedrock\b", r"llm api"],
+    "agents": [r"\bagents?\b", r"langgraph", r"tool calling", r"\bmcp\b"],
+    "evals": [r"\bevals?\b", r"evaluation", r"llm-as-a?-?judge"],
+    "fastapi": [r"fastapi"],
+    "docker_cicd": [r"docker", r"ci/cd", r"github actions"],
+    "aws": [r"\baws\b", r"lambda", r"\becs\b"],
+    "vector_db": [r"pgvector", r"pinecone", r"qdrant", r"weaviate", r"vector (db|database|store)"],
+    "fine_tuning": [r"fine[- ]tun", r"\blora\b"],
+}
+
+
+def skills_in(text: str) -> set[str]:
+    lowered = text.lower()
+    return {
+        skill
+        for skill, patterns in SKILLS.items()
+        if any(re.search(p, lowered) for p in patterns)
+    }
+
+
+def rank(postings_dir: Path) -> list[tuple[str, int, float]]:
+    files = sorted(postings_dir.glob("*.txt"))
+    if not files:
+        raise SystemExit(f"No .txt postings in {postings_dir}")
+    counts: Counter[str] = Counter()
+    for f in files:
+        counts.update(skills_in(f.read_text(encoding="utf-8")))
+    total = len(files)
+    return [(s, n, n / total) for s, n in counts.most_common()]
+
+
+if __name__ == "__main__":
+    for skill, n, share in rank(Path("postings")):
+        print(f"{skill:20} {n:4}  {share:6.1%}")
+```
+
+Guarda entre 20 y 30 ofertas de puestos a los que realmente aplicarías. Ejecuta el script cada pocas semanas. Si tu mercado local se inclina fuerte hacia Azure o Databricks, lo vas a ver, y podrás ajustar tu enfoque dentro de los Módulos 5 y 6.
+
+<Callout type="tip" title="Cuenta presencia, no frecuencia">
+
+El script cuenta una habilidad una sola vez por oferta, aunque la palabra aparezca diez veces. Una oferta que dice "RAG" seis veces no tiene seis veces más probabilidad de contratarte por RAG. La presencia por oferta es la señal útil.
+
+</Callout>
+
+## Errores comunes
+
+- **Perseguir el framework más nuevo.** Las ofertas mencionan LangChain, LlamaIndex, LangGraph, CrewAI y más. Las habilidades de fondo (retrieval, diseño de herramientas, evals) se transfieren. Aprende bien un framework y aprende a construir el núcleo sin él. El Módulo 2 hace ambas cosas.
+- **Tratar el fine-tuning como la habilidad principal.** Es Nivel 3. Los equipos lo quieren de vez en cuando. Quieren RAG y evals todo el tiempo.
+- **Ignorar la infraestructura "aburrida".** Docker, CI, nube y FastAPI aparecen en una gran parte de las ofertas. Ya los dominas. Asegúrate de que tu portafolio los *muestre*.
+- **Citar estadísticas del mercado en entrevistas.** Decir "RAG aparece en la mayoría de las ofertas" está bien. Decir "el 73,4 % de las ofertas exige RAG" invita a una pregunta que no puedes defender.
+- **Aprender solo con tutoriales.** Los tutoriales muestran el camino feliz. Las ofertas piden producción. Por eso cada módulo aquí termina con un proyecto que tiene evals, números de costo y un README.
+
+## Cómo aparece esto en las entrevistas
+
+Los entrevistadores rara vez preguntan "¿qué habilidades tienen demanda?". Sí hacen preguntas que comprueban si entiendes *por qué* existe el rol y dónde está el valor.
+
+<InterviewQuestion question="¿Cuál crees que es la habilidad más importante de un AI engineer hoy, y por qué?" level="mid">
+
+Diría que construir sistemas de RAG confiables, con evaluación integrada desde el primer día. Hoy, la mayor parte del valor que las empresas obtienen de los LLM viene de conectar un modelo con sus propios datos: documentos, tickets, políticas. Eso es RAG. Pero una demo de RAG es fácil y un producto de RAG es difícil. Lo difícil es saber si las respuestas son correctas, detectar regresiones cuando cambias un prompt o una estrategia de chunking, y mantener la latencia y el costo bajo control. Por eso me enfoco en calidad de retrieval más evals. Mi experiencia en QA ayuda directamente: trato un golden dataset como una suite de regresión y lo pongo en CI.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuándo elegirías fine-tuning en lugar de RAG?" level="senior">
+
+Rara vez como primer paso. RAG es la opción por defecto cuando el problema es de conocimiento: el modelo necesita hechos con los que no fue entrenado y esos hechos cambian. El fine-tuning ayuda cuando el problema es de comportamiento o formato: un estilo consistente, una tarea de clasificación acotada o una estructura de salida específica del dominio que el prompting no logra sostener de forma confiable. También puede reducir costo y latencia al permitir que un modelo más pequeño haga una tarea que de otro modo necesita uno grande. Antes de hacer fine-tuning agotaría el diseño de prompts, las salidas estructuradas, los ejemplos few-shot y el retrieval, y tendría un set de evals que demuestre el techo. Hacer fine-tuning sin un set de evals es adivinar. Y suma un pipeline de entrenamiento, curaduría de datos y versionado de modelos que hay que mantener.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Usa el mapa en tus respuestas">
+
+Cuando describas tu experiencia, conéctala con el vocabulario de los Niveles 1 y 2. "Construí un framework de pruebas" se convierte en "construí un harness de evaluación que bloquea releases en CI". Misma habilidad, el vocabulario que usa la oferta.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- [Anthropic — Building effective agents](https://www.anthropic.com/research/building-effective-agents)
+- [Documentación de Anthropic — Prompt engineering overview](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview)
+- [Documentación de OpenAI — Retrieval and file search](https://platform.openai.com/docs/guides/retrieval)
+- [Lewis et al. (2020) — Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://arxiv.org/abs/2005.11401)

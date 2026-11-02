@@ -1,0 +1,179 @@
+## Qué es realmente un agente
+
+Si quitas el hype, un agente es un bucle. El modelo mira la conversación, decide si llama una herramienta (tool), tu código ejecuta la herramienta, el resultado vuelve a la conversación y el modelo decide de nuevo. Se detiene cuando el modelo responde en lugar de llamar una herramienta, o cuando tu código dice "suficiente".
+
+Ese bucle tiene nombre en la literatura: **ReAct** (Reason + Act, razonar y actuar). El paper de 2022 mostró que intercalar razonamiento ("primero necesito el estado del pedido") con acciones (llamar `get_order`) y observaciones (el resultado de la herramienta) supera tanto al razonamiento puro como a la acción pura en tareas de varios pasos. Las APIs modernas de tool calling ya traen este patrón incorporado. Ya no parseas líneas `Action:` de texto libre. El modelo devuelve bloques `tool_use` estructurados y tú devuelves bloques `tool_result` estructurados.
+
+El bucle tiene cuatro partes:
+
+1. **Contexto**: system prompt, definiciones de herramientas, historial de mensajes.
+2. **Decisión**: una llamada al modelo. La salida es texto (terminó) o una o más tool calls.
+3. **Ejecución**: tu código valida los argumentos, ejecuta la herramienta y captura el resultado o el error.
+4. **Observación**: el resultado se agrega al historial como `tool_result`, y el bucle se repite.
+
+Como SDET, piénsalo como un test runner donde el modelo escribe el siguiente paso del test en tiempo de ejecución. Todo lo que sabes de pasos flaky, timeouts y aislamiento aplica. La diferencia es que el "script" no es determinista, así que las guardas y los logs no son opcionales.
+
+## Workflows vs agentes
+
+"Building effective agents" de Anthropic traza una línea que deberías usar en cada revisión de diseño:
+
+- Un **workflow** es un sistema donde las llamadas al LLM y las herramientas se orquestan mediante **rutas de código predefinidas**. Tú decides los pasos. El modelo llena los huecos: clasificar, extraer, resumir, enrutar.
+- Un **agente** es un sistema donde el **modelo decide** los pasos y la cantidad de pasos, usando herramientas en un bucle, según lo que observa.
+
+Patrones comunes de workflow: prompt chaining (la salida del paso A alimenta el paso B), routing (clasificar y luego enviar a un prompt especializado), paralelización (ejecutar N chequeos a la vez y votar o combinar), orchestrator-workers y evaluator-optimizer. La mayoría de las "funcionalidades de IA" en producción son workflows. Son más baratos, más rápidos, más fáciles de probar y más fáciles de explicar a un auditor.
+
+| | Workflow | Agente |
+|---|---|---|
+| Quién elige el siguiente paso | Tu código | El modelo |
+| Número de llamadas al LLM | Fijo o acotado | Variable, abierto |
+| Latencia y costo | Predecibles | Variables, pueden dispararse |
+| Testing | Tests unitarios y de integración clásicos por paso | Evals de trayectoria, tasas de éxito estadísticas |
+| Mejor para | Procesos conocidos, alto volumen | Tareas abiertas, muchas combinaciones de herramientas |
+
+### Cuándo NO construir un agente
+
+No construyas un agente cuando:
+
+- **Los pasos son conocidos.** "Leer el correo, extraer el id del pedido, buscar el pedido, redactar respuesta" es un pipeline. Escríbelo como cuatro funciones. Un agente agrega modos de falla y no aporta nada.
+- **Una sola llamada con buen retrieval lo resuelve.** Muchas solicitudes de "agente" en realidad son RAG más una salida estructurada.
+- **El presupuesto de latencia es estrecho.** Cada iteración del bucle es un viaje completo al modelo. Cinco iteraciones de 1.5 s cada una son 7.5 s antes de empezar a hacer streaming de la respuesta.
+- **Los errores son caros e irreversibles**, y no puedes poner una compuerta humana delante de la acción riesgosa.
+- **No puedes evaluarlo.** Si no tienes forma de decir si una trayectoria fue correcta, no puedes publicar cambios con seguridad.
+
+Construye un agente cuando la ruta realmente depende de resultados intermedios: "la entrega de este cliente falló, averigua por qué y arréglalo" puede requerir buscar el pedido, revisar el estado con la transportadora, comparar tarifas y reprogramar, o solo crear un ticket. Las combinaciones explotan, y codificar a mano el árbol de decisión se vuelve el riesgo mayor.
+
+Un buen punto de partida: empieza con un workflow, mide dónde se rompe y promueve solo ese paso a un sub-bucle agéntico con un conjunto pequeño de herramientas.
+
+## El bucle en Python puro
+
+Antes de usar LangGraph, escribe el bucle una vez a mano con el SDK de Anthropic. Elimina la magia y depurarás frameworks más rápido.
+
+```python
+import json
+import anthropic
+
+client = anthropic.AsyncAnthropic()
+
+TOOLS = [
+    {
+        "name": "get_order",
+        "description": "Look up one order by id. Returns status, carrier, promised_date and items.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"order_id": {"type": "string", "pattern": "^ORD-[0-9]{6}$"}},
+            "required": ["order_id"],
+        },
+    },
+]
+
+async def get_order(order_id: str) -> dict:
+    # Fake backend for the example
+    if order_id != "ORD-104233":
+        return {"error": {"code": "ORDER_NOT_FOUND", "message": f"{order_id} does not exist",
+                          "retryable": False, "hint": "Ask the customer to confirm the id."}}
+    return {"order_id": order_id, "status": "delayed", "carrier": "FastFreight",
+            "promised_date": "2026-11-04"}
+
+REGISTRY = {"get_order": get_order}
+
+async def run_agent(user_msg: str, max_steps: int = 6) -> str:
+    messages = [{"role": "user", "content": user_msg}]
+    for step in range(max_steps):
+        resp = await client.messages.create(
+            model="claude-sonnet-5-5",
+            max_tokens=1024,
+            system="You are a logistics support agent. Use tools; never guess order data.",
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            return "".join(b.text for b in resp.content if b.type == "text")
+
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            fn = REGISTRY.get(block.name)
+            output = await fn(**block.input) if fn else {"error": {"code": "UNKNOWN_TOOL"}}
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(output),
+                "is_error": "error" in output,
+            })
+        messages.append({"role": "user", "content": results})
+    return "Stopped: step limit reached. Escalating to a human."
+```
+
+Cosas para notar:
+
+- El turno del assistant se agrega **con sus bloques tool_use**. Si los eliminas, la siguiente llamada falla porque el `tool_result` hace referencia a un id que la API nunca vio.
+- Todos los resultados de herramientas de un turno del assistant vuelven en **un solo** mensaje de usuario. El modelo puede pedir tool calls en paralelo.
+- `is_error=True` le dice al modelo que la llamada falló, para que pueda recuperarse (pedir un id nuevo, probar otra herramienta) en lugar de tratar el texto del error como datos.
+- `max_steps` es la guarda de bucle más simple. La lección 11 agrega más.
+
+El mismo bucle en TypeScript, para comparar:
+
+<CodeTabs>
+```python
+# Python: the decision point
+if resp.stop_reason != "tool_use":
+    return final_text(resp)
+```
+```typescript
+// TypeScript: the decision point with @anthropic-ai/sdk
+if (resp.stop_reason !== "tool_use") {
+  return resp.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+}
+```
+</CodeTabs>
+
+## Leer una trayectoria
+
+Una **trayectoria** (trajectory) es la lista ordenada de pasos que tomó el agente: llamada al modelo, tool call con argumentos, resultado de la herramienta, llamada al modelo, y así. Regístrala en cada ejecución. Una trayectoria sana para "¿Dónde está ORD-104233?" se ve así:
+
+```text
+1. model -> tool_use get_order {"order_id": "ORD-104233"}
+2. tool  -> {"status": "delayed", "carrier": "FastFreight", ...}
+3. model -> text "Your order is delayed with FastFreight; promised date Nov 4."
+```
+
+Una no sana llama `get_order` tres veces con el mismo argumento, o inventa un id. Las trayectorias son lo que evalúas en la lección 13, igual que inspeccionarías un trace de Playwright para ver qué paso falló.
+
+## Errores comunes
+
+- **Construir un agente para un pipeline.** Si puedes dibujar el diagrama de flujo antes del runtime, escribe el diagrama de flujo en código.
+- **Sin límite de pasos.** Un modelo que recibe un error ambiguo una y otra vez puede quedarse en bucle hasta agotar tu presupuesto de tokens.
+- **Devolver errores como strings planos sin `is_error`.** El modelo puede citarle "Internal Server Error" al cliente como si fuera la respuesta.
+- **Eliminar del historial el turno tool_use del assistant.** Rompe el protocolo y confunde al modelo.
+- **Darle 30 herramientas al agente el primer día.** La precisión al seleccionar herramientas cae a medida que crece la lista. Empieza con 3 a 7 herramientas bien descritas.
+- **No registrar la trayectoria.** Sin ella no puedes depurar, evaluar ni explicarle una acción a un stakeholder.
+- **Dejar que el modelo ejecute acciones irreversibles directamente.** Reembolsos y cancelaciones necesitan compuertas de aprobación (lección 07).
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cuál es la diferencia entre un workflow y un agente, y cómo decides cuál construir?" level="mid">
+
+Un workflow ejecuta llamadas al LLM y herramientas por rutas de código que defino de antemano. Un agente deja que el modelo elija el siguiente paso y la cantidad de pasos en un bucle. Por defecto elijo un workflow porque es más barato, tiene latencia predecible y es más fácil de probar paso a paso. Paso a un agente solo cuando la ruta depende de resultados intermedios y las combinaciones son demasiadas para codificarlas a mano. Aun así, mantengo un conjunto pequeño de herramientas, agrego un límite de pasos y de costo, pongo las acciones irreversibles detrás de aprobación humana y evalúo trayectorias, no solo respuestas finales.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explícame qué pasa en una iteración de un bucle de agente con tool calling." level="mid">
+
+El modelo recibe el system prompt, los schemas de herramientas y el historial. Devuelve texto o bloques tool_use con ids y argumentos JSON. Mi código valida los argumentos, ejecuta cada herramienta con un timeout y envuelve la salida o un error estructurado en bloques tool_result con el tool_use_id correspondiente y un flag is_error. Agrego el turno del assistant y los resultados al historial, incremento los contadores de pasos y costo, reviso las guardas y llamo al modelo otra vez. El bucle termina con una respuesta final en texto o cuando se dispara una guarda, en cuyo caso escalo.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Señal de seniority">
+
+A los entrevistadores les encantan los candidatos que argumentan *en contra* de un agente. Di "empezaría con un workflow de routing y solo haría agéntico el paso de investigación" y explica por qué: previsibilidad de costo, testabilidad y radio de impacto.
+
+</Callout>
+
+## Lecturas adicionales
+
+- Anthropic — Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- ReAct: Synergizing Reasoning and Acting in Language Models: https://arxiv.org/abs/2210.03629
+- Documentación de tool use de Anthropic: https://docs.anthropic.com/en/docs/build-with-claude/tool-use
+- LangGraph — workflows y agentes: https://langchain-ai.github.io/langgraph/tutorials/workflows/

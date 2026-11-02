@@ -1,0 +1,210 @@
+# Pipelines de datos para ingesta y datasets de evaluación
+
+La calidad de un RAG es, sobre todo, calidad de datos. Un retriever no puede encontrar una política que nunca se ingirió, que se ingirió dos veces o que se ingirió con el número de seguro social de un cliente adentro. La calidad de los evals también es calidad de datos: un golden set con duplicados o PII filtrada es un riesgo, no un activo.
+
+Como SDET ya piensas en **gestión de datos de prueba**: fixtures, seeding, limpieza, reproducibilidad. Los pipelines de datos para IA son la misma disciplina a escala de producción. Esta lección cubre cinco propiedades que todo pipeline de ingesta y de datasets de evaluación necesita:
+
+1. **Incremental** — procesa solo lo que cambió.
+2. **Idempotente** — volver a ejecutarlo produce el mismo resultado.
+3. **Deduplicado** — el mismo contenido se guarda una sola vez.
+4. **Seguro con la PII** — los datos sensibles se eliminan antes de que se propaguen.
+5. **Trazable** — cada chunk y cada fila de evaluación sabe de dónde viene.
+
+## 1. Cargas incrementales
+
+Re-generar embeddings de 200,000 documentos cada noche es lento y caro. Procesa solo las fuentes nuevas o modificadas.
+
+La herramienta clásica es una **marca de agua alta** (watermark): guardas el `updated_at` máximo que procesaste y en la siguiente corrida lees solo las filas por encima.
+
+```python
+from datetime import datetime, timezone
+import psycopg
+
+def load_watermark(conn: psycopg.Connection, pipeline: str) -> datetime:
+    row = conn.execute(
+        "SELECT last_ts FROM pipeline_state WHERE pipeline = %s", (pipeline,)
+    ).fetchone()
+    return row[0] if row else datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+def save_watermark(conn: psycopg.Connection, pipeline: str, ts: datetime) -> None:
+    conn.execute(
+        """INSERT INTO pipeline_state (pipeline, last_ts) VALUES (%s, %s)
+           ON CONFLICT (pipeline) DO UPDATE SET last_ts = EXCLUDED.last_ts""",
+        (pipeline, ts),
+    )
+```
+
+Dos sutilezas:
+
+- **Guarda el watermark después de que la carga haga commit**, en la misma transacción si es posible. Si no, una caída entre la carga y el guardado pierde datos o los reprocesa.
+- **Datos que llegan tarde.** Si el sistema de origen escribe filas con un `updated_at` antiguo, un watermark estricto no las ve. Vuelve a leer una pequeña ventana de traslape (por ejemplo, la última hora) y deja que la idempotencia absorba los duplicados.
+
+Para archivos, el watermark es "archivos que ya vi". En Databricks, **Auto Loader** (`cloudFiles`) lleva ese registro por ti con un checkpoint, así los PDFs nuevos que caen en un Volume de Unity Catalog se procesan exactamente una vez. Lo usarás en la lección 3 y en el capstone.
+
+## 2. Idempotencia
+
+Un pipeline idempotente se puede volver a ejecutar después de una falla sin crear duplicados. Es la propiedad que te deja dormir tranquilo. Dos ingredientes:
+
+- **Ids deterministas.** Un id de chunk derivado del contenido y la posición, no un UUID aleatorio.
+- **Upserts en lugar de inserts.** `MERGE` o `INSERT ... ON CONFLICT`.
+
+```python
+import hashlib
+from pydantic import BaseModel, computed_field
+
+class Chunk(BaseModel):
+    source_uri: str
+    source_version: str      # e.g. file etag or modified timestamp
+    position: int
+    text: str
+
+    @computed_field
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(self.text.encode()).hexdigest()
+
+    @computed_field
+    @property
+    def chunk_id(self) -> str:
+        key = f"{self.source_uri}|{self.position}|{self.content_hash}"
+        return hashlib.sha256(key.encode()).hexdigest()[:32]
+```
+
+Luego haz upsert. En Postgres:
+
+```sql
+INSERT INTO chunks (chunk_id, source_uri, source_version, position, text, content_hash, run_id)
+VALUES (%(chunk_id)s, %(source_uri)s, %(source_version)s, %(position)s, %(text)s, %(content_hash)s, %(run_id)s)
+ON CONFLICT (chunk_id) DO NOTHING;
+```
+
+En Delta Lake (Databricks) la misma idea es `MERGE INTO`:
+
+```sql
+MERGE INTO main.claims.chunks AS t
+USING staged_chunks AS s
+ON t.chunk_id = s.chunk_id
+WHEN NOT MATCHED THEN INSERT *
+WHEN MATCHED AND t.content_hash <> s.content_hash THEN UPDATE SET *;
+```
+
+Cuando un documento cambia, sus chunks viejos también deben irse. Borra los chunks del `source_uri` cuyo `source_version` no sea el actual, en la misma transacción que el insert. Olvidar esto es la causa número uno de "el bot cita la política del año pasado".
+
+## 3. Deduplicación
+
+Los duplicados desperdician costo de embeddings, sesgan el retrieval (el mismo párrafo llena los 5 primeros lugares) e inflan los puntajes de evaluación.
+
+- **Duplicados exactos:** hash del texto normalizado (minúsculas, espacios colapsados, sin texto repetitivo). Conserva uno y registra los demás como alias si necesitas la procedencia.
+- **Casi duplicados:** la misma plantilla con nombres distintos, o un documento guardado de nuevo con otro pie de página. Usa MinHash con locality-sensitive hashing (LSH) para encontrar pares sobre un umbral de Jaccard, por ejemplo 0.9. Librerías como `datasketch` lo hacen. La similitud coseno de embeddings también funciona, pero cuesta más.
+- **Fuga hacia el set de evaluación:** asegúrate de que las preguntas de evaluación no estén copiadas literalmente de los documentos usados para escribir ejemplos few-shot. Deduplica entre datasets, no solo dentro de uno.
+
+## 4. Eliminación de PII
+
+Cuando la PII llega a un embedding, un índice vectorial, una línea de log o un archivo de evaluación, ya está en todas partes y es difícil borrarla. Elimínala **lo antes posible**, antes del chunking y los embeddings, y antes de exportar evals.
+
+Capas:
+
+1. **Reglas de patrones** para identificadores estructurados: emails, teléfonos, SSNs, números de póliza, números de tarjeta (con verificación de Luhn).
+2. **Detección con NER** para nombres y direcciones. Microsoft Presidio es una opción open source común.
+3. **Listas de permitidos** para cosas que parecen PII pero no lo son (el email de soporte de tu empresa).
+
+```python
+import re
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+
+POLICY_RE = re.compile(r"\bPOL-\d{8}\b")
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+
+def scrub(text: str) -> str:
+    text = POLICY_RE.sub("<POLICY_NUMBER>", text)
+    results = analyzer.analyze(
+        text=text, language="en",
+        entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD"],
+    )
+    return anonymizer.anonymize(text=text, analyzer_results=results).text
+```
+
+Decisiones que debes tomar de forma explícita:
+
+- **Redactar vs seudonimizar.** Reemplazar "Jane Doe" por `<PERSON>` pierde significado para preguntas como "¿quién presentó el reclamo?". Los seudónimos consistentes (`PERSON_1`) conservan la estructura. Si necesitas revertirlos, guarda el mapeo en una tabla separada y con control de acceso, nunca junto a los datos.
+- **Mide el recall.** Un scrubber es un clasificador. Construye un pequeño set etiquetado de ejemplos de PII y pruébalo, igual que probarías cualquier otro componente. Un SSN no detectado es un bug con severidad.
+
+## 5. Lineage (linaje)
+
+Cuando una respuesta es incorrecta necesitas caminar hacia atrás: respuesta → chunks → versión del documento fuente → corrida del pipeline → versión del código. Agrega columnas de lineage en todas partes:
+
+| Columna | Por qué |
+|---|---|
+| `source_uri`, `source_version` | Qué archivo y qué revisión |
+| `parser`, `parser_version` | Los bugs de parsing son comunes; debes saber quién produjo el texto |
+| `chunker_config` | Tamaño de chunk y traslape usados |
+| `run_id` | Qué corrida del pipeline escribió la fila |
+| `ingested_at` | Cuándo |
+
+En Databricks, **Unity Catalog** captura lineage a nivel de tabla y de columna automáticamente para las consultas y jobs que ejecuta, así puedes ver que `gold.chunks` vino de `silver.parsed_docs`, que vino de un Volume. Tus propias columnas de lineage siguen importando: funcionan a nivel de fila y viajan con los datos hacia el índice vectorial y los traces.
+
+## Los datasets de evaluación también son productos de datos
+
+Trata los golden datasets y los datasets muestreados de producción con el mismo rigor:
+
+- **Versiónalos.** En Delta, cada escritura crea una versión de la tabla; `SELECT * FROM eval.golden VERSION AS OF 12` te da exactamente lo que usó una corrida pasada. Localmente, escribe archivos inmutables como `eval_v3.jsonl` y nunca los edites en el lugar.
+- **Registra la versión en cada corrida de evaluación** (params o tags del run en MLflow). Una métrica sin la versión de su dataset no es comparable.
+- **Separa los splits.** Un **set de regresión** congelado para los gates de CI y un **set móvil** refrescado desde producción cada semana para detectar drift.
+- **Mantén el pipeline como código.** El SQL de la lección 1, más los pasos de scrub y exportación, viven en el repo y corren de forma programada, no en el historial del notebook de alguien.
+
+```python
+from pydantic import BaseModel, Field
+
+class EvalRecord(BaseModel):
+    inputs: dict[str, str]
+    expectations: dict[str, str | list[str] | None] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict)  # route, bucket, source_request_id
+
+class DatasetManifest(BaseModel):
+    name: str
+    version: str
+    created_from: str          # query file + date range
+    row_count: int
+    pii_scrubbed: bool
+    scrubber_version: str
+```
+
+## Errores comunes
+
+- **UUIDs aleatorios como ids de chunk.** Cada nueva corrida duplica el índice. Usa ids deterministas.
+- **Guardar el watermark antes del commit de la carga.** Una caída pierde un lote en silencio.
+- **No borrar chunks obsoletos** cuando un documento cambia.
+- **Eliminar PII después de generar embeddings.** Los vectores y los logs ya la contienen.
+- **Confiar en un scrubber que nunca mediste.**
+- **Editar archivos de evaluación en el lugar.** Los resultados pasados dejan de ser reproducibles.
+- **Sin lineage a nivel de fila.** No puedes rastrear una respuesta incorrecta hasta su fuente.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Tu job nocturno de ingesta se cayó a la mitad. ¿Cómo te aseguras de que volver a ejecutarlo no corrompa el índice vectorial?" level="mid">
+
+Haz el pipeline idempotente. Los ids de chunk son deterministas (hash del URI fuente, la posición y el contenido) y las escrituras son upserts (`MERGE` u `ON CONFLICT`), así que reprocesar el mismo archivo produce las mismas filas. El watermark o checkpoint se guarda solo después del commit del lote. Los chunks obsoletos de un documento modificado se borran en la misma transacción que el nuevo insert. Con eso, la solución a una caída es simplemente "ejecútalo otra vez".
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿En qué punto de un pipeline RAG eliminarías la PII y cómo sabes que funciona?" level="senior">
+
+Lo antes posible: después del parsing y antes del chunking, los embeddings, los logs o la exportación de evals, porque cuando la PII llega a vectores o logs se propaga y es difícil de borrar. Usa detección en capas: regex para ids estructurados, NER (por ejemplo Presidio) para nombres y direcciones, y listas de permitidos. Elige entre redacción o seudónimos consistentes según si las preguntas posteriores necesitan la estructura de entidades; guarda cualquier mapeo reversible en una tabla separada y gobernada. Mide el scrubber como un clasificador sobre un set etiquetado, sigue el recall por tipo de entidad y haz fallar el pipeline si el recall baja.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Conéctalo con QA">
+
+"Los pipelines idempotentes son el equivalente en datos de los tests que limpian lo que ensucian" es una frase que funciona bien con los entrevistadores y muestra que transfieres habilidades en lugar de empezar de cero.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Auto Loader de Databricks: https://docs.databricks.com/en/ingestion/cloud-object-storage/auto-loader/index.html
+- MERGE en Delta Lake: https://docs.databricks.com/en/delta/merge.html
+- Lineage en Unity Catalog: https://docs.databricks.com/en/data-governance/unity-catalog/data-lineage.html
+- Microsoft Presidio: https://microsoft.github.io/presidio/
+- INSERT ON CONFLICT en PostgreSQL: https://www.postgresql.org/docs/current/sql-insert.html

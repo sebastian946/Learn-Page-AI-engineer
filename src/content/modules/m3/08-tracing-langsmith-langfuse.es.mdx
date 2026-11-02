@@ -1,0 +1,187 @@
+## Por qué el tracing es tu nuevo debugger
+
+En una app web clásica, un request fallido deja un stack trace. En una app LLM, un request "fallido" muchas veces devuelve HTTP 200 con una respuesta segura y equivocada. Nada se cae. El bug vive en el medio: la reescritura de la consulta perdió un término clave, el retriever devolvió la política equivocada, el re-ranker empujó el chunk correcto a la posición 6, o la plantilla del prompt perdió una variable.
+
+Ya conoces la versión QA de este problema. Falla un test de Playwright y abres el trace viewer: cada acción, cada llamada de red, cada screenshot, en orden. El tracing de LLMs es la misma idea para pipelines de modelos. Un trace es la ejecución registrada de un request, paso a paso, con entradas, salidas, tiempos, tokens y costo de cada paso.
+
+Sin traces depuras volviendo a ejecutar el request y esperando que el modelo se comporte igual. No lo hará. El muestreo es no determinista, los índices de retrieval cambian y los prompts se editan. El trace es el único registro confiable de lo que realmente pasó.
+
+## El vocabulario: traces, spans, generations
+
+Todas las herramientas usan más o menos el mismo modelo:
+
+| Concepto | Qué es | Ejemplo en el asistente hipotecario |
+|---|---|---|
+| Trace | Un request de punta a punta | "¿Cuál es el DTI máximo para un préstamo FHA?" |
+| Span | Un paso cronometrado dentro del trace | `rewrite_query`, `hybrid_retrieve`, `rerank` |
+| Generation | Un span que es una llamada al LLM, con modelo, tokens y costo | `generate` con `claude-sonnet-5-5` |
+| Session | Un grupo de traces de una conversación | El hilo de chat de un oficial de crédito |
+| User | Quién disparó el trace | `user_id=lo-4821` (seudónimo) |
+| Score | Un número o etiqueta adjunto a un trace o span | `faithfulness=0.82`, `thumbs_up=1` |
+
+Los spans se anidan. El trace es la raíz. `hybrid_retrieve` puede tener spans hijos para `bm25_search` y `vector_search`. Ese árbol es lo que lees cuando depuras.
+
+Las generations llevan los campos que importan para costo y calidad: id del modelo, prompt (o el arreglo de mensajes), completion, `input_tokens`, `output_tokens`, latencia y razón de parada. Si solo vas a trazar una cosa, traza las llamadas al LLM.
+
+## LangSmith en cinco minutos
+
+LangSmith es la plataforma hospedada de observabilidad y evals de LangChain. Si tu app usa LangChain o LangGraph, basta con configurar variables de entorno para obtener traces. Para código Python plano, usa el decorador `@traceable`.
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=lsv2_...
+export LANGSMITH_PROJECT=mortgage-assistant-dev
+```
+
+```python
+from anthropic import AsyncAnthropic
+from langsmith import traceable
+
+client = AsyncAnthropic()
+
+@traceable(run_type="retriever", name="hybrid_retrieve")
+async def hybrid_retrieve(query: str, k: int = 8) -> list[dict]:
+    ...  # BM25 + pgvector, returns [{"page_content": ..., "metadata": ...}]
+
+@traceable(run_type="llm", name="generate")
+async def generate(question: str, contexts: list[dict]) -> str:
+    resp = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=800,
+        system="Answer only from the provided policy excerpts. Cite sources.",
+        messages=[{"role": "user", "content": build_prompt(question, contexts)}],
+    )
+    return resp.content[0].text
+
+@traceable(name="answer")
+async def answer(question: str) -> str:
+    contexts = await hybrid_retrieve(question)
+    return await generate(question, contexts)
+```
+
+Cada función decorada se convierte en un run, y el anidamiento sigue el call stack. LangSmith también tiene datasets y experiments: subes tu golden set, ejecutas tu pipeline contra él y comparas experimentos lado a lado. Eso conecta el tracing con los evals offline de las lecciones anteriores.
+
+## Langfuse en cinco minutos
+
+Langfuse es open source (núcleo MIT) y puedes hacer self-hosting con Docker Compose o usar su nube. Para clientes regulados (hipotecas, salud, legal) el self-hosting suele ser el factor decisivo: los traces contienen preguntas de clientes y fragmentos de documentos, y no deben salir de tu VPC.
+
+El SDK de Python tiene un decorador `@observe`. Las versiones recientes del SDK están construidas sobre OpenTelemetry. Las rutas de import cambiaron entre versiones mayores, así que revisa la documentación actual de Langfuse para los imports exactos. El patrón se ve así:
+
+```python
+from langfuse import get_client, observe
+
+langfuse = get_client()  # reads LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
+
+@observe(name="rerank")
+async def rerank(query: str, docs: list[dict]) -> list[dict]:
+    ...
+
+@observe(name="generate", as_type="generation")
+async def generate(question: str, contexts: list[dict]) -> str:
+    resp = await client.messages.create(model="claude-sonnet-5-5", max_tokens=800,
+                                        messages=[{"role": "user", "content": build_prompt(question, contexts)}])
+    langfuse.update_current_generation(
+        model="claude-sonnet-5-5",
+        usage_details={"input": resp.usage.input_tokens, "output": resp.usage.output_tokens},
+    )
+    return resp.content[0].text
+
+@observe(name="answer")
+async def answer(question: str, user_id: str, session_id: str) -> tuple[str, str]:
+    langfuse.update_current_trace(user_id=user_id, session_id=session_id,
+                                  tags=["prod", "prompt:v7"])
+    docs = await rerank(question, await hybrid_retrieve(question))
+    text = await generate(question, docs)
+    return text, langfuse.get_current_trace_id()
+```
+
+Langfuse también ofrece gestión de prompts: los prompts se versionan en la UI o la API, tu código obtiene `prompt v7` por etiqueta, y cada generation registra qué versión la produjo. Eso te da gratis la respuesta a "¿qué versión del prompt causó esta regresión?".
+
+## Vincular traces con scores y feedback
+
+Un trace es más útil cuando lleva un veredicto. Hay tres fuentes de scores:
+
+1. **Feedback del usuario.** Pulgar arriba/abajo o una corrección desde la UI. Devuelve el trace id al cliente y, cuando llega el feedback, adjúntalo a ese trace.
+2. **Evals online.** Un juez LLM muestreado o una heurística barata (¿hay cita? ¿la respuesta se negó?) se ejecuta sobre traces de producción de forma asíncrona.
+3. **Ejecuciones de evals offline.** Tu harness de CI ejecuta el golden set y registra cada caso como un trace con sus scores, así un caso fallido enlaza directo a su árbol de ejecución completo.
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Feedback(BaseModel):
+    trace_id: str
+    score: int  # 1 = helpful, 0 = not helpful
+    comment: str | None = None
+
+@app.post("/feedback")
+async def feedback(fb: Feedback) -> dict:
+    langfuse.create_score(trace_id=fb.trace_id, name="user_helpful",
+                          value=fb.score, comment=fb.comment)
+    return {"ok": True}
+```
+
+En LangSmith el equivalente es `Client().create_feedback(run_id, key="user_helpful", score=1)`.
+
+Piénsalo como enlazar un reporte de bug con la ejecución de CI que produjo el build. Un score bajo se vuelve un trace clicable, y el trace muestra qué paso falló. Luego copias esa entrada a tu golden dataset para que la suite de regresión la atrape la próxima vez. Ese ciclo (falla en producción, trace, nuevo caso dorado) es el hábito más valioso de este módulo.
+
+## Privacidad, muestreo y costo
+
+Los traces son datos. Trátalos como logs de producción con PII.
+
+- **Redacta antes de exportar.** Enmascara SSNs, números de cuenta, emails y teléfonos en entradas y salidas. Langfuse soporta una función de máscara en el cliente; LangSmith permite ocultar entradas/salidas con variables de entorno. Prueba la redacción como cualquier otra función.
+- **Muestrea.** Traza el 100% en dev y staging. En producción, un punto de partida común es el 100% de errores y requests con score bajo, más un 5–20% del resto. Ajusta según volumen y presupuesto.
+- **Retención.** Define un período de retención acorde a la política de datos del cliente (por ejemplo 30 o 90 días).
+- **No bloquees el camino del request.** Los SDKs agrupan y envían traces en un hilo de fondo. Llama a `flush()` al apagar (y en scripts de corta vida o Lambda) o perderás el último lote.
+
+## LangSmith vs Langfuse: cómo elegir
+
+| Factor | LangSmith | Langfuse |
+|---|---|---|
+| Hosting | SaaS administrado; self-host en planes enterprise | Open source, self-host sencillo, o nube |
+| Mejor ajuste | Equipos que ya usan LangChain / LangGraph | Agnóstico de framework, datos regulados |
+| Evals | Datasets, experiments, evaluadores online | Datasets, experiments, evaluadores LLM-as-judge, scores |
+| Gestión de prompts | Prompt hub | Prompts versionados con etiquetas |
+| OpenTelemetry | Acepta traces OTel | SDK construido sobre OTel, endpoint OTLP |
+
+Ambos son buenos. En una entrevista la respuesta no es "X es mejor". Es "elegí Langfuse porque el cliente exigía self-hosting y queríamos compatibilidad con OTel" o "estábamos en LangGraph, así que LangSmith nos dio traces sin escribir código".
+
+## Errores comunes
+
+- **Trazar solo la llamada final al LLM.** La mayoría de los bugs de RAG viven en el retrieval. Si no trazas las entradas del retriever y los ids de documentos devueltos, no puedes distinguir una mala respuesta de un mal contexto.
+- **No incluir el trace id en la respuesta.** Entonces el feedback del usuario no se puede vincular con nada.
+- **Registrar documentos completos en cada span.** Los traces se vuelven enormes y caros. Registra ids de documentos, scores y una vista previa corta; guarda el texto completo solo en la entrada de la generation.
+- **Olvidar `flush()`** en scripts, tests y handlers serverless.
+- **Enviar PII a un tracer SaaS** sin acuerdo de procesamiento de datos ni redacción.
+- **Traces sin tags.** Sin versión del prompt, id del modelo, entorno y git SHA como tags, no puedes filtrar "todo desde el último deploy".
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Un usuario reporta una respuesta incorrecta de tu asistente RAG. Explícame cómo lo depuras." level="mid">
+
+Encuentro el trace con el trace id de la respuesta (o por usuario y timestamp). Leo el árbol de spans de arriba hacia abajo. Primero, la consulta reescrita: ¿conservó los términos clave? Luego el retrieval: ¿estaban los documentos correctos en el top-k, y con qué scores? Luego el re-ranking: ¿sobrevivió el chunk correcto? Luego la entrada de la generation: ¿el contexto correcto estaba realmente en el prompt? Si el contexto era correcto pero la respuesta no, es un problema de generación o de prompt. Si el contexto era incorrecto, es retrieval. En ambos casos agrego la pregunta y la respuesta esperada al golden dataset para que CI lo atrape la próxima vez, y corrijo el componente que falló.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo manejas PII y costo en el tracing de LLMs a escala?" level="senior">
+
+Redacto a nivel del SDK antes de exportar, con tests unitarios para la función de enmascaramiento. Hago self-hosting del tracer (por ejemplo Langfuse) cuando los datos no pueden salir de la VPC. Muestreo: conservo todos los errores y traces con score bajo, más un porcentaje del tráfico normal. Registro ids y vistas previas en lugar de documentos completos en los spans de retrieval. Defino la retención según la política de datos. Hago el tracing asíncrono y por lotes para que nunca agregue latencia al camino del request.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Conéctalo con QA">
+
+Dilo directamente: "El tracing es el trace viewer de Playwright para pipelines LLM. Los scores en los traces son como resultados de tests adjuntos a una ejecución, y cada falla en producción se convierte en un nuevo caso de regresión". Los entrevistadores recuerdan ese enfoque.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Documentación de LangSmith: https://docs.smith.langchain.com
+- Documentación de Langfuse (tracing, scores, gestión de prompts, self-hosting): https://langfuse.com/docs
+- Guía de self-hosting de Langfuse: https://langfuse.com/self-hosting
+- Conceptos de OpenTelemetry (traces y spans): https://opentelemetry.io/docs/concepts/signals/traces/
+
+<Checklist id="m3-08-review" title="Verifica tu comprensión" items={["Puedo explicar trace, span, generation, session y score", "Puedo instrumentar una función con @traceable o @observe", "Devuelvo un trace id al cliente y le adjunto el feedback", "Sé cómo redactar PII y muestrear traces en producción", "Puedo justificar LangSmith vs Langfuse para un cliente dado"]} />

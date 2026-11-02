@@ -1,0 +1,221 @@
+## Why a state machine?
+
+A ReAct loop written by hand is a `while` loop with an LLM call and a tool dispatcher. That works for a demo. It stops working when you need to pause for a human, resume after a crash, branch on a classification, cap the number of steps, or replay a run to debug it.
+
+LangGraph models an agent as an explicit **state machine**:
+
+- **State**: a typed dictionary that every node reads and partially updates.
+- **Nodes**: plain Python functions (sync or async). They receive the state and return a *partial update*, not a new state.
+- **Edges**: fixed transitions (`A -> B`) or **conditional edges** that call a router function to pick the next node.
+- **Reducers**: per-key rules for merging a node's update into the current state.
+- **Checkpointer**: persists the state after every step, keyed by a `thread_id`.
+
+If you come from test automation, think of it as a Page Object Model for control flow. Instead of a hidden loop, you get a graph you can draw, unit-test node by node, and inspect at any step. The graph is the contract. The LLM decides *within* the graph; it does not decide what the graph is.
+
+## Typed state and reducers
+
+State is usually a `TypedDict` (Pydantic models and dataclasses also work). Each key can carry a reducer through `Annotated`. Without a reducer, a node's value **overwrites** the key. With a reducer, LangGraph calls `reducer(current, update)`.
+
+The most common reducer is `add_messages`. It appends new messages, and it replaces a message in place if the update has the same message `id`. That second behavior matters for human-in-the-loop edits, covered in the next lesson.
+
+```python
+# state.py
+import operator
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]  # append / replace by id
+    step_count: int                                       # overwrite
+    cost_usd: float                                       # overwrite
+    tool_log: Annotated[list[dict], operator.add]         # always append
+```
+
+Rules of thumb:
+
+- Counters you compute yourself (`state["step_count"] + 1`) use overwrite. Do not also add `operator.add`, or you will double-count.
+- Lists that several nodes contribute to (logs, findings from parallel branches) need an append reducer. Without one, parallel branches writing the same key raise an `InvalidUpdateError`.
+- Keep state small and serializable. It is written to the checkpointer on every step. Store IDs and summaries, not 5 MB PDFs.
+
+## Nodes return partial updates
+
+A node returns a dict containing **only the keys it changes**. LangGraph merges it through the reducers. Returning the whole state is a classic bug: with `add_messages` it is mostly harmless, but with `operator.add` on `tool_log` you duplicate every entry.
+
+```python
+# graph.py
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import MemorySaver
+
+from .state import AgentState
+from .tools import get_order, reschedule_delivery, create_ticket
+
+TOOLS = [get_order, reschedule_delivery, create_ticket]
+llm = ChatAnthropic(model="claude-sonnet-5-5", max_tokens=1024).bind_tools(TOOLS)
+
+SYSTEM = "You are a logistics support agent. Use tools; never invent order data."
+
+
+def call_model(state: AgentState) -> dict:
+    response = llm.invoke([("system", SYSTEM), *state["messages"]])
+    usage = response.usage_metadata or {}
+    # Example rates: check the provider's current pricing.
+    cost = usage.get("input_tokens", 0) * 3e-6 + usage.get("output_tokens", 0) * 15e-6
+    return {
+        "messages": [response],
+        "step_count": state.get("step_count", 0) + 1,
+        "cost_usd": state.get("cost_usd", 0.0) + cost,
+    }
+
+
+builder = StateGraph(AgentState)
+builder.add_node("agent", call_model)
+builder.add_node("tools", ToolNode(TOOLS))
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)  # -> "tools" or END
+builder.add_edge("tools", "agent")
+
+graph = builder.compile(checkpointer=MemorySaver())
+```
+
+`ToolNode` executes every tool call in the last AI message (in parallel when there are several) and appends one `ToolMessage` per call. `tools_condition` routes to `"tools"` if the last message has tool calls and to `END` otherwise. These two prebuilts are the ReAct loop from lesson 01, expressed as a graph.
+
+## Conditional edges: your own routers
+
+Prebuilts are fine until you need policy. A router is a function that reads the state and returns the name of the next node. Pass a mapping so the graph knows every possible destination (it also makes the rendered diagram correct).
+
+```python
+MAX_STEPS = 8
+
+
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    if state["step_count"] >= MAX_STEPS:
+        return "give_up"
+    if not getattr(last, "tool_calls", None):
+        return "done"
+    if any(tc["name"] == "issue_refund" for tc in last.tool_calls):
+        return "needs_approval"
+    return "tools"
+
+
+builder.add_conditional_edges(
+    "agent",
+    route_after_agent,
+    {"tools": "tools", "needs_approval": "approval", "give_up": "fallback", "done": END},
+)
+```
+
+Notice what happened: the step limit and the refund policy live in deterministic code, not in the prompt. The model cannot talk its way past them. This is the main reason to prefer an explicit graph over a free-form agent.
+
+There is a second routing style: a node can return a `Command` that both updates state and chooses the next node.
+
+```python
+from typing import Literal
+from langgraph.types import Command
+
+
+def triage(state: AgentState) -> Command[Literal["agent", "fallback"]]:
+    text = state["messages"][-1].content
+    if "legal" in text.lower():
+        return Command(goto="fallback", update={"tool_log": [{"event": "escalated_legal"}]})
+    return Command(goto="agent")
+```
+
+Use conditional edges when routing is a pure function of state. Use `Command` when the node that computes something is also the natural place to decide where to go (supervisors in multi-agent graphs use this a lot).
+
+## Checkpointers and threads
+
+Compile with a checkpointer and every super-step is saved. Each conversation or job gets a `thread_id` in the config:
+
+```python
+config = {"configurable": {"thread_id": "order-ORD-1042"}}
+
+result = graph.invoke(
+    {"messages": [("user", "Where is order ORD-1042?")], "step_count": 0, "cost_usd": 0.0},
+    config,
+)
+print(result["messages"][-1].content)
+
+# Same thread_id: the graph loads the saved state and continues the conversation.
+graph.invoke({"messages": [("user", "Move it to Friday.")]}, config)
+
+snapshot = graph.get_state(config)
+print(snapshot.values["step_count"], snapshot.next)  # next == () when finished
+
+for past in graph.get_state_history(config):  # time travel / debugging
+    print(past.config["configurable"]["checkpoint_id"], past.next)
+```
+
+What you get from a checkpointer:
+
+- **Short-term memory**: follow-up turns on the same thread see the previous messages.
+- **Durability**: if the process dies mid-run, you can resume from the last checkpoint.
+- **Human-in-the-loop**: `interrupt()` needs a checkpointer to save the paused state.
+- **Debugging**: `get_state_history` lets you replay or fork from any past step, like a trace you can re-run.
+
+`MemorySaver` keeps everything in process memory. It is for tests and notebooks. In production use a durable saver such as `PostgresSaver` from `langgraph.checkpoint.postgres` (call `.setup()` once to create tables), or the async variant for FastAPI services.
+
+## Testing nodes like functions
+
+Because nodes are functions of state, you can unit-test them without compiling the graph. Routers are the highest-value tests: they encode your policy.
+
+```python
+from langchain_core.messages import AIMessage
+
+
+def test_refund_goes_to_approval():
+    msg = AIMessage(content="", tool_calls=[
+        {"name": "issue_refund", "args": {"order_id": "ORD-1"}, "id": "c1"}
+    ])
+    state = {"messages": [msg], "step_count": 2, "cost_usd": 0.01, "tool_log": []}
+    assert route_after_agent(state) == "needs_approval"
+
+
+def test_step_limit_wins_over_tools():
+    msg = AIMessage(content="", tool_calls=[{"name": "get_order", "args": {}, "id": "c2"}])
+    state = {"messages": [msg], "step_count": 8, "cost_usd": 0.0, "tool_log": []}
+    assert route_after_agent(state) == "give_up"
+```
+
+For whole-graph tests, swap the model for a scripted fake (lesson 08 shows how) and assert on the final state and the sequence of tool calls.
+
+## Common mistakes
+
+- **Returning the full state from a node.** Return only the changed keys. Full returns duplicate entries under append reducers.
+- **Mutating state in place.** `state["messages"].append(x)` bypasses reducers and can corrupt checkpoints. Return a new value instead.
+- **Forgetting the path map on conditional edges.** The graph still runs, but the diagram is wrong and typos in returned node names fail only at runtime.
+- **Using `MemorySaver` in production.** State disappears on restart and is not shared across replicas. Use Postgres (or another durable saver).
+- **Reusing one `thread_id` for everything.** Every user and job then shares history. Derive thread ids from a real business key (ticket id, order id, session id).
+- **Putting policy in the prompt only.** "Never refund more than $200" belongs in a router or a tool guard, not just the system prompt.
+- **Huge state.** Large blobs on every checkpoint make each step slow and expensive. Store references.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Why would you use LangGraph instead of a simple while-loop agent?" level="mid">
+
+A while loop hides control flow. LangGraph makes it explicit: typed state, nodes, edges and routers. That gives me four practical things. First, **checkpointing**: state is saved per step and per thread, so I get conversation memory, crash recovery and replay. Second, **human-in-the-loop**: `interrupt()` can pause a run for approval and resume it later, even in another process. Third, **deterministic policy**: step limits, approval rules and escalation live in router code the model cannot override. Fourth, **testability**: nodes and routers are plain functions I can unit-test, and the graph can be rendered for reviews. For a single tool call with no branching I would not use it; a plain function is simpler.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What is a reducer in LangGraph and when do you need one?" level="senior">
+
+A reducer defines how a node's partial update merges into an existing state key. Without one, the update overwrites the key. `add_messages` appends messages and replaces by message id, which is what lets you edit a pending tool call. `operator.add` concatenates lists. You need a reducer whenever several nodes, especially parallel branches in the same super-step, write the same key; otherwise LangGraph raises an invalid-update error. You should *not* combine a reducer with a node that already computes the full new value (like `count + 1` with `operator.add`), or you double-count. I keep counters as overwrite keys and logs as append keys.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Code-reading questions">
+
+Expect "what does this node return?" questions. The answer is always a **partial update** that is then merged by the reducer. If the key has `add_messages`, the returned message is appended. If it has no reducer, it replaces the old value.
+
+</Callout>
+
+## Further reading
+
+- LangGraph low-level concepts (state, reducers, nodes, edges): https://langchain-ai.github.io/langgraph/concepts/low_level/
+- LangGraph persistence and checkpointers: https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents
+- Anthropic tool use docs: https://docs.anthropic.com/en/docs/build-with-claude/tool-use/overview

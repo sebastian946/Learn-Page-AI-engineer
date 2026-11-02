@@ -1,0 +1,183 @@
+## Goal
+
+Build the ingestion stage of the mortgage knowledge assistant as a small, tested CLI. It reads a folder of loan policy PDFs, underwriting guidelines and FAQ HTML pages, cleans them, extracts metadata, deduplicates, and writes one normalized document per line to `out/documents.jsonl`. Every later exercise in `rag-lab` reads this file, so quality here pays off for the rest of the module.
+
+This is the first folder in your `rag-lab` repo: `01-ingestion/`.
+
+### The corpus
+
+You need a realistic but fictional corpus. Do not use real customer or lender documents. Create 8–12 files in `01-ingestion/data/raw/`:
+
+- 4–6 **policy PDFs** (2–10 pages each), e.g. `policies/US/conventional-dti-limits_v2_2026-02-01.pdf`, `policies/TX/home-equity-50a6_v1_2025-09-15.pdf`. Include a running header, a page footer with "Page N of M", numbered sections (`4.2 Debt-to-Income Limits`) and at least one table (credit score band vs. max LTV).
+- 2 **versions of the same policy** (e.g. FHA gift funds v2 2024 and v3 2026) with one rule that changed.
+- 1 **exact duplicate** of a PDF under a different filename.
+- 2–3 **FAQ HTML pages** with nav, footer, a cookie banner and `h2`/`h3` questions.
+
+Generate the PDFs with `reportlab` or write them in a word processor and export. Fifteen minutes of corpus design saves hours later: you will reuse these files to build golden questions in lesson 15.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `python -m ingest data/raw out/documents.jsonl` runs end to end and prints a summary: files seen, documents written, duplicates skipped, pages flagged as empty.
+- [ ] Each output line validates against a Pydantic `NormalizedDoc` model with `doc_id`, `source`, `title`, `doc_type`, `jurisdiction`, `effective_date`, `version`, `content_hash`, `is_current` and `sections` (heading, level, text, page).
+- [ ] Running headers and "Page N of M" footers are removed without hard-coding the header text (statistical repeated-line detection).
+- [ ] Hyphenation across line breaks, ligatures and soft hyphens are normalized.
+- [ ] FAQ pages produce one section per question; nav, footer and cookie banner text never appears in output.
+- [ ] `effective_date`, `jurisdiction` and `version` are extracted from the path convention, falling back to the first page text.
+- [ ] The exact duplicate is skipped; of the two FHA versions only the newer one has `is_current = true`.
+- [ ] Re-running with no file changes writes the same `content_hash` values (deterministic output).
+- [ ] At least 8 pytest tests cover the cleaning functions and metadata extraction using small fixtures, and `pytest` passes.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# 01-ingestion/ingest/models.py
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, Field
+
+DocType = Literal["policy", "underwriting_guideline", "faq", "rate_sheet"]
+
+class Section(BaseModel):
+    heading: str
+    level: int = 1
+    text: str
+    page: int | None = None
+
+class NormalizedDoc(BaseModel):
+    doc_id: str
+    source: str
+    title: str
+    doc_type: DocType
+    jurisdiction: str | None = None
+    effective_date: date | None = None
+    version: str | None = None
+    content_hash: str
+    is_current: bool = True
+    sections: list[Section] = Field(default_factory=list)
+```
+
+```python
+# 01-ingestion/ingest/__main__.py
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from .clean import clean_pages          # TODO: implement
+from .metadata import from_path         # TODO: implement
+from .models import NormalizedDoc
+from .parse_html import parse_faq       # TODO: implement
+from .parse_pdf import parse_pdf        # TODO: implement -> (title, list[Section])
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def ingest(raw_dir: Path) -> list[NormalizedDoc]:
+    docs: list[NormalizedDoc] = []
+    for path in sorted(raw_dir.rglob("*")):
+        if path.suffix.lower() not in {".pdf", ".html"}:
+            continue
+        rel = path.relative_to(raw_dir).as_posix()
+        meta = from_path(rel)
+        if path.suffix.lower() == ".pdf":
+            title, sections = parse_pdf(path)
+        else:
+            title, sections = parse_faq(path.read_text(encoding="utf-8"))
+        body = "\n".join(s.text for s in sections)
+        docs.append(NormalizedDoc(
+            doc_id=sha256(f"{rel}:{meta.get('version')}")[:16],
+            source=rel, title=title, sections=sections,
+            content_hash=sha256(body), **meta,
+        ))
+    # TODO: dedupe by content_hash, then mark is_current per (title, jurisdiction)
+    return docs
+
+
+if __name__ == "__main__":
+    raw, out = Path(sys.argv[1]), Path(sys.argv[2])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    docs = ingest(raw)
+    with out.open("w", encoding="utf-8") as f:
+        for d in docs:
+            f.write(d.model_dump_json() + "\n")
+    print(json.dumps({"written": len(docs)}))
+```
+
+```python
+# 01-ingestion/tests/test_clean.py
+from ingest.clean import fix_hyphenation, find_repeated_lines
+
+def test_joins_hyphenated_words():
+    assert fix_hyphenation("under-\nwriting") == "underwriting"
+
+def test_detects_page_footer_with_varying_numbers():
+    pages = [f"Body {i}\nPage {i} of 9" for i in range(1, 10)]
+    assert "Page # of #" in find_repeated_lines(pages)
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Keep each concern in its own module: `parse_pdf.py`, `parse_html.py`, `clean.py`, `metadata.py`, `dedupe.py`. Pure functions that take strings and return strings are trivial to unit test.</Hint>
+  <Hint>For headers and footers, extract text page by page first, run repeated-line detection across all pages of one document (replace digits with `#` before counting), then strip. Do this before joining pages, or a header glued to body text is no longer a separate line.</Hint>
+  <Hint>Parse the path with one regex such as `(?P<doc_type>policies|guidelines|faq)/(?P<jur>[A-Z]{2})/(?P<slug>[a-z0-9-]+)_v(?P<ver>\d+)_(?P<date>\d{4}-\d{2}-\d{2})`. Map `policies` to `policy` and `US` to `"US"`, a state code to `"US-TX"`.</Hint>
+  <Hint>For versioning: group documents by `(slug, jurisdiction)`, sort by `effective_date`, set `is_current = False` on all but the last. For headings in PDFs, treat a line as a heading if it matches `^\d+(\.\d+)*\s+\S` or its font size is at least 1.2 times the median size.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  README.md                  # repo index: one line per technique folder
+  docker-compose.yml         # added in 03-pgvector, empty for now
+  01-ingestion/
+    README.md
+    pyproject.toml
+    data/raw/
+      policies/US/...pdf
+      policies/TX/...pdf
+      faq/US/...html
+    ingest/
+      __init__.py
+      __main__.py
+      models.py
+      parse_pdf.py
+      parse_html.py
+      clean.py
+      metadata.py
+      dedupe.py
+    tests/
+      fixtures/
+      test_clean.py
+      test_metadata.py
+      test_dedupe.py
+    out/.gitkeep
+```
+
+**README outline for `01-ingestion/`:** what it does (one paragraph), how to run, the `NormalizedDoc` schema, cleaning rules as a table (rule, why, test name), an ingestion report from your corpus (pages, empty pages, duplicates skipped, superseded versions), known limitations (tables, scanned pages).
+
+**Suggested commits:**
+
+- `feat(ingestion): add NormalizedDoc model and CLI skeleton`
+- `feat(ingestion): parse PDFs with heading detection and FAQ HTML pages`
+- `feat(ingestion): statistical header/footer removal and text normalization`
+- `feat(ingestion): metadata from path conventions, dedupe and versioning`
+- `test(ingestion): fixtures and unit tests for cleaning and metadata`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m2-03-review" title="Self-review" items={["Output JSONL validates against NormalizedDoc for every line", "No running header, page footer, nav or cookie text appears in any section", "The duplicate PDF is skipped and only the newest FHA version is current", "Two runs on unchanged files produce identical content_hash values", "Each cleaning rule has a unit test with a fixture from a real-looking document", "The README includes an ingestion report with real counts from your corpus", "The corpus is fictional and contains no real customer data"]} />

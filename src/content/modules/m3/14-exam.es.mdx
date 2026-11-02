@@ -1,0 +1,25 @@
+## Sobre este examen
+
+Este examen comprueba que puedes diseñar, ejecutar y defender una estrategia de evaluación y observabilidad para una aplicación con LLMs. Tiene 18 preguntas y un límite de 30 minutos. El puntaje para aprobar es **70%**. Aprobar desbloquea el módulo 4.
+
+**Qué cubre:**
+
+- La pirámide de evals y cómo se mapea a la pirámide de testing que ya conoces
+- Golden datasets: cobertura, versionado y uso seguro de datos sintéticos
+- LLM-as-judge: rúbricas, pairwise vs pointwise, sesgos de posición y verbosidad, calibración con kappa de Cohen
+- Gates de regresión en CI: umbrales vs baselines, manejo del no determinismo, caché y control de costos
+- Evals offline vs online y A/B testing de prompts
+- Tracing con Langfuse y LangSmith, y convenciones semánticas GenAI de OpenTelemetry
+- Monitoreo de drift, costo y latencia p50/p95
+- Guardrails, prompt injection (directa e indirecta) y fundamentos de red-teaming
+
+**Tipos de pregunta:** opción única, selección múltiple, ordenar los pasos y preguntas cortas de lectura de código (gates con pytest, YAML de GitHub Actions, spans de OpenTelemetry).
+
+**Cómo prepararte:**
+
+1. Vuelve a leer las secciones de "errores comunes" de cada lección. Muchas preguntas las evalúan.
+2. Vuelve a ejecutar tu ejercicio de eval harness y explica en voz alta cada línea de la lógica del gate.
+3. Asegúrate de poder calcular una tasa de acuerdo simple y explicar qué agrega el kappa.
+4. Repasa las categorías del OWASP LLM Top 10 relacionadas con inyección y manejo de salidas.
+
+Las opciones se mezclan en cada intento. Lee cada explicación después de enviar, incluso en las preguntas que respondiste bien.

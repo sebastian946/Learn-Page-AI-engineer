@@ -1,0 +1,142 @@
+## Goal
+
+In exercise 08 you built `langgraph-hitl-agent`: a LangGraph agent with an approval gate before risky tools. Right now nothing stops it from looping forever or spending without limit. In this exercise you add three guards and prove each one with a deterministic test:
+
+1. **Max steps** — the agent stops after `MAX_STEPS` model calls.
+2. **Repeated-action detection** — the agent stops when the same tool call (name plus arguments) appears `REPEAT_THRESHOLD` times.
+3. **Per-run cost budget** — the agent stops before a model call that would push the run over `MAX_COST_USD`.
+
+Every stop must be graceful: a clear final message, a `stop_reason` in state, and a ticket for a human. No exceptions reaching the caller.
+
+Time box: 60 minutes. You will not call a real model. Tests use a fake chat model that loops on purpose, the same way you would stub a flaky dependency in an integration test.
+
+## Context
+
+Think of this as adding timeouts and circuit breakers to a service you already own. The guards live in the graph, not in the prompt. A prompt that says "do not repeat yourself" is a suggestion. A router that checks a counter is a contract.
+
+Pricing values come from `config/pricing.yaml`. Use example values and label them as examples. The tests should inject their own prices so they never depend on real pricing.
+
+<AcceptanceCriteria>
+
+- [ ] `AgentState` has `step_count: int`, `cost_usd: float` and `stop_reason: str | None`, with sensible defaults set at graph input.
+- [ ] The agent node increments `step_count` and adds the cost of each response computed from `usage_metadata` and a prices dict.
+- [ ] A guard router runs after the agent node and before tools. It routes to `stop` on max steps, repeated action or budget, to `tools` on tool calls, and to `END` otherwise.
+- [ ] The budget check uses a pre-call estimate, so a call that would exceed the budget is never made.
+- [ ] The `stop` node writes a user-facing `AIMessage`, sets `stop_reason` to one of `max_steps`, `repeated_action`, `budget`, and calls `create_ticket` with the thread id.
+- [ ] `recursion_limit` is still set in the invoke config as a backstop, higher than `MAX_STEPS * 2 + 5`.
+- [ ] Limits are read from env or config (`MAX_STEPS`, `REPEAT_THRESHOLD`, `MAX_COST_USD`) with defaults.
+- [ ] Three pytest tests, one per guard, using a fake model. No network. Total test time under 2 seconds.
+- [ ] One test proves a normal run (two tool calls then a final answer) is not affected by the guards.
+- [ ] README has a "Guards" section with the limits, how they were chosen, and the `stop_reason` values.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# src/hitl_agent/guards.py
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from langchain_core.messages import AIMessage, AnyMessage
+
+@dataclass(frozen=True)
+class GuardConfig:
+    max_steps: int = int(os.getenv("MAX_STEPS", "8"))
+    repeat_threshold: int = int(os.getenv("REPEAT_THRESHOLD", "3"))
+    max_cost_usd: float = float(os.getenv("MAX_COST_USD", "0.25"))
+
+def call_signature(name: str, args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{name}:{canonical}".encode()).hexdigest()[:16]
+
+def find_repeated_call(messages: list[AnyMessage], threshold: int) -> str | None:
+    """Return the tool name if any (name, args) signature appears >= threshold times."""
+    raise NotImplementedError
+
+def message_cost(msg: AIMessage, prices: dict[str, float]) -> float:
+    """Cost in USD from usage_metadata. prices has input_per_mtok and output_per_mtok."""
+    raise NotImplementedError
+
+def estimate_next_call_cost(messages: list[AnyMessage], max_tokens: int,
+                            prices: dict[str, float]) -> float:
+    """Rough pre-call estimate: ~4 chars per token for input, max_tokens for output."""
+    raise NotImplementedError
+
+def check_guards(state: dict, cfg: GuardConfig, prices: dict[str, float],
+                 max_tokens: int) -> str | None:
+    """Return a stop_reason or None."""
+    raise NotImplementedError
+```
+
+```python
+# tests/test_guards.py
+from langgraph.checkpoint.memory import MemorySaver
+from hitl_agent.graph import build_graph
+from tests.fakes import ScriptedModel  # from exercise 08
+from langchain_core.messages import AIMessage
+
+def looping_model(n: int = 50) -> ScriptedModel:
+    msgs = [AIMessage(content="", tool_calls=[{
+        "name": "get_order", "args": {"order_id": "ORD-1001"}, "id": f"call_{i}"}],
+        usage_metadata={"input_tokens": 1200, "output_tokens": 40, "total_tokens": 1240})
+        for i in range(n)]
+    return ScriptedModel(msgs)
+
+def test_repeated_action_stops_run(fake_backend):
+    graph = build_graph(looping_model(), MemorySaver(), backend=fake_backend)
+    out = graph.invoke({"messages": [("user", "Where is ORD-1001?")]},
+                       config={"configurable": {"thread_id": "t-repeat"}, "recursion_limit": 40})
+    assert out["stop_reason"] == "repeated_action"
+    # TODO: assert create_ticket was called once on the fake backend
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Put all three checks in one pure function, `check_guards(state, cfg, prices, max_tokens)`, that returns a reason or `None`. Pure functions are trivial to unit test. The router just calls it and maps a reason to the `stop` node.</Hint>
+  <Hint>Reuse the `ScriptedModel` from exercise 08 (`tests/fakes.py`): `build_graph(llm, checkpointer)` already takes a pre-bound model, so the fake needs no `bind_tools`. Add an optional `backend=None` parameter to `build_graph` so tests can pass a fake backend that records calls (default: the in-memory dicts from exercise 08). Exercise 14 reuses that parameter.</Hint>
+  <Hint>For the budget test, give the fake responses large `usage_metadata` and inject prices like `{"input_per_mtok": 100.0, "output_per_mtok": 100.0}`. Then two or three steps blow a 0.25 USD budget and the test stays deterministic. Assert that the model was called fewer times than the number of fake messages you supplied.</Hint>
+  <Hint>For the stop node, return `{"messages": [AIMessage(content=...)], "stop_reason": reason}` and call the ticket tool directly (not through the model). Get the thread id from the `config` argument: `def stop_node(state, config): tid = config["configurable"]["thread_id"]`. In the max-steps test, use a fake model that calls a different order id each time, so the repeat guard does not fire first.</Hint>
+</Hints>
+
+<CommitBox repo="langgraph-hitl-agent">
+
+```text
+langgraph-hitl-agent/
+  config/
+    pricing.yaml          # example prices, labeled as examples
+  src/hitl_agent/
+    graph.py              # router now calls check_guards, adds stop node
+    state.py              # step_count, cost_usd, stop_reason
+    guards.py             # new: pure guard functions + GuardConfig
+    tools.py
+    approval.py
+    cli.py
+  tests/
+    conftest.py           # fake_backend fixture
+    test_guards.py        # unit tests for pure functions
+    test_guard_graph.py   # graph-level tests with looping fake model
+  README.md
+  pyproject.toml
+```
+
+README additions:
+
+- **Guards**: table of limit, default, env var, how chosen (for example "p95 steps in 50 traced runs was 5, so max is 8").
+- **Stop reasons**: `max_steps`, `repeated_action`, `budget` and what the user sees for each.
+- **Cost model**: how cost is computed, where prices live, note that values are examples.
+
+Suggested commits:
+
+- `feat(guards): add step counter and cost tracking to agent state`
+- `feat(guards): detect repeated tool calls by signature hash`
+- `feat(guards): enforce per-run cost budget with pre-call estimate`
+- `feat(graph): graceful stop node with ticket and stop_reason`
+- `test(guards): looping fake model covers all three guards`
+- `docs: document guard limits and stop reasons`
+
+</CommitBox>
+
+<Checklist id="m4-12-review" title="Self-review" items={["Guards are enforced in graph routing, not only in the prompt", "check_guards is a pure function with its own unit tests", "The budget check runs before the model call, not after", "Every stop produces a user message, a stop_reason and a ticket", "recursion_limit is still set as a backstop", "Tests use a fake model and run in under 2 seconds with no network", "A normal run is proven unaffected by the guards", "Prices come from config and are labeled as examples", "README explains each limit and how it was chosen"]} />

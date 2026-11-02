@@ -1,0 +1,25 @@
+## About this exam
+
+This exam checks that you can design, run and defend an evaluation and observability strategy for an LLM application. It has 18 questions and a 30-minute time limit. The passing score is **70%**. Passing unlocks Module 4.
+
+**What it covers:**
+
+- The eval pyramid and how it maps to the test pyramid you already know
+- Golden datasets: coverage, versioning and safe use of synthetic data
+- LLM-as-judge: rubrics, pairwise vs pointwise, position and verbosity bias, calibration with Cohen's kappa
+- Regression gates in CI: thresholds vs baselines, handling non-determinism, caching and cost control
+- Offline vs online evals and A/B testing prompts
+- Tracing with Langfuse and LangSmith, and OpenTelemetry GenAI semantic conventions
+- Monitoring drift, cost and p50/p95 latency
+- Guardrails, prompt injection (direct and indirect) and red-teaming basics
+
+**Question types:** single choice, multi-select, order-the-steps and short code-reading questions (pytest gates, GitHub Actions YAML, OpenTelemetry spans).
+
+**How to prepare:**
+
+1. Re-read the "common mistakes" sections of each lesson. Many questions test them.
+2. Re-run your eval harness exercise and explain each line of the gate logic out loud.
+3. Make sure you can compute a simple agreement rate and explain what kappa adds.
+4. Review the OWASP LLM Top 10 categories that relate to injection and output handling.
+
+Options are shuffled on each attempt. Read each explanation after you submit, even for questions you got right.

@@ -1,0 +1,144 @@
+## Tu cambio de carrera es una historia, así que cuéntala con intención
+
+Todo entrevistador te preguntará alguna versión de "¿por qué pasas de QA a ingeniería de IA?" y "cuéntame de un proyecto del que estés orgulloso". Las respuestas débiles suenan a disculpa ("solo era tester, pero..."). Las respuestas fuertes presentan la experiencia de SDET como la razón por la que eres bueno en la parte más difícil de la ingeniería de IA: hacer confiables sistemas no deterministas.
+
+Esta lección te da la narrativa, un banco de historias construido con tus capstones y las preguntas conductuales que deberías ensayar.
+
+## La declaración de posicionamiento
+
+Escribe una respuesta de 30 segundos para "háblame de ti". Estructura: pasado, puente, presente, siguiente paso.
+
+> "Pasé [N] años como SDET senior construyendo frameworks de pruebas y quality gates de CI para [dominio]. Hace dos años empecé a aplicar eso a funcionalidades con LLM y me di cuenta de que la parte difícil de los productos de IA es justo lo que yo venía haciendo: demostrar que un sistema se comporta correctamente cuando las salidas no son deterministas. Desde entonces he construido sistemas de RAG y agentes de punta a punta, incluida una plataforma multi-tenant de RAG + agentes con aislamiento por tenant, evals que bloquean cada PR, tracing y seguimiento de costos por tenant. Busco un rol de AI engineer donde sea dueño de funcionalidades desde el retrieval hasta producción."
+
+Fíjate: sin disculpas, artefactos concretos, la habilidad de SDET presentada como ventaja y un pedido claro.
+
+## Traducir la experiencia de SDET al lenguaje de ingeniería de IA
+
+| Lo que hiciste como SDET | Cómo decirlo en una entrevista de ingeniería de IA |
+|---|---|
+| Construí un framework de pruebas usado por 5 equipos | Construí infraestructura de evaluación reutilizable; diseñé abstracciones que otros ingenieros adoptaron |
+| Triage de tests flaky | Manejo del no determinismo: reintentos, seeds, umbrales estadísticos, separar señal de ruido |
+| Quality gates de CI | Gates de regresión para prompts y retrieval; bloquear merges cuando cae faithfulness |
+| Gestión de datos de prueba, fixtures | Curaduría, versionado y análisis de cobertura de golden datasets |
+| Contract tests entre servicios | Schemas de herramientas y contratos de error para agentes; validación de salidas estructuradas |
+| Pruebas de rendimiento | Presupuestos de latencia, p95/p99, pruebas de carga de endpoints de streaming con k6 |
+| Análisis de causa raíz de bugs en producción | Depuración guiada por traces de fallas de RAG (retrieval vs generación) |
+| Estrategia de pirámide de pruebas | Pirámide de evals: checks unitarios, evals de componentes, evals end-to-end, monitoreo online |
+
+Usa la columna derecha. Es el mismo trabajo, en el vocabulario del rol.
+
+## "Cuéntame de un proyecto": la estructura de 4 minutos
+
+Esta es la respuesta más importante que darás. Usa el capstone final. Practica hasta que salga fluida pero no memorizada.
+
+1. **Contexto (30 s):** el cliente, el problema, por qué importa. "Un SaaS de legal-tech que atiende a 12 bufetes necesitaba un asistente de investigación sobre los documentos de cada bufete, con aislamiento estricto."
+2. **Tu rol y restricciones (20 s):** solo, 5 días, objetivos de latencia y costo, requisito de aislamiento.
+3. **Arquitectura (60 s):** el camino de la petición de un tirón. Señala el diagrama si puedes compartir pantalla.
+4. **El problema más difícil (60 s):** un problema técnico profundo y cómo lo resolviste. Por ejemplo, tenants pequeños con mal recall por el post-filtrado de HNSW en un índice compartido.
+5. **Resultados con números (30 s):** puntajes de evals contra objetivos, tests de fugas, p95, costo por 1k peticiones. Solo tus números medidos.
+6. **Qué harías distinto (20 s):** demuestra criterio.
+
+Luego detente. Deja que elijan en qué profundizar. Prepárate para las preguntas de seguimiento: "¿Por qué ese vector store?", "¿Cómo construiste el golden set?", "¿Cómo falla?", "¿Cuánto costó?".
+
+## Un banco de historias como datos
+
+Trata tus historias como casos de prueba: estructuradas, versionadas y revisadas por cobertura. Guárdalas en un archivo del repo central de tu portafolio y ensaya desde ahí.
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+Competency = Literal["ownership", "conflict", "failure", "ambiguity", "influence",
+                     "quality", "speed_vs_quality", "learning", "customer_focus"]
+
+class Story(BaseModel):
+    title: str
+    source: str                      # e.g. "m4 capstone" or "2023 job, payments team"
+    competencies: list[Competency]
+    situation: str
+    task: str
+    action: str
+    result: str = Field(description="Include a measured number")
+    learned: str
+
+WORDS_PER_MINUTE = 150
+
+def speaking_minutes(s: Story) -> float:
+    words = sum(len(x.split()) for x in (s.situation, s.task, s.action, s.result, s.learned))
+    return round(words / WORDS_PER_MINUTE, 1)
+
+def coverage_gaps(stories: list[Story]) -> set[str]:
+    covered = {c for s in stories for c in s.competencies}
+    return set(Competency.__args__) - covered
+
+def lint(stories: list[Story]) -> list[str]:
+    issues = []
+    for s in stories:
+        if speaking_minutes(s) > 2.0:
+            issues.append(f"{s.title}: too long ({speaking_minutes(s)} min)")
+        if not any(ch.isdigit() for ch in s.result):
+            issues.append(f"{s.title}: result has no number")
+    return issues + [f"missing competency: {c}" for c in sorted(coverage_gaps(stories))]
+```
+
+Apunta a 8 a 10 historias que cubran cada competencia al menos dos veces. Mezcla historias de los capstones con historias de tus años como SDET. Los entrevistadores valoran las historias reales de trabajo con personas reales, sobre todo para conflicto e influencia.
+
+## Preguntas conductuales para ensayar
+
+- Cuéntame de una vez en que no estuviste de acuerdo con una decisión técnica. (Usa una historia donde los datos lo resolvieron, como un resultado de evals.)
+- Cuéntame de un fracaso. (Elige uno real. Muestra la solución y el cambio de proceso. Un gate de evals que agregaste tras una regresión es perfecto.)
+- Cuéntame de una vez en que tuviste que aprender algo rápido. (Tu propia transición a IA, con hitos concretos.)
+- ¿Cómo manejas requisitos ambiguos? (Convertir "que sea preciso" en un golden set y un umbral.)
+- Cuéntame de una vez en que te opusiste a lanzar algo. (Quality gates, explicando el trade-off de negocio.)
+- ¿Cómo decides cuándo algo es suficientemente bueno? (Objetivos definidos de antemano, medidos, y un plan de monitoreo online.)
+- ¿Por qué ingeniería de IA, por qué ahora y por qué esta empresa? (Prepara la última parte para cada empresa.)
+
+## Cómo manejar el reto "no tienes experiencia de IA en producción"
+
+Responde directo. No discutas.
+
+> "Es justo: mi experiencia en producción es en ingeniería de calidad, y mis sistemas de IA son proyectos de portafolio. Lo que puedo mostrar es que están construidos como se construyen los sistemas de producción: CI/CD a AWS, evals que bloquean cada cambio, tracing, seguimiento de costos por tenant, runbooks. Y la parte con la que los equipos más luchan en producción, la evaluación y la confiabilidad, es la que he hecho profesionalmente durante años."
+
+## Las preguntas que haces tú
+
+Haz preguntas que muestren que piensas como AI engineer:
+
+- ¿Cómo evalúan los cambios de prompts o modelos antes de lanzarlos?
+- ¿Cómo es su observabilidad para las funcionalidades con LLM?
+- ¿Cuál es la mayor fuente de incidentes en producción en sus funcionalidades de IA?
+- ¿Cómo equilibran costo y calidad, y quién es dueño de esa decisión?
+
+## Errores comunes
+
+- Disculparte por la experiencia en QA en lugar de usarla.
+- Contar la historia del proyecto como una lista de funcionalidades sin un problema difícil.
+- Números que no puedes explicar o que no se midieron.
+- Usar tanto "nosotros" que tu contribución desaparece. En los capstones fuiste tú; di "yo".
+- Respuestas memorizadas que suenan robóticas. Ensaya la estructura, no el guion.
+- No tener preguntas para el entrevistador.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Por qué deberíamos contratar a un SDET para un rol de AI engineer?" level="mid">
+
+Porque el cuello de botella en la mayoría de productos de IA no es hacer funcionar una demo; es saber si el sistema es correcto, mantenerlo correcto mientras cambian prompts, modelos y datos, y depurarlo cuando no lo es. Eso es evaluación, pruebas de regresión y observabilidad, que es lo que he hecho durante años. Encima agregué el lado de ingeniería de IA: RAG con retrieval híbrido y re-ranking, agentes de LangGraph con aprobación humana, servicios FastAPI desplegados en AWS. Mi capstone muestra ambas mitades juntas: la plataforma y el sistema de evals y tracing que demuestra que funciona.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Cuéntame de una vez en que falló un sistema de IA que construiste." level="senior">
+
+Elige una falla real de un capstone. Estructura de ejemplo: "Mi agente de soporte pasaba los evals de respuesta final con 0.9, pero en los evals de trayectoria llamaba a la herramienta de reembolso antes de revisar el estado del pedido en 4 de 30 casos. Las respuestas finales se veían bien porque el reembolso simulado tenía éxito. Agregué una precondición en el contrato de la herramienta, que rechaza reembolsos sin una consulta previa en la misma ejecución, más aserciones de trayectoria en CI. La lección: evalúa el camino, no solo la salida." Luego menciona el cambio de proceso que hiciste.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Empieza por el artefacto">
+
+Siempre que puedas, di "te lo puedo mostrar" y comparte el repo, el reporte de evals o un trace. Un enlace le gana a un adjetivo.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- El método STAR (resumen): https://en.wikipedia.org/wiki/Situation,_task,_action,_result
+- Anthropic, cómo construir agentes efectivos: https://www.anthropic.com/research/building-effective-agents
+- Conceptos de evaluación en LangSmith (para el vocabulario): https://docs.smith.langchain.com/evaluation

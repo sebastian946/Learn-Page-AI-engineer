@@ -1,0 +1,244 @@
+# SQL for AI engineers: window functions, CTEs, JSONB and LLM logs
+
+Every LLM system you ship writes data: request logs, token counts, latencies, retrieval hits, user feedback, eval results. Dashboards built by someone else will answer the easy questions. The interesting ones — "which prompt version regressed for tenant X?", "what do our worst answers have in common?" — need SQL you write yourself.
+
+You already know PostgreSQL. This lesson focuses on the four SQL tools that do most of the work in AI engineering:
+
+1. **CTEs** to break an analysis into named, testable steps.
+2. **Window functions** for per-group rankings, percentiles and run-over-run comparisons.
+3. **JSON operators** to dig into request and response payloads.
+4. **Sampling and dedup patterns** to turn production traffic into eval datasets.
+
+## The schema we will use
+
+A realistic request log table. One row per LLM call.
+
+```sql
+CREATE TABLE llm_requests (
+  request_id     uuid PRIMARY KEY,
+  ts             timestamptz NOT NULL,
+  tenant_id      text NOT NULL,
+  model          text NOT NULL,
+  prompt_version text NOT NULL,
+  input_tokens   int NOT NULL,
+  output_tokens  int NOT NULL,
+  latency_ms     int NOT NULL,
+  status         text NOT NULL,          -- 'ok' | 'error' | 'timeout' | 'refused'
+  cost_usd       numeric(12, 6) NOT NULL,
+  request        jsonb NOT NULL,         -- {"question": "...", "route": "...", "retries": 0}
+  response       jsonb,                  -- {"answer": "...", "citations": [...]}
+  feedback       smallint                -- 1 thumbs up, -1 thumbs down, NULL none
+);
+CREATE INDEX ON llm_requests (ts);
+CREATE INDEX ON llm_requests USING gin (request jsonb_path_ops);
+```
+
+Keep cost in the row, computed at write time from the price table you used that day. Recomputing cost later from today's prices gives you wrong history.
+
+## CTEs: analysis as a pipeline
+
+A CTE (`WITH ... AS`) is a named sub-result. Think of it like a fixture in a test: set up the data once, then assert on it. Long analyses become readable top-to-bottom steps.
+
+```sql
+WITH daily AS (
+  SELECT date_trunc('day', ts) AS day, tenant_id,
+         count(*)                               AS requests,
+         sum(cost_usd)                          AS cost,
+         avg((status <> 'ok')::int)::numeric(5,4) AS error_rate
+  FROM llm_requests
+  WHERE ts >= now() - interval '30 days'
+  GROUP BY 1, 2
+),
+ranked AS (
+  SELECT *, rank() OVER (PARTITION BY day ORDER BY cost DESC) AS cost_rank
+  FROM daily
+)
+SELECT day, tenant_id, requests, cost, error_rate
+FROM ranked
+WHERE cost_rank <= 3
+ORDER BY day DESC, cost_rank;
+```
+
+That answers "top three most expensive tenants per day" without nested subqueries. Each CTE can be run alone while you debug, which is the same habit as isolating a failing test step.
+
+## Window functions: the workhorse
+
+A window function computes over a set of rows related to the current row **without collapsing them**. `GROUP BY` gives one row per group. A window gives every row plus a group-level value.
+
+### Latency percentiles per model per day
+
+Averages hide tail latency. Users feel p95, not the mean.
+
+```sql
+SELECT date_trunc('day', ts) AS day, model,
+       count(*) AS n,
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99_ms
+FROM llm_requests
+WHERE status = 'ok'
+GROUP BY 1, 2
+ORDER BY 1 DESC, 2;
+```
+
+`percentile_cont` is an ordered-set aggregate in Postgres. In Databricks SQL use `percentile(latency_ms, 0.95)` or `percentile_approx(latency_ms, 0.95)` — the approximate version is much cheaper on billions of rows.
+
+### Latest row per key with ROW_NUMBER
+
+Deduplication and "latest state" both use the same pattern:
+
+```sql
+SELECT *
+FROM (
+  SELECT r.*,
+         row_number() OVER (PARTITION BY request->>'question_hash' ORDER BY ts DESC) AS rn
+  FROM llm_requests r
+) t
+WHERE rn = 1;
+```
+
+Databricks SQL supports `QUALIFY`, which removes the wrapper: `... QUALIFY row_number() OVER (...) = 1`.
+
+### Comparing runs with LAG
+
+Eval results are a time series too. Suppose you store one row per eval run:
+
+```sql
+-- eval_runs(run_id, started_at, prompt_version, dataset_version, metric, value)
+SELECT prompt_version, metric, started_at, value,
+       value - lag(value) OVER (PARTITION BY metric ORDER BY started_at) AS delta
+FROM eval_runs
+WHERE dataset_version = 'golden-v3'
+ORDER BY metric, started_at;
+```
+
+A negative `delta` on `faithfulness` is a regression. This is the query behind a "did this PR make things worse?" gate.
+
+## JSON: querying payloads
+
+Requests and responses are semi-structured. Postgres `jsonb` operators:
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `->` | get JSON value | `response->'citations'` |
+| `->>` | get as text | `request->>'route'` |
+| `@>` | containment (uses GIN index) | `request @> '{"route": "billing"}'` |
+| `jsonb_array_length` | array size | `jsonb_array_length(response->'citations')` |
+| `jsonb_path_exists` | JSONPath test | `jsonb_path_exists(request, '$.retries ? (@ > 0)')` |
+
+A useful health query: share of answers with zero citations, by route.
+
+```sql
+SELECT request->>'route' AS route,
+       count(*) AS n,
+       avg((coalesce(jsonb_array_length(response->'citations'), 0) = 0)::int) AS no_citation_rate,
+       avg((request->>'retries')::int) AS avg_retries
+FROM llm_requests
+WHERE status = 'ok' AND ts >= now() - interval '7 days'
+GROUP BY 1
+ORDER BY no_citation_rate DESC;
+```
+
+In **Databricks SQL**, JSON stored as a `STRING` is queried with the colon path syntax: `request:route`, `response:citations[0].doc_id`. You can also parse into a struct with `from_json(request, 'route STRING, retries INT')`, or use the `VARIANT` type on recent runtimes. Same ideas, different syntax — check the docs for the version you run.
+
+## Building eval datasets from production data
+
+Your golden dataset from Module 3 was hand-written. It goes stale. Production traffic shows what users actually ask. The goal is a **representative, deduplicated, labeled** sample.
+
+Rules that matter:
+
+- **Stratify.** Random sampling over-represents the dominant route. Sample N per route (or per tenant, per intent).
+- **Over-sample failures.** Thumbs-down, refusals, timeouts and no-citation answers are where bugs live. Mix them in at a fixed ratio, for example 30%.
+- **Deduplicate on a normalized question.** Lowercase, trim, collapse whitespace, then hash. Otherwise one popular question dominates.
+- **Scrub PII before export.** More on this in the next lesson.
+- **Version it.** Record the query, the date range and the row count with the dataset.
+
+```sql
+WITH base AS (
+  SELECT request_id, ts, request->>'route' AS route,
+         request->>'question' AS question,
+         response->>'answer' AS answer, feedback, status,
+         md5(regexp_replace(lower(trim(request->>'question')), '\s+', ' ', 'g')) AS qhash
+  FROM llm_requests
+  WHERE ts >= now() - interval '30 days'
+),
+dedup AS (
+  SELECT DISTINCT ON (qhash) *
+  FROM base
+  ORDER BY qhash, (feedback = -1) DESC NULLS LAST, ts DESC
+),
+strata AS (
+  SELECT *,
+         CASE WHEN feedback = -1 OR status <> 'ok' THEN 'failure' ELSE 'normal' END AS bucket,
+         row_number() OVER (
+           PARTITION BY route,
+             CASE WHEN feedback = -1 OR status <> 'ok' THEN 'failure' ELSE 'normal' END
+           ORDER BY random()) AS rn
+  FROM dedup
+)
+SELECT request_id, route, bucket, question, answer
+FROM strata
+WHERE (bucket = 'normal' AND rn <= 14) OR (bucket = 'failure' AND rn <= 6)
+ORDER BY route, bucket;
+```
+
+`DISTINCT ON` keeps the thumbs-down copy of a duplicated question, so failures survive dedup. The window gives each route 14 normal and 6 failure examples. Use `setseed(0.42)` before the query if you need reproducible samples.
+
+Then export to the shape your eval framework expects. MLflow GenAI evaluation (lesson 6) uses records like:
+
+```python
+import json
+import psycopg
+
+SQL = open("sql/eval_sample.sql").read()
+
+with psycopg.connect("postgresql://localhost/llmlogs") as conn, open("eval_v1.jsonl", "w") as f:
+    for request_id, route, bucket, question, answer in conn.execute(SQL):
+        record = {
+            "inputs": {"question": question},
+            "expectations": {"expected_response": None},  # filled by a human labeler
+            "tags": {"route": route, "bucket": bucket, "source_request_id": str(request_id)},
+        }
+        f.write(json.dumps(record) + "\n")
+```
+
+Leave `expectations` empty for a labeler or an SME review session. Never copy the production answer as the expected answer without review — you would be encoding today's bugs as tomorrow's ground truth.
+
+## Common mistakes
+
+- **Averaging latency.** Report p50/p95/p99. One slow tool call ruins the tail, not the mean.
+- **Mixing errors into latency stats.** Timeouts sit at the limit and distort percentiles. Filter by status or report them separately.
+- **Recomputing cost from current prices.** Store cost per row at write time.
+- **Random sampling for eval sets.** You get 80% of one intent and zero edge cases. Stratify and over-sample failures.
+- **No dedup.** The same FAQ appears 400 times and inflates your pass rate.
+- **Full table scans on JSON.** Add a GIN index for `@>` queries, or promote hot fields (route, tenant) to real columns.
+- **`ORDER BY random()` without a seed** when reproducibility matters.
+
+## How this shows up in interviews
+
+AI engineering interviews increasingly include a SQL screen with a logging or events schema. Expect "find p95 per group", "latest row per key" and "week-over-week change".
+
+<InterviewQuestion question="Given a table of LLM requests, how would you find which prompt version caused a quality regression?" level="mid">
+
+Join the request log with feedback or eval results, group by `prompt_version` and day, and compute a quality metric (thumbs-down rate, eval pass rate). Use `LAG` over time ordered by deploy date to get the delta between versions. Control for mix: compare within the same route or tenant, because a new version may have shipped while traffic shifted. Confirm with an offline eval of both versions on the same frozen dataset before blaming the prompt.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you build an eval dataset from production logs without biasing it?" level="senior">
+
+Stratify by intent or route so small segments are represented. Over-sample known failures (thumbs-down, refusals, no-citation answers) at a fixed, documented ratio. Deduplicate on a normalized question hash. Scrub PII before export. Label expectations with humans or SMEs, not by copying the model's answer. Version the dataset with its query, date range and counts, and refresh it on a schedule while keeping a frozen regression set for CI.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Say the trade-off">
+
+When you mention `percentile_approx`, add why: exact percentiles need a full sort per group; approximate ones are bounded-error and scale to billions of rows. Interviewers listen for that kind of reasoning.
+
+</Callout>
+
+## Further reading
+
+- PostgreSQL window functions: https://www.postgresql.org/docs/current/tutorial-window.html
+- PostgreSQL JSON functions and operators: https://www.postgresql.org/docs/current/functions-json.html
+- Databricks SQL: querying JSON strings: https://docs.databricks.com/en/sql/language-manual/sql-ref-json-path-expression.html
+- Databricks SQL `QUALIFY` clause: https://docs.databricks.com/en/sql/language-manual/sql-ref-syntax-qry-select-qualify.html

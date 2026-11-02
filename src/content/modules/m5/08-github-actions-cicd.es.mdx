@@ -1,0 +1,218 @@
+## Qué cambia en CI/CD para apps LLM
+
+Llevas años construyendo pipelines en GitHub Actions. Lint, tests, build, push, deploy. Todo eso sigue aplicando. Las apps LLM agregan tres cosas:
+
+1. **Tests que cuestan dinero y no son deterministas.** Tu suite de evals del Módulo 3 llama a un modelo real, tarda minutos y cuesta dólares por corrida. No puedes correrla en cada commit de cada rama sin pensarlo.
+2. **Cambios que no son código.** Editar una línea del prompt puede bajar el faithfulness 10 puntos. El pipeline debe tratar `prompts/` y la configuración de retrieval como código con su propio gate.
+3. **Secretos con un radio de impacto real.** Una API key del proveedor filtrada se abusa en cuestión de horas. Las llaves de AWS de larga duración en los secrets de GitHub son un riesgo.
+
+El pipeline objetivo para `mortgage-knowledge-assistant`:
+
+```text
+PR:    lint + types + unit tests  ->  eval gate (only if prompts/retrieval changed)  ->  docker build (no push)
+main:  same checks  ->  build + push image to ECR (tag = git SHA)  ->  deploy staging  ->  smoke test
+       ->  manual approval  ->  deploy production (same image digest)
+```
+
+## Primero los checks rápidos: la base de la pirámide
+
+Mantén rápido el primer job. Si lint, chequeo de tipos y tests unitarios tardan más de 3–4 minutos, los desarrolladores dejan de esperarlos. Usa `uv` con su caché y haz mock del LLM en los tests unitarios. Tu configuración `LLM_PROVIDER=mock` de lecciones anteriores rinde frutos aquí: los tests unitarios nunca tocan la red.
+
+## El eval gate: córrelo cuando importa
+
+El Módulo 3 te dio un harness de evals que falla si el faithfulness o la answer relevance bajan de un umbral. En CI, córrelo:
+
+- en PRs que tocan `prompts/`, `app/rag/`, `app/llm.py`, la configuración de retrieval o el propio dataset de evals,
+- en un schedule nocturno contra `main`, para detectar drift del lado del proveedor,
+- manualmente vía `workflow_dispatch` cuando quieras una verificación.
+
+Usa un filtro `paths` para que un arreglo del README no gaste $4 en evals. Usa un subconjunto "smoke" más pequeño (por ejemplo 50 preguntas golden) en PRs y el set completo por la noche. Pon un **tope de presupuesto** dentro del harness: registra el uso de tokens y aborta si la corrida supera `EVAL_MAX_USD`. Un bug que recorre el dataset dos veces debe fallar, no duplicar la factura en silencio.
+
+Fija el modelo juez y la versión del dataset. Si cualquiera de los dos cambia en el mismo PR que el prompt, no puedes saber qué cambio movió el score.
+
+## Construye una vez, despliega el mismo artefacto
+
+La imagen que pruebas en staging debe ser exactamente la imagen que corres en producción. Etiqueta las imágenes con el **git SHA**, nunca solo con `latest`. Despliega por **digest** si puedes. Usa Docker Buildx con el backend de caché de GitHub Actions para reutilizar las capas de dependencias entre corridas. Un build en frío de una imagen de IA en Python con dependencias pesadas puede tardar más de 5 minutos; uno en caliente, a menudo menos de 1 minuto.
+
+## OIDC en lugar de llaves de AWS de larga duración
+
+GitHub Actions puede pedir un token OIDC de corta duración, y AWS IAM puede confiar en él. Creas un rol de IAM cuya trust policy permite a `token.actions.githubusercontent.com` para tu repo, limitado por rama o environment a través del claim `sub`. El workflow asume el rol con `aws-actions/configure-aws-credentials`. No hay `AWS_ACCESS_KEY_ID` guardado en ningún lado. Las credenciales expiran en aproximadamente una hora.
+
+Usa roles separados para staging y producción, cada uno con confianza solo para su environment de GitHub correspondiente, por ejemplo `repo:you/mortgage-knowledge-assistant:environment:production`.
+
+## Environments y aprobaciones
+
+Los **environments** de GitHub te dan secrets, variables y reglas de protección por entorno. Configura:
+
+- `staging`: sin aprobación, despliega automáticamente desde `main`.
+- `production`: revisores requeridos (tú, en un proyecto personal), opcionalmente un temporizador de espera, y deploys restringidos a `main`.
+
+Un job con `environment: production` se pausa hasta que se aprueba. La interfaz de aprobación muestra el commit y el resultado de staging. Ese es tu gate de release.
+
+## El workflow
+
+```yaml
+# .github/workflows/ci-cd.yml
+name: ci-cd
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+  id-token: write   # required for OIDC
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: mortgage-knowledge-assistant
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      rag_changed: ${{ steps.filter.outputs.rag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy app
+      - run: uv run pytest -q -m "not integration"
+        env: { LLM_PROVIDER: mock }
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rag:
+              - 'prompts/**'
+              - 'app/rag/**'
+              - 'app/llm.py'
+              - 'evals/**'
+
+  eval-gate:
+    needs: checks
+    if: needs.checks.outputs.rag_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --frozen
+      - run: uv run python -m evals.run --suite smoke --min-faithfulness 0.85 --max-usd 3
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.EVAL_ANTHROPIC_API_KEY }}
+```
+
+Los jobs de build y deploy continúan en el mismo archivo:
+
+```yaml
+  build:
+    needs: [checks, eval-gate]
+    if: always() && needs.checks.result == 'success' && needs.eval-gate.result != 'failure'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        env: { REGISTRY: "${{ steps.ecr.outputs.registry }}" }
+        run: echo "image=${REGISTRY:-local}/${ECR_REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: ./infra/deploy.sh staging "${{ needs.build.outputs.image }}"
+      - run: ./infra/smoke.sh "${{ vars.BASE_URL }}"
+
+  deploy-production:
+    needs: [build, deploy-staging]
+    environment: production   # pauses for required reviewers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: ./infra/deploy.sh production "${{ needs.build.outputs.image }}"
+      - run: ./infra/smoke.sh "${{ vars.BASE_URL }}"
+```
+
+Algunos detalles a notar:
+
+- **El `if` en `build`.** Cuando `eval-gate` se omite porque no cambiaron archivos de RAG, un `needs` simple también omitiría `build`. `always()` más chequeos explícitos de resultado permiten "eval aprobado u omitido", pero bloquean ante una falla.
+- **`vars.AWS_DEPLOY_ROLE_ARN` por environment.** El mismo nombre de variable resuelve al rol de staging en el environment `staging` y al rol de producción en `production`. Lo mismo con `BASE_URL`.
+- **Concurrencia.** En PRs, un nuevo push cancela la corrida anterior. En `main`, las corridas se encolan en lugar de cancelarse, así nunca cancelas un deploy de producción a medio camino.
+- **La API key de evals es un secret separado** con su propio límite de gasto en el proveedor, no la key de producción.
+- **El script de deploy** (lección 09 y ejercicio 10) genera una nueva task definition de ECS con la imagen y espera a que el servicio esté estable.
+
+## Smoke tests después del deploy
+
+Después de cada deploy, corre un script smoke corto contra el entorno real: `GET /readyz`, un `POST /v1/chat` con una pregunta conocida y un request de streaming que verifique que el primer evento `token` llega en pocos segundos. Usa un tenant "smoke" dedicado para que estos requests sean fáciles de excluir de la analítica. Si el smoke falla en staging, producción nunca recibe la solicitud de aprobación.
+
+## Rollbacks
+
+Como cada imagen está etiquetada con un SHA, un rollback es "desplegar el SHA anterior". Déjalo como un input de `workflow_dispatch` en un pequeño workflow `rollback.yml`. Activa también el deployment circuit breaker de ECS con rollback automático (lección 09), que maneja por ti los health checks fallidos. Las regresiones que son solo de prompt suelen revertirse más rápido con un feature flag (lección 14) que con un redeploy.
+
+## Errores comunes
+
+- **Correr la suite completa de evals en cada push.** Lento, caro, y la gente aprende a ignorarlo. Usa filtros de paths, un subconjunto smoke y una corrida completa nocturna.
+- **Eval gate sin tope de presupuesto.** Un bug y tu CI gasta cientos de dólares.
+- **Usar la API key de producción en CI.** Un log filtrado o un PR malicioso desde un fork puede exponerla. Por defecto, los secrets no se pasan a workflows disparados desde forks; mantenlo así.
+- **Etiquetar solo `latest`.** No puedes saber qué está corriendo ni hacer rollback de forma confiable.
+- **Reconstruir la imagen para producción.** Staging probó un artefacto distinto. Promueve la misma imagen.
+- **Llaves de AWS de larga duración en secrets.** Usa OIDC con roles de alcance acotado.
+- **`cancel-in-progress: true` en `main`.** Un nuevo merge puede cancelar un deploy en pleno rollout.
+- **Evals inestables (flaky) bloqueando merges.** Usa una semilla fija cuando sea posible, temperature 0 en el sistema bajo prueba, un juez fijado y umbrales con una pequeña tolerancia. Sigue la tendencia del score, no solo aprobado o reprobado.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo agregas evals de LLM a CI sin que el pipeline sea lento, inestable y caro?" level="senior">
+
+Trata los evals como la cima de la pirámide de tests. Los tests unitarios con un LLM simulado corren en cada push. El eval gate corre solo cuando cambian prompts, código de retrieval, configuración del modelo o el dataset, usando un filtro de paths, y ejecuta un subconjunto smoke de unas 50 preguntas golden con un tope duro de presupuesto en dólares. La suite completa corre cada noche contra main para detectar drift del proveedor. Para manejar el no determinismo: temperature 0, versiones fijadas de modelo y juez, datasets versionados y umbrales con una banda de tolerancia más seguimiento de tendencia. La key de evals es una key separada con límite de gasto en el proveedor.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Por qué usar OIDC para autenticar GitHub Actions en AWS?" level="mid">
+
+Elimina las llaves de acceso de larga duración de GitHub. El workflow pide un token de corta duración al proveedor OIDC de GitHub, y AWS STS lo intercambia por credenciales temporales de un rol que expiran en aproximadamente una hora. La trust policy de IAM restringe qué repo, rama o environment puede asumir el rol mediante el claim `sub` del token, así que el rol de producción solo puede asumirlo un job que corre en el environment de producción. Nada que rotar, nada útil que filtrar.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Conéctalo con tu experiencia de SDET">
+
+Ya construiste gates de CI antes. Dilo: "Es el mismo enfoque de quality gates que usé para suites E2E: tests rápidos en cada commit, tests caros dirigidos por impacto del cambio, una corrida completa nocturna y manejo de flakiness. Lo nuevo son los topes de costo y el no determinismo". Es una historia creíble para el salto de QA a IA.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- GitHub Actions: usar environments para deploy: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
+- Configurar OpenID Connect en AWS: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+- Caché de builds de Docker con GitHub Actions: https://docs.docker.com/build/ci/github-actions/cache/
+- Concurrencia en GitHub Actions: https://docs.github.com/en/actions/using-jobs/using-concurrency
+- uv en GitHub Actions: https://docs.astral.sh/uv/guides/integration/github/

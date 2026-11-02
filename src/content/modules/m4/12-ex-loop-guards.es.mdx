@@ -1,0 +1,142 @@
+## Objetivo
+
+En el ejercicio 08 construiste `langgraph-hitl-agent`: un agente LangGraph con una compuerta de aprobación antes de las herramientas riesgosas. Ahora mismo nada le impide entrar en bucle para siempre o gastar sin límite. En este ejercicio agregas tres guardas y pruebas cada una con un test determinista:
+
+1. **Máximo de pasos** — el agente se detiene después de `MAX_STEPS` llamadas al modelo.
+2. **Detección de acciones repetidas** — el agente se detiene cuando la misma tool call (nombre más argumentos) aparece `REPEAT_THRESHOLD` veces.
+3. **Presupuesto de costo por ejecución** — el agente se detiene antes de una llamada al modelo que empujaría la ejecución por encima de `MAX_COST_USD`.
+
+Cada parada debe ser elegante: un mensaje final claro, un `stop_reason` en el estado y un ticket para un humano. Ninguna excepción debe llegar a quien invoca.
+
+Tiempo: 60 minutos. No vas a llamar a un modelo real. Los tests usan un modelo de chat falso que entra en bucle a propósito, igual que harías un stub de una dependencia flaky en un test de integración.
+
+## Contexto
+
+Piensa en esto como agregar timeouts y circuit breakers a un servicio que ya es tuyo. Las guardas viven en el grafo, no en el prompt. Un prompt que dice "no te repitas" es una sugerencia. Un router que revisa un contador es un contrato.
+
+Los precios vienen de `config/pricing.yaml`. Usa valores de ejemplo y etiquétalos como ejemplos. Los tests deben inyectar sus propios precios para no depender nunca de precios reales.
+
+<AcceptanceCriteria>
+
+- [ ] `AgentState` tiene `step_count: int`, `cost_usd: float` y `stop_reason: str | None`, con valores por defecto razonables en la entrada del grafo.
+- [ ] El nodo del agente incrementa `step_count` y suma el costo de cada respuesta calculado con `usage_metadata` y un dict de precios.
+- [ ] Un router de guardas corre después del nodo del agente y antes de las herramientas. Enruta a `stop` por máximo de pasos, acción repetida o presupuesto, a `tools` si hay tool calls, y a `END` en otro caso.
+- [ ] La revisión de presupuesto usa una estimación previa, así que una llamada que excedería el presupuesto nunca se hace.
+- [ ] El nodo `stop` escribe un `AIMessage` para el usuario, define `stop_reason` como `max_steps`, `repeated_action` o `budget`, y llama `create_ticket` con el thread id.
+- [ ] `recursion_limit` sigue definido en la config de invoke como respaldo, mayor que `MAX_STEPS * 2 + 5`.
+- [ ] Los límites se leen de env o config (`MAX_STEPS`, `REPEAT_THRESHOLD`, `MAX_COST_USD`) con valores por defecto.
+- [ ] Tres tests de pytest, uno por guarda, con un modelo falso. Sin red. Tiempo total de tests por debajo de 2 segundos.
+- [ ] Un test prueba que una ejecución normal (dos tool calls y luego una respuesta final) no se ve afectada por las guardas.
+- [ ] El README tiene una sección "Guards" con los límites, cómo se eligieron y los valores de `stop_reason`.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# src/hitl_agent/guards.py
+import hashlib
+import json
+import os
+from dataclasses import dataclass
+from langchain_core.messages import AIMessage, AnyMessage
+
+@dataclass(frozen=True)
+class GuardConfig:
+    max_steps: int = int(os.getenv("MAX_STEPS", "8"))
+    repeat_threshold: int = int(os.getenv("REPEAT_THRESHOLD", "3"))
+    max_cost_usd: float = float(os.getenv("MAX_COST_USD", "0.25"))
+
+def call_signature(name: str, args: dict) -> str:
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{name}:{canonical}".encode()).hexdigest()[:16]
+
+def find_repeated_call(messages: list[AnyMessage], threshold: int) -> str | None:
+    """Return the tool name if any (name, args) signature appears >= threshold times."""
+    raise NotImplementedError
+
+def message_cost(msg: AIMessage, prices: dict[str, float]) -> float:
+    """Cost in USD from usage_metadata. prices has input_per_mtok and output_per_mtok."""
+    raise NotImplementedError
+
+def estimate_next_call_cost(messages: list[AnyMessage], max_tokens: int,
+                            prices: dict[str, float]) -> float:
+    """Rough pre-call estimate: ~4 chars per token for input, max_tokens for output."""
+    raise NotImplementedError
+
+def check_guards(state: dict, cfg: GuardConfig, prices: dict[str, float],
+                 max_tokens: int) -> str | None:
+    """Return a stop_reason or None."""
+    raise NotImplementedError
+```
+
+```python
+# tests/test_guards.py
+from langgraph.checkpoint.memory import MemorySaver
+from hitl_agent.graph import build_graph
+from tests.fakes import ScriptedModel  # from exercise 08
+from langchain_core.messages import AIMessage
+
+def looping_model(n: int = 50) -> ScriptedModel:
+    msgs = [AIMessage(content="", tool_calls=[{
+        "name": "get_order", "args": {"order_id": "ORD-1001"}, "id": f"call_{i}"}],
+        usage_metadata={"input_tokens": 1200, "output_tokens": 40, "total_tokens": 1240})
+        for i in range(n)]
+    return ScriptedModel(msgs)
+
+def test_repeated_action_stops_run(fake_backend):
+    graph = build_graph(looping_model(), MemorySaver(), backend=fake_backend)
+    out = graph.invoke({"messages": [("user", "Where is ORD-1001?")]},
+                       config={"configurable": {"thread_id": "t-repeat"}, "recursion_limit": 40})
+    assert out["stop_reason"] == "repeated_action"
+    # TODO: assert create_ticket was called once on the fake backend
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Pon las tres revisiones en una función pura, `check_guards(state, cfg, prices, max_tokens)`, que devuelva una razón o `None`. Las funciones puras son triviales de probar. El router solo la llama y mapea la razón al nodo `stop`.</Hint>
+  <Hint>Reutiliza el `ScriptedModel` del ejercicio 08 (`tests/fakes.py`): `build_graph(llm, checkpointer)` ya recibe un modelo con las tools enlazadas, así que el fake no necesita `bind_tools`. Agrega un parámetro opcional `backend=None` a `build_graph` para que los tests pasen un backend falso que registra las llamadas (por defecto: los diccionarios en memoria del ejercicio 08). El ejercicio 14 reutiliza ese parámetro.</Hint>
+  <Hint>Para el test de presupuesto, dale a las respuestas falsas una `usage_metadata` grande e inyecta precios como `{"input_per_mtok": 100.0, "output_per_mtok": 100.0}`. Así dos o tres pasos revientan un presupuesto de 0.25 USD y el test sigue siendo determinista. Verifica que el modelo se llamó menos veces que el número de mensajes falsos que entregaste.</Hint>
+  <Hint>Para el nodo stop, devuelve `{"messages": [AIMessage(content=...)], "stop_reason": reason}` y llama la herramienta de tickets directamente (no a través del modelo). Obtén el thread id del argumento `config`: `def stop_node(state, config): tid = config["configurable"]["thread_id"]`. En el test de máximo de pasos, usa un modelo falso que consulte un order id distinto cada vez, para que la guarda de repetición no se dispare primero.</Hint>
+</Hints>
+
+<CommitBox repo="langgraph-hitl-agent">
+
+```text
+langgraph-hitl-agent/
+  config/
+    pricing.yaml          # example prices, labeled as examples
+  src/hitl_agent/
+    graph.py              # router now calls check_guards, adds stop node
+    state.py              # step_count, cost_usd, stop_reason
+    guards.py             # new: pure guard functions + GuardConfig
+    tools.py
+    approval.py
+    cli.py
+  tests/
+    conftest.py           # fake_backend fixture
+    test_guards.py        # unit tests for pure functions
+    test_guard_graph.py   # graph-level tests with looping fake model
+  README.md
+  pyproject.toml
+```
+
+Agregados al README:
+
+- **Guards**: tabla con límite, valor por defecto, variable de entorno y cómo se eligió (por ejemplo "el p95 de pasos en 50 ejecuciones trazadas fue 5, así que el máximo es 8").
+- **Stop reasons**: `max_steps`, `repeated_action`, `budget` y qué ve el usuario en cada caso.
+- **Modelo de costo**: cómo se calcula el costo, dónde viven los precios, nota de que los valores son ejemplos.
+
+Commits sugeridos:
+
+- `feat(guards): add step counter and cost tracking to agent state`
+- `feat(guards): detect repeated tool calls by signature hash`
+- `feat(guards): enforce per-run cost budget with pre-call estimate`
+- `feat(graph): graceful stop node with ticket and stop_reason`
+- `test(guards): looping fake model covers all three guards`
+- `docs: document guard limits and stop reasons`
+
+</CommitBox>
+
+<Checklist id="m4-12-review" title="Autorrevisión" items={["Las guardas se aplican en el enrutamiento del grafo, no solo en el prompt", "check_guards es una función pura con sus propios tests unitarios", "La revisión de presupuesto corre antes de la llamada al modelo, no después", "Cada parada produce un mensaje al usuario, un stop_reason y un ticket", "recursion_limit sigue definido como respaldo", "Los tests usan un modelo falso y corren en menos de 2 segundos sin red", "Está probado que una ejecución normal no se ve afectada por las guardas", "Los precios vienen de configuración y están etiquetados como ejemplos", "El README explica cada límite y cómo se eligió"]} />

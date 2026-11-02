@@ -1,0 +1,172 @@
+# Building a portfolio that proves skills
+
+Your resume says "built RAG systems". So does everyone else's. A portfolio is how you prove it. For a career-changer it matters even more: you do not yet have "AI Engineer" on your job history, so your GitHub has to carry that weight.
+
+This lesson covers what a hiring manager actually checks, the README structure every project in this course will use, and how to produce the evidence: architecture, evals, cost analysis and a demo.
+
+## The two-minute review
+
+Most portfolio reviews are short. A hiring manager or senior engineer opens your repo between meetings. They do not clone it. They do not run it. In roughly two minutes they decide "worth an interview" or "next".
+
+Here is what they look at, in order:
+
+1. **The first screen of the README.** One sentence on what it does, for whom. A demo GIF. If they have to scroll to understand the project, you lost part of the audience.
+2. **The architecture diagram.** Does this person think in systems? Are there clear components, data flow, external services?
+3. **Evidence of quality.** An eval section with numbers. "Faithfulness 0.91 on 60 golden questions" beats "high accuracy". A green CI badge.
+4. **Cost and latency awareness.** A table with cost per request or per 1k requests, and p50/p95 latency. This is the single strongest "production mindset" signal, and most candidates skip it.
+5. **Code skim.** Folder structure, one or two files. Type hints, tests folder, no secrets in the repo, no 900-line `main.py`.
+6. **Commit history.** Small, meaningful commits over several days. One giant "initial commit" looks like a copied tutorial.
+
+Your repos should answer all six in that order.
+
+## Depth beats breadth
+
+Three deep projects beat fifteen shallow ones. A shallow project is a tutorial with a new name: one notebook, no tests, no README beyond a title. A deep project has:
+
+- A realistic problem and user ("internal policy assistant for loan officers", not "chat with PDF").
+- Evaluation with a dataset you built.
+- At least one trade-off you measured and documented ("hybrid search raised context recall from 0.72 to 0.84 at +40 ms p95").
+- A deploy story, even if it is a Docker Compose file and a short "how to run".
+
+By the end of this course you will have one deep project per module, plus a final capstone. That is plenty.
+
+## The README contract
+
+Every project in this course follows the same README structure. Consistency helps reviewers and saves you time. You will create the template in this module's exercise.
+
+```markdown
+# Project name
+
+One sentence: what it does, for whom, and the key result.
+
+![Demo](docs/demo.gif)
+
+[![CI](https://github.com/you/repo/actions/workflows/ci.yml/badge.svg)](...)
+
+## Problem
+Who has this problem, why it matters, what "good" looks like.
+
+## Architecture
+Mermaid diagram + 5-8 bullets explaining each component and why it was chosen.
+
+## Evaluation
+Dataset (size, how it was built), metrics, results table, how to re-run.
+
+## Cost & latency
+Cost per request and per 1k requests, p50/p95 latency, model choices.
+
+## Trade-offs & decisions
+What you tried, what you measured, what you chose and why.
+
+## Run it
+Prerequisites, env vars, one command to start, one command to run evals.
+
+## Limitations & next steps
+Honest list of what does not work yet.
+```
+
+Notice the order. Results first (demo, evals, cost), instructions later. Reviewers care about *what you proved* before *how to run it*.
+
+## Producing the cost analysis
+
+A cost section turns "I used Claude" into "I made a deliberate model choice". You need three inputs per model: average input tokens, average output tokens and price per million tokens. Measure tokens from real runs (the API response includes `usage`). Keep prices in config, never hardcoded in prose, because prices change.
+
+```python
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Price:
+    input_per_mtok: float   # USD per 1M input tokens
+    output_per_mtok: float  # USD per 1M output tokens
+
+
+def load_prices(path: Path) -> dict[str, Price]:
+    # prices.toml holds the provider's CURRENT list prices; check them before publishing.
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    return {model: Price(**p) for model, p in raw["models"].items()}
+
+
+def cost_per_request(price: Price, input_tokens: float, output_tokens: float) -> float:
+    return (input_tokens * price.input_per_mtok + output_tokens * price.output_per_mtok) / 1_000_000
+
+
+def markdown_table(prices: dict[str, Price], avg_in: float, avg_out: float) -> str:
+    rows = ["| Model | Cost / request | Cost / 1k requests |", "|---|---|---|"]
+    for model, price in prices.items():
+        c = cost_per_request(price, avg_in, avg_out)
+        rows.append(f"| `{model}` | ${c:.5f} | ${c * 1000:.2f} |")
+    return "\n".join(rows)
+
+
+if __name__ == "__main__":
+    # Averages measured from the usage field of 200 real eval runs.
+    print(markdown_table(load_prices(Path("prices.toml")), avg_in=3_200, avg_out=350))
+```
+
+The output is a table you paste into the README, next to a sentence like: "Haiku meets the 0.85 faithfulness target at a fraction of Sonnet's cost, so production uses Haiku and escalates low-confidence answers to Sonnet." That sentence is what gets you the interview.
+
+<Callout type="warning" title="Label your prices">
+
+Always write the date you checked the prices and link the provider's pricing page. Never present a price from memory as a fact. Reviewers notice stale or invented numbers.
+
+</Callout>
+
+## Making the demo GIF
+
+A 10–20 second GIF at the top of the README does more than three paragraphs. Keep it short and focused on the result.
+
+- **Terminal projects:** record with [VHS](https://github.com/charmbracelet/vhs) (scriptable, reproducible) or asciinema plus `agg` to convert to GIF.
+- **Web UIs:** use ScreenToGif (Windows), Kap (macOS) or Peek (Linux). Or record with Playwright's video option and convert with ffmpeg. You already know Playwright, so this is a nice touch.
+- **Size:** aim for under 5 MB. Crop to the relevant area, reduce frame rate to 10–15 fps.
+- **Content:** show one realistic question, the streamed answer and the citations. No login screens, no typing setup commands.
+
+## The portfolio hub
+
+Reviewers often land on your GitHub profile, not a specific repo. A hub repo (`ai-engineer-portfolio`) solves that. It holds:
+
+- A short intro: who you are, what you are targeting.
+- A table of projects with one-line results and links.
+- The shared templates and conventions all your projects follow.
+
+Pin it on your profile next to your two best projects. You will build it in the exercise.
+
+## Common mistakes
+
+- **No README, or a README that is just setup instructions.** The README is the product page. Write it like one.
+- **Notebooks as the main artifact.** Fine for exploration. For a portfolio, ship a package or service with tests. Keep notebooks in a `notebooks/` folder.
+- **Committing secrets.** An `.env` file with an API key in your history is an instant rejection, and a real security incident. Use `.env.example` and a pre-commit secret scanner.
+- **Claims without numbers.** "Improved accuracy" means nothing. "Context precision 0.68 to 0.81 after re-ranking" means a lot.
+- **Hiding limitations.** Senior reviewers trust candidates who say what does not work. An honest "Limitations" section signals seniority.
+- **Forking tutorials.** A fork of a popular repo with three changed lines is visible and hurts more than it helps.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Walk me through a project you're proud of." level="mid">
+
+Use the README order as your structure, and keep it to about two minutes. Example: "I built an internal knowledge assistant for a fictional mortgage lender. Loan officers ask policy questions and get cited answers from about 300 pages of PDFs. Architecture: ingestion with document-aware chunking, pgvector with hybrid BM25 plus vector search, a cross-encoder re-ranker and Claude for generation with mandatory citations. What I am most proud of is the evaluation: 60 golden questions built with a domain checklist, measured with Ragas for faithfulness and context recall, running in GitHub Actions on every PR. Adding the re-ranker raised context precision noticeably for a small latency cost, and I documented that trade-off. I also measured cost per 1k requests for two models and chose the cheaper one because it met the quality bar. The biggest limitation is tables in scanned PDFs, which I list as next step."
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you know your LLM project actually works?" level="senior">
+
+I define "works" before I build. For a RAG assistant that means a golden dataset of real questions with expected answers and source documents, plus target thresholds: for example faithfulness above 0.85 and context recall above 0.8, and p95 latency under a set budget. I measure retrieval and generation separately, so I know where failures come from. The suite runs in CI and blocks regressions. I spot-check judge scores against my own labels to make sure the LLM judge agrees with a human. In production I add tracing and sample real conversations for review. It is the same mindset as test strategy: define the oracle, automate it, gate on it and monitor in production.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Your README is your interview script">
+
+If your README has Problem, Architecture, Evaluation, Cost, Trade-offs and Limitations, you already have the outline for any "tell me about a project" question. Rehearse it out loud once per project.
+
+</Callout>
+
+## Further reading
+
+- [GitHub docs — About READMEs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes)
+- [GitHub docs — Creating Mermaid diagrams](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams)
+- [Anthropic — Pricing](https://www.anthropic.com/pricing)
+- [Charmbracelet VHS](https://github.com/charmbracelet/vhs)

@@ -1,0 +1,179 @@
+## Dos tipos de memoria
+
+Los LLM no tienen estado. Cada llamada ve solo lo que pones en la ventana de contexto. La "memoria" de un agente es una decisión de ingeniería sobre **qué guardar, dónde, por cuánto tiempo y qué volver a enviarle al modelo**.
+
+LangGraph separa dos alcances:
+
+| | Memoria de corto plazo | Memoria de largo plazo |
+|---|---|---|
+| Alcance | Un hilo (una conversación, un ticket, un trabajo) | Entre hilos (por usuario, por cliente, por tenant) |
+| Mecanismo | Estado del grafo guardado por el **checkpointer** | Un **store** (`BaseStore`) con namespaces y keys |
+| Contenido típico | Mensajes, resultados de herramientas, planes intermedios | Preferencias, hechos conocidos, resoluciones pasadas, procedimientos |
+| Duración | Hasta que el hilo termina o se archiva | Hasta que lo borras o vence un TTL |
+| Riesgo principal | El contexto crece hasta volverse lento, caro o truncado | Hechos viejos, erróneos o sensibles se filtran a conversaciones nuevas |
+
+Un modelo mental útil desde el testing: la memoria de corto plazo es el estado de una ejecución de test; la memoria de largo plazo es una base de datos de fixtures compartida. Los fixtures compartidos son poderosos y son una fuente clásica de bugs flaky que dependen del orden. Trata la memoria de largo plazo con la misma desconfianza.
+
+## Memoria de corto plazo: el hilo
+
+Ya la tienes. Compila con un checkpointer, reutiliza el mismo `thread_id` y la lista `messages` sigue creciendo turno tras turno. El problema es el crecimiento. Un hilo de soporte con 15 tool calls que devuelven 2 KB de JSON cada una cuesta más en cada turno nuevo, se vuelve más lento y eventualmente choca con la ventana de contexto.
+
+Tres estrategias, de la más simple a la más capaz:
+
+1. **Recortar (trim)**: envía al modelo solo los últimos N tokens de mensajes. El estado conserva todo; el modelo ve una ventana.
+2. **Resumir**: reemplaza los mensajes viejos por un resumen acumulado y bórralos del estado.
+3. **Comprimir resultados de herramientas**: guarda una versión corta de las salidas grandes (ids, campos clave) y conserva el payload crudo en tu base de datos o en el trace.
+
+Recortar es una vista sobre el estado. No cambia lo que se guarda:
+
+```python
+from langchain_core.messages import trim_messages
+
+
+def call_model(state: AgentState) -> dict:
+    window = trim_messages(
+        state["messages"],
+        max_tokens=6_000,
+        strategy="last",
+        token_counter=llm,          # uses the model's token counting
+        start_on="human",           # never start the window on a dangling tool result
+        include_system=True,
+    )
+    response = llm.invoke([("system", SYSTEM), *window])
+    return {"messages": [response]}
+```
+
+`start_on="human"` importa. Si la ventana empieza con un `ToolMessage` cuya tool call correspondiente quedó recortada, el proveedor rechaza la solicitud.
+
+## El resumen como nodo
+
+Resumir sí cambia el estado. Un patrón común: después de cada turno del agente, si el hilo tiene más de K mensajes, un nodo `summarize` le pide a un modelo pequeño y barato que integre los mensajes más viejos en un campo `summary` y luego los borra con `RemoveMessage`.
+
+```python
+from langchain_core.messages import RemoveMessage, SystemMessage
+from langchain_anthropic import ChatAnthropic
+
+summarizer = ChatAnthropic(model="claude-haiku-5-5", max_tokens=400)
+KEEP_LAST = 8
+
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], add_messages]
+    summary: str
+
+
+def summarize(state: AgentState) -> dict:
+    old = state["messages"][:-KEEP_LAST]
+    if not old:
+        return {}
+    prompt = (
+        "Update the running summary of this logistics support case. Keep order ids, "
+        "decisions, promises made to the customer and open questions. Drop small talk.\n\n"
+        f"Current summary:\n{state.get('summary', '(none)')}"
+    )
+    new_summary = summarizer.invoke([SystemMessage(prompt), *old]).content
+    return {
+        "summary": new_summary,
+        "messages": [RemoveMessage(id=m.id) for m in old],  # add_messages deletes these
+    }
+
+
+def should_summarize(state: AgentState) -> str:
+    return "summarize" if len(state["messages"]) > 20 else "end"
+```
+
+En el nodo del agente, antepone el resumen como contexto: `[("system", SYSTEM + "\n\nCase summary:\n" + summary), *messages]`.
+
+Cuida el límite: no cortes entre un mensaje de la IA con tool calls y sus resultados. Mueve el punto de corte hacia atrás hasta que el tramo conservado empiece en un mensaje humano.
+
+## Memoria de largo plazo: el store
+
+El store es un almacén de documentos clave-valor con **namespaces** (tuplas) y búsqueda semántica opcional. Lo pasas al compilar, y los nodos lo reciben declarando un parámetro `store`.
+
+```python
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+from langchain_core.runnables import RunnableConfig
+
+store = InMemoryStore(index={"embed": embeddings, "dims": 1536})  # embeddings: any LangChain Embeddings
+
+
+def recall(state: AgentState, config: RunnableConfig, *, store: BaseStore) -> dict:
+    customer_id = config["configurable"]["customer_id"]
+    query = state["messages"][-1].content
+    hits = store.search(("customers", customer_id, "facts"), query=query, limit=5)
+    facts = "\n".join(f"- {h.value['fact']}" for h in hits)
+    return {"summary": state.get("summary", "") + f"\n\nKnown about customer:\n{facts}"}
+
+
+def remember(state: AgentState, config: RunnableConfig, *, store: BaseStore) -> dict:
+    customer_id = config["configurable"]["customer_id"]
+    # Facts extracted by a structured-output call earlier in the graph (not shown).
+    for fact in state.get("new_facts", []):
+        store.put(
+            ("customers", customer_id, "facts"),
+            key=fact["key"],                     # stable key -> update, not duplicate
+            value={"fact": fact["text"], "source_thread": config["configurable"]["thread_id"]},
+        )
+    return {}
+
+
+graph = builder.compile(checkpointer=checkpointer, store=store)
+graph.invoke(
+    {"messages": [("user", "Same as last time, deliver to the back dock.")]},
+    {"configurable": {"thread_id": "ticket-9001", "customer_id": "CUST-77"}},
+)
+```
+
+Notas de diseño:
+
+- **Usa namespaces por tenant y usuario** primero: `("customers", customer_id, "facts")`. Un tenant que falta en el namespace es una fuga de datos entre clientes.
+- **Keys estables** (`"delivery_preference"`) hacen que las actualizaciones sobrescriban los valores viejos en lugar de acumular contradicciones.
+- **Registra la procedencia** (hilo de origen, timestamp). Cuando una memoria está mal, necesitas saber de dónde vino.
+- `InMemoryStore` es para desarrollo. Usa `PostgresStore` (de `langgraph.store.postgres`) con pgvector en producción.
+
+## Qué escribir y qué olvidar
+
+Escribir memoria es fácil. Escribir *buena* memoria es una decisión de producto. Vale la pena guardar tres tipos:
+
+- **Semántica**: hechos y preferencias ("recibe entregas en el muelle trasero", "prefiere correo").
+- **Episódica**: casos pasados y cómo se resolvieron ("mayo 2026: pallet dañado, se reenvió, sin reembolso"). Buen material para few-shot.
+- **Procedimental**: reglas que el agente aprendió o recibió ("con el transportista X, reprogramar requiere 48 h de aviso"). Muchas veces es mejor mantenerlas en prompts versionados que en un store.
+
+Olvidar es una funcionalidad:
+
+- **No guardes** secretos, datos de pago ni datos personales sensibles que no necesitas. La memoria es una base de datos; las solicitudes de borrado tipo GDPR aplican a ella.
+- **Haz expirar** los hechos con límite de tiempo usando un TTL (la dirección de entrega de un solo envío no es una preferencia permanente).
+- **Sobrescribe, no agregues**, cuando un hecho cambia. Dos memorias contradictorias confunden más al modelo que ninguna.
+- **No guardes suposiciones del modelo como hechos.** Escribe solo lo que el usuario dijo o lo que una herramienta confirmó.
+- **Dale a usuarios y operadores una forma de ver y borrar** lo que el agente recuerda.
+
+## Errores comunes
+
+- **Hilos sin límite.** El costo y la latencia crecen en cada turno hasta que se rompe la ventana de contexto. Recorta o resume desde el primer día.
+- **Recortes que dejan resultados de herramientas huérfanos.** El proveedor rechaza un resultado de herramienta sin su tool call. Empieza las ventanas en un mensaje humano.
+- **Usar la memoria de largo plazo como log.** Guardar cada mensaje en el store hace que la recuperación sea ruidosa. Guarda hechos destilados; deja el historial crudo en los traces.
+- **Sin tenant en el namespace.** Las preferencias de un cliente aparecen en la conversación de otro.
+- **Resúmenes que pierden compromisos.** Si el resumen pierde "prometimos una llamada el viernes", el agente rompe una promesa. Dile al resumidor qué debe sobrevivir y pruébalo.
+- **Memoria sin tests.** Escribe evals que verifiquen que un hecho recordado se usa en un hilo posterior y que un hecho borrado no.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo manejas un historial de conversación que crece demasiado para la ventana de contexto?" level="mid">
+
+Separo lo que se guarda de lo que se envía. El checkpointer conserva el hilo completo y el modelo recibe una ventana: `trim_messages` con un presupuesto de tokens, empezando en un mensaje humano para que ningún resultado de herramienta quede huérfano. Para casos largos agrego un nodo de resumen que corre al pasar un umbral: un modelo barato integra los mensajes viejos en un resumen acumulado y `RemoveMessage` los borra del estado. El prompt del resumen lista lo que debe sobrevivir, como ids, decisiones y promesas. También reduzco las salidas grandes de herramientas antes de que entren al estado. Luego mido tokens por turno para confirmar que se mantiene estable.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Qué guardarías en memoria de largo plazo para un agente de soporte al cliente y qué evitarías?" level="senior">
+
+Guardaría hechos destilados y confirmados: preferencias, restricciones de entrega, resoluciones pasadas. Cada uno va en un namespace por tenant y cliente, tiene una key estable para que las actualizaciones sobrescriban y registra su hilo de origen y su timestamp. Evitaría transcripciones crudas, suposiciones del modelo, datos de pago y cualquier dato sensible que no necesite, y pondría TTLs a los hechos con límite de tiempo. Las reglas procedimentales normalmente van en prompts versionados, no en memoria, para que pasen por revisión. Los operadores tienen una forma de ver y borrar memorias, lo que también cubre solicitudes de borrado. Por último, pruebo la memoria: un hecho aprendido en el hilo A debe cambiar el comportamiento en el hilo B, y un hecho borrado no.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Conceptos de memoria en LangGraph: https://langchain-ai.github.io/langgraph/concepts/memory/
+- Persistencia en LangGraph (checkpointers y stores): https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Ventanas de contexto en Anthropic: https://docs.anthropic.com/en/docs/build-with-claude/context-windows
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents

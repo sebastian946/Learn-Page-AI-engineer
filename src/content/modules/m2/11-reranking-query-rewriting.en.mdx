@@ -1,0 +1,199 @@
+## Why first-stage retrieval is not enough
+
+Hybrid search (lesson 09) gives you a good candidate list. It does not give you a good *order*. Bi-encoder embeddings compress a whole chunk into one vector before they ever see the question. BM25 counts terms and knows nothing about meaning. Both are fast because they score each document independently of the query's full context.
+
+That trade-off shows up in production as a familiar bug report: "the right paragraph was retrieved, but it was chunk #14, and we only send the top 5 to the LLM." In QA terms, your retriever has decent **recall** but weak **precision at the top**.
+
+Two techniques attack this from opposite sides:
+
+- **Re-ranking** fixes the *output* of retrieval. You fetch a wide net (say 50 candidates) and re-score them with a slower, more accurate model.
+- **Query rewriting** fixes the *input* of retrieval. You transform the user's question into one or more queries that match how your documents are written.
+
+Most production RAG systems use both. The pattern is: rewrite → retrieve wide → re-rank → keep top-k → generate.
+
+<Diagram caption="Two-stage retrieval with query rewriting" chart={`flowchart LR
+  Q[User question] --> RW["Query rewriter (LLM)"]
+  RW --> H["Hybrid retrieval (top 50)"]
+  H --> RR["Cross-encoder re-ranker"]
+  RR --> K["Top 5 chunks"]
+  K --> G["LLM answer with citations"]`} />
+
+## Bi-encoders vs cross-encoders
+
+A **bi-encoder** embeds the query and the document separately, then compares vectors with cosine similarity. Document vectors are precomputed, so search over millions of chunks takes milliseconds.
+
+A **cross-encoder** takes the pair `(query, document)` as a single input and outputs one relevance score. The transformer attends across both texts at once, so it can notice that "Can I use gift funds for a down payment on an investment property?" and a chunk saying "Gift funds are permitted for primary residences only" are a strong (negative-answer) match. A bi-encoder often ranks that chunk below a generic "About gift funds" paragraph.
+
+The cost: a cross-encoder must run once per candidate, at query time. Nothing is precomputed. That is why it is a *second* stage, never the first.
+
+| | Bi-encoder | Cross-encoder |
+|---|---|---|
+| Input | query and doc encoded separately | `(query, doc)` pair together |
+| Precompute docs? | Yes | No |
+| Typical use | first-stage retrieval over the whole corpus | re-score 20–100 candidates |
+| Accuracy on ranking | good | noticeably better on most benchmarks |
+| Latency | milliseconds for millions of docs | grows linearly with candidate count |
+
+### Local cross-encoder with sentence-transformers
+
+`cross-encoder/ms-marco-MiniLM-L-6-v2` is a small model trained on MS MARCO passage ranking. It runs on CPU, which makes it a good default for a lab and for many production workloads.
+
+```python
+from dataclasses import dataclass
+from sentence_transformers import CrossEncoder
+
+
+@dataclass
+class Candidate:
+    chunk_id: str
+    text: str
+    source: str
+    score: float = 0.0
+
+
+class LocalReranker:
+    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2") -> None:
+        # max_length truncates long chunks; keep it aligned with your chunk size
+        self.model = CrossEncoder(model_name, max_length=512)
+
+    def rerank(self, query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
+        if not candidates:
+            return []
+        pairs = [(query, c.text) for c in candidates]
+        scores = self.model.predict(pairs, batch_size=32)
+        for c, s in zip(candidates, scores):
+            c.score = float(s)
+        return sorted(candidates, key=lambda c: c.score, reverse=True)[:top_k]
+```
+
+Two details matter. First, the scores are raw logits, not probabilities. Do not compare them across models, and do not treat `0.0` as a universal threshold. Second, `predict` is CPU-bound and synchronous. In a FastAPI service, run it in a thread pool (`await asyncio.to_thread(reranker.rerank, ...)`) so it does not block the event loop.
+
+### Hosted re-ranking with Cohere Rerank
+
+If you do not want to host a model, Cohere Rerank is an API that does the same job. You send the query and a list of documents; it returns indexes with relevance scores.
+
+```python
+import os
+import cohere
+
+co = cohere.ClientV2(api_key=os.environ["COHERE_API_KEY"])
+RERANK_MODEL = os.environ.get("COHERE_RERANK_MODEL", "rerank-v3.5")  # example — check Cohere's current model list
+
+
+def cohere_rerank(query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
+    resp = co.rerank(
+        model=RERANK_MODEL,
+        query=query,
+        documents=[c.text for c in candidates],
+        top_n=top_k,
+    )
+    out: list[Candidate] = []
+    for r in resp.results:
+        c = candidates[r.index]
+        c.score = r.relevance_score  # normalized 0..1, unlike raw cross-encoder logits
+        out.append(c)
+    return out
+```
+
+Choosing between them is an engineering decision, not a quality contest:
+
+- **Local cross-encoder:** no per-call fee, data stays in your VPC (important for loan files with PII), but you own CPU/GPU capacity and cold starts.
+- **Hosted rerank:** strong multilingual models, zero infra, but a network hop, a per-search cost and a data-processing agreement to review.
+
+Put the re-ranker behind a small interface (`rerank(query, candidates, top_k)`) so you can swap and A/B them with your eval suite in lesson 14.
+
+### How many candidates to re-rank?
+
+Latency grows linearly with candidates. A reasonable starting point: retrieve 30–50, re-rank, keep 4–8. Then measure. If recall@50 is high but recall@5 after re-ranking does not move, your re-ranker is not helping and you should check truncation or domain mismatch. If recall@50 itself is low, re-ranking cannot save you; fix chunking or retrieval first.
+
+## Query rewriting
+
+Users do not write queries the way policy documents are written. A borrower asks "can my mom help pay for the house?" The underwriting guide says "gift funds from an acceptable donor." Rewriting bridges that vocabulary gap.
+
+### 1. Multi-query
+
+Ask an LLM for 3–5 paraphrases, retrieve for each, and merge the lists with reciprocal rank fusion (you already built RRF in lesson 10). This raises recall when the question is ambiguous or uses lay terms.
+
+### 2. HyDE (Hypothetical Document Embeddings)
+
+Ask the LLM to write a *hypothetical answer* paragraph, then embed that paragraph instead of the question. The fake answer looks like a policy document, so it lands closer to real policy chunks in vector space. HyDE helps dense retrieval on short or vague questions. It can hurt when the model hallucinates specifics (a wrong DTI limit pulls the wrong chunks), so keep the real query in the mix.
+
+### 3. Step-back prompting
+
+Generate a more general question first. "Is a 2019 Chapter 7 bankruptcy a problem for an FHA loan closing next month?" steps back to "What are FHA waiting periods after bankruptcy?" Retrieve for both. The general query fetches the rule; the specific query fetches the edge case.
+
+### 4. Conversation condensation
+
+In chat, follow-ups are not standalone: "what about for condos?" means nothing to a retriever. Condense the history plus the new turn into one self-contained query before retrieval. This is the single most important rewrite for any conversational RAG.
+
+```python
+import json
+from anthropic import AsyncAnthropic
+from pydantic import BaseModel, Field
+
+client = AsyncAnthropic()
+
+REWRITE_SYSTEM = """You rewrite user questions for a mortgage policy search engine.
+Return JSON only: {"standalone": str, "variants": [str, ...], "step_back": str}.
+- standalone: the last user turn rewritten to be self-contained, using the chat history.
+- variants: 3 paraphrases using underwriting vocabulary (DTI, LTV, gift funds, reserves).
+- step_back: a more general question about the underlying policy.
+Never answer the question."""
+
+
+class Rewrite(BaseModel):
+    standalone: str
+    variants: list[str] = Field(max_length=5)
+    step_back: str
+
+
+async def rewrite_query(history: list[dict], question: str) -> Rewrite:
+    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history[-6:])
+    msg = await client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=400,
+        system=REWRITE_SYSTEM,
+        messages=[{"role": "user", "content": f"History:\n{transcript}\n\nLast question: {question}"}],
+    )
+    return Rewrite.model_validate(json.loads(msg.content[0].text))
+```
+
+Use a small, fast model for rewriting. It adds one LLM round-trip before retrieval, so it sits directly on your time-to-first-token. Cache rewrites for identical `(history_hash, question)` keys (lesson 16).
+
+## Common mistakes
+
+- **Re-ranking too few candidates.** Re-ranking the top 5 into a different top 5 barely changes anything. The point is to promote item #23 into the top 5.
+- **Truncating chunks silently.** MiniLM cross-encoders cap at 512 tokens. If your chunks are 1,000 tokens, the re-ranker only sees the first half. Match chunk size to the re-ranker, or re-rank on a summary field.
+- **Thresholding on raw logits.** A cutoff tuned for one model breaks when you swap models. Use top-k, or calibrate a threshold per model on your golden set.
+- **Letting HyDE replace the real query.** Always fuse HyDE results with the original query results.
+- **Rewriting without logging.** If you do not log the rewritten queries, you cannot debug a bad answer. Trace the rewrite as its own span.
+- **Forgetting latency budgets.** Rewrite (300–800 ms) + retrieval + re-rank (50–300 ms on CPU for 50 short chunks) adds up. Measure p95, not averages.
+- **No eval before and after.** Adding a re-ranker "because everyone does" without measuring context precision is cargo culting. Lesson 15 gives you the harness.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Why not use a cross-encoder for the whole retrieval step?" level="mid">
+
+A cross-encoder scores each `(query, document)` pair jointly, so nothing can be precomputed. Scoring a million chunks per query would take minutes. Bi-encoders precompute document vectors and use an ANN index, so first-stage search is milliseconds. The standard design is two-stage: cheap, high-recall retrieval (hybrid BM25 + vectors) for 30–100 candidates, then an accurate cross-encoder to fix the order and keep the top few. I would size the candidate count by measuring recall@N and the re-ranker's p95 latency.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A conversational RAG bot answers follow-up questions badly. What do you check?" level="senior">
+
+First I look at traces: what query actually hit the retriever. Most often the follow-up ("and for condos?") is sent raw, so retrieval returns noise. The fix is a condensation step that rewrites history plus the last turn into a standalone query, with the rewritten query logged as its own span. Then I check whether the history window is too short or too long, whether the rewrite model is dropping key entities (loan type, state), and I add follow-up questions to the golden dataset so the regression is caught in CI.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Talk in trade-offs">
+
+When you mention a re-ranker, attach numbers: candidates re-ranked, added p95 latency, and the change in context precision on your golden set. "We re-rank 40 candidates with a MiniLM cross-encoder, it adds about 120 ms on CPU and lifted context precision from 0.61 to 0.78 on 80 golden questions" is a senior answer. Use your own measured numbers.
+
+</Callout>
+
+## Further reading
+
+- Sentence Transformers — Cross-Encoders: https://www.sbert.net/docs/cross_encoder/usage/usage.html
+- Cohere Rerank docs: https://docs.cohere.com/docs/rerank-overview
+- HyDE paper, "Precise Zero-Shot Dense Retrieval without Relevance Labels": https://arxiv.org/abs/2212.10496
+- Step-back prompting paper: https://arxiv.org/abs/2310.06117
+- LangChain retrievers (MultiQueryRetriever, contextual compression): https://python.langchain.com/docs/how_to/#retrievers

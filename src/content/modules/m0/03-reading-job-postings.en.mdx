@@ -1,0 +1,208 @@
+# How to read an AI Engineer job posting
+
+A job posting is a requirements document written by several people with different goals: the hiring manager, the team, HR and sometimes a recruiter who copied half of it from another posting. Your job is the same as when you get a vague user story: extract the real requirements, separate must-haves from noise and spot the risks.
+
+This lesson gives you a repeatable method and walks through a fictional posting end to end.
+
+## The four-pass method
+
+Read every posting four times, quickly, each time looking for one thing.
+
+### Pass 1 — What family is it?
+
+Use the previous lesson. Is this AI-first, AI-support or ML? Look at the first three responsibilities, not the title. If it is clearly an ML training role, stop here.
+
+### Pass 2 — What will you actually do every day?
+
+Rewrite the responsibilities as verbs and objects. "Drive innovation in generative AI" means nothing. "Build retrieval pipelines over internal policy documents" means a lot. Keep only the concrete ones. These tell you which portfolio project to show.
+
+### Pass 3 — Must-have vs nice-to-have
+
+Postings mix hard requirements and wish lists. Signals that something is a **must-have**:
+
+- It appears in both the responsibilities and the requirements.
+- It is listed early under "Requirements" or "What you bring".
+- It uses strong wording: "required", "proven experience", "you have shipped".
+- It is tied to the product: a RAG product posting that mentions vector search is not joking.
+
+Signals that something is a **nice-to-have**:
+
+- It sits under "Bonus", "Preferred", "Nice to have", "Plus".
+- It is one item in a long list of tools: "LangChain, LlamaIndex, Haystack, DSPy, CrewAI...". They want one, not all.
+- It is a buzzword with no responsibility attached.
+
+A practical rule: if you match roughly 60–70% of the must-haves and can tell a credible story for the gaps, apply. Postings describe an ideal candidate who rarely exists.
+
+### Pass 4 — Red flags and questions
+
+Note anything that worries you. You will turn these into interview questions.
+
+## Decoding the keywords
+
+Postings use shorthand. Here is what common phrases usually mean in practice.
+
+| Posting says | Usually means |
+|---|---|
+| "LLM integration" | Calling provider APIs from a backend: streaming, retries, cost and rate-limit handling |
+| "Prompt engineering" | System prompts, structured outputs, few-shot, prompt versioning and tests |
+| "RAG experience" | Chunking, embeddings, vector search, re-ranking, citations, retrieval evals |
+| "Agentic workflows" | Tool calling, LangGraph or similar, multi-step tasks, human-in-the-loop |
+| "Evaluate model performance" | Golden datasets, LLM-as-judge, metrics, regression testing in CI |
+| "Productionize" | Docker, CI/CD, cloud deploy, monitoring, SLOs |
+| "Responsible AI" / "guardrails" | Content filtering, PII handling, prompt-injection defense, audit logs |
+| "Fast-paced environment" | Small team, loose specs, frequent priority changes |
+| "Full-stack AI engineer" | Backend plus some frontend, usually React or Next.js |
+| "Experience with LLMOps" | Tracing, prompt and model versioning, eval pipelines, cost dashboards |
+
+## Red flags
+
+Not every bad sign is a deal-breaker. But each one deserves a question.
+
+- **The title says AI Engineer, the requirements say PhD and PyTorch internals.** Mismatch. It is an ML research role.
+- **Every AI tool ever released is required.** Nobody has five years of LangGraph. The team does not know what it needs yet.
+- **No mention of evaluation, testing or quality anywhere.** They may be shipping demos. Could be an opportunity for you, could be chaos.
+- **"Build our AI strategy" for a single engineer with no team.** You would be the whole AI department. Know that before you accept.
+- **Unrealistic year counts.** "5+ years of LLM experience" in a field this young signals copied requirements.
+- **No data access story.** An "internal knowledge assistant" role with no mention of where the data lives often means months of blocked work.
+
+## Worked example
+
+Here is a fictional posting. Read it once before you look at the breakdown.
+
+```text
+Senior AI Engineer — Brightpath Lending (Remote, US/LatAm)
+
+Brightpath is a digital mortgage lender. We are adding AI to our loan
+origination platform to help underwriters and support agents.
+
+What you will do
+- Design and build a retrieval-augmented assistant over our policy
+  manuals, underwriting guidelines and product docs.
+- Integrate LLMs (Anthropic, OpenAI via AWS Bedrock) into our Python
+  services with streaming responses.
+- Build evaluation pipelines to measure answer accuracy and catch
+  regressions before release.
+- Deploy and operate services on AWS (ECS, Lambda) with Docker and
+  GitHub Actions.
+- Partner with compliance to make sure answers are traceable and cited.
+
+What you bring
+- 5+ years of software engineering, mostly Python.
+- Hands-on experience building RAG systems in production.
+- Experience with vector databases (pgvector, OpenSearch or similar).
+- Strong testing mindset; experience with automated testing and CI/CD.
+- Familiarity with LLM evaluation (Ragas, DeepEval or custom metrics).
+
+Nice to have
+- LangGraph or other agent frameworks.
+- Experience in financial services or another regulated industry.
+- Fine-tuning experience.
+- Databricks.
+```
+
+### Breakdown
+
+**Pass 1 — Family.** AI-support. Established lender, AI added to an existing platform. Good fit.
+
+**Pass 2 — Daily work.** Build a RAG assistant over policy PDFs. Integrate Bedrock models into Python services. Build eval pipelines. Deploy on AWS. Work with compliance on citations.
+
+**Pass 3 — Must-haves.**
+
+1. Python backend engineering. In both sections. You have it.
+2. RAG in production. In both sections. Module 2 capstone (`mortgage-knowledge-assistant`) is almost a copy of this job.
+3. Vector databases. pgvector is named. Module 2.
+4. Testing mindset, CI/CD. Your core strength. Lead with it.
+5. LLM evaluation. Ragas and DeepEval named. Module 3.
+6. AWS deploy with Docker and GitHub Actions. Module 5.
+
+Nice-to-haves: LangGraph (Module 4), regulated industry (your QA work in any regulated domain counts), fine-tuning and Databricks (Module 6). None is required.
+
+**Pass 4 — Red flags and questions.** "5+ years of software engineering" is reasonable, not "5 years of LLMs". No major red flags. Questions to ask: Where do the policy documents live and how often do they change? Who owns the eval dataset? What is the latency target for underwriters? How is compliance sign-off done today?
+
+**Verdict.** Strong match. The portfolio pieces to show: the Module 2 capstone and the Module 3 eval harness. The story: "I built a cited RAG assistant over mortgage policies, with a 50+ question golden set that gates every PR".
+
+## Automate the first pass
+
+When you are reading 30 postings a week, a structured extraction helps. Below, Claude extracts must-haves and nice-to-haves into a Pydantic model using forced tool use, then you compare against your own skills. Treat the output as a first draft: you still do pass 4 yourself.
+
+```python
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.AsyncAnthropic()
+
+
+class PostingAnalysis(BaseModel):
+    role_family: str = Field(description="ai-first | ai-support | ml")
+    daily_work: list[str] = Field(description="Concrete verb + object tasks")
+    must_have: list[str]
+    nice_to_have: list[str]
+    red_flags: list[str]
+
+
+MY_SKILLS = {"python", "rag", "evals", "ci/cd", "docker", "aws", "pgvector"}
+
+
+async def analyze(posting: str) -> PostingAnalysis:
+    msg = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=1500,
+        system="You analyze AI Engineer job postings for a senior SDET. Be literal; do not invent requirements.",
+        tools=[{
+            "name": "record_analysis",
+            "description": "Record the structured analysis of a job posting.",
+            "input_schema": PostingAnalysis.model_json_schema(),
+        }],
+        tool_choice={"type": "tool", "name": "record_analysis"},
+        messages=[{"role": "user", "content": posting}],
+    )
+    tool_use = next(b for b in msg.content if b.type == "tool_use")
+    return PostingAnalysis.model_validate(tool_use.input)
+
+
+async def main() -> None:
+    result = await analyze(Path("postings/brightpath.txt").read_text(encoding="utf-8"))
+    gaps = [m for m in result.must_have if not any(s in m.lower() for s in MY_SKILLS)]
+    print(result.model_dump_json(indent=2))
+    print("Possible gaps:", gaps)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+The gap check is deliberately naive substring matching. It is a prompt for your own judgment, not a verdict.
+
+## Common mistakes
+
+- **Not applying because you miss one must-have.** If you cover most of them and can learn the rest, apply.
+- **Applying to everything with "AI" in the title.** Filter by family first. A targeted application with a matching project beats ten generic ones.
+- **Reading only the requirements.** Responsibilities tell you what they will ask in the interview. Requirements tell you what the resume filter checks.
+- **Ignoring the domain.** A fintech posting cares about compliance and citations. A support platform cares about latency and cost per ticket. Tailor your examples.
+- **Trusting automated extraction blindly.** A model can merge "nice to have" into "must have". Always skim the original.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Why are you interested in this role specifically?" level="mid">
+
+Tie the answer to pass 2 and pass 3. Example for the Brightpath posting: "Three things in the posting match what I have been building. You need a cited RAG assistant over policy documents; I built one over mortgage policies with hybrid retrieval and citations. You want evaluation pipelines that catch regressions before release; that is my background as an SDET, and my project has a golden set of more than 50 questions running in GitHub Actions. And you deploy on AWS with Docker and CI/CD, which I have done for years on the testing side. I also like that this is a regulated domain: traceability and test evidence matter, and that is where I am strongest."
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Turn red flags into good questions">
+
+"How do you measure answer quality today?" is a polite way to probe a missing eval story. "Who else works on AI features?" probes the one-person-AI-department risk. Interviewers remember candidates who ask sharp questions.
+
+</Callout>
+
+## Further reading
+
+- [Anthropic docs — Tool use overview](https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview)
+- [Pydantic docs — JSON Schema](https://docs.pydantic.dev/latest/concepts/json_schema/)
+- [Ragas documentation](https://docs.ragas.io/)
+- [AWS docs — What is Amazon Bedrock?](https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html)

@@ -1,0 +1,202 @@
+## Qué hace realmente un vector store
+
+Un vector store hace tres trabajos: guarda los vectores junto a su texto y metadata, encuentra rápido los vectores más cercanos a un vector de consulta y filtra por metadata mientras lo hace. La búsqueda exacta de vecinos más cercanos compara la consulta con cada vector; eso está bien para 10k chunks y es demasiado lento para 10M. Por eso los stores construyen índices de **vecinos más cercanos aproximados (ANN, approximate nearest neighbour)** que cambian un poco de recall por mucha velocidad.
+
+El orden del curso es deliberado: **primero pgvector**. Ya operas PostgreSQL, tu equipo ya sabe respaldarlo, asegurarlo y monitorearlo, y tu metadata ya vive en tablas. Para la mayoría de los asistentes de conocimiento interno, incluido el de nuestro prestamista hipotecario, una base de datos vectorial dedicada es una optimización que quizás nunca necesites.
+
+## pgvector en 10 minutos
+
+Córrelo localmente con la imagen oficial:
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+volumes:
+  pgdata:
+```
+
+Un schema que mantiene juntos los chunks, la metadata y el modelo de embeddings:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE documents (
+  doc_id          text PRIMARY KEY,
+  source          text NOT NULL,
+  title           text NOT NULL,
+  doc_type        text NOT NULL,
+  jurisdiction    text,
+  effective_date  date,
+  is_current      boolean NOT NULL DEFAULT true,
+  content_hash    text NOT NULL
+);
+
+CREATE TABLE chunks (
+  chunk_id        text PRIMARY KEY,
+  doc_id          text NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+  section         text,
+  page            int,
+  content         text NOT NULL,
+  embedding_model text NOT NULL,
+  embedding       vector(1024) NOT NULL
+);
+
+-- ANN index: HNSW with cosine distance
+CREATE INDEX chunks_embedding_hnsw ON chunks
+  USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX documents_filter_idx ON documents (doc_type, jurisdiction, is_current);
+```
+
+Consultas: `<=>` es la *distancia* coseno (0 es idéntico), así que ordena de forma ascendente y conviértela a similitud si quieres mostrarla.
+
+```sql
+SET hnsw.ef_search = 80;   -- higher = better recall, slower; default 40
+
+SELECT c.chunk_id, d.title, c.section, c.page,
+       1 - (c.embedding <=> $1::vector) AS similarity
+FROM chunks c
+JOIN documents d USING (doc_id)
+WHERE d.is_current
+  AND d.jurisdiction IN ('US', 'US-TX')
+ORDER BY c.embedding <=> $1::vector
+LIMIT 5;
+```
+
+### HNSW vs IVFFlat
+
+| | HNSW | IVFFlat |
+|---|---|---|
+| Cómo funciona | grafo de proximidad de varias capas | vectores agrupados en `lists`; busca en las `probes` listas más cercanas |
+| Construcción | más lenta, más memoria | más rápida, necesita los datos presentes antes de construir |
+| Velocidad de consulta / recall | mejor trade-off en la mayoría de los casos | bueno si `lists` y `probes` están ajustados |
+| Inserciones tras construir | las maneja bien | el recall se degrada cuando los datos se alejan de los clusters; reconstruye periódicamente |
+| Perillas de ajuste | `m`, `ef_construction`, `hnsw.ef_search` | `lists` (para empezar, a menudo filas/1000), `ivfflat.probes` |
+
+Usa HNSW por defecto. Usa IVFFlat cuando el tiempo de construcción o la memoria sean la restricción y los datos sean mayormente estáticos.
+
+### Filtrado y la trampa de "muy pocos resultados"
+
+Los índices ANN encuentran primero los candidatos más cercanos y luego Postgres aplica tu cláusula `WHERE`. Si el filtro es selectivo (solo el 2% de los chunks son políticas de home equity de Texas), el índice puede devolver 40 candidatos de los cuales ninguno sobrevive, y obtienes menos filas que el `LIMIT`. Soluciones:
+
+- pgvector 0.8+ soporta **escaneos de índice iterativos**: `SET hnsw.iterative_scan = relaxed_order;` sigue escaneando hasta que suficientes filas pasan el filtro.
+- Sube `hnsw.ef_search` para las consultas filtradas.
+- Para unos pocos valores de filtro de alto valor, usa **índices parciales** (`... WHERE doc_type = 'policy'`) o particiona la tabla.
+- Para filtros muy selectivos, la búsqueda exacta sobre el subconjunto filtrado (sin ANN) suele ser lo bastante rápida y tiene recall perfecto.
+
+Escribe un test para esto: una consulta con un filtro estrecho debe devolver `k` resultados cuando existen al menos `k` chunks que coinciden.
+
+### pgvector a través de LangChain
+
+```python
+import os
+from langchain_openai import OpenAIEmbeddings
+from langchain_postgres import PGVector
+
+store = PGVector(
+    embeddings=OpenAIEmbeddings(model=os.environ["EMBEDDING_MODEL"]),
+    collection_name="mortgage_policies_v1",
+    connection="postgresql+psycopg://rag:rag@localhost:5432/rag",
+    use_jsonb=True,
+)
+store.add_documents(chunks, ids=[c.metadata["chunk_id"] for c in chunks])
+hits = store.similarity_search(
+    "max LTV for cash-out refinance in Texas",
+    k=5,
+    filter={"jurisdiction": {"$in": ["US", "US-TX"]}, "is_current": True},
+)
+```
+
+El adaptador de LangChain administra sus propias tablas con la metadata en JSONB. Es rápido para empezar. Tu propio schema (arriba) te da columnas tipadas, llaves foráneas, índices normales y búsqueda full-text en la misma tabla, algo que necesitarás para la búsqueda híbrida en la lección 9. En el ejercicio usarás tu propio schema.
+
+## Chroma: el store embebido amigable para desarrolladores
+
+Chroma corre dentro del proceso (como SQLite) o como servidor. Es excelente para notebooks, prototipos y tests.
+
+```python
+import chromadb
+
+client = chromadb.PersistentClient(path=".chroma")
+col = client.get_or_create_collection("mortgage_policies", metadata={"hnsw:space": "cosine"})
+col.upsert(ids=chunk_ids, embeddings=vectors.tolist(), documents=texts, metadatas=metas)
+res = col.query(query_embeddings=[q_vec.tolist()], n_results=5,
+                where={"$and": [{"jurisdiction": "US-TX"}, {"is_current": True}]})
+```
+
+Fortalezas: cero infraestructura, API simple, bueno para tests unitarios y de integración de la lógica de retrieval. Debilidades a escala de producción: menos funcionalidades operativas que Postgres o Qdrant (herramientas de backup, replicación, control de acceso granular), y los valores de metadata se limitan a tipos simples.
+
+## Qdrant: una base de datos vectorial dedicada
+
+Qdrant es una base de datos vectorial construida para ese propósito, escrita en Rust, con filtrado rico por payload, cuantización y escalado horizontal.
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (Distance, FieldCondition, Filter, MatchAny,
+                                  MatchValue, PointStruct, VectorParams)
+
+qc = QdrantClient(url="http://localhost:6333")
+qc.create_collection("mortgage_policies",
+                     vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
+qc.upsert("mortgage_policies", points=[
+    PointStruct(id=i, vector=v.tolist(), payload=m) for i, (v, m) in enumerate(zip(vectors, metas))
+])
+hits = qc.query_points(
+    "mortgage_policies", query=q_vec.tolist(), limit=5,
+    query_filter=Filter(must=[
+        FieldCondition(key="jurisdiction", match=MatchAny(any=["US", "US-TX"])),
+        FieldCondition(key="is_current", match=MatchValue(value=True)),
+    ]),
+).points
+```
+
+Qdrant aplica los filtros *durante* el recorrido del grafo (HNSW filtrable), lo que maneja bien los filtros selectivos. Crea índices de payload en los campos por los que filtras. También soporta vectores sparse de forma nativa, así que la búsqueda híbrida puede vivir en un solo motor.
+
+## Cómo elegir
+
+| Situación | Elección |
+|---|---|
+| Ya operas Postgres, el corpus tiene menos de unos pocos millones de chunks, necesitas joins con datos de negocio | **pgvector** |
+| Prototipo, notebook, tests en CI de la lógica de retrieval | **Chroma** (embebido) |
+| Decenas de millones de vectores, búsqueda filtrada intensiva, necesitas cuantización y sharding | **Qdrant** (o un equivalente administrado) |
+| Aislamiento estricto por tenant a gran escala | colecciones/shards de Qdrant, o particiones de Postgres con row-level security |
+
+La respuesta lista para entrevista no es "X es la mejor base vectorial". Es "empieza con el store que tu equipo puede operar, mide la latencia p95 y el recall con filtros realistas, y migra cuando alcances un límite medido". Mantén una interfaz `Retriever` delgada en tu código para que migrar sea un cambio acotado.
+
+## Errores comunes
+
+- **La clase de operador del índice no coincide con el operador de la consulta.** Un índice construido con `vector_cosine_ops` no se usa en una consulta con `<->` (L2). Verifícalo con `EXPLAIN`.
+- **Ningún índice.** Los escaneos exactos se sienten bien con 5k filas en dev y se caen en producción.
+- **Ignorar el recall filtrado.** Los resultados se ven excelentes sin filtros y se encogen en silencio con ellos.
+- **Metadata solo en blobs JSON.** Pierdes tipos, restricciones e índices B-tree normales.
+- **Elegir una base vectorial dedicada desde el primer día** y luego operar dos bases de datos, dos estrategias de backup y dos revisiones de seguridad para un corpus de 100k chunks.
+- **No guardar `embedding_model`.** Vuelve peligrosas las migraciones (lección 6).
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿pgvector o una base de datos vectorial dedicada para un producto RAG nuevo?" level="mid">
+
+Por defecto pgvector si el equipo ya opera Postgres y el corpus está en los pocos millones de chunks: una sola base de datos que operar, actualizaciones transaccionales de chunks y metadata, joins con permisos y tablas de negocio, y búsqueda full-text para retrieval híbrido en la misma consulta. Usaría HNSW con la clase de operador que coincida con mi distancia y probaría el recall de las consultas filtradas. Migraría a Qdrant o similar cuando las mediciones muestren un límite: latencia p95 bajo carga con filtros selectivos, memoria con decenas de millones de vectores o la necesidad de cuantización y sharding integrados. Una interfaz de retriever delgada mantiene pequeña esa migración.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Una consulta vectorial filtrada devuelve solo 2 resultados aunque el LIMIT es 10. ¿Por qué y cómo lo corriges?" level="senior">
+
+El índice ANN devolvió primero sus mejores candidatos (acotados por `ef_search`) y la cláusula `WHERE` eliminó la mayoría porque el filtro es selectivo. Es un problema de post-filtrado. Soluciones: habilitar los escaneos de índice iterativos de pgvector 0.8+ para que el escaneo continúe hasta que suficientes filas califiquen; subir `ef_search` para estas consultas; agregar índices parciales o particiones para los filtros comunes de alta selectividad; o, para subconjuntos filtrados muy pequeños, saltarse el ANN y correr una búsqueda exacta sobre el subconjunto. En motores con HNSW filtrable como Qdrant, agrega índices de payload en los campos de filtro. Luego agrega un test de regresión que verifique que las consultas filtradas devuelvan k resultados.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- [pgvector en GitHub (indexación, filtrado, escaneos iterativos)](https://github.com/pgvector/pgvector)
+- [LangChain — Integración con PGVector](https://python.langchain.com/docs/integrations/vectorstores/pgvector/)
+- [Documentación de Chroma](https://docs.trychroma.com/)
+- [Documentación de Qdrant — filtrado e indexación](https://qdrant.tech/documentation/)
+- [Malkov y Yashunin, HNSW (arXiv:1603.09320)](https://arxiv.org/abs/1603.09320)

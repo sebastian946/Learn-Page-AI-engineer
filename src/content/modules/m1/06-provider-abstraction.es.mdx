@@ -1,0 +1,284 @@
+## Por qué abstraer el proveedor
+
+La mayoría de las empresas que contratan AI engineers usa más de un proveedor de modelos. Razones que escucharás:
+
+- **Resiliencia**: una caída o una tormenta de rate limits en un vendor debería degradar la feature, no matarla.
+- **Enrutamiento por costo/calidad**: un modelo barato para requests fáciles, uno más fuerte para los difíciles.
+- **Cumplimiento y compras**: algunos clientes exigen AWS Bedrock (los datos se quedan en su cuenta cloud); otros ya tienen contrato con OpenAI o Anthropic.
+- **Evaluación**: comparar modelos sobre tu set de evals requiere llamarlos de la misma manera.
+
+El objetivo **no** es fingir que todos los modelos son idénticos. Es mantener el código específico de cada vendor en una capa delgada, para que el resto del sistema hable un solo idioma: tus tipos de dominio.
+
+Es el patrón Page Object aplicado a LLMs. Los tests hablan con `LoginPage`, no con selectores. Las features hablan con `LLMClient`, no con `anthropic.types.ToolUseBlock`.
+
+## La forma de una buena abstracción
+
+<Diagram caption="Puertos y adaptadores para proveedores LLM" chart={`flowchart LR
+  F["Features (router, extractor)"] --> C["LLMClient (retries, limits, cost)"]
+  C --> P{{"LLMProvider protocol"}}
+  P --> A[AnthropicProvider]
+  P --> O[OpenAIProvider]
+  P --> B["BedrockProvider (Converse)"]
+  P --> K["FakeProvider (tests)"]
+  C --> L[("Cost and usage log")]`} />
+
+Tres capas:
+
+1. **Tipos normalizados** – tus propios `LLMRequest`, `LLMResponse`, `ToolCall`, `Usage`, `StopReason`, `StreamEvent`.
+2. **Adaptadores** – uno por proveedor, que traducen los requests de entrada y las respuestas de salida, y mapean los errores a tu propia jerarquía de excepciones.
+3. **El cliente** – políticas transversales independientes del proveedor: reintentos, rate limiting, concurrencia, timeouts, registro de costos, fallback entre proveedores.
+
+### Tipos normalizados
+
+```python
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Literal
+
+class StopReason(StrEnum):
+    END = "end"
+    MAX_TOKENS = "max_tokens"
+    TOOL_USE = "tool_use"
+    REFUSAL = "refusal"
+    OTHER = "other"
+
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+@dataclass
+class LLMRequest:
+    model: str                           # logical name, e.g. "fast" or "smart"
+    messages: list[dict[str, Any]]       # role/content with plain-text content
+    system: str | None = None
+    max_tokens: int = 1024
+    tools: list[dict[str, Any]] = field(default_factory=list)  # name/description/schema
+    json_schema: dict[str, Any] | None = None
+    temperature: float | None = None     # optional capability, dropped if unsupported
+    metadata: dict[str, str] = field(default_factory=dict)  # feature, prompt_version...
+
+@dataclass(frozen=True)
+class LLMResponse:
+    text: str
+    tool_calls: list[ToolCall]
+    stop_reason: StopReason
+    usage: Usage
+    provider: str
+    model: str                           # the concrete model id actually used
+    latency_ms: float
+    raw: Any = None                      # escape hatch for debugging
+```
+
+### El protocolo y las capacidades
+
+```python
+from collections.abc import AsyncIterator
+from typing import Protocol
+
+@dataclass(frozen=True)
+class ModelSpec:
+    provider: Literal["anthropic", "openai", "bedrock"]
+    model_id: str
+    supports_temperature: bool
+    supports_json_schema: bool
+    max_output_tokens: int
+
+class LLMProvider(Protocol):
+    name: str
+    async def complete(self, req: LLMRequest, spec: ModelSpec) -> LLMResponse: ...
+    def stream(self, req: LLMRequest, spec: ModelSpec) -> AsyncIterator["StreamEvent"]: ...
+```
+
+Los ids de modelo viven en la **configuración**, mapeados desde nombres lógicos. Las features piden `"fast"` o `"smart"`, nunca un string de vendor. Cambiar de modelo es un cambio de configuración más una corrida de evals, no un cambio de código.
+
+```toml
+# models.toml — model ids are config. Non-Anthropic ids are examples: check your provider's current list.
+[fast]
+provider = "anthropic"
+model_id = "claude-haiku-5-5"
+supports_temperature = false
+supports_json_schema = true
+max_output_tokens = 8192
+
+[smart]
+provider = "anthropic"
+model_id = "claude-sonnet-5-5"
+supports_temperature = false
+supports_json_schema = true
+max_output_tokens = 16000
+
+[fast_fallback]
+provider = "openai"
+model_id = "${OPENAI_FAST_MODEL}"
+supports_temperature = true
+supports_json_schema = true
+max_output_tokens = 8192
+```
+
+## Escribir un adaptador: Anthropic
+
+```python
+import time
+from anthropic import AsyncAnthropic
+import anthropic
+
+_STOP = {"end_turn": StopReason.END, "stop_sequence": StopReason.END,
+         "max_tokens": StopReason.MAX_TOKENS, "tool_use": StopReason.TOOL_USE,
+         "refusal": StopReason.REFUSAL}
+
+class AnthropicProvider:
+    name = "anthropic"
+
+    def __init__(self, client: AsyncAnthropic | None = None) -> None:
+        self._client = client or AsyncAnthropic(max_retries=0)  # WE own retries
+
+    async def complete(self, req: LLMRequest, spec: ModelSpec) -> LLMResponse:
+        kwargs: dict = {"model": spec.model_id, "max_tokens": req.max_tokens,
+                        "messages": req.messages}
+        if req.system:
+            kwargs["system"] = req.system
+        if req.tools:
+            kwargs["tools"] = [{"name": t["name"], "description": t["description"],
+                                "input_schema": t["schema"]} for t in req.tools]
+        if req.json_schema and spec.supports_json_schema:
+            kwargs["output_config"] = {"format": {"type": "json_schema",
+                                                  "schema": req.json_schema}}
+        if req.temperature is not None and spec.supports_temperature:
+            kwargs["temperature"] = req.temperature
+        start = time.perf_counter()
+        try:
+            r = await self._client.messages.create(**kwargs)
+        except anthropic.RateLimitError as e:
+            raise RateLimited(self.name, retry_after=_retry_after(e.response)) from e
+        except anthropic.APIStatusError as e:
+            raise ProviderError(self.name, e.status_code, retryable=e.status_code >= 500) from e
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+            raise ProviderError(self.name, None, retryable=True) from e
+        return LLMResponse(
+            text="".join(b.text for b in r.content if b.type == "text"),
+            tool_calls=[ToolCall(b.id, b.name, b.input) for b in r.content if b.type == "tool_use"],
+            stop_reason=_STOP.get(r.stop_reason, StopReason.OTHER),
+            usage=Usage(r.usage.input_tokens, r.usage.output_tokens,
+                        r.usage.cache_read_input_tokens or 0,
+                        r.usage.cache_creation_input_tokens or 0),
+            provider=self.name, model=r.model,
+            latency_ms=(time.perf_counter() - start) * 1000, raw=r,
+        )
+```
+
+Observa `max_retries=0`. Los SDKs reintentan los 429 y 5xx por defecto (dos veces en el caso de Anthropic). Si tu cliente también reintenta, una sola llamada lógica puede convertirse en 9 llamadas HTTP. Elige **una** capa para hacerse cargo de los reintentos. En un cliente multi-proveedor, esa es tu capa, porque además puede hacer failover a otro proveedor.
+
+## El adaptador de Bedrock en breve
+
+La **Converse API** de Bedrock ofrece una única forma de request para muchas familias de modelos (Anthropic, Meta, Mistral, Amazon y otras). `boto3` es síncrono, así que ejecútalo en un thread (o usa un cliente AWS asíncrono):
+
+```python
+import asyncio, boto3
+from botocore.exceptions import ClientError
+
+class BedrockProvider:
+    name = "bedrock"
+
+    def __init__(self, region: str) -> None:
+        self._rt = boto3.client("bedrock-runtime", region_name=region)
+
+    async def complete(self, req: LLMRequest, spec: ModelSpec) -> LLMResponse:
+        body = {
+            "modelId": spec.model_id,
+            "messages": [{"role": m["role"], "content": [{"text": m["content"]}]}
+                         for m in req.messages],
+            "inferenceConfig": {"maxTokens": req.max_tokens},
+        }
+        if req.system:
+            body["system"] = [{"text": req.system}]
+        start = time.perf_counter()
+        try:
+            r = await asyncio.to_thread(self._rt.converse, **body)
+        except ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code == "ThrottlingException":
+                raise RateLimited(self.name, retry_after=None) from e
+            raise ProviderError(self.name, None, retryable=code in {"ServiceUnavailableException", "ModelNotReadyException"}) from e
+        blocks = r["output"]["message"]["content"]
+        return LLMResponse(
+            text="".join(b.get("text", "") for b in blocks),
+            tool_calls=[ToolCall(b["toolUse"]["toolUseId"], b["toolUse"]["name"], b["toolUse"]["input"])
+                        for b in blocks if "toolUse" in b],
+            stop_reason=_STOP.get(r["stopReason"], StopReason.OTHER),
+            usage=Usage(r["usage"]["inputTokens"], r["usage"]["outputTokens"]),
+            provider=self.name, model=spec.model_id,
+            latency_ms=(time.perf_counter() - start) * 1000, raw=r,
+        )
+```
+
+Para Claude específicamente en Bedrock, el SDK de Anthropic también incluye un cliente dedicado de Bedrock con la misma superficie `messages.create`. Converse es la opción correcta cuando quieres un solo adaptador para varias familias de modelos.
+
+## Normaliza los errores, no solo las respuestas
+
+Tu lógica de reintentos y fallback no debe importar excepciones de los vendors. Mapea todo a una jerarquía pequeña:
+
+```python
+class LLMError(Exception):
+    def __init__(self, provider: str, status: int | None = None, retryable: bool = False):
+        super().__init__(f"{provider} error status={status}")
+        self.provider, self.status, self.retryable = provider, status, retryable
+
+class RateLimited(LLMError):
+    def __init__(self, provider: str, retry_after: float | None):
+        super().__init__(provider, 429, retryable=True)
+        self.retry_after = retry_after
+
+class ProviderError(LLMError): ...
+```
+
+`400` (bad request) y `401/403` (autenticación) **no** son reintentables: reintentar pierde tiempo y oculta bugs. `429`, `5xx`, el `529 overloaded` de Anthropic, los timeouts y los errores de conexión sí son reintentables.
+
+## Construir vs. comprar
+
+Librerías como LiteLLM o las interfaces de chat models de LangChain ya normalizan decenas de proveedores. Usar una es razonable. Construir tú mismo una capa delgada (como en el ejercicio) sigue valiendo la pena porque:
+
+- controlas exactamente los reintentos, el registro de costos y la semántica de errores;
+- entiendes qué hace la librería cuando se comporta mal;
+- los entrevistadores te piden diseñar esto.
+
+Un buen compromiso en proyectos reales: una interfaz interna delgada (`LLMClient`) cuyos adaptadores pueden envolver una librería.
+
+## Errores comunes
+
+- **Diseño de mínimo común denominador** que oculta features útiles (prompt caching, structured outputs). Agrega flags de capacidad y una válvula de escape (`provider_options`) en su lugar.
+- **Tipos del vendor que se filtran** a las features, de modo que un cambio obliga a tocar 40 archivos.
+- **Reintentar en dos capas** (SDK y la tuya).
+- **Ids de modelo codificados** en el código de las features en lugar de la configuración.
+- **Sin proveedor falso**, así que los tests unitarios llaman APIs reales, cuestan dinero y son flaky.
+- **Asumir comportamiento idéntico.** El mismo prompt puede rendir muy distinto entre modelos. Cada modelo de la cadena de fallback necesita su propia corrida de evals.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Diseña un cliente LLM que pueda alternar entre Anthropic, OpenAI y Bedrock." level="senior">
+
+Puertos y adaptadores. Un protocolo con `complete` y `stream` que recibe mi request normalizado y devuelve una respuesta normalizada: texto, tool calls, stop reason normalizado, usage, id concreto del modelo, latencia. Un adaptador por proveedor mapea requests, respuestas y errores a mis tipos, con una especificación de capacidades por modelo (soporte de JSON schema, temperature, salida máxima) cargada desde configuración con nombres lógicos como fast y smart. Las políticas transversales viven encima de los adaptadores: reintentos con backoff y jitter (reintentos del SDK desactivados), rate limiting, límites de concurrencia, timeouts, fallback de proveedor y registro de costos etiquetado por feature y versión de prompt. Un proveedor falso soporta los tests unitarios, y cada modelo de la cadena de fallback se valida sobre el mismo set de evals porque los prompts no se transfieren perfectamente.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Espera esta pregunta de seguimiento">
+
+"¿No usarías simplemente LiteLLM?" Una respuesta sólida: "Tal vez, detrás de mi propia interfaz. El valor está en controlar los reintentos, la semántica de errores y la atribución de costos en un solo lugar, y en poder cambiar también la librería."
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Anthropic, SDKs cliente: https://docs.anthropic.com/en/api/client-sdks
+- Anthropic, Claude en Amazon Bedrock: https://docs.anthropic.com/en/api/claude-on-amazon-bedrock
+- AWS, Bedrock Converse API: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
+- OpenAI, referencia de la API: https://platform.openai.com/docs/api-reference
+- Anthropic, errores: https://docs.anthropic.com/en/api/errors

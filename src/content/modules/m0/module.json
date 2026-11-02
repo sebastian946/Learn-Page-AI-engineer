@@ -3,11 +3,66 @@
   "order": 0,
   "days": 1,
   "hours": 6,
-  "title": { "en": "Sample module", "es": "Modulo de ejemplo" },
-  "summary": { "en": "Pipeline smoke test.", "es": "Prueba del pipeline." },
+  "title": {
+    "en": "The AI Engineer role & your learning system",
+    "es": "El rol de AI Engineer y tu sistema de aprendizaje"
+  },
+  "summary": {
+    "en": "What companies actually hire AI Engineers for, how to read postings and choose the right role family, and how to build a portfolio that proves your skills. You finish by setting up your portfolio hub repo and the habits that carry you through the course.",
+    "es": "Para qué contratan realmente las empresas a un AI Engineer, cómo leer ofertas y elegir la familia de roles correcta, y cómo construir un portafolio que demuestre tus habilidades. Terminas creando el repo hub de tu portafolio y los hábitos que te acompañarán durante el curso."
+  },
   "lessons": [
-    { "slug": "01-sample", "type": "concept", "minutes": 10, "title": { "en": "Sample lesson", "es": "Leccion de ejemplo" } },
-    { "slug": "02-exam", "type": "exam", "minutes": 20, "title": { "en": "Exam", "es": "Examen" } }
+    {
+      "slug": "01-what-companies-hire-for",
+      "type": "concept",
+      "minutes": 40,
+      "title": { "en": "What companies hire AI Engineers for", "es": "Para qué contratan las empresas a un AI Engineer" }
+    },
+    {
+      "slug": "02-ai-role-types",
+      "type": "concept",
+      "minutes": 40,
+      "title": { "en": "AI-first, AI-support and ML roles", "es": "Roles AI-first, AI-support y de ML" }
+    },
+    {
+      "slug": "03-reading-job-postings",
+      "type": "concept",
+      "minutes": 45,
+      "title": { "en": "How to read an AI Engineer job posting", "es": "Cómo leer una oferta de empleo de AI Engineer" }
+    },
+    {
+      "slug": "04-portfolio-that-proves-skills",
+      "type": "concept",
+      "minutes": 45,
+      "title": { "en": "Building a portfolio that proves skills", "es": "Construir un portafolio que demuestre habilidades" }
+    },
+    {
+      "slug": "05-your-learning-system",
+      "type": "concept",
+      "minutes": 35,
+      "title": { "en": "Your learning system", "es": "Tu sistema de aprendizaje" }
+    },
+    {
+      "slug": "06-ex-portfolio-hub",
+      "type": "exercise",
+      "minutes": 90,
+      "title": { "en": "Exercise: create your portfolio hub repo", "es": "Ejercicio: crea el repo hub de tu portafolio" }
+    },
+    {
+      "slug": "07-exam",
+      "type": "exam",
+      "minutes": 25,
+      "title": { "en": "Module 0 exam", "es": "Examen del módulo 0" }
+    }
   ],
-  "repos": [{ "id": "m0-sample", "name": "sample-repo", "description": { "en": "Sample", "es": "Ejemplo" } }]
+  "repos": [
+    {
+      "id": "m0-portfolio-hub",
+      "name": "ai-engineer-portfolio",
+      "description": {
+        "en": "Portfolio hub: intro, projects table, reusable project README template, PR template, conventions doc and a README linter running in GitHub Actions.",
+        "es": "Hub del portafolio: introducción, tabla de proyectos, plantilla reutilizable de README de proyecto, plantilla de PR, documento de convenciones y un linter de README que corre en GitHub Actions."
+      }
+    }
+  ]
 }

@@ -1,0 +1,228 @@
+## Why Redis matters more in LLM apps
+
+In a classic web service, Redis saves you a few milliseconds and some database load. In an LLM service it saves you **seconds and real money** on every hit. A cached answer costs zero tokens and returns in about 5 ms instead of 3–8 seconds.
+
+Redis also protects you from your own users. One tenant running a script in a loop can burn your monthly provider budget in an afternoon. It can also exhaust your provider rate limit and take down every other tenant. Rate limiting is not a nice-to-have here. It is a cost control and an availability control.
+
+This lesson covers four things:
+
+1. **Exact cache**: same normalized question, same context, same answer.
+2. **Semantic cache**: similar question, reuse the answer, carefully.
+3. **Per-tenant token buckets**: atomic Lua scripts in Redis.
+4. **Token-based limits**: limit what actually costs money, not just request count.
+
+You already know Redis data types, TTLs and `EVAL`. We focus on what is specific to LLM traffic.
+
+## Exact cache: the key is everything
+
+An exact cache is a dictionary from a key to a stored response. The hard part is the key. If the key is too loose, you serve stale or wrong answers. If it is too strict, your hit rate is near zero.
+
+For a RAG answer, the response depends on more than the question text. It depends on:
+
+- the **normalized question** (lowercase, trimmed, collapsed whitespace, maybe stripped punctuation),
+- the **model id** (`claude-sonnet-5-5` vs `claude-haiku-5-5` give different answers),
+- the **prompt version** (you changed the system prompt, old answers are no longer valid),
+- the **retrieval corpus version** (a policy PDF was updated, the old answer may cite a dead rule),
+- the **tenant** (tenant A must never see an answer built from tenant B's documents),
+- generation parameters that change output (temperature, max tokens).
+
+Hash all of that into one key. Use the corpus version from your ingestion pipeline. A simple approach is a hash of the sorted `(doc_id, doc_version)` pairs of the documents that were retrieved. A coarser approach is a single `corpus_version` counter you bump on every ingestion run. The coarse one is simpler and invalidates everything at once. That is usually fine for daily ingestion.
+
+```python
+# app/cache.py
+import hashlib
+import json
+import re
+from pydantic import BaseModel
+from redis.asyncio import Redis
+
+class CachedAnswer(BaseModel):
+    answer: str
+    citations: list[dict]
+    model: str
+    prompt_version: str
+
+_ws = re.compile(r"\s+")
+
+def normalize(question: str) -> str:
+    return _ws.sub(" ", question.strip().lower()).rstrip("?!. ")
+
+def cache_key(*, tenant_id: str, question: str, model: str,
+              prompt_version: str, corpus_version: str, temperature: float) -> str:
+    payload = json.dumps(
+        {"q": normalize(question), "m": model, "pv": prompt_version,
+         "cv": corpus_version, "t": temperature},
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"mka:answer:{tenant_id}:{digest}"
+
+class AnswerCache:
+    def __init__(self, redis: Redis, ttl_seconds: int = 6 * 3600) -> None:
+        self.redis = redis
+        self.ttl = ttl_seconds
+
+    async def get(self, key: str) -> CachedAnswer | None:
+        raw = await self.redis.get(key)
+        return CachedAnswer.model_validate_json(raw) if raw else None
+
+    async def set(self, key: str, value: CachedAnswer) -> None:
+        await self.redis.set(key, value.model_dump_json(), ex=self.ttl)
+```
+
+Notes on this design:
+
+- The tenant id is **in the key prefix**, not only inside the hash. That lets you delete one tenant's cache with a `SCAN` + `UNLINK` on `mka:answer:tenant-42:*`.
+- The TTL is a safety net, not the main invalidation strategy. Version fields in the key do the real invalidation.
+- Only cache **successful, complete** answers. Never cache a refusal caused by a provider error, a truncated stream or a guardrail block that might pass on retry.
+
+**Streaming and caching.** If your endpoint streams SSE, you cannot cache until the stream ends. Accumulate the tokens, and on the `done` event write the full answer to the cache. On a cache hit, you can still stream: send the cached answer as one `token` event (or a few chunks), then `citations`, then `done`. Clients keep one code path.
+
+## Semantic cache: higher hit rate, higher risk
+
+Users rarely type the same question twice. "What's the max DTI for FHA loans?" and "max debt-to-income ratio FHA" are the same question. An exact cache misses. A semantic cache embeds the question, searches for a stored question with cosine similarity above a threshold, and returns that answer.
+
+Redis Stack (RediSearch) supports vector indexes, so you can keep this in the same Redis. You store a hash per entry with the embedding, the answer, the tenant, and the versions. You query with a KNN search **filtered by tenant, prompt version and corpus version**.
+
+```python
+# Index once at startup (Redis Stack / RediSearch)
+# FT.CREATE idx:semcache ON HASH PREFIX 1 mka:sem:
+#   SCHEMA tenant TAG pv TAG cv TAG
+#          vec VECTOR HNSW 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
+import numpy as np
+from redis.commands.search.query import Query
+
+async def semantic_lookup(redis, emb: list[float], tenant: str, pv: str, cv: str,
+                          max_distance: float = 0.08) -> str | None:
+    q = (
+        Query(f"(@tenant:{{{tenant}}} @pv:{{{pv}}} @cv:{{{cv}}})=>[KNN 1 @vec $v AS dist]")
+        .return_fields("answer", "dist")
+        .dialect(2)
+    )
+    res = await redis.ft("idx:semcache").search(
+        q, query_params={"v": np.asarray(emb, dtype=np.float32).tobytes()}
+    )
+    if res.docs and float(res.docs[0].dist) <= max_distance:
+        return res.docs[0].answer
+    return None
+```
+
+Cosine **distance** 0.08 means similarity about 0.92. That number is an example. You must tune it on your own data.
+
+The risk is real. "Can I get an FHA loan with a 580 credit score?" and "Can I get an FHA loan with a 500 credit score?" are extremely similar in embedding space. They have different answers. A semantic cache will happily serve the wrong one.
+
+How to use semantic caching safely:
+
+- **Tune the threshold with an eval set.** Build pairs of "same intent" and "different intent but similar wording" questions. Pick the threshold where false hits are near zero. This is a classification problem; measure precision, not just hit rate.
+- **Scope it.** Always filter by tenant and versions. Consider excluding questions with numbers, dates or names (simple regex), since those are where near-duplicates diverge.
+- **Use it for the head of the distribution.** FAQs and onboarding questions benefit most. Long, specific questions rarely hit anyway.
+- **Log every semantic hit** with both questions. Sample them in your online evals from Module 3.
+- **Add a kill switch.** A feature flag that disables the semantic layer without a deploy.
+
+Order the layers: exact cache first (cheap, safe), semantic cache second, then the full RAG pipeline.
+
+## Rate limiting: per-tenant token buckets
+
+A token bucket has a capacity and a refill rate. Each request takes tokens out. If the bucket is empty, you reject. It allows short bursts and enforces an average rate. That fits chat traffic well.
+
+The implementation must be **atomic**. If two API replicas read the bucket, compute, and write back, they race. Redis runs a Lua script atomically, so do the read-compute-write in Lua.
+
+```lua
+-- app/lua/token_bucket.lua
+-- KEYS[1] bucket key; ARGV: capacity, refill_per_sec, cost, now_ms, force
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local force = tonumber(ARGV[5]) or 0
+
+local state = redis.call("HMGET", KEYS[1], "tokens", "ts")
+local tokens = tonumber(state[1]) or capacity
+local ts = tonumber(state[2]) or now
+
+tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)
+local allowed = 0
+local retry_after = 0
+if force == 1 or tokens >= cost then
+  tokens = math.min(capacity, tokens - cost)
+  allowed = 1
+else
+  retry_after = math.ceil((cost - tokens) / rate)
+end
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now)
+redis.call("PEXPIRE", KEYS[1], math.ceil(capacity / rate * 1000) + 1000)
+return {allowed, retry_after, math.floor(tokens)}
+```
+
+Pass `now_ms` from the app, or use `redis.call("TIME")` inside the script to avoid clock skew between replicas. Register it once with `redis.register_script(...)`, which uses `EVALSHA` and falls back to `EVAL`.
+
+When a request is rejected, return **HTTP 429** with a `Retry-After` header in seconds. Add `X-RateLimit-Remaining` if your clients want it. Well-behaved clients (and your own frontend) back off based on that header.
+
+## Token-based limits: limit what costs money
+
+Request-count limits are not enough. One request with a 150k-token context costs as much as hundreds of short ones. So run **two buckets per tenant**:
+
+- a **request bucket** (for example 60 requests/minute) to stop floods,
+- a **token bucket** (for example 200k LLM tokens/minute) to stop cost spikes.
+
+The problem: you only know the real token count **after** the call. The solution is **estimate, then reconcile**:
+
+1. Before the call, estimate input tokens (prompt + retrieved context) plus `max_tokens` for output. Use a tokenizer or the provider's token counting endpoint, or a cheap heuristic like characters divided by 4 with a safety margin.
+2. Debit the estimate from the token bucket. Reject with 429 if it does not fit.
+3. After the call, read `usage.input_tokens` and `usage.output_tokens` from the response. Debit or credit the difference.
+
+```python
+# app/ratelimit.py (excerpt)
+async def reserve(self, tenant: str, estimated_tokens: int) -> RateDecision:
+    req = await self._bucket(f"rl:req:{tenant}", self.req_cap, self.req_rate, 1)
+    if not req.allowed:
+        return req
+    return await self._bucket(f"rl:tok:{tenant}", self.tok_cap, self.tok_rate, estimated_tokens)
+
+async def reconcile(self, tenant: str, estimated: int, actual: int) -> None:
+    delta = actual - estimated  # positive: we under-reserved
+    if delta != 0:
+        # Negative cost refunds tokens; the script clamps at capacity.
+        await self._bucket(f"rl:tok:{tenant}", self.tok_cap, self.tok_rate, delta, force=True)
+```
+
+`force=True` means "apply the debit even if it drives the bucket negative". A negative balance simply delays the tenant's next request. That is the fair outcome when they used more than estimated.
+
+Also keep a **global** bucket per provider key, set slightly below the provider's own limit. That way you fail fast with your own clean 429 instead of getting provider 429s mid-stream.
+
+## Common mistakes
+
+- **Cache key without tenant or corpus version.** Leaks data across tenants, or serves answers based on yesterday's policy.
+- **Caching errors or partial streams.** A transient failure becomes a permanent wrong answer for six hours.
+- **Semantic cache threshold picked by eye.** Tune it on labeled pairs. Numbers and entities are the classic false hits.
+- **Non-atomic rate limiting.** `GET` then `SET` from Python across replicas lets bursts through. Use Lua or `INCR` with expiry.
+- **Only counting requests.** Token spend, not request count, drives your bill.
+- **Fail-closed on Redis outage without thinking.** Decide explicitly: for the cache, fail open (skip cache). For rate limiting, many teams fail open with a local in-memory fallback limiter, because rejecting all traffic is worse than a short budget risk.
+- **No metrics.** Without cache hit rate and 429 counts per tenant, you cannot prove the cache saves money or tune limits.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you design the cache key for a multi-tenant RAG answer cache?" level="mid">
+
+Hash the normalized question together with every input that changes the answer: model id, prompt version, corpus or retrieved-document versions, and generation parameters like temperature. Prefix the key with the tenant id so tenants are isolated and so you can purge one tenant with a prefix scan. Version fields do the invalidation; the TTL is only a safety net. Only cache complete, successful answers, never errors or truncated streams.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A semantic cache raised hit rate from 8% to 35%, but support tickets about wrong answers went up. What do you do?" level="senior">
+
+First, turn it off or tighten it with a feature flag; correctness beats savings. Then pull the logged semantic hits and label them. Usually the false hits share a pattern: different numbers, dates, product names or negations with near-identical embeddings. Fix with a stricter threshold tuned on labeled "same vs different intent" pairs, entity/number guards that bypass the semantic layer, and strict scoping by tenant and versions. Re-enable gradually and track false-hit rate as an online eval metric, not just hit rate.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Rate limiting talking point">
+
+Say "two buckets per tenant: requests and LLM tokens, enforced atomically in Redis with Lua, estimate-then-reconcile for tokens, 429 with Retry-After, plus a global bucket below the provider limit." That one sentence shows you understand cost, fairness and provider constraints.
+
+</Callout>
+
+## Further reading
+
+- Redis vector search docs: https://redis.io/docs/latest/develop/interact/search-and-query/advanced-concepts/vectors/
+- Redis Lua scripting: https://redis.io/docs/latest/develop/interact/programmability/eval-intro/
+- Anthropic token counting and rate limits: https://docs.anthropic.com/en/api/rate-limits
+- AWS Builders' Library, "Fairness in multi-tenant systems": https://aws.amazon.com/builders-library/fairness-in-multi-tenant-systems/

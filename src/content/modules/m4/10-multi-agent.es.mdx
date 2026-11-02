@@ -1,0 +1,182 @@
+## ¿Por qué dividir un agente en varios?
+
+Un solo agente con 30 herramientas y un system prompt de 4,000 palabras empieza a degradarse. Elige la herramienta equivocada más seguido, el prompt se vuelve difícil de cambiar sin regresiones y cada llamada paga por schemas de herramientas que no necesita. Los diseños multi-agente dividen el trabajo en **especialistas** con prompts pequeños y pocas herramientas cada uno, más una forma de pasarse el control.
+
+Los beneficios son reales, pero más acotados de lo que dice el hype:
+
+- **Conjuntos de herramientas más pequeños por agente**, así que la selección de herramientas es más precisa.
+- **Prompts separados** que distintos equipos pueden poseer, versionar y probar.
+- **Modelos distintos por rol**: un modelo barato y rápido para el triage, uno más fuerte para razonamiento difícil.
+- **Aislamiento**: un agente de facturación nunca ve las herramientas de transportistas, y viceversa.
+
+Los costos son igual de reales: más llamadas al LLM, más latencia, más lugares donde se pierde el contexto y una depuración mucho más difícil. Piénsalo como microservicios. Dividir un monolito arregla algunos problemas y crea problemas de sistemas distribuidos.
+
+## Patrón 1: supervisor
+
+Un nodo **supervisor** decide qué especialista corre después. Los especialistas hacen su trabajo y devuelven el control al supervisor, que vuelve a enrutar o termina. El control siempre pasa por un único centro.
+
+<Diagram caption="Patrón supervisor: cada especialista reporta a un único router" chart={`flowchart TD
+  U[Solicitud del usuario] --> S{Supervisor}
+  S -->|pregunta de pedido| O[Agente de pedidos]
+  S -->|transportista o tarifas| C[Agente de transportistas]
+  S -->|reembolso o ticket| B[Agente de facturación]
+  O --> S
+  C --> S
+  B --> S
+  S -->|listo| E[Respuesta final]`} />
+
+Un supervisor hecho a mano usa structured output para elegir el siguiente worker y `Command(goto=...)` para enrutar:
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import create_react_agent
+from langgraph.types import Command
+
+Worker = Literal["orders", "carrier", "billing"]
+
+
+class Route(BaseModel):
+    next: Worker | Literal["FINISH"]
+    reason: str = Field(description="One sentence, for logs.")
+
+
+router_llm = ChatAnthropic(model="claude-haiku-5-5").with_structured_output(Route)
+SUPERVISOR = (
+    "You route logistics support work. orders: order status and delivery dates. "
+    "carrier: rates and rescheduling. billing: refunds and tickets. "
+    "Reply FINISH when the user's request is fully answered."
+)
+
+
+def supervisor(state: MessagesState) -> Command[Worker | Literal["__end__"]]:
+    route = router_llm.invoke([("system", SUPERVISOR), *state["messages"]])
+    if route.next == "FINISH":
+        return Command(goto=END)
+    return Command(goto=route.next)
+
+
+worker_llm = ChatAnthropic(model="claude-sonnet-5-5")
+orders_agent = create_react_agent(worker_llm, [get_order, list_orders], name="orders")
+carrier_agent = create_react_agent(worker_llm, [get_carrier_rates, reschedule_delivery], name="carrier")
+billing_agent = create_react_agent(worker_llm, [issue_refund, create_ticket], name="billing")
+
+builder = StateGraph(MessagesState)
+builder.add_node("supervisor", supervisor)
+for name, agent in [("orders", orders_agent), ("carrier", carrier_agent), ("billing", billing_agent)]:
+    builder.add_node(name, agent)          # a compiled graph can be a node (subgraph)
+    builder.add_edge(name, "supervisor")   # always report back
+builder.add_edge(START, "supervisor")
+graph = builder.compile(checkpointer=checkpointer)
+```
+
+Puntos a notar:
+
+- Cada especialista es un subgrafo compilado con su **propia lista pequeña de herramientas**.
+- El supervisor usa un modelo barato y structured output. Enrutar no necesita el modelo más fuerte.
+- El campo `reason` va a tus logs y traces. Cuando el enrutamiento falla, quieres saber por qué.
+- Agrega una guarda: cuenta los turnos del supervisor en el estado y detente después de N (lección 11). Un supervisor que hace ping-pong entre dos workers es una falla común.
+
+El paquete `langgraph-supervisor` envuelve este patrón (`create_supervisor`). Constrúyelo a mano una vez para entender lo que hace la librería y luego usa la librería si encaja.
+
+## Patrón 2: swarm (handoffs)
+
+En un **swarm** no hay router central. Cada agente puede pasar el control directamente a un par llamando a una **herramienta de handoff** (traspaso). El agente activo habla con el usuario hasta que decide que otro debe tomar el caso. Se siente natural en conversaciones: "te transfiero con facturación".
+
+Una herramienta de handoff devuelve un `Command` que le dice al grafo **padre** que salte a otro nodo de agente:
+
+```python
+from typing import Annotated
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool, InjectedToolCallId
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
+
+
+def make_handoff(agent_name: str, description: str):
+    @tool(f"transfer_to_{agent_name}", description=description)
+    def handoff(
+        state: Annotated[dict, InjectedState],
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        ack = ToolMessage(content=f"Transferred to {agent_name}.", tool_call_id=tool_call_id)
+        return Command(
+            goto=agent_name,
+            graph=Command.PARENT,  # route in the parent graph, not inside this agent
+            update={"messages": state["messages"] + [ack], "active_agent": agent_name},
+        )
+    return handoff
+
+
+to_billing = make_handoff("billing", "Hand off when the user asks for a refund or compensation.")
+to_orders = make_handoff("orders", "Hand off when the user asks about order status or delivery.")
+
+orders_agent = create_react_agent(worker_llm, [get_order, list_orders, to_billing], name="orders")
+billing_agent = create_react_agent(worker_llm, [issue_refund, create_ticket, to_orders], name="billing")
+```
+
+El grafo padre guarda `active_agent` en el estado, así que cuando el usuario envía el siguiente mensaje en el mismo hilo, un router pequeño en `START` lo manda directo a quien estaba activo. El paquete `langgraph-swarm` (`create_swarm`) implementa esta contabilidad por ti.
+
+Fíjate en el `ToolMessage` de confirmación: el handoff es en sí una tool call, así que necesita un resultado de herramienta, o la siguiente llamada al modelo falla.
+
+## Supervisor vs swarm
+
+| | Supervisor | Swarm |
+|---|---|---|
+| Control | Un router central decide cada salto | Los agentes se pasan el control entre pares |
+| Llamadas extra al LLM | Una llamada al router por salto | Ninguna para enrutar; el handoff es una tool call |
+| Previsibilidad | Mayor; un solo lugar para registrar y poner guardas | Menor; cualquier agente puede mandar el control a donde tenga una herramienta |
+| Ideal para | Flujos de back-office, investigación en paralelo, políticas estrictas | Asistentes conversacionales con límites de dominio claros |
+| Falla típica | Ping-pong entre workers, router como cuello de botella | Bucles de handoff, contexto perdido tras la transferencia |
+
+Puedes combinarlos: un supervisor arriba, y uno de sus workers es a su vez un equipo pequeño.
+
+## Cuándo multi-agente es excesivo
+
+La mayoría de los "agentes" en producción deberían ser **un solo agente o un workflow**. Antes de dividir, revisa:
+
+1. **¿Un workflow fijo puede hacerlo?** Si los pasos son conocidos (clasificar, consultar, redactar, aprobar), un grafo con nodos simples es más barato y más confiable que cualquier agente. Ver lección 01.
+2. **¿El agente único realmente está fallando?** Mide primero la precisión de selección de herramientas en un set de evals. Si está por encima de tu objetivo, detente.
+3. **¿Puedes arreglarlo de forma más barata?** Mejores descripciones de herramientas, menos herramientas que se solapan o cargar solo las herramientas relevantes por solicitud suelen arreglar el problema de "demasiadas herramientas" sin más agentes.
+4. **¿Puedes pagar la latencia?** Cada salto agrega al menos un viaje de ida y vuelta al LLM. Un supervisor con tres saltos puede duplicar fácilmente la latencia de punta a punta.
+5. **¿Puedes depurarlo?** Necesitas traces que muestren cada salto, la razón del enrutamiento y las tool calls de cada agente. Sin ellos, los bugs multi-agente son casi imposibles de reproducir.
+
+Una buena regla: empieza con un agente, agrega especialistas solo cuando los evals muestren una falla específica y persistente que la división arregla, y mantén pequeño el número de agentes.
+
+## Errores comunes
+
+- **Multi-agente por defecto.** Agregar agentes porque suena avanzado. Suma costo y modos de falla sin ganancia medida.
+- **Responsabilidades solapadas.** Dos agentes que "manejan problemas de entrega" convierten el enrutamiento en una moneda al aire. Escribe descripciones nítidas y sin solapamiento.
+- **Perder contexto en el handoff.** Si el agente que recibe no ve el historial relevante o un resumen estructurado, el usuario tiene que repetir todo.
+- **Sin límite de saltos.** Los supervisores hacen ping-pong; los swarms entran en bucle. Cuenta los saltos en el estado y detente con un fallback seguro.
+- **Darle todas las herramientas a cada agente.** Anula el propósito. Un agente de facturación con herramientas de transportistas las va a usar.
+- **Evaluar solo la respuesta final.** También necesitas saber si el agente correcto manejó la solicitud y cuántos saltos tomó (lección 13).
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cuándo elegirías una arquitectura multi-agente sobre un solo agente?" level="mid">
+
+Solo cuando un agente único falla de forma medible y dividir arregla esa falla. Los disparadores típicos son demasiadas herramientas, lo que perjudica la selección de herramientas, prompts que distintos equipos necesitan poseer por separado, o roles que requieren modelos o permisos distintos. Antes de dividir, pruebo arreglos más baratos: descripciones de herramientas más claras, quitar herramientas que se solapan o cargar solo las herramientas relevantes por solicitud. Si divido, prefiero un supervisor para trabajo de back-office porque da un solo lugar para registrar, poner guardas y probar el enrutamiento. Agrego un límite de saltos y evalúo la precisión del enrutamiento y la cantidad de saltos, no solo la respuesta final.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explica la diferencia entre un supervisor y un swarm, y el principal modo de falla de cada uno." level="senior">
+
+En un diseño supervisor, un nodo router central elige el siguiente especialista después de cada paso, y los especialistas siempre vuelven a él. Es predecible y fácil de proteger con guardas, pero cuesta una llamada extra al LLM por salto y tiende a hacer ping-pong entre dos workers. En un swarm, cada agente tiene herramientas de handoff que devuelven un `Command` que enruta el grafo padre hacia un par, y el agente activo se guarda en el estado para que el siguiente turno del usuario vaya directo a él. Es más barato y se siente conversacional, pero los bucles de handoff y el contexto perdido después de una transferencia son comunes. En ambos casos cuento los saltos en el estado, exijo un tool message de confirmación para los handoffs y registro en el trace la razón del enrutamiento de cada salto.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Una señal fuerte">
+
+Decir "empecé con un solo agente, medí la precisión de selección de herramientas y solo dividí cuando bajó del objetivo" demuestra criterio de ingeniería. Vale más que un diagrama con siete agentes.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Conceptos multi-agente en LangGraph: https://langchain-ai.github.io/langgraph/concepts/multi_agent/
+- Conceptos de bajo nivel de LangGraph (Command, subgrafos): https://langchain-ai.github.io/langgraph/concepts/low_level/
+- Anthropic, Building effective agents (workflows vs agentes, orchestrator-workers): https://www.anthropic.com/research/building-effective-agents
+- Tracing de LangSmith para ejecuciones de varios pasos: https://docs.smith.langchain.com/

@@ -1,0 +1,245 @@
+## ¿Dónde debería correr un servicio LLM?
+
+Ya sabes desplegar contenedores. La pregunta aquí es más específica: ¿qué runtime maneja bien la forma rara del tráfico LLM?
+
+Las peticiones LLM no se parecen a una API CRUD típica:
+
+- **Son largas.** Una respuesta en streaming puede tardar 10–60 segundos. Una llamada CRUD tarda 50 ms.
+- **Casi todo es espera.** Tu proceso pasa la mayor parte del tiempo bloqueado en el stream de red del proveedor, no en CPU.
+- **Mantienen una conexión abierta.** SSE mantiene viva una respuesta HTTP durante toda la generación. Cada proxy entre el usuario y tu contenedor debe permitirlo.
+- **Son impredecibles y caras.** Los reintentos amplifican la carga, y una petición atascada sigue quemando tokens.
+
+Así que el runtime debe soportar respuestas en streaming de larga duración, escalar con la señal correcta y permitir deploys sin cortar streams en curso. Esta lección cubre **ECS Fargate** como destino principal, **Lambda** y sus trade-offs, y **Fly.io** como alternativa más simple.
+
+## ECS Fargate: la opción por defecto
+
+Fargate ejecuta tu contenedor sin que administres hosts EC2. Para un servicio FastAPI + uvicorn es el camino más directo de `docker-compose.yml` a producción.
+
+Las piezas:
+
+| Pieza | Qué hace por una app LLM |
+|---|---|
+| ECR | Guarda la imagen construida en CI, etiquetada con el SHA de git |
+| Task definition | Imagen, CPU/memoria, env, **secretos**, health check, logs |
+| Service | Mantiene N tareas corriendo, deploys rolling, autoscaling |
+| ALB | TLS, ruteo, health checks, **idle timeout** |
+| Secrets Manager / SSM | API keys del proveedor inyectadas al iniciar la tarea |
+| CloudWatch | Logs y métricas; las alarmas alimentan el circuit breaker del deploy |
+
+### La task definition
+
+Guárdala en el repo (por ejemplo `infra/taskdef.json`) y deja que CI complete la imagen. Los secretos se referencian por ARN; nunca se meten en la imagen ni se escriben como valores planos en `environment`.
+
+```json
+{
+  "family": "mortgage-knowledge-assistant",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/mka-task-execution",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/mka-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "REPLACED_BY_CI",
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "environment": [
+        { "name": "LLM_PROVIDER", "value": "anthropic" },
+        { "name": "LLM_MODEL", "value": "claude-sonnet-5-5" },
+        { "name": "LLM_FALLBACK_MODEL", "value": "claude-haiku-5-5" }
+      ],
+      "secrets": [
+        { "name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:mka/anthropic-AbCdEf" },
+        { "name": "DATABASE_URL", "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/mka/prod/database_url" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')\""],
+        "interval": 15, "timeout": 5, "retries": 3, "startPeriod": 30
+      },
+      "stopTimeout": 90,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": { "awslogs-group": "/ecs/mka", "awslogs-region": "us-east-1", "awslogs-stream-prefix": "api" }
+      }
+    }
+  ]
+}
+```
+
+Fíjate en tres detalles específicos de LLM:
+
+1. **`secrets` usa el execution role.** Ese rol necesita `secretsmanager:GetSecretValue` / `ssm:GetParameters` exactamente sobre esos ARNs. El task role (con el que corre tu código) es otro y no debería necesitarlos.
+2. **`stopTimeout: 90`.** En un deploy, ECS envía `SIGTERM`, espera y luego `SIGKILL`. Uvicorn deja de aceptar conexiones nuevas y deja terminar las peticiones en curso. Un stream de 60 segundos necesita más que los 30 segundos por defecto para drenar.
+3. **El health check usa Python, no `curl`.** Las imágenes slim a menudo no traen curl. El check llama a `/healthz` (proceso vivo), no a `/readyz` (dependencias OK). Si el proveedor está caído, no quieres que ECS mate todas las tareas en un bucle.
+
+### El idle timeout del ALB
+
+Este es el problema más común de "funciona en local, falla en prod" con streaming. El ALB cierra una conexión cuando **no fluyen bytes** durante el idle timeout (60 segundos por defecto). Un paso de retrieval largo más un primer token lento pueden superarlo. Dos soluciones, usa ambas:
+
+- Sube el idle timeout del ALB (por ejemplo a 120–300 segundos) con el atributo `idle_timeout.timeout_seconds`.
+- Envía un heartbeat como comentario SSE (`: ping\n\n`) cada 10–15 segundos mientras esperas, para que la conexión nunca quede inactiva.
+
+Configura también el **deregistration delay** del target group en al menos tu stream más largo esperado. Durante un deploy rolling, el ALB deja de enviar peticiones nuevas a una tarea que está drenando, pero mantiene las conexiones existentes hasta que termina ese delay.
+
+### Autoscaling con la señal correcta
+
+Los servicios LLM están limitados por I/O. La CPU puede estar al 15% mientras el servicio está saturado, porque cada worker está esperando al proveedor. Escalar solo por CPU escala demasiado tarde.
+
+Mejores señales:
+
+- Target tracking con **`ALBRequestCountPerTarget`**. Funciona, pero una petición no es una unidad fija de trabajo.
+- **Peticiones concurrentes en curso por tarea**, publicadas como métrica custom de CloudWatch desde tu app. Esto se mapea directo a la ley de Little (lección 11).
+- **Latencia p95** como alarma, no como señal de escalado. La latencia sube también cuando el proveedor está lento, y agregar tareas no lo arregla.
+
+Pon un mínimo de 2 tareas en 2 AZs. Pon un máximo acorde a tu rate limit con el proveedor. Escalar a 50 tareas no sirve si tu cuenta solo puede hacer 100 peticiones por minuto a la API del modelo.
+
+### Deploys rolling con circuit breaker
+
+Activa el **deployment circuit breaker** de ECS con rollback. Si las tareas nuevas fallan los health checks repetidamente, ECS detiene el deploy y vuelve a la última task definition buena. Combínalo con `minimumHealthyPercent: 100` y `maximumPercent: 200` para que la capacidad nunca baje durante un deploy. También puedes asociar alarmas de CloudWatch (por ejemplo, tasa de 5xx) para disparar el rollback.
+
+Un extracto corto de Terraform:
+
+```hcl
+resource "aws_ecs_service" "api" {
+  name            = "mka-api"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = 2
+  launch_type     = "FARGATE"
+
+  deployment_minimum_healthy_percent = 100
+  deployment_maximum_percent         = 200
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8000
+  }
+
+  network_configuration {
+    subnets         = var.private_subnet_ids
+    security_groups = [aws_security_group.api.id]
+  }
+}
+
+resource "aws_lb" "api" {
+  name               = "mka-alb"
+  load_balancer_type = "application"
+  subnets            = var.public_subnet_ids
+  idle_timeout       = 300
+}
+```
+
+## Lambda: cuándo encaja y cuándo no
+
+Lambda es tentador: sin costo en reposo, escala a cero, pagas por invocación. Para apps LLM tiene trade-offs reales. Los límites cambian con el tiempo, así que **revisa la documentación actual de AWS** antes de comprometerte con un diseño.
+
+**Lo que funciona:**
+
+- **Trabajo asíncrono y por lotes.** Ingesta, jobs de embeddings, evals nocturnos, handlers de webhooks. Cortos o disparados por colas, sin streaming.
+- **Tráfico bajo e irregular.** Una herramienta interna usada 200 veces al día cuesta casi nada.
+- **Response streaming** está soportado mediante Lambda Function URLs con el modo de invocación streaming. El runtime de Node.js lo soporta de forma nativa. Para Python/FastAPI, el camino habitual es el **Lambda Web Adapter** ejecutando tu imagen de contenedor con response streaming activado.
+
+**Lo que duele:**
+
+- **Duración máxima.** Una invocación de Lambda tiene un límite duro de tiempo (15 minutos al momento de escribir esto). Está bien para una respuesta de chat, pero las ejecuciones largas de agentes necesitan Step Functions o una cola.
+- **Buffering de API Gateway.** API Gateway REST históricamente ha hecho buffering de respuestas y ha impuesto un timeout de integración de unos 29 segundos por defecto. Eso rompe SSE. Si usas Lambda para streaming, pon una Function URL (opcionalmente detrás de CloudFront), o verifica el soporte actual de streaming en API Gateway.
+- **Cold starts.** Una imagen Python con LangChain, un SDK y drivers de pgvector puede tardar segundos en inicializar. Eso se suma directo al TTFT. La provisioned concurrency lo arregla, pero elimina el ahorro de "escalar a cero".
+- **Conexiones.** Cada invocación concurrente es su propio proceso. 300 invocaciones concurrentes significan 300 conexiones a Postgres, a menos que uses RDS Proxy.
+- **Pagas por esperar.** Lambda cobra duración de reloj. Una llamada LLM es 95% espera al proveedor. Con tráfico sostenido, tareas de Fargate que sirven 50 streams concurrentes cada una suelen ser más baratas.
+
+**Regla práctica:** Fargate para la API de streaming de cara al usuario, Lambda para los jobs dirigidos por eventos a su alrededor.
+
+## La alternativa: Fly.io
+
+Para un proyecto de portafolio o un producto en etapa temprana, Fly.io te da un deploy global, con TLS y compatible con streaming en minutos. Ejecuta tu Dockerfile como VMs Firecracker y su proxy deja pasar SSE.
+
+```toml
+app = "mortgage-knowledge-assistant"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  LLM_PROVIDER = "anthropic"
+  LLM_MODEL = "claude-sonnet-5-5"
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 40
+    hard_limit = 60
+
+[[http_service.checks]]
+  method = "GET"
+  path = "/healthz"
+  interval = "15s"
+  timeout = "5s"
+  grace_period = "20s"
+```
+
+```bash
+fly launch --no-deploy            # creates the app from fly.toml
+fly secrets set ANTHROPIC_API_KEY=sk-ant-... DATABASE_URL=postgres://...
+fly deploy --strategy rolling
+fly scale count 2 --region iad,lhr
+```
+
+`concurrency.type = "requests"` con un `soft_limit` encaja bien con tráfico LLM: el proxy desvía peticiones nuevas de una máquina que ya tiene 40 en curso. Es balanceo por concurrencia sin escribir una métrica custom. Railway es una opción parecida con flujo de Git push. Ambos cambian control fino de red e IAM por velocidad.
+
+| | ECS Fargate | Lambda | Fly.io |
+|---|---|---|---|
+| Streams SSE largos | Sí (ajusta el ALB) | Con Function URL + adapter | Sí |
+| Escalar a cero | No | Sí | Sí (auto-stop) |
+| Cold start en el TTFT | No (tareas mínimas) | Sí | En la primera petición tras detenerse |
+| IAM / VPC / compliance | AWS completo | AWS completo | Limitado |
+| Esfuerzo de operación | Medio | Bajo–medio | Bajo |
+
+## Errores comunes
+
+- **Dejar el idle timeout del ALB en 60 segundos** sin enviar heartbeats. Los streams mueren en silencio en respuestas lentas.
+- **Apuntar el health check del contenedor a `/readyz`.** Una caída del proveedor se convierte en un bucle de reinicios de ECS.
+- **`stopTimeout` y deregistration delay por defecto.** Cada deploy corta respuestas en curso.
+- **API keys en `environment` en vez de `secrets`.** Aparecen en la consola, en la salida de `describe-task-definition` y en los logs de CI.
+- **Escalar solo por CPU.** Los servicios limitados por I/O se saturan mucho antes de que la CPU se mueva.
+- **Elegir Lambda + API Gateway REST para SSE** sin revisar el comportamiento de buffering y timeouts.
+- **No tener capacidad máxima ligada a los límites del proveedor.** El autoscaling convierte una tormenta de 429 del proveedor en una más grande.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="Tu endpoint de streaming funciona en local, pero en producción los usuarios ven respuestas cortadas después de un minuto aproximadamente. ¿Qué revisas?" level="mid">
+Empieza por los proxies, porque la app funciona en local. En AWS la causa habitual es el **idle timeout del ALB** (60 segundos por defecto). Si el retrieval más el time-to-first-token supera eso sin enviar bytes, el ALB cierra la conexión. Soluciones: subir `idle_timeout` y enviar heartbeats como comentarios SSE cada 10–15 segundos. Luego revisa cada salto: timeouts de origen en CloudFront, cualquier API Gateway delante (hace buffering y tiene timeout de integración), `proxy_buffering` y `proxy_read_timeout` en nginx. Por último revisa los deploys. Si los cortes coinciden con deploys, sube `stopTimeout` y el deregistration delay del target group para que las tareas que drenan terminen sus streams.
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Desplegarías una API de chat LLM en Lambda o en ECS Fargate?" level="senior">
+Para la API de streaming de cara al usuario elegiría **Fargate** por defecto. Las peticiones son largas y casi todo es espera al proveedor. Las tareas de Fargate manejan muchos streams concurrentes por tarea con I/O asíncrono. No hay cold starts en el TTFT, y el connection pooling a Postgres es simple. Lambda cobra tiempo de reloj por invocación, así que pagas esa espera. El streaming necesita Function URLs y un adapter para Python. Cada invocación necesita su propia conexión a la base, así que necesitas RDS Proxy.
+
+Usaría **Lambda** alrededor de la API: ingesta disparada por eventos de S3, lotes de embeddings, evals programados, webhooks. Si el tráfico es muy bajo e irregular, Lambda con Function URL puede ser más barato. Lo demostraría con un modelo de costos, no lo asumiría.
+</InterviewQuestion>
+
+<Callout type="interview" title="Muestra el trade-off, no la herramienta">
+A los entrevistadores rara vez les importa qué plataforma elegiste. Les importa que puedas nombrar la restricción que te llevó a ella: duración del stream, idle timeouts, cold starts en el TTFT, número de conexiones, rate limits del proveedor, costo del reposo vs costo de la espera.
+</Callout>
+
+## Lecturas recomendadas
+
+- [Amazon ECS task definition parameters](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html)
+- [Passing sensitive data to an ECS container](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/specifying-sensitive-data.html)
+- [ECS deployment circuit breaker](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-circuit-breaker.html)
+- [Application Load Balancer attributes (idle timeout)](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html)
+- [Lambda response streaming](https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html)
+- [Fly.io app configuration (fly.toml)](https://fly.io/docs/reference/configuration/)

@@ -1,0 +1,180 @@
+## Goal
+
+Write a k6 load test for the `mortgage-knowledge-assistant` streaming endpoint. Run it against your docker-compose stack with the mock provider. Then write a short, honest **results report** that names your first bottleneck. This is the artifact a hiring manager reads: thresholds, numbers, and a clear explanation of what limits the service.
+
+As an SDET you already know a test without assertions is not a test. Here the assertions are **thresholds**. k6 exits non-zero when one fails, so the same script can later gate a deploy.
+
+Target for this exercise (adjust if your hardware is small, and say so in the report):
+
+| Metric | Threshold |
+|---|---|
+| Steady load | 10 requests/second for 3 minutes |
+| `ttft_ms` p95 | under 1500 ms (mock TTFT set to 800 ms) |
+| `http_req_duration` p95 | under 12 s |
+| Error rate (HTTP + in-stream SSE errors) | under 1% |
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `loadtest/chat_stream.js` uses an **arrival-rate** executor (`ramping-arrival-rate` or `constant-arrival-rate`), not fixed VUs.
+- [ ] Custom metrics: `ttft_ms` (Trend), `tokens_per_sec` (Trend), `sse_error_rate` (Rate).
+- [ ] Thresholds for p95 TTFT, p95 duration, `http_req_failed` and `sse_error_rate`. At least one threshold uses `abortOnFail`.
+- [ ] TTFT comes from the server-reported `done` event (or an SSE extension). The report explains why plain `timings.waiting` is not used.
+- [ ] `loadtest/questions.json` holds at least 50 varied questions, so the exact-match cache does not dominate.
+- [ ] The stack runs with `LLM_PROVIDER=mock`, `MOCK_TTFT_MS=800`, `MOCK_TOKENS_PER_SEC=60` from a compose override file.
+- [ ] Two runs are recorded: cache **off** and cache **on**.
+- [ ] A **stress run** ramps past the target until a threshold breaks. The report gives the rate where it broke.
+- [ ] `loadtest/RESULTS.md` follows the template below and names a bottleneck with evidence (trace spans, container stats, or logs).
+- [ ] A `make loadtest` (or `just`/script) target runs everything with one command.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```yaml
+# docker-compose.loadtest.yml (override)
+services:
+  api:
+    environment:
+      LLM_PROVIDER: mock
+      MOCK_TTFT_MS: "800"
+      MOCK_TOKENS_PER_SEC: "60"
+      CACHE_ENABLED: "${CACHE_ENABLED:-false}"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2g
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    volumes:
+      - ./loadtest:/scripts
+    environment:
+      BASE_URL: http://api:8000
+    command: run --summary-export=/scripts/results/summary.json /scripts/chat_stream.js
+    depends_on: [api]
+```
+
+```javascript
+// loadtest/chat_stream.js (skeleton)
+import http from 'k6/http';
+import { check } from 'k6';
+import { Trend, Rate } from 'k6/metrics';
+
+const ttft = new Trend('ttft_ms', true);
+const tps = new Trend('tokens_per_sec');
+const sseErrors = new Rate('sse_error_rate');
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+const RATE = Number(__ENV.RATE || 10);
+const QUESTIONS = JSON.parse(open('./questions.json'));
+
+export const options = {
+  scenarios: {
+    steady: {
+      executor: 'constant-arrival-rate',
+      rate: RATE,
+      timeUnit: '1s',
+      duration: '3m',
+      preAllocatedVUs: 50,
+      maxVUs: 300,
+    },
+  },
+  thresholds: {
+    // TODO: p95 TTFT, p95 duration, http_req_failed, sse_error_rate
+    // TODO: abortOnFail on the error-rate threshold
+  },
+};
+
+export default function () {
+  const q = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
+  const res = http.post(`${BASE_URL}/v1/chat/stream`, JSON.stringify({ question: q }), {
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': `load-${__VU % 10}` },
+    timeout: '60s',
+  });
+  // TODO: parse SSE blocks into events
+  // TODO: record sse_error_rate (error event OR missing done)
+  // TODO: read ttft_ms and output_tokens from the done event, compute tokens/sec
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+```markdown
+<!-- loadtest/RESULTS.md template: replace every bracket -->
+# Load test results: mortgage-knowledge-assistant
+
+## Setup
+- Date, git SHA, machine (CPU/RAM), where k6 ran
+- Stack: api (1 vCPU / 2 GB), Postgres + pgvector, Redis
+- Provider: mock, TTFT 800 ms, 60 tokens/s, about 45 output tokens per answer
+
+## Results
+| Run | Rate | Requests | p50 / p95 TTFT | p95 duration | tokens/s p50 | Errors | Pass? |
+|---|---|---|---|---|---|---|---|
+| Cache off | 10/s | | | | | | |
+| Cache on | 10/s | | | | | | |
+| Stress | ramp to [N]/s | | | | | | broke at [N]/s |
+
+## Concurrency check (Little's law)
+Expected in-flight = rate x avg duration = [..]. Observed peak VUs = [..].
+
+## Bottleneck
+What broke first, the evidence (span timings / docker stats / logs), and why.
+
+## What I would change
+1-3 concrete fixes, each with the expected effect.
+
+## Caveats
+Mock vs real provider, single host, network not included in server-side TTFT.
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Start with a smoke run: `RATE=1` for 30 seconds. Confirm that every request parses a `done` event and that `ttft_ms` is close to 800 ms. If TTFT is much higher at 1 request per second, you have overhead before the LLM call (retrieval, re-ranking, an embedding call) that you should measure first.</Hint>
+  <Hint>Thresholds are an object keyed by metric name. Use the long form for abort: `sse_error_rate: [{ threshold: 'rate<0.01', abortOnFail: true, delayAbortEval: '30s' }]`. The delay stops one early failure during warm-up from killing the run.</Hint>
+  <Hint>For the stress run, switch to `ramping-arrival-rate` with stages like 10, 20, 40, 60 requests per second, two minutes each. Watch `docker stats` and your tracing UI side by side. Note the stage where p95 TTFT crosses 1500 ms. If k6 warns about insufficient VUs, raise `maxVUs`. That warning means k6 itself became the bottleneck.</Hint>
+  <Hint>Typical first bottlenecks with the mock: the Postgres pool (look for time spent waiting on pool acquire, or `QueuePool limit` errors), a CPU-bound cross-encoder re-ranker running on the event loop (CPU pinned at 100%, TTFT rises for every request), or a sync Redis client. Find which span grows with load. That span is your answer.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Branch: `m5/k6-load-test`
+
+```text
+mortgage-knowledge-assistant/
+  loadtest/
+    chat_stream.js         # steady + stress scenarios via env vars
+    questions.json         # 50+ varied mortgage questions
+    results/
+      summary-cache-off.json
+      summary-cache-on.json
+      summary-stress.json
+    RESULTS.md             # the write-up
+  docker-compose.loadtest.yml
+  Makefile                 # make loadtest / make stress
+  README.md                # link to loadtest/RESULTS.md
+```
+
+README addition: a "Performance" section with the results table, the bottleneck in one sentence, and a link to `loadtest/RESULTS.md`.
+
+Suggested commits:
+
+- `test(load): add k6 streaming scenario with custom TTFT and tokens/sec metrics`
+- `test(load): add compose override with mock provider`
+- `test(load): add thresholds and stress scenario`
+- `docs: add load test results and bottleneck analysis`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m5-12-review" title="Self-review" items={["The executor is arrival-rate, so a slow service cannot quietly lower the load", "An SSE error event or a missing done event counts as a failure", "TTFT comes from the server-reported done event and the report says why", "The question set is varied and I compared cache on vs cache off", "k6 exits non-zero when a threshold fails (I tested this on purpose)", "The stress run found a breaking point and the report gives the rate", "The bottleneck claim is backed by evidence, not a guess", "The report lists its caveats: mock provider, single host, no client network"]} />

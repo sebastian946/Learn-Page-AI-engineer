@@ -1,0 +1,182 @@
+## Objetivo
+
+Escribe una prueba de carga con k6 para el endpoint de streaming de `mortgage-knowledge-assistant`. Ejecútala contra tu stack de docker-compose con el proveedor mock. Luego escribe un **reporte de resultados** corto y honesto que nombre tu primer cuello de botella. Este es el artefacto que lee un hiring manager: thresholds, números y una explicación clara de qué limita al servicio.
+
+Como SDET ya sabes que una prueba sin aserciones no es una prueba. Aquí las aserciones son los **thresholds**. k6 termina con código distinto de cero cuando uno falla, así que el mismo script puede luego bloquear un deploy.
+
+Objetivo de este ejercicio (ajústalo si tu hardware es pequeño, y dilo en el reporte):
+
+| Métrica | Threshold |
+|---|---|
+| Carga estable | 10 peticiones/segundo durante 3 minutos |
+| `ttft_ms` p95 | menos de 1500 ms (TTFT del mock en 800 ms) |
+| `http_req_duration` p95 | menos de 12 s |
+| Tasa de errores (HTTP + errores SSE dentro del stream) | menos de 1% |
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] `loadtest/chat_stream.js` usa un executor de **arrival rate** (`ramping-arrival-rate` o `constant-arrival-rate`), no VUs fijos.
+- [ ] Métricas custom: `ttft_ms` (Trend), `tokens_per_sec` (Trend), `sse_error_rate` (Rate).
+- [ ] Thresholds para TTFT p95, duración p95, `http_req_failed` y `sse_error_rate`. Al menos un threshold usa `abortOnFail`.
+- [ ] El TTFT viene del evento `done` reportado por el servidor (o de una extensión SSE). El reporte explica por qué no se usa `timings.waiting` directamente.
+- [ ] `loadtest/questions.json` tiene al menos 50 preguntas variadas, para que la caché exacta no domine.
+- [ ] El stack corre con `LLM_PROVIDER=mock`, `MOCK_TTFT_MS=800`, `MOCK_TOKENS_PER_SEC=60` desde un archivo override de compose.
+- [ ] Se registran dos ejecuciones: caché **desactivada** y caché **activada**.
+- [ ] Una **ejecución de estrés** sube por encima del objetivo hasta que un threshold falla. El reporte da la tasa donde se rompió.
+- [ ] `loadtest/RESULTS.md` sigue la plantilla de abajo y nombra un cuello de botella con evidencia (spans de tracing, estadísticas de contenedores o logs).
+- [ ] Un target `make loadtest` (o `just`/script) ejecuta todo con un solo comando.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```yaml
+# docker-compose.loadtest.yml (override)
+services:
+  api:
+    environment:
+      LLM_PROVIDER: mock
+      MOCK_TTFT_MS: "800"
+      MOCK_TOKENS_PER_SEC: "60"
+      CACHE_ENABLED: "${CACHE_ENABLED:-false}"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2g
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    volumes:
+      - ./loadtest:/scripts
+    environment:
+      BASE_URL: http://api:8000
+    command: run --summary-export=/scripts/results/summary.json /scripts/chat_stream.js
+    depends_on: [api]
+```
+
+```javascript
+// loadtest/chat_stream.js (skeleton)
+import http from 'k6/http';
+import { check } from 'k6';
+import { Trend, Rate } from 'k6/metrics';
+
+const ttft = new Trend('ttft_ms', true);
+const tps = new Trend('tokens_per_sec');
+const sseErrors = new Rate('sse_error_rate');
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+const RATE = Number(__ENV.RATE || 10);
+const QUESTIONS = JSON.parse(open('./questions.json'));
+
+export const options = {
+  scenarios: {
+    steady: {
+      executor: 'constant-arrival-rate',
+      rate: RATE,
+      timeUnit: '1s',
+      duration: '3m',
+      preAllocatedVUs: 50,
+      maxVUs: 300,
+    },
+  },
+  thresholds: {
+    // TODO: p95 TTFT, p95 duration, http_req_failed, sse_error_rate
+    // TODO: abortOnFail on the error-rate threshold
+  },
+};
+
+export default function () {
+  const q = QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)];
+  const res = http.post(`${BASE_URL}/v1/chat/stream`, JSON.stringify({ question: q }), {
+    headers: { 'Content-Type': 'application/json', 'X-Tenant-ID': `load-${__VU % 10}` },
+    timeout: '60s',
+  });
+  // TODO: parse SSE blocks into events
+  // TODO: record sse_error_rate (error event OR missing done)
+  // TODO: read ttft_ms and output_tokens from the done event, compute tokens/sec
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+```markdown
+<!-- loadtest/RESULTS.md template: replace every bracket -->
+# Load test results: mortgage-knowledge-assistant
+
+## Setup
+- Date, git SHA, machine (CPU/RAM), where k6 ran
+- Stack: api (1 vCPU / 2 GB), Postgres + pgvector, Redis
+- Provider: mock, TTFT 800 ms, 60 tokens/s, about 45 output tokens per answer
+
+## Results
+| Run | Rate | Requests | p50 / p95 TTFT | p95 duration | tokens/s p50 | Errors | Pass? |
+|---|---|---|---|---|---|---|---|
+| Cache off | 10/s | | | | | | |
+| Cache on | 10/s | | | | | | |
+| Stress | ramp to [N]/s | | | | | | broke at [N]/s |
+
+## Concurrency check (Little's law)
+Expected in-flight = rate x avg duration = [..]. Observed peak VUs = [..].
+
+## Bottleneck
+What broke first, the evidence (span timings / docker stats / logs), and why.
+
+## What I would change
+1-3 concrete fixes, each with the expected effect.
+
+## Caveats
+Mock vs real provider, single host, network not included in server-side TTFT.
+```
+
+</StarterCode>
+
+El reporte puede ir en inglés (el mercado objetivo es en inglés), por eso la plantilla se mantiene igual.
+
+## Pistas
+
+<Hints>
+  <Hint>Empieza con una ejecución de humo: `RATE=1` durante 30 segundos. Confirma que cada petición parsea un evento `done` y que `ttft_ms` está cerca de 800 ms. Si el TTFT es mucho mayor a 1 petición por segundo, tienes overhead antes de la llamada al LLM (retrieval, re-ranking, una llamada de embeddings) que debes medir primero.</Hint>
+  <Hint>Los thresholds son un objeto con el nombre de la métrica como clave. Usa la forma larga para abortar: `sse_error_rate: [{ threshold: 'rate<0.01', abortOnFail: true, delayAbortEval: '30s' }]`. El delay evita que una falla temprana durante el calentamiento mate la ejecución.</Hint>
+  <Hint>Para la ejecución de estrés, cambia a `ramping-arrival-rate` con etapas como 10, 20, 40, 60 peticiones por segundo, dos minutos cada una. Mira `docker stats` y tu UI de tracing lado a lado. Anota la etapa donde el TTFT p95 cruza 1500 ms. Si k6 avisa que faltan VUs, sube `maxVUs`. Ese aviso significa que k6 mismo se volvió el cuello de botella.</Hint>
+  <Hint>Cuellos de botella típicos con el mock: el pool de Postgres (busca tiempo esperando para obtener una conexión del pool, o errores `QueuePool limit`), un re-ranker cross-encoder limitado por CPU corriendo en el event loop (CPU al 100%, el TTFT sube para todas las peticiones), o un cliente de Redis síncrono. Encuentra qué span crece con la carga. Ese span es tu respuesta.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Rama: `m5/k6-load-test`
+
+```text
+mortgage-knowledge-assistant/
+  loadtest/
+    chat_stream.js         # steady + stress scenarios via env vars
+    questions.json         # 50+ varied mortgage questions
+    results/
+      summary-cache-off.json
+      summary-cache-on.json
+      summary-stress.json
+    RESULTS.md             # the write-up
+  docker-compose.loadtest.yml
+  Makefile                 # make loadtest / make stress
+  README.md                # link to loadtest/RESULTS.md
+```
+
+Adición al README: una sección "Performance" con la tabla de resultados, el cuello de botella en una frase y un enlace a `loadtest/RESULTS.md`.
+
+Commits sugeridos:
+
+- `test(load): add k6 streaming scenario with custom TTFT and tokens/sec metrics`
+- `test(load): add compose override with mock provider`
+- `test(load): add thresholds and stress scenario`
+- `docs: add load test results and bottleneck analysis`
+
+</CommitBox>
+
+## Autorrevisión
+
+<Checklist id="m5-12-review" title="Autorrevisión" items={["El executor es de arrival rate, así que un servicio lento no puede bajar la carga sin avisar", "Un evento SSE error o la falta del evento done cuenta como falla", "El TTFT viene del evento done reportado por el servidor y el reporte explica por qué", "El conjunto de preguntas es variado y comparé caché activada vs desactivada", "k6 termina con código distinto de cero cuando falla un threshold (lo probé a propósito)", "La ejecución de estrés encontró un punto de quiebre y el reporte da la tasa", "La afirmación sobre el cuello de botella tiene evidencia, no es una suposición", "El reporte lista sus salvedades: proveedor mock, un solo host, sin red del cliente"]} />

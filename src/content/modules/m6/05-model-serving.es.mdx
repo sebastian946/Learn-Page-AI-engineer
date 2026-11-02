@@ -1,0 +1,167 @@
+# Model Serving: Foundation Model APIs, provisioned throughput y modelos externos
+
+Tu cadena necesita un LLM. Tu índice Delta Sync necesita un modelo de embeddings. Tu agente necesita un endpoint al que los usuarios puedan llamar. En Databricks, los tres son **endpoints de Model Serving**. Saber qué tipo de endpoint encaja en un escenario es una de las habilidades más evaluadas en el examen Generative AI Engineer Associate, y también es una decisión de arquitectura real con consecuencias de costo.
+
+<Callout type="warning" title="Los nombres de endpoints y las funciones cambian">
+
+Los nombres de modelos en Foundation Model APIs rotan a medida que salen nuevos modelos abiertos, y las funciones de AI Gateway siguen creciendo. Trata cada nombre de endpoint de esta lección como un ejemplo. Revisa la lista y los precios actuales en docs.databricks.com y en la página de Serving de tu workspace.
+
+</Callout>
+
+## Cuatro tipos de serving
+
+| Tipo | Qué sirve | Forma de cobro | Uso típico |
+|---|---|---|---|
+| Foundation Model APIs — pay-per-token | Modelos abiertos alojados por Databricks (chat, embeddings) en infraestructura compartida | Por token | Prototipos, volumen bajo o variable, embeddings para Vector Search |
+| Foundation Model APIs — provisioned throughput | Las mismas familias de modelos, o tus variantes con fine-tuning, en capacidad dedicada | Por hora de capacidad reservada | SLAs de producción, volumen alto y predecible, modelos con fine-tuning, necesidades de aislamiento de datos |
+| Modelos externos | Proveedores externos (Anthropic, OpenAI, Google, Bedrock, ...) detrás de un endpoint de Databricks | Precio por token del proveedor | Usar modelos frontera con gobernanza central |
+| Modelos personalizados | Cualquier modelo de MLflow: tu cadena, agente, clasificador | Cómputo por hora (con opción de escalar a cero) | Servir tu propia lógica |
+
+### Pay-per-token
+
+Los endpoints compartidos ya están creados en las regiones soportadas, con nombres como `databricks-meta-llama-3-3-70b-instruct` o `databricks-gte-large-en` (ejemplos; revisa tu workspace). Sin configuración. Buenos para desarrollo y para cargas donde no puedes predecir el volumen. Los trade-offs: los rate limits son compartidos y no garantizados, y los modelos disponibles son los que ofrece Databricks.
+
+### Provisioned throughput
+
+Reservas capacidad medida en unidades de throughput para un modelo específico. Obtienes rendimiento garantizado y aislamiento. Es el camino documentado para servir modelos foundation **con fine-tuning** y para cargas de producción con SLAs. El trade-off es que pagas la capacidad reservada aunque esté inactiva, así que solo conviene con tráfico sostenido. Un patrón común: pay-per-token en dev, provisioned throughput en prod una vez que mediste el tráfico.
+
+### Modelos externos
+
+Un endpoint de modelo externo es un proxy: el cliente llama a un endpoint de Databricks y Databricks reenvía al proveedor. ¿Por qué agregar un salto?
+
+- **Las credenciales viven en un solo lugar** (secrets de Databricks), no en cada app.
+- **Una sola forma de API** para todos los proveedores, así cambiar de proveedor es un cambio de configuración.
+- **Aplican las funciones de AI Gateway**: rate limits, seguimiento de uso, registro de payloads, guardrails.
+- **Gobernanza**: los permisos del endpoint controlan quién puede usar qué proveedor.
+
+Esta es la respuesta de Databricks a la capa de "abstracción de proveedor" que construiste en el Módulo 1.
+
+```python
+from mlflow.deployments import get_deploy_client
+
+client = get_deploy_client("databricks")
+client.create_endpoint(
+    name="claude-sonnet-gateway",
+    config={
+        "served_entities": [
+            {
+                "name": "claude-sonnet",
+                "external_model": {
+                    "name": "claude-sonnet-5-5",
+                    "provider": "anthropic",
+                    "task": "llm/v1/chat",
+                    "anthropic_config": {
+                        "anthropic_api_key": "{{secrets/llm/anthropic_api_key}}"
+                    },
+                },
+            }
+        ]
+    },
+)
+```
+
+La referencia `{{secrets/scope/key}}` mantiene la clave fuera del código y fuera de la configuración del endpoint visible para los usuarios.
+
+### Modelos personalizados
+
+Tu cadena o agente, registrado con MLflow, servido como endpoint REST. La lección 7 cubre la versión para agentes, donde `agents.deploy` crea el endpoint por ti. Los endpoints personalizados pueden **escalar a cero** en dev, a costa de un cold start en la primera petición.
+
+## Consultar un endpoint
+
+Los endpoints de chat (Foundation Model APIs y modelos externos) hablan una API compatible con OpenAI, así que el SDK de OpenAI funciona apuntándolo a tu workspace:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["DATABRICKS_TOKEN"],
+    base_url=f"{os.environ['DATABRICKS_HOST']}/serving-endpoints",
+)
+
+resp = client.chat.completions.create(
+    model=os.environ.get("CHAT_ENDPOINT", "claude-sonnet-gateway"),  # the endpoint name
+    messages=[
+        {"role": "system", "content": "You answer insurance policy questions. Cite sections."},
+        {"role": "user", "content": "Is mold covered after a roof leak?"},
+    ],
+    max_tokens=400,
+    temperature=0.0,
+)
+print(resp.choices[0].message.content)
+print(resp.usage)
+```
+
+Fíjate que `model` es el **nombre del endpoint**, no el id del modelo del proveedor. El mismo código llama a un endpoint pay-per-token de Llama o a un endpoint externo de Claude; solo cambia el nombre. En LangChain, `databricks_langchain.ChatDatabricks(endpoint="...")` hace lo mismo.
+
+## Inferencia batch con `ai_query`
+
+No todo necesita un endpoint en tiempo real. Clasificar 2 millones de reclamos históricos o extraer campos de cada documento de una tabla es un job batch. Databricks SQL puede llamar a un endpoint de serving por fila:
+
+```sql
+CREATE OR REPLACE TABLE main.claims.claim_triage AS
+SELECT
+  claim_id,
+  ai_query(
+    'claude-sonnet-gateway',
+    CONCAT('Classify this claim description into one of: water, fire, theft, wind, other. ',
+           'Answer with the label only. Description: ', description)
+  ) AS loss_type
+FROM main.claims.claims_raw
+WHERE ingested_at >= current_date() - INTERVAL 1 DAY;
+```
+
+`ai_query` también soporta salida estructurada mediante un argumento de formato de respuesta en runtimes recientes. Para jobs grandes sobre endpoints de provisioned throughput, suele ser la forma más simple y eficiente de hacer enriquecimiento offline. También hay funciones específicas por tarea (`ai_classify`, `ai_extract`, `ai_summarize`) para trabajo rápido.
+
+## AI Gateway: controles de producción en cualquier endpoint
+
+Las funciones de AI Gateway se pueden activar en los endpoints de serving:
+
+- **Rate limits** por usuario, por service principal o por endpoint. Protegen presupuestos y capacidad compartida.
+- **Seguimiento de uso** en system tables, para atribuir el uso de tokens por usuario y equipo.
+- **Inference tables**: los payloads de request y response se registran automáticamente en una tabla Delta de Unity Catalog. Es tu log de producción para análisis SQL (lección 1), monitoreo y construcción de sets de evaluación (lección 2).
+- **Guardrails**: filtrado de seguridad y detección de PII en entradas y salidas.
+- **División de tráfico y fallbacks**: enviar un porcentaje del tráfico a un modelo nuevo, o recurrir a otra entidad servida cuando hay errores.
+
+Las inference tables merecen énfasis: convierten cada endpoint en una fuente de datos. "¿Cómo monitoreamos la calidad en producción?" en el examen suele tener como respuesta "activa inference tables y evalúalas con MLflow".
+
+## Cómo elegir: una guía de decisión estilo examen
+
+1. **¿Necesitas un modelo propietario frontera?** → Endpoint de modelo externo.
+2. **¿Es un modelo abierto con fine-tuning o una carga de producción con SLA?** → Provisioned throughput.
+3. **¿Prototipo, volumen bajo o impredecible, o embeddings para Vector Search?** → Pay-per-token.
+4. **¿Es la lógica de tu propia cadena o agente?** → Endpoint de modelo personalizado (vía `agents.deploy` para agentes).
+5. **¿Es offline, sobre una tabla?** → `ai_query` en batch, no un endpoint en tiempo real.
+
+Luego razona el costo como en el Módulo 5: tokens por request por requests al mes con precio por token, comparado con capacidad reservada por hora. Haz las cuentas con los precios **actuales** del proveedor; el punto de cruce depende de la forma de tu tráfico.
+
+## Errores comunes
+
+- **Poner API keys de proveedores en notebooks** en lugar de usar endpoints de modelos externos con secrets.
+- **Provisioned throughput para un prototipo** con diez requests al día.
+- **Pay-per-token para un SLA estricto de producción** donde los rate limits compartidos son un riesgo.
+- **Llamar a un endpoint en tiempo real fila por fila desde un loop de Python** para un job batch. Usa `ai_query` o inferencia batch.
+- **No activar inference tables** y luego no tener datos de producción para evals.
+- **Pasar el id del modelo del proveedor** como `model` en lugar del nombre del endpoint.
+
+## Cómo aparece esto en entrevistas y en el examen
+
+<InterviewQuestion question="Una empresa quiere que sus equipos usen modelos de Claude y GPT, pero seguridad exige que ningún equipo tenga API keys de proveedores y que el uso se mida por equipo. ¿Qué propones en Databricks?" level="mid">
+
+Crea endpoints de modelos externos para cada proveedor, con las claves guardadas en secrets de Databricks y referenciadas en la configuración del endpoint. Otorga `CAN QUERY` sobre los endpoints a los grupos de cada equipo o a service principals. Activa el seguimiento de uso de AI Gateway y rate limits por equipo, además de inference tables para auditoría. Los equipos llaman a los endpoints con el cliente compatible con OpenAI usando su propia identidad de Databricks, así las claves nunca salen de la plataforma y cambiar de proveedor es un cambio de configuración.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu variante de Llama con fine-tuning debe servir una app de cara al cliente con un SLA de latencia. ¿Qué opción de serving eliges y por qué?" level="senior">
+
+Provisioned throughput en Foundation Model APIs. Es el camino soportado para modelos foundation con fine-tuning y da capacidad dedicada y predecible en lugar de rate limits compartidos. Dimensionaría el throughput a partir de los tokens por segundo pico medidos más un margen, haría pruebas de carga (como en el Módulo 5 con k6), activaría inference tables para monitoreo y mantendría una ruta de fallback. Si el tráfico es bajo la mayor parte del día, compararía el costo de la capacidad reservada con el de una API externa y documentaría el punto de cruce.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Visión general de Model Serving: https://docs.databricks.com/en/machine-learning/model-serving/index.html
+- Foundation Model APIs: https://docs.databricks.com/en/machine-learning/foundation-models/index.html
+- Modelos externos: https://docs.databricks.com/en/generative-ai/external-models/index.html
+- AI Gateway: https://docs.databricks.com/en/ai-gateway/index.html
+- Función `ai_query`: https://docs.databricks.com/en/sql/language-manual/functions/ai_query.html

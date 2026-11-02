@@ -1,0 +1,189 @@
+## Tools are an API for a non-deterministic client
+
+The model is a new kind of API consumer. It reads your documentation every single time, takes it literally, cannot ask clarifying questions, and will occasionally send garbage. Most agent failures in production are not "the model is dumb". They are tool design bugs: vague descriptions, overlapping tools, errors the model cannot act on, results too large for the context window.
+
+Your SDET instincts help here. A tool definition is a **contract**. Design it like a public API, then test it like one.
+
+## 1. The schema: make invalid calls impossible
+
+The JSON schema is the first line of defense. Use it to constrain, not just to describe.
+
+- Use `enum` for closed sets (`category`, `status`).
+- Use `pattern` for ids (`^ORD-[0-9]{6}$`), `format: date` for dates, `minimum`/`maximum` for numbers.
+- Prefer integers in minor units for money: `amount_cents`, not a float `amount`.
+- Mark only truly required fields as `required`. Give optional fields defaults in code.
+- Keep parameters flat. Nested objects three levels deep invite malformed calls.
+
+With Pydantic v2 you write the model once and generate the schema:
+
+```python
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class RescheduleDeliveryInput(BaseModel):
+    """Move the delivery of ONE existing order to a new date.
+
+    Use only after get_order confirms the order is not yet delivered.
+    The new date must be a business day within the next 14 days.
+    Safe to retry with the same idempotency_key.
+    """
+    order_id: str = Field(pattern=r"^ORD-[0-9]{6}$", description="Order id, e.g. ORD-104233")
+    new_date: date = Field(description="Requested delivery date, ISO format YYYY-MM-DD")
+    idempotency_key: str = Field(min_length=8, description="Unique key per intended change; reuse it on retries")
+
+class CreateTicketInput(BaseModel):
+    """Open a support ticket for a human team. Use when no tool can resolve the issue."""
+    order_id: str = Field(pattern=r"^ORD-[0-9]{6}$")
+    category: Literal["damaged", "lost", "late", "billing", "other"]
+    summary: str = Field(max_length=500, description="One paragraph, facts only, no speculation")
+
+def to_anthropic_tool(name: str, model: type[BaseModel]) -> dict:
+    return {
+        "name": name,
+        "description": model.__doc__.strip(),
+        "input_schema": model.model_json_schema(),
+    }
+```
+
+Then validate on the way in. Never trust that the model respected the schema. `RescheduleDeliveryInput.model_validate(block.input)` turns a malformed call into a clean validation error you can send back.
+
+## 2. Descriptions: write for a smart new hire
+
+The description is the prompt for tool selection. Good descriptions answer four questions:
+
+1. **What does it do?** One sentence.
+2. **When should it be used, and when not?** "Use only after get_order confirms..." Disambiguate from similar tools.
+3. **What does it return?** Name the key fields so the model knows what to expect.
+4. **What are the side effects?** "Changes customer-visible state." "Read-only." "Safe to retry."
+
+Bad: `"get_order: gets order"`. Good: `"Look up one order by id. Read-only. Returns status (pending|in_transit|delayed|delivered|cancelled), carrier, promised_date and items. Use list_orders to search by customer."`
+
+Name tools with verbs and nouns from the domain: `get_order`, `reschedule_delivery`. Avoid near-duplicates like `get_order` and `fetch_order_details`. If two tools overlap, the model will pick randomly between them, and your trajectory evals will be flaky for a reason that has nothing to do with the model.
+
+## 3. Idempotency: retries must be safe
+
+Agents retry. The model may call the same tool twice because it did not "see" the first result, your loop may retry after a timeout, or a human may resume a graph after an interrupt and replay a node. For any tool that **changes state**, a duplicate call must not double the effect.
+
+Pattern: the tool takes an `idempotency_key`. The backend stores the key with the result. A repeated key returns the stored result instead of acting again.
+
+```python
+import hashlib, json
+
+async def reschedule_delivery(inp: RescheduleDeliveryInput, db) -> dict:
+    existing = await db.fetchrow(
+        "SELECT response FROM idempotency WHERE key = $1", inp.idempotency_key
+    )
+    if existing:
+        return json.loads(existing["response"]) | {"replayed": True}
+
+    order = await db.fetchrow("SELECT status FROM orders WHERE id = $1", inp.order_id)
+    if order is None:
+        return tool_error("ORDER_NOT_FOUND", f"{inp.order_id} does not exist",
+                          retryable=False, hint="Confirm the id with the customer or call list_orders.")
+    if order["status"] == "delivered":
+        return tool_error("ALREADY_DELIVERED", "Order was delivered; it cannot be rescheduled.",
+                          retryable=False, hint="Offer create_ticket with category 'other'.")
+
+    await db.execute("UPDATE orders SET promised_date = $1 WHERE id = $2", inp.new_date, inp.order_id)
+    response = {"order_id": inp.order_id, "new_date": inp.new_date.isoformat(), "status": "rescheduled"}
+    await db.execute("INSERT INTO idempotency(key, response) VALUES ($1, $2)",
+                     inp.idempotency_key, json.dumps(response))
+    return response
+```
+
+Who generates the key? Two options. Let the model pass one (simple, but the model might reuse a key for a different intent). Or derive it in your executor from the thread id plus the normalized arguments, e.g. `sha256(thread_id + tool_name + canonical_json(args))`. The second is more robust; it turns "same intent in the same conversation" into the same key.
+
+Read-only tools are naturally idempotent. Design them that way: no hidden writes in a `get_` tool.
+
+## 4. Error contracts the model can act on
+
+A stack trace is useless to a model. An error must tell it **what went wrong, whether retrying makes sense, and what to do instead**. Use one shape for every tool:
+
+```python
+def tool_error(code: str, message: str, *, retryable: bool, hint: str) -> dict:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+```
+
+```json
+{"error": {"code": "ORDER_NOT_FOUND", "message": "ORD-999999 does not exist",
+           "retryable": false, "hint": "Ask the customer to confirm the order id or call list_orders with their customer_id."}}
+```
+
+- `code`: stable, machine-readable, enumerable. Your evals and dashboards group by it.
+- `retryable`: `true` for timeouts and 429s, `false` for validation and business rule errors. This prevents the model from hammering a dead end.
+- `hint`: the next best action, in plain language. This is the most underrated field in agent engineering.
+
+Send it back as a `tool_result` with `is_error: true`. Do not raise an exception that kills the loop unless the failure is truly unrecoverable (auth broken, config missing). Those should stop the agent and alert you.
+
+Handle **transient** errors inside the tool, not in the model. Retry a 503 twice with backoff in code. Only surface the error to the model when your retries are exhausted. Every retry the model performs costs a full model call.
+
+## 5. Pagination and result size
+
+Tool results go into the context window. A `list_orders` that returns 2,000 orders will cost thousands of tokens, push useful history out, and degrade reasoning.
+
+- Default to small pages (`limit` default 20, max 50).
+- Return a `next_cursor` and a `total` so the model knows more exist.
+- Return **summaries**, not full records. Let the model call `get_order` for details.
+- Truncate long text fields and say so: `"notes": "...(truncated, 4,210 chars)"`.
+
+```json
+{"orders": [{"order_id": "ORD-104233", "status": "delayed", "promised_date": "2026-11-04"}],
+ "next_cursor": "eyJvZmZzZXQiOjIwfQ", "total": 87}
+```
+
+A cursor is opaque. Do not let the model compute offsets; it will get them wrong.
+
+## 6. Timeouts and latency
+
+Every tool call needs a timeout. A hung carrier API should not hang your agent for 60 seconds while the user stares at a spinner.
+
+```python
+import asyncio
+
+async def call_with_timeout(fn, args, timeout_s: float = 8.0) -> dict:
+    try:
+        return await asyncio.wait_for(fn(args), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return tool_error("UPSTREAM_TIMEOUT", f"{fn.__name__} took longer than {timeout_s}s",
+                          retryable=True, hint="Retry once. If it fails again, create a ticket.")
+```
+
+Set timeouts per tool from observed p99 latency, not one global number. Rates from a carrier aggregator may need 10 s; a database lookup should finish in 500 ms.
+
+## Testing tools like an SDET
+
+- **Unit tests** per tool: happy path, every error code, idempotent replay.
+- **Contract tests**: schema snapshots in CI, so a renamed field is a reviewed change.
+- **Selection tests**: a small eval set of user requests with the expected tool. Run it whenever you edit a description. This is where vague descriptions get caught.
+
+## Common mistakes
+
+- **Overlapping tools** with similar names and descriptions. The model picks randomly.
+- **Floats for money** and free-text dates. Use `amount_cents` and ISO dates.
+- **Non-idempotent writes.** A retried refund becomes two refunds.
+- **Errors as exceptions or raw stack traces.** The loop dies or the model gets noise.
+- **Unbounded list results.** Context bloat and higher cost.
+- **No per-tool timeout.** One slow upstream stalls everything.
+- **Exposing low-level APIs.** Ten CRUD endpoints are worse than three task-shaped tools.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you design a tool so an agent can use it reliably?" level="mid">
+
+I treat it like a public API contract. Strict JSON schema: enums, patterns, integer minor units for money, ISO dates, few required fields. A description that says what it does, when to use it and not use it, what it returns and whether it has side effects. Writes take an idempotency key so retries are safe. Every error uses one shape with a stable code, a retryable flag and a hint for the next action, returned as an error tool result. Results are paginated and summarized, and every call has a timeout. Then I test it: unit tests per error code, schema snapshots and a tool-selection eval set.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="An agent issued the same refund twice. What went wrong and how do you prevent it?" level="senior">
+
+The refund tool was not idempotent, and something replayed the call: the model repeated it, my loop retried after a timeout, or a resumed graph re-ran the node. The fix is layered. The tool requires an idempotency key, derived by my executor from thread id plus canonical arguments, and the backend stores key and response so a replay returns the original result. Refunds sit behind a human approval gate. A loop guard flags repeated identical tool calls. And I add a regression case to the trajectory eval suite that asserts exactly one refund call.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Anthropic — Define tools (tool use docs): https://docs.anthropic.com/en/docs/build-with-claude/tool-use
+- Anthropic — Building effective agents, appendix on prompt engineering your tools: https://www.anthropic.com/research/building-effective-agents
+- Pydantic JSON Schema: https://docs.pydantic.dev/latest/concepts/json_schema/
+- JSON Schema reference: https://json-schema.org/understanding-json-schema/

@@ -1,0 +1,191 @@
+## Why OpenTelemetry, if Langfuse and LangSmith already trace?
+
+Vendor SDKs are quick to start with. They also lock your instrumentation to one backend. Your client's platform team probably already runs an observability stack: Grafana Tempo, Jaeger, Datadog, Honeycomb, New Relic. They want LLM spans next to the HTTP, database and Redis spans they already collect, in the same trace.
+
+OpenTelemetry (OTel) is the vendor-neutral standard for traces, metrics and logs. You instrument once with the OTel API, and an exporter (or the OTel Collector) sends the data wherever you want. Langfuse accepts OTLP. LangSmith accepts OTLP. Every major APM vendor accepts OTLP. Switching backends becomes a config change, not a rewrite.
+
+The QA analogy: OTel is to observability what the WebDriver protocol was to browser automation. One standard API, many backends. You stop rewriting the same instrumentation for each tool.
+
+## The pieces
+
+| Piece | Role |
+|---|---|
+| API | What your code calls: `tracer.start_as_current_span(...)`, `span.set_attribute(...)` |
+| SDK | The implementation: `TracerProvider`, samplers, span processors |
+| Exporter | Sends spans out, usually OTLP over HTTP (port 4318) or gRPC (port 4317) |
+| Collector | Optional separate process that receives, batches, filters, redacts and routes telemetry |
+| Resource | Attributes that describe the service: `service.name`, `service.version`, `deployment.environment` |
+| Context propagation | Passes the trace id across process boundaries with the W3C `traceparent` header |
+
+In production, the common pattern is: app exports OTLP to a local Collector (sidecar or DaemonSet in Kubernetes), and the Collector fans out to Tempo for infra traces and to Langfuse for LLM traces. Redaction and sampling rules live in the Collector config, owned by the platform team.
+
+## GenAI semantic conventions
+
+Semantic conventions are agreed attribute names. They let any backend understand that a span is an LLM call and render tokens and model correctly. The GenAI conventions define attributes such as:
+
+| Attribute | Example |
+|---|---|
+| `gen_ai.operation.name` | `chat`, `embeddings`, `execute_tool` |
+| `gen_ai.provider.name` (older versions: `gen_ai.system`) | `anthropic`, `openai`, `aws.bedrock` |
+| `gen_ai.request.model` | `claude-sonnet-5-5` |
+| `gen_ai.response.model` | The model id the provider actually reported |
+| `gen_ai.request.max_tokens`, `gen_ai.request.temperature` | `800`, `0.0` |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | `2140`, `312` |
+| `gen_ai.response.finish_reasons` | `["end_turn"]` |
+
+The recommended span name is `{operation} {model}`, for example `chat claude-sonnet-5-5`.
+
+<Callout type="warning" title="These conventions are still evolving">
+
+The GenAI semantic conventions are marked experimental/development and attribute names have changed between releases (for example `gen_ai.system` was renamed to `gen_ai.provider.name`). Pin the version you follow, check the current spec on opentelemetry.io, and centralize attribute names in one module so a rename is a one-line change.
+
+</Callout>
+
+Prompt and completion content is sensitive and large. The conventions treat it as opt-in (as events or attributes depending on the spec version). Default to not capturing content in your OTel spans, and enable it only in dev or behind redaction.
+
+There is no standard retrieval-specific namespace that every backend renders yet. For retrieval spans, use a clear span name (`retrieve hybrid`) and your own namespaced attributes, such as `rag.retrieval.top_k`, `rag.retrieval.doc_ids` and `rag.rerank.model`.
+
+## Setting up the SDK
+
+```python
+# app/observability/otel.py
+import base64
+import os
+
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+
+def setup_tracing(service: str = "mortgage-knowledge-assistant") -> None:
+    resource = Resource.create({
+        "service.name": service,
+        "service.version": os.getenv("GIT_SHA", "dev"),
+        "deployment.environment": os.getenv("ENV", "local"),
+    })
+    ratio = float(os.getenv("OTEL_SAMPLE_RATIO", "1.0"))
+    provider = TracerProvider(resource=resource, sampler=ParentBased(TraceIdRatioBased(ratio)))
+
+    # Default: a local Collector or Jaeger on 4318.
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces")
+    headers: dict[str, str] = {}
+    if pk := os.getenv("LANGFUSE_PUBLIC_KEY"):
+        # Langfuse OTLP endpoint uses basic auth with public:secret keys.
+        token = base64.b64encode(f"{pk}:{os.environ['LANGFUSE_SECRET_KEY']}".encode()).decode()
+        headers["Authorization"] = f"Basic {token}"
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, headers=headers)))
+    trace.set_tracer_provider(provider)
+```
+
+For Langfuse, the traces endpoint is `<LANGFUSE_HOST>/api/public/otel/v1/traces`. For Jaeger or a Collector, it's `http://<host>:4318/v1/traces`. Use `BatchSpanProcessor` in apps, never `SimpleSpanProcessor`, which exports synchronously on every span end.
+
+## Manual spans for retrieval, LLM and tool calls
+
+```python
+# app/observability/spans.py
+from anthropic import AsyncAnthropic
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("mortgage.rag")
+client = AsyncAnthropic()
+MODEL = "claude-sonnet-5-5"
+
+async def retrieve(query: str, k: int = 8) -> list[dict]:
+    with tracer.start_as_current_span("retrieve hybrid") as span:
+        span.set_attribute("rag.retrieval.top_k", k)
+        docs = await hybrid_search(query, k)  # your Module 2 function
+        span.set_attribute("rag.retrieval.doc_ids", [d["id"] for d in docs])
+        span.set_attribute("rag.retrieval.top_score", docs[0]["score"] if docs else 0.0)
+        return docs
+
+async def chat(system: str, user: str) -> str:
+    with tracer.start_as_current_span(f"chat {MODEL}") as span:
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.provider.name", "anthropic")
+        span.set_attribute("gen_ai.request.model", MODEL)
+        span.set_attribute("gen_ai.request.max_tokens", 800)
+        try:
+            resp = await client.messages.create(model=MODEL, max_tokens=800, system=system,
+                                                messages=[{"role": "user", "content": user}])
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR))
+            raise
+        span.set_attribute("gen_ai.response.model", resp.model)
+        span.set_attribute("gen_ai.usage.input_tokens", resp.usage.input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", resp.usage.output_tokens)
+        span.set_attribute("gen_ai.response.finish_reasons", [resp.stop_reason or "unknown"])
+        return resp.content[0].text
+```
+
+Tool calls follow the same shape: span name `execute_tool <tool_name>`, `gen_ai.operation.name="execute_tool"`, plus the tool name and call id. You will use this heavily for agents in Module 4.
+
+## Propagation across FastAPI and HTTP
+
+Auto-instrumentation for FastAPI and httpx creates the server span and propagates the `traceparent` header. Your manual spans become children of the request span automatically, and a downstream re-ranker microservice joins the same trace.
+
+```python
+from fastapi import FastAPI, Response
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+setup_tracing()
+app = FastAPI()
+FastAPIInstrumentor.instrument_app(app)
+HTTPXClientInstrumentor().instrument()
+
+@app.post("/ask")
+async def ask(q: dict, response: Response) -> dict:
+    result = await answer(q["question"])
+    trace_id = format(trace.get_current_span().get_span_context().trace_id, "032x")
+    response.headers["X-Trace-Id"] = trace_id
+    return {"answer": result.answer, "citations": result.citations, "trace_id": trace_id}
+```
+
+## Auto-instrumentation libraries
+
+You don't have to write every LLM span by hand. Two open source projects provide OTel instrumentation for LLM SDKs and frameworks (Anthropic, OpenAI, Bedrock, LangChain, LlamaIndex, vector DBs):
+
+- **OpenLLMetry** (Traceloop): instrumentors that emit GenAI-style attributes.
+- **OpenInference** (Arize): instrumentors plus its own semantic conventions, widely used with Phoenix.
+
+They save time, but check which convention version they emit and what content they capture by default. A good approach: auto-instrument the SDK calls, and add manual spans for your domain steps (query rewrite, hybrid retrieval, re-rank, citation check) that no library knows about.
+
+## Common mistakes
+
+- **Forgetting the resource.** Without `service.name`, all spans show up as `unknown_service`.
+- **Capturing full prompts in production spans** without redaction. Spans go to many backends and many people.
+- **`SimpleSpanProcessor` in production.** It adds export latency to every request.
+- **No shutdown flush.** Call `provider.shutdown()` on app shutdown and at the end of eval scripts, or the last batch is lost.
+- **Hardcoding attribute strings everywhere.** The GenAI conventions change; keep names in one constants module.
+- **Breaking propagation** by creating new event loops or threads without passing context, which produces orphan traces.
+- **Sampling LLM spans independently of the parent.** Use `ParentBased` so a trace is kept or dropped as a whole.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Why would you instrument an LLM app with OpenTelemetry instead of only a vendor SDK?" level="senior">
+
+Portability and correlation. With OTel I instrument once and route spans through a Collector to any backend: Langfuse for LLM-specific views, Tempo or Datadog for the platform team. LLM spans live in the same trace as the HTTP, Postgres and Redis spans, so I can see that a slow answer was really a slow pgvector query. The Collector also centralizes redaction, sampling and routing. The trade-off is that GenAI conventions are still experimental, so I pin a version, keep attribute names in one place, and sometimes use a vendor SDK for features like prompt management on top.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Which attributes would you put on an LLM span?" level="mid">
+
+The GenAI semantic convention attributes: operation name (`chat`), provider, request model and response model, max tokens and temperature, input and output token usage, and finish reasons. Plus errors recorded with `record_exception` and an error status. I add my own namespaced attributes for prompt version and, on retrieval spans, top-k and doc ids. Prompt and completion content is opt-in and redacted.
+
+</InterviewQuestion>
+
+## Further reading
+
+- OpenTelemetry Python docs: https://opentelemetry.io/docs/languages/python/
+- GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+- OpenTelemetry Collector: https://opentelemetry.io/docs/collector/
+- Langfuse OpenTelemetry integration: https://langfuse.com/docs/opentelemetry/get-started
+- OpenLLMetry: https://github.com/traceloop/openllmetry
+- OpenInference: https://github.com/Arize-ai/openinference
+
+<Checklist id="m3-09-review" title="Check your understanding" items={["I can explain API, SDK, exporter, Collector and resource", "I can name the core gen_ai.* attributes and know they are experimental", "I can create manual spans for retrieval, LLM and tool calls", "I can export OTLP to Jaeger or Langfuse with the right endpoint", "I propagate trace context across FastAPI and httpx and return the trace id"]} />

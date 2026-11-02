@@ -1,0 +1,216 @@
+<ClientBrief company="Northwind Mortgage" industry="Fintech / Mortgage lending" duration="4 days" />
+
+## Company context
+
+Northwind Mortgage is a mid-size US mortgage lender. It has about 600 loan officers, 40 underwriters and a platform team of 12 engineers. In Module 2 you built their internal knowledge assistant, `mortgage-knowledge-assistant`. It answers loan officers' questions over underwriting guidelines, product sheets and internal policies, with citations.
+
+The pilot ran for six weeks with 35 loan officers. Feedback was good. Now leadership wants to roll it out to all 600 officers next quarter.
+
+There is a problem. Nobody can prove the assistant is good. The pilot "evaluation" was a spreadsheet of 50 questions that one engineer re-ran by hand before each release. Prompt changes shipped on gut feeling. One release silently broke citations for a week. Compliance found out from a loan officer, not from a dashboard.
+
+Two other teams want to ship LLM features in the next six months: the collections team (a borrower-facing chatbot for payment plans) and the document operations team (extracting fields from bank statements). The Head of Platform does not want three teams building three different eval stacks.
+
+You are hired as the AI quality engineer. Your job: build a reusable **LLM QA framework**, apply it first to the knowledge assistant, and publish a quality report that compliance can sign off on.
+
+## Stakeholders
+
+| Stakeholder | What they care about | What they will ask you |
+|---|---|---|
+| Dana Okafor, Head of Platform | One reusable toolkit, low maintenance, adoption by other teams | "Can the collections team adopt this in a day?" |
+| Marcus Lee, Compliance Officer | Evidence of quality, audit trail, no PII leaks, no invented policy | "Show me how you know it doesn't make up guideline numbers." |
+| Priya Raman, Product Owner (knowledge assistant) | Ship prompt and retrieval improvements fast without breaking things | "Will this slow my team's PRs down?" |
+| Tomás García, SRE Lead | Latency, cost, alerting, tracing that works with their OpenTelemetry stack | "Does this plug into our collector, or is it another silo?" |
+
+## Business goal
+
+Make LLM quality **measurable, gated and visible**:
+
+1. No prompt, model or retrieval change reaches production without passing an automated eval gate.
+2. Every production answer can be traced: question, retrieved chunks, model call, tokens, cost, latency.
+3. Compliance gets a versioned, published quality report per release.
+4. Other teams can reuse the same toolkit with their own datasets and metrics.
+
+Success in one sentence: the next time a release breaks citations, the PR is blocked before merge, and the report shows exactly which cases regressed.
+
+## Functional requirements
+
+**FR1 — Dataset management.** Load golden datasets from versioned JSONL files. Each case has an `id`, `question`, `reference_answer`, `reference_source_ids`, `tags` (for example `product:fha`, `type:numeric`, `adversarial`) and an optional `expected_behavior` (`answer` or `refuse`). Validate the schema with Pydantic. Print coverage by tag.
+
+**FR2 — Golden dataset for the assistant.** Start from the 50+ pairs you built in Module 2. Extend to about 100 cases. Include at least 15 adversarial or out-of-scope cases (prompt injection inside a question, questions about competitors' rates, requests for borrower PII, questions with no answer in the corpus). Document how each case was created: human-written, mined from pilot logs, or synthetic and reviewed.
+
+**FR3 — Metrics.** Two layers, like a test pyramid:
+
+- Deterministic checks: valid JSON/schema, citation present, cited source ids exist in the retrieved set, numeric values in the answer appear in the cited chunk, refusal on out-of-scope cases, answer length budget.
+- Model-graded metrics: faithfulness, answer relevance, context precision and recall (Ragas or DeepEval, or your own judge prompts).
+
+**FR4 — Calibrated judge.** Any custom LLM judge must ship with a calibration report against at least 40 human-labeled examples: agreement rate, Cohen's kappa, confusion matrix, and known biases tested (position bias for pairwise, verbosity bias). The judge prompt and model id are versioned.
+
+**FR5 — Runner.** Run the target app over the dataset with bounded concurrency, retries and a response cache keyed by prompt version, model id and input hash. Support `--sample N` for fast PR runs and a full run for nightly or release.
+
+**FR6 — Gate.** Compare a run against a stored baseline. Fail on: absolute thresholds (for example faithfulness below 0.85), relative regressions beyond a tolerance (for example a drop of more than 0.03 on any metric), or any failure in a `critical` tag. Output a machine-readable result and a markdown summary.
+
+**FR7 — CLI.** `llmqa run`, `llmqa gate`, `llmqa report`, with a single `llmqa.toml` config per project.
+
+**FR8 — CI integration.** A reusable GitHub Actions workflow (`on: workflow_call`) that other repos call with a few inputs. It posts the markdown summary as a PR comment and uploads the run as an artifact.
+
+**FR9 — Tracing.** Instrument the assistant with OpenTelemetry using the GenAI semantic conventions: spans for retrieval, re-ranking, LLM call and any tool call, with token usage and model attributes. Export to Langfuse (or LangSmith) and to the SRE team's OTLP collector. Eval runs link each case to its trace id.
+
+**FR10 — Red-team suite.** A tagged set of attacks (direct and indirect prompt injection via a poisoned document, PII extraction, policy fabrication, jailbreak attempts) run as a separate job, with pass/fail per OWASP LLM Top 10 category.
+
+**FR11 — Quality report.** A static report (HTML or markdown) generated per run: summary scores vs baseline, per-tag breakdown, worst 10 cases with trace links, judge calibration, red-team results, cost and latency. Published to GitHub Pages, one page per release, with history.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| PR eval run time | under 10 minutes for the sampled suite (about 30 cases) |
+| PR eval cost | under a fixed budget per run, for example $2 (example — compute from your provider's current pricing and log the actual) |
+| Nightly full run | full dataset plus red-team suite, under 45 minutes |
+| Faithfulness | at least 0.85 on the full golden set |
+| Citation correctness (deterministic) | at least 95% of answers cite a source that was retrieved |
+| Out-of-scope refusal | at least 90% correct refusals on adversarial cases |
+| Judge agreement | Cohen's kappa at least 0.6 vs human labels |
+| Assistant p95 latency | under 4 s end to end, reported per run |
+| Tracing overhead | under 5% added latency at p50, async/batched export |
+| Privacy | borrower names, SSNs, loan numbers and emails redacted before traces leave the process |
+| Cost reporting | cost per 1k requests reported for the app and for the eval suite itself |
+| Flakiness | a re-run of the same commit with cache disabled changes no gate decision on at least 9 of 10 runs |
+
+## Out of scope
+
+- Changing the assistant's retrieval or prompts to improve scores. You measure; Priya's team fixes. (A small fix to prove the gate works is fine.)
+- Fine-tuning any model.
+- Building a custom dashboard UI. Use Langfuse/LangSmith and the static report.
+- Production deployment of the assistant (that is Module 5).
+- Human labeling tooling beyond a simple CSV or notebook workflow.
+
+## Deliverables
+
+1. Repo `llm-qa-framework` with the `llmqa` package, CLI, tests and docs.
+2. `examples/mortgage-knowledge-assistant/` with config, the ~100-case golden dataset, baseline file and adapter code.
+3. Reusable workflow `.github/workflows/llmqa-eval.yml` and a calling workflow in the assistant repo.
+4. Judge calibration report (markdown) with the labeled set.
+5. Red-team suite and results mapped to OWASP LLM Top 10.
+6. Published quality report on GitHub Pages.
+7. README with architecture, metrics definitions, cost analysis, an "adopt in 30 minutes" guide for other teams, and a demo GIF of a PR being blocked.
+
+Suggested layout:
+
+```text
+llm-qa-framework/
+  llmqa/
+    datasets/        # schema, loaders, coverage
+    metrics/         # deterministic/ and model_graded/
+    judges/          # prompts, calibration
+    runners/         # async runner, cache, budget guard
+    gates/           # thresholds, baseline compare
+    tracing/         # otel setup, genai attributes, redaction, langfuse export
+    redteam/         # attack sets, scorers
+    report/          # markdown + html templates
+    cli.py
+  examples/
+    mortgage-knowledge-assistant/
+      llmqa.toml
+      golden/v2.jsonl
+      baseline.json
+      adapter.py
+  .github/workflows/
+    llmqa-eval.yml   # on: workflow_call
+    ci.yml
+  docs/
+  tests/
+```
+
+## Acceptance criteria
+
+- `llmqa run --config examples/mortgage-knowledge-assistant/llmqa.toml --sample 30` finishes under 10 minutes and logs total cost.
+- Introducing a deliberate regression (for example removing the "cite your sources" instruction from the prompt) makes the CI gate fail with a clear message naming the metric, the delta and the top failing cases.
+- Reverting the regression makes the gate pass.
+- The golden dataset has at least 100 cases, at least 15 adversarial, and coverage by tag is printed in the report.
+- The judge calibration report shows kappa at least 0.6, or documents why not and what was changed.
+- Every eval case in the report links to a trace showing retrieval, LLM spans and token usage.
+- Traces contain no unredacted PII from a seeded test case containing a fake SSN and email.
+- The red-team job runs nightly and its results appear in the report.
+- A second, toy project (for example a 10-case "collections FAQ" bot) adopts the toolkit using only the README and the reusable workflow.
+- The quality report is live on GitHub Pages.
+
+## Suggested architecture
+
+<Diagram caption="LLM QA framework applied to the mortgage knowledge assistant" chart={`flowchart LR
+  subgraph CI["GitHub Actions"]
+    PR["Pull request"] --> WF["Reusable workflow llmqa-eval"]
+    NIGHT["Nightly schedule"] --> WF
+  end
+  WF --> RUN["llmqa run"]
+  DS[("Golden dataset JSONL v2")] --> RUN
+  RUN --> APP["mortgage-knowledge-assistant adapter"]
+  APP --> RET["Hybrid retrieval + re-rank"]
+  APP --> LLM["LLM call"]
+  RUN --> CACHE[("Response cache")]
+  RUN --> MET["Metrics: deterministic + judges"]
+  MET --> GATE["llmqa gate vs baseline"]
+  GATE -->|fail| BLOCK["PR blocked + comment"]
+  GATE -->|pass| MERGE["Merge allowed"]
+  MET --> REP["llmqa report"]
+  REP --> PAGES["GitHub Pages report"]
+  APP -. OTel GenAI spans .-> OTEL["OTLP collector"]
+  OTEL --> LF["Langfuse"]
+  OTEL --> SRE["SRE observability stack"]
+  RT["Red-team suite"] --> RUN`} />
+
+Design notes:
+
+- The adapter is the only project-specific code. It maps a dataset case to a call into the app and returns `answer`, `citations`, `contexts`, `trace_id`, `usage`. That is what makes the toolkit reusable.
+- Deterministic metrics run first and are free. Model-graded metrics only run on cases that pass schema checks.
+- The cache key includes prompt version and model id, so a prompt change always invalidates its own cases but unchanged code paths stay cheap.
+- Redaction happens in a span processor before export, not in the exporter config, so every backend gets clean data.
+
+## Evaluation rubric
+
+| Criterion | Weight | Meets expectations | Exceeds expectations |
+|---|---|---|---|
+| Golden dataset quality | 15% | 100 cases, tags, provenance documented | Coverage analysis drives new cases; synthetic cases reviewed with an acceptance rate reported |
+| Metrics design | 15% | Deterministic + model-graded layers, clear definitions | Metric validity argued per metric, including known failure modes |
+| Judge calibration | 15% | Kappa reported against 40+ labels | Bias experiments (position, verbosity) with mitigations and before/after numbers |
+| CI gate | 20% | Blocks a real regression, passes on revert | Handles non-determinism with repeated sampling or confidence intervals; budget guard; PR comment |
+| Tracing and privacy | 15% | GenAI spans exported to Langfuse with token usage | Same traces reach an OTLP collector; redaction tested; eval-to-trace links |
+| Red-teaming | 10% | Attack suite mapped to OWASP categories | Indirect injection via poisoned document, regression-tracked over time |
+| Report and docs | 10% | Published report, clear README | Adoption proven by a second project; report readable by a non-engineer |
+
+## Suggested timeline (4 days)
+
+**Day 1 — Foundations and dataset.** Scaffold the package and CLI. Define the case schema. Port the Module 2 dataset, extend to ~100 cases with tags and adversarial cases. Implement deterministic metrics and the runner with cache and budget guard. Write the adapter for the assistant.
+
+**Day 2 — Judges and gate.** Add model-graded metrics. Label 40+ examples by hand, calibrate your judge, write the calibration report. Implement baseline compare and thresholds. Build the reusable workflow and prove it blocks a deliberate regression.
+
+**Day 3 — Tracing and red-team.** Add OpenTelemetry with GenAI conventions, the redaction span processor, and export to Langfuse plus a local OTLP collector (Docker). Link eval cases to traces. Build the red-team suite and nightly job.
+
+**Day 4 — Report, adoption, polish.** Generate the HTML/markdown report and publish to GitHub Pages. Adopt the toolkit in a toy second project from the README alone. Record the demo GIF. Write the cost analysis and the stakeholder summary.
+
+## Definition of Done
+
+<Checklist id="m3-15-dod" title="Definition of Done" items={["llmqa package with run, gate and report CLI commands and unit tests for metrics and gates", "Golden dataset of 100+ cases with tags, provenance and 15+ adversarial cases", "Deterministic metrics: schema, citation present, citation in retrieved set, numeric grounding, refusal", "Model-graded faithfulness and relevance metrics with versioned judge prompts", "Judge calibration report against 40+ human labels with Cohen's kappa and bias tests", "Baseline compare with absolute thresholds, relative tolerance and critical tags", "Reusable GitHub Actions workflow that blocks a deliberate regression and passes on revert", "PR comment with metric deltas and worst failing cases", "OpenTelemetry GenAI spans for retrieval, LLM and tool calls exported to Langfuse and an OTLP collector", "PII redaction verified with a seeded fake SSN and email", "Red-team suite mapped to OWASP LLM Top 10, running nightly", "Cost per 1k requests and p50/p95 latency in the report", "Quality report published on GitHub Pages", "Second toy project adopted the toolkit from the README", "README with architecture diagram, metric definitions, cost analysis and demo GIF"]} />
+
+## How to present this in an interview
+
+This capstone is your strongest differentiator. Most AI engineering candidates can build a RAG demo. Few can prove it works and keep it working. You can, because you have done this for years with deterministic software.
+
+**The 60-second pitch.** "A mortgage lender's knowledge assistant was moving from pilot to 600 users with no way to prove quality. I built a reusable LLM QA framework: a versioned golden dataset of about 100 cases, a two-layer metric stack with deterministic checks and calibrated LLM judges, a CI gate that blocks PRs on faithfulness regressions, OpenTelemetry tracing with PII redaction, a nightly red-team suite, and a published quality report. A deliberate citation regression gets blocked in under 10 minutes for about two dollars per run." Replace the numbers with your real ones.
+
+**Map it to your QA background out loud.** Interviewers like the translation:
+
+- Test pyramid becomes the eval pyramid: cheap deterministic checks, then model-graded metrics, then human review.
+- Flaky tests become non-determinism: you fixed temperature, cached responses, sampled repeatedly and used tolerances instead of exact matches.
+- Regression suite becomes the golden dataset, with versioning and coverage by tag.
+- Contract tests become output schemas and citation checks.
+- Test reports become the published quality report.
+
+**Expect these follow-ups and prepare answers:**
+
+- "How do you know your judge is right?" Talk about the labeled set, kappa, the confusion matrix, and the bias you found and fixed.
+- "How do you avoid a flaky gate?" Talk about tolerance bands, repeated sampling on borderline cases, critical tags and the cache.
+- "What does it cost?" Give the cost per PR run, per nightly run and cost per 1k requests for the app.
+- "What did you find?" Have one real story: a case the gate caught, a bias in the judge, or an injection that worked before you added a guardrail.
+- "How would another team adopt it?" Show the adapter interface and the reusable workflow call. Mention the toy second project.
+
+**Show, don't tell.** Open the GitHub Pages report. Then show the PR where the gate failed, the comment with deltas, and click through to the Langfuse trace of the worst case. That three-click story beats any slide.

@@ -1,0 +1,196 @@
+## From "it works on my laptop" to production pgvector
+
+In Module 2 you put embeddings in pgvector and ran `ORDER BY embedding <=> $1 LIMIT 5`. With 20k chunks, a sequential scan is fast enough and you never thought about it. In production you will have hundreds of thousands to millions of chunks, many tenants, concurrent writers from ingestion, and a p95 latency budget. Now four things matter:
+
+1. **Which approximate index** you use, and how you tune it.
+2. **Filtered search**, which quietly breaks recall.
+3. **Migrations** that do not lock your table for an hour.
+4. **Connection pooling** for an async API with many replicas.
+
+You already know Postgres well. This lesson is about where vectors change the rules.
+
+## HNSW vs IVFFlat
+
+pgvector supports two approximate nearest neighbor (ANN) index types. Both trade a little recall for a lot of speed. Without an index, every query is an exact scan: perfect recall, but latency grows linearly with rows.
+
+**HNSW** (Hierarchical Navigable Small World) builds a multi-layer graph. Queries walk the graph from coarse to fine layers.
+
+- Build parameters: `m` (edges per node, default 16) and `ef_construction` (candidate list size during build, default 64). Higher values mean better recall, slower builds, more memory.
+- Query parameter: `hnsw.ef_search` (default 40). Higher means better recall and slower queries. It also caps how many rows the index returns, which matters for filtering (see below).
+- Can be created on an **empty table** and stays good as rows are inserted.
+- Builds are slower and use more memory than IVFFlat. Large builds want generous `maintenance_work_mem`, otherwise the build spills and slows down a lot.
+
+**IVFFlat** clusters vectors into `lists` partitions using k-means, then searches only the nearest partitions.
+
+- Build parameter: `lists`. The pgvector README suggests `rows / 1000` up to 1M rows and `sqrt(rows)` above that.
+- Query parameter: `ivfflat.probes` (default 1). A common start is `sqrt(lists)`.
+- Must be built **after** you load representative data, because the centroids come from the data present at build time. If your data distribution shifts a lot, you need to rebuild.
+- Faster to build and smaller in memory.
+
+| | HNSW | IVFFlat |
+|---|---|---|
+| Query speed / recall trade-off | Better | Good |
+| Build time | Slower | Faster |
+| Memory | Higher | Lower |
+| Build on empty table | Yes | No (needs data for centroids) |
+| Main query knob | `hnsw.ef_search` | `ivfflat.probes` |
+
+**Default choice: HNSW.** It has a better speed/recall curve, it handles incremental inserts from continuous ingestion, and you do not have to remember to rebuild. Choose IVFFlat when build time or memory is the real constraint, for example a very large, mostly static corpus on a small instance.
+
+```sql
+-- Match the operator class to your distance: vector_cosine_ops for <=>,
+-- vector_l2_ops for <->, vector_ip_ops for <#>.
+SET maintenance_work_mem = '2GB';
+SET max_parallel_maintenance_workers = 4;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS chunks_embedding_hnsw
+  ON chunks USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+
+-- Per query or per transaction:
+SET LOCAL hnsw.ef_search = 100;
+SELECT id, doc_id, content
+FROM chunks
+WHERE tenant_id = $1
+ORDER BY embedding <=> $2
+LIMIT 8;
+```
+
+A classic bug: the index uses `vector_l2_ops` but queries use `<=>` (cosine). Postgres silently ignores the index and does a full scan. Always check with `EXPLAIN ANALYZE` that you see an index scan on your HNSW index.
+
+**Measure recall, do not assume it.** Take 200 sample queries. Compute exact top-k with the index disabled (`SET enable_indexscan = off`). Compare with the ANN top-k. Recall@k = overlap / k. Tune `ef_search` until recall is above your target (say 0.95) at acceptable latency. This is just another eval, and you already have the harness from Module 3.
+
+## Filtered search pitfalls
+
+Multi-tenant RAG always filters: `WHERE tenant_id = $1 AND doc_type = 'policy'`. ANN indexes and filters do not mix well.
+
+With HNSW, Postgres asks the index for the nearest `ef_search` candidates, **then** applies the `WHERE` filter. If tenant 42 owns 1% of the rows and `ef_search = 40`, on average fewer than one of the 40 candidates belongs to tenant 42. You ask for 8 results and get 0, 1 or 2. No error. Just bad answers.
+
+Mitigations, roughly in order of preference:
+
+- **Iterative index scans** (pgvector 0.8.0+): `SET hnsw.iterative_scan = relaxed_order;` makes the scan keep going until enough rows pass the filter, bounded by `hnsw.max_scan_tuples`. Check your pgvector version first; on managed services it depends on the engine version.
+- **Partial indexes** for a small number of large, stable filter values: `CREATE INDEX ... WHERE doc_type = 'policy'`.
+- **Partitioning by tenant** (list or hash partitions), each with its own index. Good isolation, more operational work. Works well for a few big tenants.
+- **Raise `ef_search`** for filtered queries. Simple, costs latency.
+- **Exact scan for small tenants.** If a tenant has 5k chunks, a B-tree index on `tenant_id` plus an exact distance sort is fast and has perfect recall. The planner often picks this on its own if statistics are fresh.
+
+Put a **test** in your suite: a small tenant with known documents, a query whose correct chunk is known, and an assertion that it comes back in the top-k. This catches filter-recall regressions after index or version changes.
+
+## Migrations with Alembic
+
+You will change embeddings over time: new model, new dimension, new index parameters. Treat that like any schema migration, with two vector-specific twists.
+
+**Twist 1: index builds are long.** A plain `CREATE INDEX` takes a lock that blocks writes for the whole build. On millions of rows that can be many minutes. Use `CREATE INDEX CONCURRENTLY`. It cannot run inside a transaction, and Alembic wraps migrations in one by default. Use an autocommit block:
+
+```python
+# migrations/versions/0007_hnsw_index.py
+from alembic import op
+
+revision = "0007_hnsw_index"
+down_revision = "0006_add_tenant_id"
+
+def upgrade() -> None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    with op.get_context().autocommit_block():
+        op.execute("SET maintenance_work_mem = '2GB'")
+        op.execute(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS chunks_embedding_hnsw "
+            "ON chunks USING hnsw (embedding vector_cosine_ops) "
+            "WITH (m = 16, ef_construction = 64)"
+        )
+
+def downgrade() -> None:
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS chunks_embedding_hnsw")
+```
+
+If a concurrent build fails, it leaves an `INVALID` index. Drop it and retry. Check with `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;`.
+
+**Twist 2: changing the embedding model is a data migration, not a column type change.** Use expand/contract:
+
+1. Add a new column `embedding_v2 vector(1024)` (nullable).
+2. Backfill in batches with a background job, re-embedding chunks. Track progress.
+3. Build the index on the new column concurrently.
+4. Ship code that reads from `embedding_v2` behind a feature flag. Run your retrieval evals against both.
+5. Flip the flag. Keep the old column for a rollback window.
+6. Drop the old column and index in a later migration.
+
+Never run the backfill inside the migration itself. Migrations should be fast and run in your deploy pipeline; backfills should be resumable jobs.
+
+## Connection pooling
+
+An async FastAPI service with 4 replicas, each with a pool of 20, needs 80 connections. Add the ingestion workers and the eval jobs and you approach the `max_connections` of a small RDS instance quickly. Each Postgres connection is a process with real memory cost.
+
+Size the app pool deliberately:
+
+```python
+# app/db.py
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from app.settings import get_settings
+
+settings = get_settings()
+
+engine = create_async_engine(
+    settings.database_url,          # postgresql+asyncpg://...
+    pool_size=10,                   # steady-state connections per replica
+    max_overflow=5,                 # short bursts
+    pool_timeout=5,                 # fail fast instead of queueing forever
+    pool_recycle=1800,              # avoid stale connections behind proxies
+    pool_pre_ping=True,
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+```
+
+Key point for LLM apps: **never hold a DB connection while waiting on the LLM.** Retrieval takes 20–80 ms. Generation takes seconds. Open a session, retrieve, close it, then call the model. If you keep the session open across the stream, a pool of 10 supports only 10 concurrent chats per replica.
+
+**PgBouncer** (or RDS Proxy) multiplexes many client connections onto fewer server connections. In **transaction pooling** mode, a server connection is only yours for one transaction. Caveats:
+
+- Session-level `SET hnsw.ef_search = 100` leaks to the next client or gets lost. Use `SET LOCAL` inside a transaction instead.
+- Prepared statements: asyncpg caches them per connection, which breaks in transaction mode on older PgBouncer versions. Either use PgBouncer 1.21+ with `max_prepared_statements` configured, or disable the cache: `connect_args={"statement_cache_size": 0}`.
+- Advisory locks, `LISTEN/NOTIFY` and temp tables are session features. Do not rely on them through transaction pooling.
+
+## RDS and Aurora notes
+
+- Both RDS for PostgreSQL and Aurora PostgreSQL support pgvector. The available version depends on the engine version. Check the AWS docs before you rely on features like iterative scans.
+- HNSW performance depends on the index fitting in memory. Size the instance so the index plus hot data fits in shared buffers and OS cache. Watch `BufferCacheHitRatio` and read IOPS.
+- Use a read replica for heavy retrieval traffic if the writer is busy with ingestion. Accept slight replica lag; for RAG, a few seconds is fine.
+- Store connection credentials in Secrets Manager (lesson 03), and consider RDS Proxy for Lambda or bursty workloads.
+
+## Common mistakes
+
+- **Operator class does not match the distance operator.** The index is never used. Always `EXPLAIN ANALYZE`.
+- **Building IVFFlat on an empty or tiny table.** Bad centroids, bad recall forever until rebuilt.
+- **Ignoring filtered recall.** Small tenants silently get fewer results. Test it.
+- **Plain `CREATE INDEX` in a deploy migration.** Writes blocked, ingestion stalls, maybe health checks fail.
+- **Holding DB connections during generation.** Pool exhaustion at modest concurrency.
+- **Session `SET` behind PgBouncer.** Settings leak or vanish. Use `SET LOCAL`.
+- **Swapping the embedding model in place.** No rollback and mixed vectors from two models in one column, which makes distances meaningless.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="HNSW or IVFFlat for a production RAG system on pgvector? Why?" level="mid">
+
+Usually HNSW. It has a better recall/latency trade-off, it can be built on an empty table, and it keeps working well as ingestion inserts new rows, so no periodic rebuild is needed. The costs are slower builds and more memory. I would tune `m` and `ef_construction` at build time and `hnsw.ef_search` at query time, measuring recall@k against exact search on a sample of real queries. IVFFlat makes sense for a large mostly static corpus where build time or memory dominates, and it must be built after loading representative data.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Small tenants in your multi-tenant RAG get fewer and worse results than big tenants. What is happening and how do you fix it?" level="senior">
+
+Classic filtered ANN problem. The HNSW index returns the top `ef_search` candidates globally, then the tenant filter removes most of them, so small tenants end up with few results. Fixes: enable iterative index scans on pgvector 0.8+, raise `ef_search` for filtered queries, partition by tenant or use partial indexes for big stable segments, or let small tenants use an exact scan via a B-tree on tenant_id. I would add a regression test with a small tenant and a known relevant chunk, and track recall@k per tenant size bucket.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Show production instincts">
+
+Mention three things unprompted: `CREATE INDEX CONCURRENTLY` in an autocommit block, expand/contract for embedding model changes, and "never hold a DB connection across the LLM call". Interviewers hear a lot about vector indexes. They hear much less about the operational details.
+
+</Callout>
+
+## Further reading
+
+- pgvector README (indexing, filtering, iterative scans): https://github.com/pgvector/pgvector
+- PostgreSQL `CREATE INDEX CONCURRENTLY`: https://www.postgresql.org/docs/current/sql-createindex.html
+- Alembic operations and autocommit blocks: https://alembic.sqlalchemy.org/en/latest/api/runtime.html
+- SQLAlchemy connection pooling: https://docs.sqlalchemy.org/en/20/core/pooling.html
+- PgBouncer features and pooling modes: https://www.pgbouncer.org/features.html
+- Amazon RDS for PostgreSQL extensions: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_PostgreSQL.html

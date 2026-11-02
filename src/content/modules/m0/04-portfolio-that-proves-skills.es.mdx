@@ -1,0 +1,172 @@
+# Construir un portafolio que demuestre habilidades
+
+Tu CV dice "construí sistemas de RAG". El de todos los demás también. Un portafolio es la forma de demostrarlo. Para alguien que cambia de carrera importa todavía más: aún no tienes "AI Engineer" en tu historial laboral, así que tu GitHub tiene que cargar con ese peso.
+
+Esta lección cubre lo que realmente revisa un hiring manager, la estructura de README que usará cada proyecto de este curso y cómo producir la evidencia: arquitectura, evals, análisis de costos y una demo.
+
+## La revisión de dos minutos
+
+La mayoría de las revisiones de portafolio son cortas. Un hiring manager o un ingeniero senior abre tu repo entre reuniones. No lo clona. No lo ejecuta. En unos dos minutos decide "vale una entrevista" o "siguiente".
+
+Esto es lo que mira, en orden:
+
+1. **La primera pantalla del README.** Una frase sobre qué hace y para quién. Un GIF de demo. Si tiene que hacer scroll para entender el proyecto, perdiste a parte de la audiencia.
+2. **El diagrama de arquitectura.** ¿Esta persona piensa en sistemas? ¿Hay componentes claros, flujo de datos, servicios externos?
+3. **Evidencia de calidad.** Una sección de evals con números. "Faithfulness 0.91 sobre 60 preguntas golden" le gana a "alta precisión". Un badge de CI en verde.
+4. **Conciencia de costo y latencia.** Una tabla con costo por request o por 1k requests, y latencia p50/p95. Es la señal más fuerte de "mentalidad de producción", y la mayoría de los candidatos la omite.
+5. **Vistazo al código.** Estructura de carpetas, uno o dos archivos. Type hints, carpeta de tests, ningún secreto en el repo, nada de un `main.py` de 900 líneas.
+6. **Historial de commits.** Commits pequeños y con sentido a lo largo de varios días. Un único "initial commit" gigante parece un tutorial copiado.
+
+Tus repos deben responder las seis cosas en ese orden.
+
+## Profundidad antes que amplitud
+
+Tres proyectos profundos valen más que quince superficiales. Un proyecto superficial es un tutorial con otro nombre: un notebook, sin tests, sin README más allá de un título. Un proyecto profundo tiene:
+
+- Un problema y un usuario realistas ("asistente de políticas internas para oficiales de crédito", no "chatea con un PDF").
+- Evaluación con un dataset que construiste tú.
+- Al menos un trade-off que mediste y documentaste ("la búsqueda híbrida subió el context recall de 0.72 a 0.84 con +40 ms en p95").
+- Una historia de deploy, aunque sea un archivo de Docker Compose y un breve "cómo ejecutarlo".
+
+Al terminar este curso tendrás un proyecto profundo por módulo, más un capstone final. Es más que suficiente.
+
+## El contrato del README
+
+Cada proyecto de este curso sigue la misma estructura de README. La consistencia ayuda a quien revisa y te ahorra tiempo. Vas a crear la plantilla en el ejercicio de este módulo.
+
+```markdown
+# Project name
+
+One sentence: what it does, for whom, and the key result.
+
+![Demo](docs/demo.gif)
+
+[![CI](https://github.com/you/repo/actions/workflows/ci.yml/badge.svg)](...)
+
+## Problem
+Who has this problem, why it matters, what "good" looks like.
+
+## Architecture
+Mermaid diagram + 5-8 bullets explaining each component and why it was chosen.
+
+## Evaluation
+Dataset (size, how it was built), metrics, results table, how to re-run.
+
+## Cost & latency
+Cost per request and per 1k requests, p50/p95 latency, model choices.
+
+## Trade-offs & decisions
+What you tried, what you measured, what you chose and why.
+
+## Run it
+Prerequisites, env vars, one command to start, one command to run evals.
+
+## Limitations & next steps
+Honest list of what does not work yet.
+```
+
+La plantilla está en inglés porque tu mercado objetivo lee en inglés. Fíjate en el orden. Primero los resultados (demo, evals, costo), después las instrucciones. A quien revisa le importa *qué demostraste* antes que *cómo ejecutarlo*.
+
+## Producir el análisis de costos
+
+Una sección de costos convierte "usé Claude" en "tomé una decisión deliberada de modelo". Necesitas tres datos por modelo: tokens de entrada promedio, tokens de salida promedio y precio por millón de tokens. Mide los tokens con ejecuciones reales (la respuesta de la API incluye `usage`). Guarda los precios en configuración, nunca escritos a mano en el texto, porque los precios cambian.
+
+```python
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class Price:
+    input_per_mtok: float   # USD per 1M input tokens
+    output_per_mtok: float  # USD per 1M output tokens
+
+
+def load_prices(path: Path) -> dict[str, Price]:
+    # prices.toml holds the provider's CURRENT list prices; check them before publishing.
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    return {model: Price(**p) for model, p in raw["models"].items()}
+
+
+def cost_per_request(price: Price, input_tokens: float, output_tokens: float) -> float:
+    return (input_tokens * price.input_per_mtok + output_tokens * price.output_per_mtok) / 1_000_000
+
+
+def markdown_table(prices: dict[str, Price], avg_in: float, avg_out: float) -> str:
+    rows = ["| Model | Cost / request | Cost / 1k requests |", "|---|---|---|"]
+    for model, price in prices.items():
+        c = cost_per_request(price, avg_in, avg_out)
+        rows.append(f"| `{model}` | ${c:.5f} | ${c * 1000:.2f} |")
+    return "\n".join(rows)
+
+
+if __name__ == "__main__":
+    # Averages measured from the usage field of 200 real eval runs.
+    print(markdown_table(load_prices(Path("prices.toml")), avg_in=3_200, avg_out=350))
+```
+
+La salida es una tabla que pegas en el README, junto a una frase como: "Haiku alcanza el objetivo de faithfulness de 0.85 por una fracción del costo de Sonnet, así que producción usa Haiku y escala a Sonnet las respuestas con baja confianza". Esa frase es la que te consigue la entrevista.
+
+<Callout type="warning" title="Etiqueta tus precios">
+
+Escribe siempre la fecha en la que revisaste los precios y enlaza la página de precios del proveedor. Nunca presentes como un hecho un precio que recuerdas de memoria. Quien revisa nota los números desactualizados o inventados.
+
+</Callout>
+
+## Hacer el GIF de demo
+
+Un GIF de 10 a 20 segundos al principio del README hace más que tres párrafos. Mantenlo corto y enfocado en el resultado.
+
+- **Proyectos de terminal:** graba con [VHS](https://github.com/charmbracelet/vhs) (programable, reproducible) o con asciinema más `agg` para convertir a GIF.
+- **Interfaces web:** usa ScreenToGif (Windows), Kap (macOS) o Peek (Linux). O graba con la opción de video de Playwright y convierte con ffmpeg. Ya conoces Playwright, así que es un buen detalle.
+- **Tamaño:** apunta a menos de 5 MB. Recorta al área relevante y baja la tasa a 10–15 fps.
+- **Contenido:** muestra una pregunta realista, la respuesta en streaming y las citas. Nada de pantallas de login ni de escribir comandos de configuración.
+
+## El hub del portafolio
+
+Quien revisa suele llegar a tu perfil de GitHub, no a un repo concreto. Un repo hub (`ai-engineer-portfolio`) resuelve eso. Contiene:
+
+- Una introducción breve: quién eres y a qué apuntas.
+- Una tabla de proyectos con resultados de una línea y enlaces.
+- Las plantillas y convenciones compartidas que siguen todos tus proyectos.
+
+Fíjalo (pin) en tu perfil junto a tus dos mejores proyectos. Lo vas a construir en el ejercicio.
+
+## Errores comunes
+
+- **Sin README, o un README que solo tiene instrucciones de instalación.** El README es la página de producto. Escríbelo como tal.
+- **Notebooks como artefacto principal.** Sirven para explorar. Para un portafolio, entrega un paquete o servicio con tests. Deja los notebooks en una carpeta `notebooks/`.
+- **Subir secretos.** Un archivo `.env` con una API key en tu historial es un rechazo inmediato, y un incidente de seguridad real. Usa `.env.example` y un escáner de secretos en pre-commit.
+- **Afirmaciones sin números.** "Mejoré la precisión" no significa nada. "Context precision de 0.68 a 0.81 tras el re-ranking" significa mucho.
+- **Ocultar las limitaciones.** Los revisores senior confían en candidatos que dicen qué no funciona. Una sección honesta de "Limitations" transmite seniority.
+- **Hacer fork de tutoriales.** Un fork de un repo popular con tres líneas cambiadas se nota y perjudica más de lo que ayuda.
+
+## Cómo aparece esto en las entrevistas
+
+<InterviewQuestion question="Cuéntame sobre un proyecto del que estés orgulloso." level="mid">
+
+Usa el orden del README como estructura y mantenlo en unos dos minutos. Ejemplo: "Construí un asistente de conocimiento interno para un prestamista hipotecario ficticio. Los oficiales de crédito hacen preguntas sobre políticas y reciben respuestas con citas a partir de unas 300 páginas de PDFs. Arquitectura: ingesta con chunking consciente del documento, pgvector con búsqueda híbrida BM25 más vectorial, un re-ranker cross-encoder y Claude para la generación con citas obligatorias. De lo que más orgulloso estoy es de la evaluación: 60 preguntas golden construidas con un checklist del dominio, medidas con Ragas para faithfulness y context recall, corriendo en GitHub Actions en cada PR. Agregar el re-ranker subió notablemente el context precision con un costo de latencia pequeño, y documenté ese trade-off. También medí el costo por 1k requests de dos modelos y elegí el más barato porque cumplía el umbral de calidad. La mayor limitación son las tablas en PDFs escaneados, que dejo como próximo paso."
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo sabes que tu proyecto con LLM realmente funciona?" level="senior">
+
+Defino qué significa "funciona" antes de construir. Para un asistente de RAG eso es un golden dataset de preguntas reales con respuestas esperadas y documentos fuente, más umbrales objetivo: por ejemplo faithfulness por encima de 0.85, context recall por encima de 0.8 y una latencia p95 bajo un presupuesto definido. Mido el retrieval y la generación por separado, para saber de dónde vienen las fallas. La suite corre en CI y bloquea regresiones. Reviso a mano una muestra de los puntajes del juez contra mis propias etiquetas para asegurarme de que el LLM juez coincide con un humano. En producción agrego tracing y tomo muestras de conversaciones reales para revisarlas. Es la misma mentalidad de una estrategia de pruebas: definir el oráculo, automatizarlo, usarlo como gate y monitorear en producción.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Tu README es tu guion de entrevista">
+
+Si tu README tiene Problem, Architecture, Evaluation, Cost, Trade-offs y Limitations, ya tienes el esquema para cualquier pregunta tipo "cuéntame sobre un proyecto". Ensáyalo en voz alta una vez por proyecto.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- [Documentación de GitHub — About READMEs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes)
+- [Documentación de GitHub — Creating Mermaid diagrams](https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams)
+- [Anthropic — Pricing](https://www.anthropic.com/pricing)
+- [Charmbracelet VHS](https://github.com/charmbracelet/vhs)

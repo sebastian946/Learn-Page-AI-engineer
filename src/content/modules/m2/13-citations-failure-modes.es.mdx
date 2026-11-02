@@ -1,0 +1,159 @@
+## Por qué las citas son un requisito de producto, no un extra
+
+En un prestamista hipotecario, un oficial de crédito que actúa sobre una respuesta incorrecta puede fijar mal el precio de un préstamo o aprobar un expediente que falla una auditoría post-cierre. "El asistente lo dijo" no es una defensa. "El asistente citó la Guía de Underwriting §4.2, página 37, y aquí está el párrafo" es algo que una persona puede verificar en diez segundos.
+
+Las citas cumplen tres funciones:
+
+1. **Verificación.** Los usuarios pueden revisar la fuente en lugar de confiar ciegamente en el modelo.
+2. **Presión de grounding.** Pedirle al modelo que cite cada afirmación lo empuja a quedarse dentro del contexto proporcionado.
+3. **Testabilidad.** Una cita es un artefacto verificable por máquina. Puedes afirmar que cada chunk citado realmente se recuperó y que el texto citado existe. Eso convierte un difuso "¿esta respuesta es correcta?" en un contract test.
+
+**Grounding** (anclaje) significa que la respuesta está respaldada por el contexto recuperado, no por los datos de entrenamiento del modelo. Una respuesta con grounding todavía puede ser incorrecta si el documento fuente está desactualizado, pero entonces el bug está en tu corpus, y eso sí lo puedes arreglar.
+
+## Diseñar un contrato de citas
+
+Trata las citas como un contrato de API entre el generador y el resto de tu sistema. El enfoque más limpio: dale a cada chunk un ID corto y estable en el prompt, pide salida estructurada y valídala.
+
+```python
+from pydantic import BaseModel, Field
+
+
+class Claim(BaseModel):
+    text: str = Field(description="One factual sentence of the answer")
+    chunk_ids: list[str] = Field(min_length=1, description="IDs of chunks that support this sentence")
+    quote: str = Field(description="Short verbatim span from the cited chunk")
+
+
+class CitedAnswer(BaseModel):
+    answer_found: bool
+    claims: list[Claim]
+    follow_up: str | None = None
+
+
+def format_context(chunks: list[dict]) -> str:
+    # Stable, short IDs keep the prompt compact and easy to validate
+    return "\n\n".join(
+        f'<chunk id="{c["chunk_id"]}" source="{c["source"]}" page="{c["page"]}">\n{c["text"]}\n</chunk>'
+        for c in chunks
+    )
+
+
+SYSTEM = """You answer questions for loan officers using ONLY the chunks provided.
+Rules:
+- Every claim must cite at least one chunk id and include a short verbatim quote from it.
+- If the chunks do not contain the answer, set answer_found=false and return no claims.
+- Never use outside knowledge about mortgage rules; policies differ per lender.
+- If chunks conflict, say so and cite both."""
+```
+
+Luego valida después de la generación. Esta es la parte que la mayoría de los tutoriales se saltan:
+
+```python
+def validate_citations(answer: CitedAnswer, chunks: list[dict]) -> list[str]:
+    by_id = {c["chunk_id"]: c["text"] for c in chunks}
+    problems: list[str] = []
+    for i, claim in enumerate(answer.claims):
+        unknown = [cid for cid in claim.chunk_ids if cid not in by_id]
+        if unknown:
+            problems.append(f"claim {i}: cites unknown chunk(s) {unknown}")
+            continue
+        normalized_quote = " ".join(claim.quote.split()).lower()
+        if not any(normalized_quote in " ".join(by_id[cid].split()).lower() for cid in claim.chunk_ids):
+            problems.append(f"claim {i}: quote not found in cited chunk(s)")
+    if not answer.answer_found and answer.claims:
+        problems.append("answer_found=false but claims were returned")
+    return problems
+```
+
+Qué haces con `problems` es una decisión de producto. Opciones, de la más estricta a la más permisiva: rechazar y mostrar "No encontré una respuesta verificada"; reintentar una vez pasándole los problemas al modelo; o descartar las afirmaciones no verificadas y mostrar el resto. Para contenido regulado, registra cada falla y genera una alerta cuando la tasa suba.
+
+La API de Anthropic también ofrece una función nativa de **citations**: pasas documentos como content blocks con las citas habilitadas, y la respuesta incluye los fragmentos citados con ubicación por caracteres o por página. Eso elimina la necesidad de hacer matching de citas de tu lado. Elijas lo que elijas, mantén el paso de validación en tus tests.
+
+### Mostrar las citas
+
+Muestra las citas en línea (`[1]`, `[2]`) con un hover o panel lateral que muestre el título de la fuente, la sección, la página y el fragmento citado. Enlaza a la página del PDF original cuando puedas. Los usuarios confían en las citas que pueden abrir.
+
+## Modos de falla de RAG
+
+Una respuesta RAG pasa por muchas etapas. Cada una puede fallar de forma independiente, y el síntoma ("respuesta incorrecta") se ve igual desde afuera. Tu trabajo es localizar la etapa que falla. La siguiente tabla es tu mapa de depuración.
+
+| # | Modo de falla | Etapa | Síntoma | Primera solución a probar |
+|---|---|---|---|---|
+| 1 | Contenido faltante | Corpus | La respuesta es "no encontrado" o alucinada; no existe nada relevante | Agregar el documento; hacer que "no sé" sea la respuesta esperada |
+| 2 | Extracción defectuosa | Ingesta | Tablas desordenadas, encabezados mezclados con el texto | Mejor parser de PDF, extracción consciente de tablas |
+| 3 | Límites de chunk malos | Chunking | La regla queda separada de su excepción ("...excepto para condominios" en el siguiente chunk) | Chunking consciente de la estructura, overlap, parent-document retrieval |
+| 4 | Fuera del top-k | Retrieval | El chunk correcto existe pero queda por debajo del corte | Búsqueda híbrida, re-ranking, reescritura de consultas |
+| 5 | Filtro incorrecto | Retrieval | Resultados de otro producto, estado o versión vencida | Filtros por metadata, campos de fecha de vigencia |
+| 6 | Sobrecarga de contexto | Prompt | El chunk correcto se recupera pero queda enterrado entre otros 20 | Menos chunks y mejores; ordenar del mejor al peor |
+| 7 | No extraído | Generación | La respuesta está en el contexto, el modelo la ignora | Instrucciones más claras, citas por afirmación |
+| 8 | Alucinación | Generación | Afirmaciones que no están en ningún chunk | Validación de citas, evals de faithfulness |
+| 9 | Formato incorrecto o incompleto | Generación | Lista solo 2 de 4 condiciones | Salida estructurada, verificaciones de completitud |
+| 10 | Fuentes obsoletas o en conflicto | Corpus | La respuesta cita una política reemplazada | Versionado, metadata `effective_from` y `superseded_by` |
+
+Varios de estos están adaptados del paper "Seven Failure Points When Engineering a Retrieval Augmented Generation System" (Barnett et al., 2024), más algunos que aparecen constantemente en dominios regulados.
+
+### Diagnostica por etapa, como un test flaky
+
+Cuando un test falla de forma intermitente, no reescribes la app; aíslas la capa. Aquí es igual:
+
+1. **¿La respuesta está en el corpus?** Busca en los documentos crudos con grep. Si no está, falla #1.
+2. **¿Está en algún chunk, completa?** Revisa la tabla de chunks. Si la oración está cortada o desordenada, #2 o #3.
+3. **¿Ese chunk está en el top-k recuperado?** Revisa el trace. Si está en el puesto 23 de 50, #4. Si fue filtrado, #5.
+4. **¿Está en el prompt final?** Si sí y la respuesta sigue mal, es un problema de generación: #6–#9.
+
+<Diagram caption="Localiza la etapa que falla antes de arreglar algo" chart={`flowchart TD
+  A[Se reporta respuesta incorrecta] --> B{"¿Respuesta en documentos crudos?"}
+  B -- No --> F1["Contenido faltante: agregar doc o esperar 'no encontrado'"]
+  B -- Sí --> C{"¿Completa en un chunk?"}
+  C -- No --> F2["Arreglar extracción o chunking"]
+  C -- Sí --> D{"¿Chunk en el top-k recuperado?"}
+  D -- No --> F3["Arreglar retrieval: híbrido, filtros, re-rank, reescritura"]
+  D -- Sí --> E{"¿La respuesta usa ese chunk?"}
+  E -- No --> F4["Arreglar generación: prompt, citas, menos chunks"]
+  E -- Sí --> F5["La fuente misma está obsoleta o mal"]`} />
+
+Esto solo funciona si **trazas cada solicitud**: la consulta original, las consultas reescritas, los IDs de chunks recuperados con sus scores, el prompt final, la salida cruda y los resultados de validación de citas. El Módulo 3 convierte esto en observabilidad completa con LangSmith/Langfuse; por ahora basta con un log JSONL por solicitud.
+
+### "No sé" es una funcionalidad
+
+La falla más dañina en un contexto de préstamos es una respuesta segura a una pregunta que tu corpus no cubre. Diseña para la abstención:
+
+- Instruye al modelo para que devuelva `answer_found=false` cuando el contexto sea insuficiente.
+- Agrega **preguntas sin respuesta** a tu golden dataset (alrededor del 10–20%) y puntúa la abstención como correcta.
+- Considera un piso de score de retrieval: si el mejor score del re-ranker está por debajo de un umbral calibrado con tus datos, sáltate la generación y responde "no encontrado" con enlaces a los documentos más cercanos.
+
+## Errores comunes
+
+- **Citar documentos, no chunks.** "Fuente: Guía de Underwriting (212 páginas)" no es verificable. Cita sección y página.
+- **Confiar en las citas sin revisarlas.** Los modelos pueden inventar IDs de chunk plausibles o citar mal. Valida cada una.
+- **Usar IDs inestables.** Si los IDs de chunk cambian en cada re-indexado, los traces viejos y los golden datasets se rompen. Deriva los IDs del ID del documento + sección + hash del contenido.
+- **No tener preguntas sin respuesta en los tests.** Tu sistema se verá genial hasta que un usuario real pregunte algo fuera del corpus.
+- **Ignorar versiones de documentos.** Las políticas cambian. Sin metadata `effective_from`, el retriever mezcla felizmente reglas de 2023 y 2026.
+- **Arreglar la generación cuando el retrieval está roto.** Ajustar el prompt no puede hacer aparecer un chunk que nunca se recuperó. Diagnostica primero.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Cómo te aseguras de que las citas de un sistema RAG sean reales?" level="mid">
+
+Le doy a cada chunk un ID estable en el prompt y exijo salida estructurada donde cada afirmación lista IDs de chunks y una cita textual corta. Después de la generación valido: cada ID citado debe estar en el conjunto recuperado, y cada cita debe aparecer (tras normalizar espacios) en el chunk citado. Las fallas disparan un reintento o un rechazo, y se registran y cuentan. En los tests, verifico la validez de las citas sobre el golden dataset y monitoreo faithfulness junto con eso. Si el proveedor tiene citas nativas, las uso, pero mantengo la validación en CI.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Los usuarios dicen que el asistente da respuestas incorrectas. Explícame tu proceso de depuración." level="senior">
+
+Consigo ejemplos concretos y uso los traces para localizar la etapa. ¿La respuesta está en el corpus crudo? ¿Está completa en un chunk? ¿Ese chunk está en el top-k recuperado y en qué posición? ¿Llegó al prompt? ¿El modelo lo usó? Cada "no" apunta a una solución distinta: brechas de contenido, extracción o chunking, retrieval (híbrido, filtros, re-ranking, reescritura) o generación. Agrego cada caso fallido al golden dataset para que el arreglo quede protegido por un test de regresión, y monitoreo la distribución de tipos de falla para decidir dónde invertir.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Nombra los modos de falla">
+
+A los entrevistadores les encantan los candidatos que pueden listar los puntos de falla por etapa y explicar cómo detectarían cada uno en producción. Relaciónalos con métricas: las fallas de retrieval aparecen en context recall y las de generación en faithfulness. Eso te prepara para la siguiente lección.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Barnett et al., "Seven Failure Points When Engineering a Retrieval Augmented Generation System": https://arxiv.org/abs/2401.05856
+- Documentación de Anthropic — Citations: https://docs.anthropic.com/en/docs/build-with-claude/citations
+- Liu et al., "Lost in the Middle: How Language Models Use Long Contexts": https://arxiv.org/abs/2307.03172
+- LangChain — cómo devolver citas: https://python.langchain.com/docs/how_to/qa_citations/

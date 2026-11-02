@@ -1,0 +1,181 @@
+## A dónde se van el dinero y los milisegundos
+
+Antes de agregar cualquier caché, anota el costo de una solicitud. Una solicitud RAG típica en este módulo hace:
+
+1. Una llamada pequeña al LLM para reescribir la consulta (lección 11).
+2. De una a cuatro llamadas de embeddings (la consulta y sus variantes).
+3. Una búsqueda híbrida en Postgres.
+4. Un re-rank sobre 30–50 candidatos.
+5. Una llamada de generación con un system prompt más 4–8 chunks de contexto, a menudo 3,000–6,000 tokens de entrada.
+
+Los tokens de entrada del paso 5 suelen dominar el costo. La llamada de generación suele dominar la latencia. Eso te dice dónde el caché rinde y dónde es ruido.
+
+Un modelo de costos simple que deberías tener en código, no en una hoja de cálculo:
+
+```python
+from pydantic import BaseModel
+
+
+class Pricing(BaseModel):
+    """Per-million-token prices. Load from config — check the provider's current pricing page."""
+    input_per_mtok: float
+    output_per_mtok: float
+    cache_write_per_mtok: float
+    cache_read_per_mtok: float
+
+
+class Usage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+
+def request_cost(u: Usage, p: Pricing) -> float:
+    return (
+        u.input_tokens * p.input_per_mtok
+        + u.output_tokens * p.output_per_mtok
+        + u.cache_creation_input_tokens * p.cache_write_per_mtok
+        + u.cache_read_input_tokens * p.cache_read_per_mtok
+    ) / 1_000_000
+```
+
+Registra `request_cost` en cada solicitud, etiquetado con la configuración del pipeline. Así "costo por 1,000 solicitudes" se vuelve una consulta, no una suposición. Vas a necesitar ese número para el dashboard del proyecto final.
+
+## Cinco capas de caché
+
+Piensa en el caché como capas, desde la más fácil de hacer bien hasta la más riesgosa.
+
+| Capa | Clave | Ahorra | Riesgo |
+|---|---|---|---|
+| 1. Caché de embeddings | `hash(model, normalized_text)` | Llamadas de embeddings al re-indexar y en consultas repetidas | Casi ninguno, si el modelo está en la clave |
+| 2. Caché de reescritura | `hash(model, prompt_version, history, question)` | Una llamada al LLM por turno | Bajo |
+| 3. Caché de retrieval | `hash(query, filters, index_version)` | Latencia de BD + re-rank | Resultados obsoletos tras re-indexar, salvo que estén versionados |
+| 4. Caché exacto de respuestas | `hash(question, filters, corpus_version, prompt_version, model)` | Todo el pipeline | Servir una respuesta vieja tras un cambio de política |
+| 5. Caché semántico | vecino más cercano entre preguntas pasadas por encima de un umbral de similitud | Todo el pipeline para paráfrasis | Respuesta incorrecta para una pregunta "parecida" pero distinta |
+
+Más una capa que vive en el proveedor: el **prompt caching**.
+
+### Capa 1: el caché de embeddings no es negociable
+
+Re-indexar el corpus después de un cambio de chunking no debería volver a generar embeddings de texto que no cambió. Haz hash del texto normalizado del chunk más el nombre del modelo de embeddings y guarda los vectores con ese hash como clave. Probablemente hiciste una versión de esto en `03-pgvector/`; hazlo explícito. Incluir el modelo en la clave importa: los vectores de dos modelos distintos viven en espacios diferentes y nunca deben mezclarse.
+
+### Capas 3–4: versiona todo en la clave
+
+El bug clásico del caché es la invalidación. Evita la invalidación manual por completo poniendo versiones en la clave:
+
+```python
+import hashlib
+import json
+
+import redis.asyncio as redis
+
+r = redis.from_url("redis://localhost:6379/0")
+
+
+def cache_key(kind: str, **parts: object) -> str:
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False)
+    return f"rag:{kind}:" + hashlib.sha256(blob.encode()).hexdigest()
+
+
+async def cached_answer(question: str, filters: dict, ctx: dict, compute) -> dict:
+    key = cache_key(
+        "answer",
+        q=" ".join(question.lower().split()),
+        filters=filters,
+        corpus_version=ctx["corpus_version"],   # bump on every ingestion run
+        prompt_version=ctx["prompt_version"],   # bump on every prompt change
+        model=ctx["model"],
+    )
+    if (hit := await r.get(key)) is not None:
+        return json.loads(hit) | {"cache": "hit"}
+    result = await compute()
+    if result.get("answer_found") and not result.get("citation_problems"):
+        await r.set(key, json.dumps(result), ex=60 * 60 * 24)  # 24h TTL as a safety net
+    return result | {"cache": "miss"}
+```
+
+Fíjate en la guarda: solo se cachean respuestas que pasaron la validación de citas. Cachear una mala respuesta convierte una falla puntual en una falla persistente.
+
+Cuando la ingesta publica documentos nuevos, incrementa `corpus_version`. Las claves viejas dejan de coincidir y expiran solas con su TTL. Sin scripts de `DEL`, sin condiciones de carrera.
+
+### Capa 5: caché semántico, con cuidado
+
+Un caché semántico genera el embedding de la pregunta entrante y devuelve una respuesta guardada si una pregunta pasada está más cerca que cierto umbral. Sube la tasa de aciertos en tráfico tipo FAQ. También es peligroso en préstamos: "DTI máximo para FHA" y "DTI máximo para convencional" son extremadamente parecidas en el espacio de embeddings y tienen respuestas distintas.
+
+Si usas uno:
+
+- Mantén un umbral estricto y ajústalo con un set etiquetado de pares casi duplicados *y* de casi aciertos que en realidad son distintos.
+- Incluye los filtros (producto, estado) en la búsqueda, no solo el texto.
+- Prefiérelo para contenido FAQ público, no para reglas de underwriting.
+- Registra cada acierto semántico con la pregunta que coincidió para poder auditarlo.
+
+### Prompt caching del proveedor
+
+El prompt caching de Anthropic te permite marcar un prefijo estable del prompt con `cache_control`. Las solicitudes posteriores con el mismo prefijo idéntico lo leen desde el caché, que se cobra a una tarifa reducida y baja la latencia. Escribir en el caché cuesta un poco más que la entrada normal. Revisa la página de precios actual y la longitud mínima cacheable para tu modelo.
+
+En RAG, los chunks recuperados cambian por pregunta, así que pon primero el contenido estable: system prompt, reglas de citas, ejemplos few-shot, glosario. Después el contexto variable y la pregunta.
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+
+async def generate(system_rules: str, context: str, question: str):
+    return await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=800,
+        system=[
+            {"type": "text", "text": system_rules, "cache_control": {"type": "ephemeral"}},
+        ],
+        messages=[{"role": "user", "content": f"{context}\n\nQuestion: {question}"}],
+    )
+    # response.usage includes cache_creation_input_tokens and cache_read_input_tokens
+```
+
+Lee `usage.cache_read_input_tokens` en tus logs. Si siempre es cero, tu prefijo "estable" está cambiando (un timestamp en el system prompt es el culpable habitual).
+
+## Palancas de costo más allá del caché
+
+- **Menos chunks y mejores.** Pasar de 10 chunks a 5 después de agregar un re-ranker puede reducir a la mitad los tokens de entrada y a menudo mejora la faithfulness.
+- **Modelos del tamaño correcto.** Usa un modelo pequeño (`claude-haiku-5-5`) para reescritura y ruteo; reserva el modelo grande para la generación. Mide la calidad con tu golden set antes y después.
+- **Limita la salida.** Ajusta `max_tokens` a lo que necesita la UI. Pide respuestas concisas con citas, no ensayos.
+- **Evita trabajo.** Si el retrieval no encuentra nada por encima de tu piso, responde "no encontrado" sin llamar al LLM.
+- **Procesa en lote el trabajo offline.** Los embeddings de la ingesta y el juicio de evals pueden usar APIs batch donde el proveedor las ofrezca.
+
+## Errores comunes
+
+- **Cachear sin versiones en la clave.** Vas a servir una política reemplazada durante días.
+- **Cachear fallas.** Nunca caches errores, abstenciones causadas por timeouts ni respuestas que fallaron la verificación de citas.
+- **Caché semántico con umbral flojo.** Un umbral de coseno de 0.90 puede parecer estricto y aun así mezclar preguntas de FHA con convencionales. Prueba con pares de casi aciertos.
+- **Ignorar datos por usuario.** Si las respuestas dependen de permisos del usuario o del tenant, el ID del tenant debe estar en la clave.
+- **Medir la tasa de aciertos pero no la corrección.** Un caché con 60% de aciertos y 2% de respuestas incorrectas es un pasivo. Pasa tu golden set también por la ruta con caché.
+- **Prefijos de prompt volátiles.** Fechas, IDs de solicitud o ejemplos barajados al inicio del prompt rompen el caché del proveedor.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Cómo reducirías a la mitad el costo de un sistema RAG sin afectar la calidad?" level="senior">
+
+Primero mido: costo por solicitud desglosado por etapa, usando el uso de tokens de cada llamada. Normalmente dominan los tokens de entrada de la generación. Luego aplico palancas en orden de riesgo: agregar un re-ranker y enviar menos chunks; mover las instrucciones estables a un prefijo cacheado con el prompt caching del proveedor; usar un modelo más pequeño para reescribir consultas; limitar los tokens de salida; agregar caché de embeddings y un caché exacto de respuestas con clave por versión de corpus y de prompt. Cada cambio se valida contra el golden dataset, así puedo mostrar que el costo por 1,000 solicitudes bajó mientras faithfulness y context recall se mantuvieron dentro de la tolerancia.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuáles son los riesgos del caché semántico en un dominio regulado?" level="mid">
+
+Preguntas semánticamente parecidas pueden tener respuestas correctas distintas: FHA vs convencional, un estado vs otro, una política antes y después de su fecha de vigencia. Un caché semántico puede devolver una respuesta segura y con citas que es incorrecta para la nueva pregunta. Lo limitaría a contenido FAQ de bajo riesgo, incluiría filtros y versión de corpus en la búsqueda, usaría un umbral estricto ajustado con pares de casi aciertos y registraría cada acierto para auditoría. Para reglas de underwriting preferiría solo caché por coincidencia exacta.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Lleva un modelo de costos">
+
+Decir "cuesta alrededor de X por cada 1,000 solicitudes, impulsado sobre todo por los tokens de entrada de la generación, y cachear el system prompt lo redujo en Y%" demuestra que operas sistemas, no demos. Usa tus propios números medidos y los precios actuales del proveedor.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Documentación de Anthropic — Prompt caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- Documentación de Anthropic — Message Batches: https://docs.anthropic.com/en/docs/build-with-claude/batch-processing
+- Documentación de Redis — expiración de claves: https://redis.io/docs/latest/commands/expire/
+- Documentación de OpenAI — Prompt caching: https://platform.openai.com/docs/guides/prompt-caching

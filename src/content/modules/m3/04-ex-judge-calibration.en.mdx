@@ -1,0 +1,157 @@
+## Goal
+
+Before you let a judge block pull requests (exercise 06), you prove it agrees with humans. In this exercise you build a small calibration workflow in your `llm-eval-harness` repo:
+
+1. A human-labeled set of about 30 RAG outputs from your Module 2 mortgage assistant.
+2. A faithfulness judge with a versioned rubric.
+3. A script that runs the judge, computes agreement, Cohen's kappa and a confusion matrix, and lists every disagreement.
+4. At least one rubric iteration, measured on a held-out split, with the results written to a calibration report.
+
+This is the QA equivalent of validating a new test oracle before trusting it in the pipeline.
+
+## Context
+
+You will create the labeled set yourself. Run 30 golden questions through `mortgage-knowledge-assistant` (or reuse saved outputs from Module 2) and store, per case: the question, the retrieved contexts, the answer. Then label each one **as a domain expert would**: `faithful` or `unfaithful`, with a one-line note. To get enough failures, deliberately produce some bad outputs: shrink `top_k` to 1, remove the "answer only from context" instruction, or edit a few answers by hand to change a number. Aim for roughly 30–40% unfaithful cases. A set with 2 failures cannot measure anything.
+
+Label **before** you run the judge, so its verdicts do not anchor you. If a friend or colleague can label 10 cases independently, compute human-human kappa too. That is your ceiling.
+
+Use this row format in `calibration/human_labels.jsonl`:
+
+```json
+{"id": "cal-007", "question": "Is PMI required on a conventional loan with 15% down?", "contexts": ["Conventional loans with less than 20% down require private mortgage insurance (PMI)..."], "answer": "Yes. With 15% down, PMI is required until you reach 20% equity.", "human_label": "faithful", "labeler": "jd", "note": "Matches policy 4.2"}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `calibration/human_labels.jsonl` has at least 30 rows, each validated by a Pydantic model, with at least 9 `unfaithful` labels
+- [ ] Labels were created before running the judge (state this in the README)
+- [ ] The rubric lives in a versioned file (`calibration/rubrics/faithfulness_v1.md`, `faithfulness_v2.md`) and is loaded by the script, not hard-coded
+- [ ] The labeled set is split into a dev split (about 20 rows) and a held-out split (about 10 rows) with a fixed random seed
+- [ ] `calibrate.py` reports raw agreement, Cohen's kappa, the confusion matrix, false-faithful rate and the list of disagreements with judge reasoning
+- [ ] Judge calls are cached on disk keyed by (model, rubric hash, case id), so reruns are free
+- [ ] You iterated the rubric at least once on the dev split and report v1 vs v2 kappa on the held-out split
+- [ ] `calibration/REPORT.md` records judge model, rubric version, kappa, false-faithful rate, date and a go/no-go decision for using the judge as a CI gate (target: kappa at least 0.6 and false-faithful rate at most 10%)
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# calibration/calibrate.py
+import argparse
+import asyncio
+import hashlib
+import json
+import random
+from pathlib import Path
+from typing import Literal
+
+import anthropic
+from pydantic import BaseModel
+from sklearn.metrics import cohen_kappa_score, confusion_matrix
+
+Label = Literal["faithful", "unfaithful"]
+CACHE_DIR = Path("calibration/.cache")
+client = anthropic.AsyncAnthropic()
+
+
+class LabeledCase(BaseModel):
+    id: str
+    question: str
+    contexts: list[str]
+    answer: str
+    human_label: Label
+    labeler: str
+    note: str = ""
+
+
+class Verdict(BaseModel):
+    reasoning: str
+    verdict: Label
+
+
+def load_cases(path: Path) -> list[LabeledCase]:
+    return [LabeledCase.model_validate_json(l) for l in path.read_text("utf-8").splitlines() if l.strip()]
+
+
+def split(cases: list[LabeledCase], seed: int = 42, holdout: int = 10) -> tuple[list[LabeledCase], list[LabeledCase]]:
+    shuffled = cases[:]
+    random.Random(seed).shuffle(shuffled)
+    return shuffled[holdout:], shuffled[:holdout]
+
+
+async def judge(case: LabeledCase, rubric: str, model: str) -> Verdict:
+    key = hashlib.sha256(f"{model}|{rubric}|{case.id}".encode()).hexdigest()[:16]
+    cached = CACHE_DIR / f"{key}.json"
+    # TODO(you): return the cached Verdict if the file exists
+    # TODO(you): call client.messages.create(model=model, system=rubric, temperature=0, ...)
+    #            with question, numbered contexts and the answer wrapped in <answer> tags
+    # TODO(you): validate with Verdict.model_validate_json, write to cache, return it
+    raise NotImplementedError
+
+
+def metrics(human: list[str], judge_labels: list[str]) -> dict:
+    # TODO(you): agreement, kappa, confusion matrix (labels order: faithful, unfaithful)
+    # TODO(you): false_faithful_rate = judge said faithful when human said unfaithful / human unfaithful count
+    raise NotImplementedError
+
+
+async def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--rubric", default="calibration/rubrics/faithfulness_v1.md")
+    p.add_argument("--model", default="claude-sonnet-5-5")
+    p.add_argument("--split", choices=["dev", "holdout", "all"], default="dev")
+    args = p.parse_args()
+    # TODO(you): load, split, judge concurrently (asyncio.Semaphore(5)), print metrics and disagreements
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Get the data right first. Twenty minutes spent creating realistic unfaithful answers (a wrong percentage, an invented fee, a claim the context never makes) is worth more than any rubric tweak. Keep the failure types varied, or your kappa only measures one kind of error.</Hint>
+  <Hint>Use `asyncio.Semaphore(5)` around the judge call and `asyncio.gather` over the cases. Write the cache file only after `Verdict.model_validate_json` succeeds, so a malformed response is retried next run instead of cached.</Hint>
+  <Hint>For the false-faithful rate, the confusion matrix with `labels=["faithful", "unfaithful"]` gives rows as human and columns as judge. The dangerous cell is row "unfaithful", column "faithful": `cm[1][0] / cm[1].sum()`.</Hint>
+  <Hint>Typical v1 failures: the judge forgives "reasonable" claims not in the context, or punishes correct refusals. Typical v2 fixes: state that unsupported-but-plausible claims are unfaithful, state that "the documents do not cover this" is faithful, ask for a claim-by-claim list before the verdict, and add one short worked example that is not in your held-out split.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-harness">
+
+```text
+llm-eval-harness/
+  README.md
+  pyproject.toml
+  calibration/
+    human_labels.jsonl
+    calibrate.py
+    rubrics/
+      faithfulness_v1.md
+      faithfulness_v2.md
+    REPORT.md
+    .cache/            # gitignored
+  harness/             # filled in exercise 06
+  tests/
+    test_calibration_data.py
+```
+
+README section outline (add a "Judge calibration" section):
+
+- Why calibrate: the judge is a test oracle that needs validation
+- How the labeled set was built (sources, failure injection, labeled before judging, labelers)
+- How to run: `python calibration/calibrate.py --rubric calibration/rubrics/faithfulness_v2.md --split holdout`
+- Results table: rubric version, split, agreement, kappa, false-faithful rate
+- Decision: go/no-go for CI gating, and when to recalibrate
+
+Suggested commits:
+
+- `feat(calibration): add 30 human-labeled faithfulness cases`
+- `feat(calibration): judge runner with disk cache and agreement metrics`
+- `feat(calibration): rubric v2 with claim-level checks`
+- `docs(calibration): calibration report with kappa and go/no-go decision`
+
+</CommitBox>
+
+<Checklist id="m3-04-review" title="Self-review" items={["My labeled set has enough unfaithful cases (at least 30%) and varied failure types", "I labeled before running the judge", "The rubric is versioned and its hash is part of the cache key", "I report kappa and false-faithful rate, not just raw agreement", "Rubric v2 was tuned on dev and measured on the held-out split", "REPORT.md states a clear go/no-go decision with the thresholds used"]} />

@@ -1,0 +1,170 @@
+## Goal
+
+Turn "it looks fine" into numbers. You will build a golden dataset of 30 questions over the mortgage corpus, run your `05-reranking` pipeline on it, and score it with Ragas (faithfulness, answer relevance, context precision, context recall) plus deterministic recall@5. Then you compare two pipeline configurations and write a short eval report.
+
+This folder becomes the seed of the eval suite for the capstone and for Module 3. Build it as if other people will run it: one command, reproducible, versioned.
+
+Folder: `rag-lab/06-evals/`.
+
+**Time box:** 90 minutes. Roughly 35 minutes on the dataset, 30 on the runner, 25 on analysis and the report. Do not skip the analysis; it is the part interviewers ask about.
+
+## Dataset requirements
+
+Write `data/golden.jsonl` with 30 items. Each item:
+
+```json
+{"id": "gift-003", "question": "Are gift funds allowed for a down payment on an investment property?",
+ "reference": "No. Gift funds are allowed only for primary residences and second homes.",
+ "relevant_chunk_ids": ["uw-guide-5.1-9c2e"], "tags": ["gift-funds", "investment"],
+ "difficulty": "lookup", "answerable": true}
+```
+
+Mix:
+
+- At least 6 topics (DTI, LTV, gift funds, reserves, credit events, property types, rate locks, closing costs).
+- At least 18 `lookup`, 6 `multi_hop` (answer needs two chunks), 3 `numeric` (a calculation or threshold).
+- At least 4 `answerable: false` items, whose reference is "The policies do not cover this."
+- `relevant_chunk_ids` must point to real chunk IDs in your pgvector table. Write a small script that checks this.
+
+<AcceptanceCriteria>
+
+- [ ] `data/golden.jsonl` has 30 items matching the schema, validated by a Pydantic model in `golden.py`.
+- [ ] `scripts/check_golden.py` fails if any `relevant_chunk_id` does not exist in the database.
+- [ ] `run_eval.py --config baseline|rerank` runs the pipeline on every item and stores raw results (answer, retrieved chunk IDs and texts, latency) in `runs/<timestamp>-<config>.jsonl`.
+- [ ] Ragas scores faithfulness, response relevancy, context precision and context recall with a pinned judge model; deterministic recall@5 and MRR@10 are computed from chunk IDs.
+- [ ] Unanswerable items are scored separately: abstention rate (the system said it could not find an answer).
+- [ ] The report `reports/<date>.md` includes an aggregate table for both configs, the 5 worst items with a one-line diagnosis each (retrieval vs generation), and a recommendation.
+- [ ] Library versions and the judge model id are recorded in the report header.
+- [ ] Re-running the eval does not re-call the pipeline when `--from-run` points to an existing run file (separating generation from scoring).
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 06-evals/golden.py
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class GoldenItem(BaseModel):
+    id: str
+    question: str
+    reference: str
+    relevant_chunk_ids: list[str] = Field(default_factory=list)
+    tags: list[str]
+    difficulty: Literal["lookup", "multi_hop", "numeric"]
+    answerable: bool = True
+
+
+def load_golden(path: Path = Path("data/golden.jsonl")) -> list[GoldenItem]:
+    items = [GoldenItem.model_validate_json(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+    ids = [i.id for i in items]
+    assert len(ids) == len(set(ids)), "duplicate ids in golden set"
+    return items
+
+
+class RunRecord(BaseModel):
+    item_id: str
+    answer: str
+    answer_found: bool
+    retrieved_ids: list[str]
+    retrieved_texts: list[str]
+    latency_ms: float
+
+
+def save_run(records: list[RunRecord], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(r.model_dump_json() for r in records), "utf-8")
+```
+
+```python
+# 06-evals/run_eval.py (scoring part)
+from ragas import EvaluationDataset, SingleTurnSample, evaluate
+from ragas.metrics import Faithfulness, LLMContextPrecisionWithReference, LLMContextRecall, ResponseRelevancy
+
+from golden import GoldenItem, RunRecord
+
+
+def to_ragas(items: list[GoldenItem], runs: dict[str, RunRecord]) -> EvaluationDataset:
+    samples = []
+    for item in items:
+        if not item.answerable:
+            continue  # scored separately as abstention
+        r = runs[item.id]
+        samples.append(
+            SingleTurnSample(
+                user_input=item.question,
+                retrieved_contexts=r.retrieved_texts,
+                response=r.answer,
+                reference=item.reference,
+            )
+        )
+    return EvaluationDataset(samples=samples)
+
+
+def score(items, runs, judge, embeddings):
+    # TODO: call evaluate(...) with the four metrics, return result.to_pandas()
+    # TODO: join per-sample scores with item ids/tags for the worst-5 analysis
+    raise NotImplementedError
+
+
+def abstention_rate(items: list[GoldenItem], runs: dict[str, RunRecord]) -> float:
+    unanswerable = [i for i in items if not i.answerable]
+    # TODO: fraction of unanswerable items where runs[i.id].answer_found is False
+    raise NotImplementedError
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Write the dataset first, from the documents, not from your system's answers. If you copy what your pipeline says into `reference`, you are snapshot-testing your bugs. Open the PDF, find the paragraph, write the reference in your own words, and note the chunk ID.</Hint>
+  <Hint>Separate generation from scoring. Run the pipeline once and save raw outputs to `runs/`. Scoring then reads that file. You will tweak scoring and analysis many times; you do not want to pay for 30 generations each time.</Hint>
+  <Hint>Ragas calls the judge many times per sample (claims extraction, verification). If you hit rate limits, use a `RunConfig(max_workers=4, timeout=120)` and pass it to `evaluate`. Set the judge temperature to 0.</Hint>
+  <Hint>For the worst-5 analysis, sort the per-sample dataframe by faithfulness and by context recall. Low context recall plus a correct chunk missing from `retrieved_ids` means retrieval. High context recall plus low faithfulness means generation. Write that diagnosis in one line per item.</Hint>
+</Hints>
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  06-evals/
+    README.md
+    golden.py
+    run_eval.py
+    data/
+      golden.jsonl
+    scripts/
+      check_golden.py
+    runs/                  # gitignored except one sample run
+    reports/
+      2026-11-02.md
+    tests/
+      test_golden_schema.py
+```
+
+**README outline**
+
+1. Purpose: regression suite for the RAG pipeline
+2. Dataset: size, topic and difficulty mix, how items were written and reviewed
+3. How to run: `uv run python run_eval.py --config rerank` and `--from-run`
+4. Metrics: what each one means and the thresholds you propose
+5. Latest results table (link to the report)
+6. Known limitations: judge noise, dataset size, single annotator
+
+**Suggested commits**
+
+- `feat(06-evals): add golden dataset schema and 30 reviewed items`
+- `feat(06-evals): validate golden chunk ids against pgvector`
+- `feat(06-evals): run pipeline and persist raw run records`
+- `feat(06-evals): score runs with Ragas and deterministic retrieval metrics`
+- `docs(06-evals): add first eval report comparing baseline and rerank`
+
+</CommitBox>
+
+<Checklist id="m2-15-review" title="Self-review" items={["References were written from the source documents, not copied from system output", "Every relevant_chunk_id exists in the database", "At least 4 unanswerable items are included and scored as abstention", "Generation and scoring are separate steps; I can re-score a saved run", "The judge model id and library versions are pinned and recorded", "I inspected per-item scores, not only averages", "Each of the 5 worst items has a retrieval-vs-generation diagnosis", "The report compares two configurations and makes a recommendation", "The dataset is in git so changes are reviewable"]} />

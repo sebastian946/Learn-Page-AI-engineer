@@ -1,0 +1,203 @@
+# Ejercicio: crea el repo hub de tu portafolio
+
+Cada proyecto de este curso va a terminar en tu GitHub. Antes de escribir la primera línea de código con LLM, preparas el lugar que los une y las convenciones que todos siguen. Piénsalo como el framework de pruebas que construyes antes de escribir el primer test: un poco de esfuerzo ahora te evita inconsistencias en siete repos más adelante.
+
+**Tiempo:** de 60 a 90 minutos.
+
+## Objetivo
+
+Crea un repo público llamado `ai-engineer-portfolio` que contenga:
+
+1. Un **README hub**: quién eres, a qué apuntas y una tabla de proyectos que irás completando.
+2. Una **plantilla reutilizable de README de proyecto** con las secciones que todo proyecto debe tener: Problem, Architecture, Evaluation, Cost & latency, Trade-offs, Run it, Limitations. Más un espacio para el GIF de demo al principio.
+3. Una **plantilla de pull request en `.github`** que pida resultados de evals e impacto en costos en cada cambio.
+4. Un **documento de convenciones** (`CONVENTIONS.md`): nombres, ramas, commits, estructura de carpetas, secretos, evals y reglas del README.
+5. Un pequeño **linter de README** (`scripts/check_readme.py`) que falle si a un README le faltan secciones obligatorias, y un workflow de GitHub Actions que lo ejecute. Eres SDET: tus convenciones tienen un gate automático.
+
+Vas a copiar la plantilla de README y la de PR en cada repo que crees en los Módulos 1 a 7.
+
+<AcceptanceCriteria>
+
+- [ ] Repo público en GitHub llamado `ai-engineer-portfolio` con una descripción corta y topics (por ejemplo `ai-engineering`, `llm`, `rag`, `portfolio`).
+- [ ] `README.md` (hub) tiene: una introducción de un párrafo, una línea de "Target roles", una tabla de proyectos con las columnas Project, What it proves, Key result, Status, y un enlace a `CONVENTIONS.md`.
+- [ ] `templates/PROJECT_README.md` contiene las secciones en este orden: título + pitch de una línea, GIF de demo, badge de CI, Problem, Architecture (con un bloque Mermaid), Evaluation (con una tabla de resultados), Cost & latency (con una tabla de costos y una fecha de "prices checked on"), Trade-offs & decisions, Run it, Limitations & next steps.
+- [ ] `.github/pull_request_template.md` incluye: resumen, tipo de cambio, resultados de evals antes/después, impacto en costo/latencia, evidencia de pruebas y un checklist.
+- [ ] `CONVENTIONS.md` cubre: nombres de repos, nombres de ramas, Conventional Commits, estructura estándar de carpetas, política de secretos, requisitos de evals y el contrato del README.
+- [ ] `scripts/check_readme.py` termina con código 1 y lista las secciones faltantes cuando a un README le falta algún encabezado obligatorio; termina con 0 en caso contrario. Se ejecuta contra `templates/PROJECT_README.md` y pasa.
+- [ ] `.github/workflows/readme-check.yml` ejecuta el script en cada push y PR, y la primera ejecución está en verde.
+- [ ] Existen `.gitignore` y `templates/.env.example`; no hay secretos reales en ninguna parte del historial.
+- [ ] Existe `LEARNING_LOG.md` con tu primera entrada de hoy.
+- [ ] Al menos 4 commits con mensajes en formato Conventional Commits.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+"""Fail CI when a project README is missing required sections.
+
+Usage: python scripts/check_readme.py path/to/README.md [more READMEs...]
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+REQUIRED_SECTIONS: list[str] = [
+    "Problem",
+    "Architecture",
+    "Evaluation",
+    "Cost & latency",
+    "Trade-offs & decisions",
+    "Run it",
+    "Limitations & next steps",
+]
+
+
+def headings(markdown: str) -> list[str]:
+    """Return the text of every level-2 heading (lines starting with '## ')."""
+    # TODO: ignore headings inside fenced code blocks
+    return [m.group(1).strip() for m in re.finditer(r"^## (.+)$", markdown, re.MULTILINE)]
+
+
+def missing_sections(markdown: str) -> list[str]:
+    # TODO: compare REQUIRED_SECTIONS against headings(), case-insensitive
+    raise NotImplementedError
+
+
+def has_demo_gif(markdown: str) -> bool:
+    # TODO: True if there is a markdown image pointing to a .gif file
+    raise NotImplementedError
+
+
+def main(paths: list[str]) -> int:
+    failed = False
+    for p in paths:
+        text = Path(p).read_text(encoding="utf-8")
+        problems = [f"missing section: {s}" for s in missing_sections(text)]
+        if not has_demo_gif(text):
+            problems.append("missing demo GIF")
+        # TODO: print problems per file and set failed
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+```
+
+```markdown
+## Summary
+What changed and why, in 1-3 sentences.
+
+## Type of change
+- [ ] Feature
+- [ ] Bug fix
+- [ ] Prompt change
+- [ ] Retrieval / data change
+- [ ] Infra / CI
+
+## Eval results
+| Metric | Before | After |
+|---|---|---|
+|  |  |  |
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Empieza por el esqueleto del repo y la plantilla, no por el script. Crea las carpetas, escribe `templates/PROJECT_README.md` copiando el contrato de README de la lección anterior y haz tu primer commit. El script es más fácil cuando tienes un archivo real con el cual probarlo.</Hint>
+  <Hint>En `missing_sections`, normaliza ambos lados: minúsculas y sin espacios en los extremos. Arma un set con los encabezados encontrados y devuelve los obligatorios que no estén en él, manteniendo el orden original para que la salida sea legible. Para el check del GIF alcanza con una regex como `!\[[^\]]*\]\([^)]+\.gif\)`.</Hint>
+  <Hint>Para ignorar encabezados dentro de bloques de código, recorre las líneas y alterna una bandera `in_fence` cada vez que una línea empiece con tres backticks. Solo recolecta líneas `## ` cuando la bandera esté apagada. Pruébalo con un README cuyo bloque de código de ejemplo contenga una línea `## Problem`: el script debe seguir reportando que falta Problem si el encabezado real no está.</Hint>
+  <Hint>El workflow necesita solo cuatro pasos: `actions/checkout@v4`, `actions/setup-python@v5` con `python-version: "3.12"` y luego `python scripts/check_readme.py templates/PROJECT_README.md`. Agrega también una prueba negativa: un pequeño `tests/fixtures/bad_README.md` y un archivo de pytest que verifique que `main()` devuelve 1 para él. Es tu quality gate probándose a sí mismo.</Hint>
+</Hints>
+
+## Referencia: esquema de CONVENTIONS.md
+
+Úsalo como punto de partida y adáptalo. Mantenlo corto; nadie lee un documento de convenciones de 20 páginas. Va en inglés porque lo leerán revisores del mercado objetivo.
+
+```markdown
+# Conventions
+
+## Repo naming
+kebab-case, describes the product not the tech: `support-ticket-router`, not `langchain-test-2`.
+
+## Branches
+main is always green. Work on `feat/<short-desc>`, `fix/<short-desc>`, `eval/<short-desc>`, `chore/<short-desc>`.
+
+## Commits
+Conventional Commits: feat, fix, docs, test, eval, refactor, chore, ci. Imperative, max 72 chars.
+Example: `eval: add 20 golden questions for refinance policies`.
+
+## Folder layout (Python projects)
+src/<package>/   app code
+tests/           unit + integration tests
+evals/           datasets/, metrics, run_evals.py, results/
+docs/            architecture.md, demo.gif, adr/
+scripts/         one-off tools
+
+## Secrets
+Never commit keys. `.env` is gitignored; `.env.example` lists every variable with a fake value.
+Model names and prices live in config, not in code.
+
+## Evals
+Every project has an eval dataset and a one-command eval run.
+Any PR that changes prompts, retrieval or models must include before/after eval numbers.
+
+## README contract
+Every project README follows templates/PROJECT_README.md and passes scripts/check_readme.py.
+```
+
+<CommitBox repo="ai-engineer-portfolio">
+
+**Estructura de carpetas**
+
+```text
+ai-engineer-portfolio/
+├── README.md                      # hub: intro, target roles, projects table
+├── CONVENTIONS.md
+├── LEARNING_LOG.md
+├── templates/
+│   ├── PROJECT_README.md          # copied into every project repo
+│   ├── prices.example.toml        # model price config with "checked on" date
+│   └── .env.example
+├── scripts/
+│   └── check_readme.py
+├── tests/
+│   ├── fixtures/
+│   │   └── bad_README.md
+│   └── test_check_readme.py
+├── .github/
+│   ├── pull_request_template.md
+│   └── workflows/
+│       └── readme-check.yml
+└── .gitignore
+```
+
+**Esquema del README hub**
+
+1. Nombre y titular de una línea ("Senior SDET building reliable LLM systems: RAG, evals, agents").
+2. Roles objetivo: AI Engineer, Applied AI Engineer, LLM Engineer.
+3. Tabla de proyectos: una fila por cada repo del curso (`llm-provider-client`, `support-ticket-router`, `rag-lab`, `mortgage-knowledge-assistant`, `llm-eval-harness`, ...). Estado "planned" por ahora.
+4. Cómo trabajo: enlace a `CONVENTIONS.md` y a las plantillas.
+5. Enlaces de contacto.
+
+**Commits sugeridos**
+
+- `chore: initialize portfolio hub with gitignore and env example`
+- `docs: add project README template and conventions`
+- `docs: add pull request template with eval and cost sections`
+- `feat: add README section linter`
+- `test: add negative fixture for README linter`
+- `ci: run README linter on push and pull request`
+- `docs: add hub README and first learning log entry`
+
+</CommitBox>
+
+## Cuando termines
+
+- Fija (pin) `ai-engineer-portfolio` en tu perfil de GitHub.
+- Pega su URL en el seguimiento del portafolio del panel.
+- Agrega la primera entrada a `LEARNING_LOG.md`: qué aprendiste en el Módulo 0, qué sigue sin estar claro, qué entregaste.
+
+<Checklist id="m0-06-review" title="Autorrevisión" items={["El repo es público, tiene descripción y topics, y está fijado en mi perfil", "La plantilla de README de proyecto tiene todas las secciones obligatorias en el orden correcto, incluido el espacio para el GIF de demo y una tabla de costos con fecha", "La plantilla de PR pide números de evals antes/después e impacto en costo/latencia", "CONVENTIONS.md cabe aproximadamente en una pantalla y cubre nombres, ramas, commits, estructura, secretos, evals y READMEs", "check_readme.py ignora los encabezados dentro de bloques de código y devuelve código 1 con el fixture malo", "El workflow de GitHub Actions se ejecutó y está en verde", "No hay secretos en ninguna parte del historial de git", "Hice al menos 4 commits con Conventional Commits", "Pegué la URL del repo en el seguimiento del portafolio del panel"]} />

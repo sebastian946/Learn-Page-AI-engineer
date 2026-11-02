@@ -1,0 +1,228 @@
+## Por qué Redis importa más en apps LLM
+
+En un servicio web clásico, Redis te ahorra unos milisegundos y algo de carga en la base de datos. En un servicio LLM te ahorra **segundos y dinero real** en cada hit. Una respuesta en caché cuesta cero tokens y vuelve en unos 5 ms en lugar de 3–8 segundos.
+
+Redis también te protege de tus propios usuarios. Un tenant que corre un script en loop puede quemar tu presupuesto mensual del proveedor en una tarde. También puede agotar tu rate limit con el proveedor y tumbar a todos los demás tenants. El rate limiting aquí no es opcional. Es un control de costos y un control de disponibilidad.
+
+Esta lección cubre cuatro cosas:
+
+1. **Caché exacta**: misma pregunta normalizada, mismo contexto, misma respuesta.
+2. **Caché semántica**: pregunta similar, reutiliza la respuesta, con cuidado.
+3. **Token buckets por tenant**: scripts Lua atómicos en Redis.
+4. **Límites por tokens**: limita lo que realmente cuesta dinero, no solo el número de requests.
+
+Ya conoces los tipos de datos de Redis, los TTL y `EVAL`. Nos enfocamos en lo específico del tráfico LLM.
+
+## Caché exacta: la clave lo es todo
+
+Una caché exacta es un diccionario de una clave a una respuesta guardada. Lo difícil es la clave. Si es demasiado laxa, sirves respuestas viejas o incorrectas. Si es demasiado estricta, tu hit rate es casi cero.
+
+En una respuesta RAG, el resultado depende de más que el texto de la pregunta. Depende de:
+
+- la **pregunta normalizada** (minúsculas, sin espacios extra, quizá sin puntuación),
+- el **id del modelo** (`claude-sonnet-5-5` y `claude-haiku-5-5` dan respuestas distintas),
+- la **versión del prompt** (cambiaste el system prompt, las respuestas viejas ya no son válidas),
+- la **versión del corpus de retrieval** (se actualizó un PDF de políticas, la respuesta vieja puede citar una regla muerta),
+- el **tenant** (el tenant A nunca debe ver una respuesta construida con documentos del tenant B),
+- los parámetros de generación que cambian la salida (temperature, max tokens).
+
+Haz hash de todo eso en una sola clave. Usa la versión del corpus que produce tu pipeline de ingesta. Un enfoque simple es un hash de los pares `(doc_id, doc_version)` ordenados de los documentos recuperados. Un enfoque más grueso es un único contador `corpus_version` que incrementas en cada corrida de ingesta. El grueso es más simple e invalida todo de una vez. Eso suele bastar con ingesta diaria.
+
+```python
+# app/cache.py
+import hashlib
+import json
+import re
+from pydantic import BaseModel
+from redis.asyncio import Redis
+
+class CachedAnswer(BaseModel):
+    answer: str
+    citations: list[dict]
+    model: str
+    prompt_version: str
+
+_ws = re.compile(r"\s+")
+
+def normalize(question: str) -> str:
+    return _ws.sub(" ", question.strip().lower()).rstrip("?!. ")
+
+def cache_key(*, tenant_id: str, question: str, model: str,
+              prompt_version: str, corpus_version: str, temperature: float) -> str:
+    payload = json.dumps(
+        {"q": normalize(question), "m": model, "pv": prompt_version,
+         "cv": corpus_version, "t": temperature},
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"mka:answer:{tenant_id}:{digest}"
+
+class AnswerCache:
+    def __init__(self, redis: Redis, ttl_seconds: int = 6 * 3600) -> None:
+        self.redis = redis
+        self.ttl = ttl_seconds
+
+    async def get(self, key: str) -> CachedAnswer | None:
+        raw = await self.redis.get(key)
+        return CachedAnswer.model_validate_json(raw) if raw else None
+
+    async def set(self, key: str, value: CachedAnswer) -> None:
+        await self.redis.set(key, value.model_dump_json(), ex=self.ttl)
+```
+
+Notas sobre este diseño:
+
+- El id del tenant va **en el prefijo de la clave**, no solo dentro del hash. Así puedes borrar la caché de un tenant con `SCAN` + `UNLINK` sobre `mka:answer:tenant-42:*`.
+- El TTL es una red de seguridad, no la estrategia principal de invalidación. Los campos de versión en la clave hacen la invalidación real.
+- Guarda solo respuestas **exitosas y completas**. Nunca guardes un rechazo causado por un error del proveedor, un stream truncado o un bloqueo de guardrail que podría pasar al reintentar.
+
+**Streaming y caché.** Si tu endpoint hace streaming SSE, no puedes guardar en caché hasta que termine el stream. Acumula los tokens y, en el evento `done`, escribe la respuesta completa en caché. En un hit puedes seguir haciendo streaming: envía la respuesta cacheada como un evento `token` (o unos pocos chunks), luego `citations` y luego `done`. Los clientes mantienen un solo camino de código.
+
+## Caché semántica: más hit rate, más riesgo
+
+Los usuarios rara vez escriben la misma pregunta dos veces. "What's the max DTI for FHA loans?" y "max debt-to-income ratio FHA" son la misma pregunta. Una caché exacta falla. Una caché semántica genera el embedding de la pregunta, busca una pregunta guardada con similitud coseno por encima de un umbral y devuelve esa respuesta.
+
+Redis Stack (RediSearch) soporta índices vectoriales, así que puedes mantener esto en el mismo Redis. Guardas un hash por entrada con el embedding, la respuesta, el tenant y las versiones. Consultas con una búsqueda KNN **filtrada por tenant, versión de prompt y versión de corpus**.
+
+```python
+# Index once at startup (Redis Stack / RediSearch)
+# FT.CREATE idx:semcache ON HASH PREFIX 1 mka:sem:
+#   SCHEMA tenant TAG pv TAG cv TAG
+#          vec VECTOR HNSW 6 TYPE FLOAT32 DIM 1024 DISTANCE_METRIC COSINE
+import numpy as np
+from redis.commands.search.query import Query
+
+async def semantic_lookup(redis, emb: list[float], tenant: str, pv: str, cv: str,
+                          max_distance: float = 0.08) -> str | None:
+    q = (
+        Query(f"(@tenant:{{{tenant}}} @pv:{{{pv}}} @cv:{{{cv}}})=>[KNN 1 @vec $v AS dist]")
+        .return_fields("answer", "dist")
+        .dialect(2)
+    )
+    res = await redis.ft("idx:semcache").search(
+        q, query_params={"v": np.asarray(emb, dtype=np.float32).tobytes()}
+    )
+    if res.docs and float(res.docs[0].dist) <= max_distance:
+        return res.docs[0].answer
+    return None
+```
+
+Una **distancia** coseno de 0.08 significa una similitud de aproximadamente 0.92. Ese número es un ejemplo. Debes ajustarlo con tus propios datos.
+
+El riesgo es real. "Can I get an FHA loan with a 580 credit score?" y "Can I get an FHA loan with a 500 credit score?" son extremadamente parecidas en el espacio de embeddings. Tienen respuestas distintas. Una caché semántica servirá felizmente la incorrecta.
+
+Cómo usar caché semántica de forma segura:
+
+- **Ajusta el umbral con un eval set.** Construye pares de preguntas con "misma intención" y con "intención distinta pero redacción similar". Elige el umbral donde los falsos hits sean casi cero. Es un problema de clasificación; mide precisión, no solo hit rate.
+- **Acótala.** Filtra siempre por tenant y versiones. Considera excluir preguntas con números, fechas o nombres (regex simple), porque ahí es donde los casi-duplicados divergen.
+- **Úsala para la cabeza de la distribución.** Las FAQs y preguntas de onboarding se benefician más. Las preguntas largas y específicas casi nunca hacen hit de todos modos.
+- **Registra cada hit semántico** con ambas preguntas. Muestréalos en tus evals online del Módulo 3.
+- **Agrega un kill switch.** Un feature flag que desactive la capa semántica sin un deploy.
+
+Ordena las capas: primero la caché exacta (barata, segura), luego la semántica y después el pipeline RAG completo.
+
+## Rate limiting: token buckets por tenant
+
+Un token bucket tiene una capacidad y una tasa de recarga. Cada request saca tokens. Si el bucket está vacío, rechazas. Permite ráfagas cortas y hace cumplir una tasa promedio. Encaja bien con el tráfico de chat.
+
+La implementación debe ser **atómica**. Si dos réplicas de la API leen el bucket, calculan y escriben, compiten entre sí. Redis ejecuta un script Lua de forma atómica, así que haz el ciclo leer-calcular-escribir en Lua.
+
+```lua
+-- app/lua/token_bucket.lua
+-- KEYS[1] bucket key; ARGV: capacity, refill_per_sec, cost, now_ms, force
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local force = tonumber(ARGV[5]) or 0
+
+local state = redis.call("HMGET", KEYS[1], "tokens", "ts")
+local tokens = tonumber(state[1]) or capacity
+local ts = tonumber(state[2]) or now
+
+tokens = math.min(capacity, tokens + (now - ts) / 1000 * rate)
+local allowed = 0
+local retry_after = 0
+if force == 1 or tokens >= cost then
+  tokens = math.min(capacity, tokens - cost)
+  allowed = 1
+else
+  retry_after = math.ceil((cost - tokens) / rate)
+end
+redis.call("HSET", KEYS[1], "tokens", tokens, "ts", now)
+redis.call("PEXPIRE", KEYS[1], math.ceil(capacity / rate * 1000) + 1000)
+return {allowed, retry_after, math.floor(tokens)}
+```
+
+Pasa `now_ms` desde la app, o usa `redis.call("TIME")` dentro del script para evitar diferencias de reloj entre réplicas. Regístralo una vez con `redis.register_script(...)`, que usa `EVALSHA` y cae a `EVAL` si hace falta.
+
+Cuando rechazas un request, devuelve **HTTP 429** con un header `Retry-After` en segundos. Agrega `X-RateLimit-Remaining` si tus clientes lo quieren. Los clientes bien hechos (y tu propio frontend) hacen backoff según ese header.
+
+## Límites por tokens: limita lo que cuesta dinero
+
+Los límites por número de requests no bastan. Un request con 150k tokens de contexto cuesta lo mismo que cientos de requests cortos. Así que usa **dos buckets por tenant**:
+
+- un **bucket de requests** (por ejemplo 60 requests/minuto) para frenar avalanchas,
+- un **bucket de tokens** (por ejemplo 200k tokens LLM/minuto) para frenar picos de costo.
+
+El problema: solo conoces el número real de tokens **después** de la llamada. La solución es **estimar y luego conciliar**:
+
+1. Antes de la llamada, estima los tokens de entrada (prompt + contexto recuperado) más `max_tokens` de salida. Usa un tokenizer, el endpoint de conteo de tokens del proveedor o una heurística barata como caracteres divididos entre 4 con un margen de seguridad.
+2. Debita la estimación del bucket de tokens. Rechaza con 429 si no cabe.
+3. Después de la llamada, lee `usage.input_tokens` y `usage.output_tokens` de la respuesta. Debita o acredita la diferencia.
+
+```python
+# app/ratelimit.py (excerpt)
+async def reserve(self, tenant: str, estimated_tokens: int) -> RateDecision:
+    req = await self._bucket(f"rl:req:{tenant}", self.req_cap, self.req_rate, 1)
+    if not req.allowed:
+        return req
+    return await self._bucket(f"rl:tok:{tenant}", self.tok_cap, self.tok_rate, estimated_tokens)
+
+async def reconcile(self, tenant: str, estimated: int, actual: int) -> None:
+    delta = actual - estimated  # positive: we under-reserved
+    if delta != 0:
+        # Negative cost refunds tokens; the script clamps at capacity.
+        await self._bucket(f"rl:tok:{tenant}", self.tok_cap, self.tok_rate, delta, force=True)
+```
+
+`force=True` significa "aplica el débito aunque deje el bucket en negativo". Un saldo negativo simplemente retrasa el siguiente request del tenant. Es el resultado justo cuando usaron más de lo estimado.
+
+Mantén también un bucket **global** por API key del proveedor, configurado un poco por debajo del límite del propio proveedor. Así fallas rápido con tu propio 429 limpio en lugar de recibir 429 del proveedor a mitad de un stream.
+
+## Errores comunes
+
+- **Clave de caché sin tenant o sin versión de corpus.** Filtra datos entre tenants, o sirve respuestas basadas en la política de ayer.
+- **Guardar errores o streams parciales.** Una falla transitoria se vuelve una respuesta incorrecta permanente durante seis horas.
+- **Umbral de caché semántica elegido a ojo.** Ajústalo con pares etiquetados. Los números y las entidades son los falsos hits clásicos.
+- **Rate limiting no atómico.** Un `GET` y luego `SET` desde Python entre réplicas deja pasar ráfagas. Usa Lua o `INCR` con expiración.
+- **Contar solo requests.** El gasto en tokens, no el número de requests, es lo que mueve tu factura.
+- **Fallar cerrado ante una caída de Redis sin pensarlo.** Decide explícitamente: para la caché, falla abierto (omite la caché). Para rate limiting, muchos equipos fallan abierto con un limitador local en memoria como respaldo, porque rechazar todo el tráfico es peor que un riesgo breve de presupuesto.
+- **Sin métricas.** Sin hit rate de caché y conteo de 429 por tenant, no puedes probar que la caché ahorra dinero ni ajustar los límites.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo diseñarías la clave de caché para una caché de respuestas RAG multi-tenant?" level="mid">
+
+Haz hash de la pregunta normalizada junto con cada entrada que cambia la respuesta: id del modelo, versión del prompt, versiones del corpus o de los documentos recuperados y parámetros de generación como temperature. Pon el id del tenant como prefijo de la clave para aislar tenants y poder purgar uno con un scan por prefijo. Los campos de versión hacen la invalidación; el TTL es solo una red de seguridad. Guarda solo respuestas completas y exitosas, nunca errores ni streams truncados.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Una caché semántica subió el hit rate de 8% a 35%, pero aumentaron los tickets de soporte por respuestas incorrectas. ¿Qué haces?" level="senior">
+
+Primero, apágala o ajústala con un feature flag; la corrección vale más que el ahorro. Luego extrae los hits semánticos registrados y etiquétalos. Normalmente los falsos hits comparten un patrón: números, fechas, nombres de producto o negaciones distintas con embeddings casi idénticos. Corrige con un umbral más estricto ajustado sobre pares etiquetados de "misma vs distinta intención", guardas de entidades/números que salten la capa semántica y un acotamiento estricto por tenant y versiones. Reactívala gradualmente y mide la tasa de falsos hits como métrica de eval online, no solo el hit rate.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Punto clave sobre rate limiting">
+
+Di "dos buckets por tenant: requests y tokens LLM, aplicados de forma atómica en Redis con Lua, estimar y conciliar para los tokens, 429 con Retry-After, más un bucket global por debajo del límite del proveedor". Esa sola frase muestra que entiendes costo, equidad y las restricciones del proveedor.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Documentación de búsqueda vectorial en Redis: https://redis.io/docs/latest/develop/interact/search-and-query/advanced-concepts/vectors/
+- Scripting con Lua en Redis: https://redis.io/docs/latest/develop/interact/programmability/eval-intro/
+- Conteo de tokens y rate limits de Anthropic: https://docs.anthropic.com/en/api/rate-limits
+- AWS Builders' Library, "Fairness in multi-tenant systems": https://aws.amazon.com/builders-library/fairness-in-multi-tenant-systems/

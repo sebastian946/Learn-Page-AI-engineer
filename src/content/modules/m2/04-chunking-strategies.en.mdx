@@ -1,0 +1,188 @@
+## Why chunking matters more than it looks
+
+A chunk is the unit of retrieval. It is what gets embedded, what gets ranked, and what gets pasted into the prompt. Chunking decides three things at once:
+
+- **What a vector means.** An embedding is a single point summarizing the whole chunk. A chunk that covers DTI limits *and* reserve requirements is a blurry average of both topics, and it matches neither query well.
+- **What the model sees.** If the answer is "45% DTI, up to 50% with compensating factors", and your chunk boundary falls between those two clauses, the model gets half a rule. In lending, half a rule is a wrong rule.
+- **What you pay.** Every retrieved chunk costs input tokens. Bigger chunks with `k = 6` can mean several thousand tokens of context per question.
+
+There is no universally right chunk size. There is a right size for your corpus and query mix, and you find it by measuring (next exercise). This lesson gives you the four strategies and the trade-offs.
+
+## Strategy 1: fixed-size
+
+Split every N characters (or tokens) with M characters of overlap.
+
+```python
+def fixed_chunks(text: str, size: int = 800, overlap: int = 100) -> list[str]:
+    step = size - overlap
+    return [text[i : i + size] for i in range(0, max(len(text) - overlap, 1), step)]
+```
+
+- **Pros:** trivial, predictable chunk count and cost, fast.
+- **Cons:** ignores structure. Cuts mid-sentence, mid-table, mid-list. The overlap is a band-aid that duplicates tokens.
+- **Use it as:** a baseline you must beat, never as the final answer for structured documents.
+
+Measure size in **tokens** when cost or the embedding model's input limit matters, and in characters when you just need a fast approximation (roughly 4 characters per token for English prose; check with your provider's tokenizer).
+
+## Strategy 2: recursive
+
+Try to split on the largest natural separator first, and only fall back to smaller ones when a piece is still too big: paragraphs, then lines, then sentences, then words. This is LangChain's `RecursiveCharacterTextSplitter`, and it is the sensible default for prose.
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,
+    chunk_overlap=100,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
+chunks = splitter.split_text(policy_text)
+
+# Token-based sizing with tiktoken, closer to what you actually pay for
+token_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="cl100k_base", chunk_size=256, chunk_overlap=32,
+)
+```
+
+- **Pros:** respects paragraphs most of the time, cheap, good default.
+- **Cons:** still blind to document semantics. A section heading can end up as the last line of the previous chunk, orphaned from its content.
+
+## Strategy 3: semantic
+
+Embed each sentence, then start a new chunk wherever the similarity between consecutive sentences drops sharply. Chunks follow topic shifts rather than character counts.
+
+```python
+import numpy as np
+
+def semantic_chunks(sentences: list[str], vectors: np.ndarray,
+                    percentile: float = 90, max_sentences: int = 12) -> list[str]:
+    """vectors: L2-normalized sentence embeddings, shape (n, d)."""
+    sims = np.sum(vectors[:-1] * vectors[1:], axis=1)       # cosine of neighbours
+    distances = 1 - sims
+    threshold = np.percentile(distances, percentile)
+    chunks, current = [], [sentences[0]]
+    for i, dist in enumerate(distances, start=1):
+        if dist > threshold or len(current) >= max_sentences:
+            chunks.append(" ".join(current))
+            current = []
+        current.append(sentences[i])
+    chunks.append(" ".join(current))
+    return chunks
+```
+
+LangChain ships this as `SemanticChunker` in `langchain_experimental`.
+
+- **Pros:** chunks are topically coherent, which can improve precision on long, loosely structured prose (memos, emails, meeting notes).
+- **Cons:** you pay to embed every sentence at index time; results are sensitive to the threshold; chunk sizes vary wildly; and on documents that already have headings it rarely beats simply using the headings.
+
+Treat semantic chunking as something to *try and measure*, not a default upgrade.
+
+## Strategy 4: document-aware (structure-aware)
+
+Use the structure the author already gave you: headings, numbered sections, FAQ question-answer pairs, table boundaries. For our mortgage corpus this is usually the winner, because policy manuals are written as numbered sections that each state one rule.
+
+The recipe:
+
+1. Split on structure (sections from ingestion, lesson 2).
+2. If a section is too long, split it recursively *within* the section.
+3. If a section is tiny, merge it with its siblings under the same parent heading.
+4. **Prepend the heading path** to every chunk's text, so the embedding knows the context.
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel
+
+class Chunk(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str                   # what gets embedded (with heading path)
+    heading_path: list[str]
+    page: int | None
+    metadata: dict
+
+inner = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+def structure_chunks(doc: dict, min_chars: int = 200) -> list[Chunk]:
+    out: list[Chunk] = []
+    buffer = ""
+    for s in doc["sections"]:
+        body = (buffer + "\n" + s["text"]).strip() if buffer else s["text"]
+        if len(body) < min_chars:
+            buffer = body                       # merge tiny sections forward
+            continue
+        buffer = ""
+        path = [doc["title"], s["heading"]]
+        for i, piece in enumerate(inner.split_text(body)):
+            out.append(Chunk(
+                chunk_id=f"{doc['doc_id']}:{len(out)}",
+                doc_id=doc["doc_id"],
+                text=" > ".join(path) + "\n\n" + piece,
+                heading_path=path, page=s.get("page"),
+                metadata={k: doc.get(k) for k in
+                          ("doc_type", "jurisdiction", "effective_date", "is_current", "source")},
+            ))
+    if buffer:  # trailing tiny section: attach to previous chunk instead of dropping it
+        if out:
+            out[-1].text += "\n" + buffer
+        else:
+            out.append(Chunk(chunk_id=f"{doc['doc_id']}:0", doc_id=doc["doc_id"], text=buffer,
+                             heading_path=[doc["title"]], page=None, metadata={}))
+    return out
+```
+
+The heading prefix is cheap and powerful. A chunk that says only "The maximum is 45%, or 50% with two compensating factors" is ambiguous. Prefixed with "Conventional Loan Policy > 4.2 Debt-to-Income Limits", it embeds near DTI questions and the model can cite "§4.2".
+
+### Contextual chunk headers and contextual retrieval
+
+A stronger version of the same idea: before embedding, ask a cheap LLM to write one or two sentences situating the chunk in its document ("This chunk is from the 2026 Texas home equity policy and describes the 80% LTV cap under Section 50(a)(6)"). Anthropic published this as *contextual retrieval*. It costs one LLM call per chunk at index time (prompt caching on the full document makes it much cheaper), and it helps most when chunks are short and documents are long. Try it after you have a baseline.
+
+## Tables and FAQs
+
+- **Tables:** never split a table across chunks. Keep each table as one chunk with its caption and heading, rendered as Markdown. For large tables, emit one chunk per row group with the header row repeated.
+- **FAQ pages:** one question-answer pair per chunk. Do not merge unrelated questions to reach a target size.
+
+## Parent-child (small-to-big) retrieval
+
+There is a tension: small chunks embed precisely, large chunks give the model enough context. You can have both. Index **small child chunks** (sentences or ~200 tokens) for matching, and store a pointer to their **parent** (the full section). Retrieve on children, then return the deduplicated parents to the LLM. LangChain's `ParentDocumentRetriever` implements this; you will also do it by hand in lesson 17.
+
+## Choosing parameters
+
+Starting points, to be validated with retrieval metrics on your own golden set:
+
+| Corpus | Strategy | Size | Overlap |
+|---|---|---|---|
+| Policy manuals with numbered sections | document-aware + recursive inside | 500–1,000 tokens max per section piece | 10–15% inside long sections |
+| FAQ pages | one Q&A pair per chunk | natural | none |
+| Long unstructured memos | recursive, then try semantic | 300–500 tokens | 10–15% |
+| Rate tables | one table (or row group) per chunk | natural | repeat header row |
+
+Overlap is not free: 20% overlap means about 20% more vectors, storage and embedding cost, and more near-duplicate results that crowd out diverse ones. Use it where boundaries are arbitrary, skip it where boundaries are structural.
+
+## Common mistakes
+
+- **Picking chunk size by vibes.** "512 tokens is standard" is not a reason. Measure recall@k on your questions.
+- **Exceeding the embedding model's input limit.** Many models silently truncate long inputs. A 3,000-token chunk embedded with a 512-token limit is mostly invisible.
+- **Losing metadata during splitting.** Each chunk must carry `doc_id`, page, heading path and filter fields. If you split strings instead of documents, you lose them.
+- **Embedding the heading-prefixed text but showing the model something else.** Keep `text` for embedding and keep the original body for display, but make sure citations point to the same section.
+- **Non-deterministic chunk ids.** If ids change on every run, incremental re-indexing and eval references break. Derive them from `doc_id`, section and position.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you choose a chunking strategy and chunk size for a new corpus?" level="mid">
+
+Start by looking at the documents and the queries. If documents have structure (headings, numbered sections, Q&A), chunk on that structure and split long sections recursively, with the heading path prepended to each chunk. Then treat size and overlap as hyperparameters: build a small golden set of questions with the expected source section, run two or three configurations, and compare recall@k and MRR. Also check token cost per query and the embedding model's input limit. I would pick the smallest configuration that hits the recall target, because smaller context is cheaper and usually more faithful.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What is parent-child retrieval and when does it help?" level="senior">
+
+You index small chunks for precise matching but return their larger parent section to the LLM. It helps when the matching signal is local (one sentence mentions "gift funds") but the answer needs surrounding context (the conditions in the rest of the section). The costs: more vectors to store, a lookup from child to parent, and deduplication when several children share a parent. It can also blow up context size if parents are huge, so cap parent length or fall back to a window around the child. I would validate it against plain section-level chunks on the golden set before adopting it.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [LangChain — Text splitters](https://python.langchain.com/docs/concepts/text_splitters/)
+- [Anthropic — Introducing Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval)
+- [LangChain — Parent document retriever](https://python.langchain.com/docs/how_to/parent_document_retriever/)
+- [Pinecone — Chunking strategies for LLM applications](https://www.pinecone.io/learn/chunking-strategies/)

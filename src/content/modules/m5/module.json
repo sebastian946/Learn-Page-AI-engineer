@@ -1,0 +1,32 @@
+{
+  "id": "m5",
+  "order": 5,
+  "days": 5,
+  "hours": 30,
+  "title": { "en": "Serving & productionizing", "es": "Serving y puesta en producción" },
+  "summary": {
+    "en": "Turn an LLM prototype into a production service: FastAPI streaming, Docker, secrets, Redis caching and rate limiting, pgvector in production, CI/CD with an eval gate, AWS deploys, k6 load tests, cost modeling and graceful degradation.",
+    "es": "Convierte un prototipo LLM en un servicio de producción: streaming con FastAPI, Docker, secretos, caché y rate limiting con Redis, pgvector en producción, CI/CD con eval gate, deploys en AWS, pruebas de carga con k6, modelado de costos y degradación elegante."
+  },
+  "lessons": [
+    { "slug": "01-fastapi-llm-service", "type": "concept", "minutes": 50, "title": { "en": "FastAPI service design for LLM apps", "es": "Diseño de servicios FastAPI para apps LLM" } },
+    { "slug": "02-docker-python-ai", "type": "concept", "minutes": 40, "title": { "en": "Docker multi-stage builds for Python AI apps", "es": "Builds multi-stage de Docker para apps de IA en Python" } },
+    { "slug": "03-config-secrets", "type": "concept", "minutes": 35, "title": { "en": "Configuration and secrets: pydantic-settings and AWS", "es": "Configuración y secretos: pydantic-settings y AWS" } },
+    { "slug": "04-ex-containerize", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: containerize the mortgage knowledge assistant", "es": "Ejercicio: conteneriza el asistente de conocimiento hipotecario" } },
+    { "slug": "05-redis-cache-rate-limit", "type": "concept", "minutes": 45, "title": { "en": "Redis for LLM apps: exact and semantic caching, token-based rate limiting", "es": "Redis para apps LLM: caché exacta y semántica, rate limiting por tokens" } },
+    { "slug": "06-pgvector-production", "type": "concept", "minutes": 45, "title": { "en": "PostgreSQL + pgvector in production", "es": "PostgreSQL + pgvector en producción" } },
+    { "slug": "07-ex-cache-rate-limit", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: add a Redis cache and per-tenant rate limiting", "es": "Ejercicio: agrega caché en Redis y rate limiting por tenant" } },
+    { "slug": "08-github-actions-cicd", "type": "concept", "minutes": 45, "title": { "en": "CI/CD for LLM apps with GitHub Actions", "es": "CI/CD para apps LLM con GitHub Actions" } },
+    { "slug": "09-deploy-aws-alternatives", "type": "concept", "minutes": 50, "title": { "en": "Deploying to AWS (ECS Fargate, Lambda) and Fly.io", "es": "Deploy en AWS (ECS Fargate, Lambda) y Fly.io" } },
+    { "slug": "10-ex-cicd-deploy", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: CI/CD pipeline to ECS Fargate (or Fly.io)", "es": "Ejercicio: pipeline de CI/CD a ECS Fargate (o Fly.io)" } },
+    { "slug": "11-load-testing-k6", "type": "concept", "minutes": 45, "title": { "en": "Load testing LLM endpoints with k6", "es": "Pruebas de carga de endpoints LLM con k6" } },
+    { "slug": "12-ex-k6-load-test", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: k6 load test with thresholds and a results write-up", "es": "Ejercicio: prueba de carga con k6, thresholds y reporte de resultados" } },
+    { "slug": "13-cost-modeling", "type": "concept", "minutes": 40, "title": { "en": "Cost modeling and capacity planning", "es": "Modelado de costos y planificación de capacidad" } },
+    { "slug": "14-graceful-degradation", "type": "concept", "minutes": 45, "title": { "en": "Graceful degradation and feature flags for prompts", "es": "Degradación elegante y feature flags para prompts" } },
+    { "slug": "15-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 5 exam", "es": "Examen del módulo 5" } },
+    { "slug": "16-capstone-support-prod", "type": "project", "minutes": 1800, "title": { "en": "Capstone: customer support assistant in production", "es": "Proyecto final: asistente de soporte al cliente en producción" } }
+  ],
+  "repos": [
+    { "id": "m5-support-prod", "name": "support-assistant-prod", "description": { "en": "Capstone: production deployment of a customer support assistant with SLOs, monitoring, runbook, incident playbook, load tests and cost model.", "es": "Proyecto final: deploy en producción de un asistente de soporte con SLOs, monitoreo, runbook, playbook de incidentes, pruebas de carga y modelo de costos." } }
+  ]
+}

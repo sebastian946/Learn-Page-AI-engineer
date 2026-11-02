@@ -1,0 +1,205 @@
+## Por qué el costo es un input de diseño, no un reporte de finanzas
+
+En un servicio web clásico, el costo marginal de una petición es casi cero. Pagas por servidores, y los servidores están casi siempre ociosos. En un servicio LLM, cada petición tiene un **costo variable directo**: tokens de entrada más tokens de salida, multiplicados por un precio que depende del modelo. Ese costo suele ser mayor que toda tu infraestructura junta.
+
+Por eso el costo se vuelve un input de diseño, como la latencia. Un product manager preguntará: "¿Cuánto nos cuesta por cliente al mes?". Un CTO preguntará: "¿Qué pasa con la factura si el uso se triplica?". Necesitas un modelo que responda ambas en cinco minutos, no una suposición.
+
+Esta lección construye ese modelo. La unidad central es el **costo por 1k peticiones**. Es fácil de comparar entre modelos, escala linealmente a cualquier nivel de tráfico y es el número que los clientes ponen en los requisitos ("menos de $4 por 1k peticiones").
+
+## Anatomía de una petición
+
+Toma una petición RAG del asistente de conocimiento hipotecario. Descomponla en sus drivers de costo:
+
+| Componente | Driver | Tamaño típico (ejemplo) |
+|---|---|---|
+| System prompt | Tokens fijos por petición | 600 tokens |
+| Contexto recuperado | `top_k` × tamaño de chunk | 6 × 400 = 2,400 tokens |
+| Historial de conversación | Turnos conservados × tamaño promedio | 0–2,000 tokens |
+| Pregunta del usuario | Variable | 40 tokens |
+| Salida | Largo de la respuesta, limitado por `max_tokens` | 250 tokens |
+| Embedding de la consulta | Una llamada de embedding | 40 tokens |
+| Re-ranking (opcional) | Precio por documento o por búsqueda | 1 llamada |
+
+Fíjate dónde están los tokens. La pregunta del usuario es menos del 2% de la entrada. **El contexto recuperado y el system prompt dominan.** Por eso `top_k`, el tamaño de chunk y el truncado del historial son palancas de costo, no solo de calidad.
+
+## La fórmula
+
+Para una llamada al modelo:
+
+```text
+cost_per_request = (input_tokens  / 1_000_000) * input_price_per_mtok
+                 + (output_tokens / 1_000_000) * output_price_per_mtok
+```
+
+Para la petición completa, suma embeddings, re-ranking y cualquier llamada LLM extra (reescritura de consultas, clasificadores de guardrails, LLM-as-judge en evals online). Luego:
+
+```text
+cost_per_1k_requests = 1000 * (1 - cache_hit_rate) * avg_cost_per_uncached_request
+                     + 1000 * cache_hit_rate * cost_per_cache_hit
+                     + infra_cost_per_1k_requests
+```
+
+Un cache hit casi no cuesta tokens. Si el 30% del tráfico pega en caché, eliminas aproximadamente el 30% de la factura de tokens. Por eso la caché exacta de la lección 05 suele pagarse sola en la primera semana.
+
+El prompt caching del proveedor (por ejemplo, el prompt caching de Anthropic para un system prompt largo y estable) es otra palanca distinta. Descuenta el prefijo repetido de la entrada. Modélalo como un precio de entrada efectivo más bajo para la porción cacheada. Revisa la página de precios actual del proveedor para los multiplicadores exactos.
+
+## Un modelo de costos en código
+
+Mantén el modelo en el repo, junto al código, para que cambie cuando cambia el código. Los precios vienen de configuración, nunca de constantes hard-coded que se vuelven obsoletas en silencio.
+
+```python
+# tools/cost_model.py
+from pydantic import BaseModel
+
+
+class ModelPrice(BaseModel):
+    name: str
+    input_per_mtok: float   # USD per 1M input tokens — read from config
+    output_per_mtok: float  # USD per 1M output tokens — read from config
+
+
+class RequestProfile(BaseModel):
+    system_tokens: int = 600
+    context_tokens: int = 2400
+    history_tokens: int = 800
+    question_tokens: int = 40
+    output_tokens: int = 250
+    extra_calls_usd: float = 0.0002  # embeddings + re-rank per request
+
+
+def cost_per_request(p: RequestProfile, m: ModelPrice) -> float:
+    input_tokens = p.system_tokens + p.context_tokens + p.history_tokens + p.question_tokens
+    llm = input_tokens / 1e6 * m.input_per_mtok + p.output_tokens / 1e6 * m.output_per_mtok
+    return llm + p.extra_calls_usd
+
+
+def cost_per_1k(
+    p: RequestProfile,
+    m: ModelPrice,
+    cache_hit_rate: float = 0.0,
+    infra_per_1k: float = 0.05,
+) -> float:
+    uncached = cost_per_request(p, m)
+    return 1000 * (1 - cache_hit_rate) * uncached + infra_per_1k
+
+
+if __name__ == "__main__":
+    # Example prices only — check the provider's current pricing page.
+    sonnet = ModelPrice(name="claude-sonnet-5-5", input_per_mtok=3.0, output_per_mtok=15.0)
+    haiku = ModelPrice(name="claude-haiku-5-5", input_per_mtok=1.0, output_per_mtok=5.0)
+    profile = RequestProfile()
+    for model in (sonnet, haiku):
+        for hit in (0.0, 0.3):
+            print(f"{model.name:20} hit={hit:.0%}  ${cost_per_1k(profile, model, hit):.2f} / 1k")
+```
+
+Con estos precios de ejemplo, Sonnet queda alrededor de $15 por 1k peticiones sin caché y Haiku alrededor de $5. Los números exactos importan menos que la **forma**: los tokens de salida son caros por token, los de entrada son caros por volumen y el cache hit rate es un multiplicador directo.
+
+## Mide, no supongas
+
+El perfil de arriba es una suposición hasta que lo reemplaces con datos de producción. Tu servicio ya registra `input_tokens` y `output_tokens` por petición (del cost logging del Módulo 1 y del campo `usage` de cada respuesta). Calcula la distribución real:
+
+```sql
+-- Cost per 1k requests over the last 7 days, by model and tenant
+SELECT
+  model,
+  tenant_id,
+  count(*)                                   AS requests,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY input_tokens)  AS p50_in,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY input_tokens) AS p95_in,
+  avg(output_tokens)                          AS avg_out,
+  1000 * avg(cost_usd)                        AS usd_per_1k
+FROM llm_requests
+WHERE created_at > now() - interval '7 days'
+GROUP BY model, tenant_id
+ORDER BY usd_per_1k DESC;
+```
+
+Mira el p95, no solo los promedios. Unos pocos tenants que pegan documentos de 30 páginas en el chat pueden duplicar tu promedio de tokens de entrada. Esa es una decisión de producto (limitar la entrada) disfrazada de problema de costos.
+
+## Planificación de capacidad
+
+El costo responde "cuánto". La capacidad responde "cuántos contenedores, y si el proveedor nos lo va a permitir". Hay tres techos, y chocas primero con el más bajo.
+
+**1. Rate limits del proveedor.** Los proveedores limitan peticiones por minuto y tokens por minuto (entrada y salida, a veces por separado). Convierte tu tráfico pico a tokens por minuto:
+
+```text
+peak_rps          = 20 requests/s
+input_tpm_needed  = 20 * 60 * 3,840 ≈ 4.6M input tokens/min
+output_tpm_needed = 20 * 60 * 250   = 300k output tokens/min
+```
+
+Compáralo con los límites del tier de tu cuenta. Si te pasas, necesitas un tier más alto, un segundo proveedor o región, un contexto más pequeño o una caché. Averígualo **antes** del día de lanzamiento.
+
+**2. Concurrencia en tu servicio.** Ley de Little: `concurrency = arrival_rate × time_in_system`. Si las peticiones tardan 6 segundos de punta a punta a 20 rps, mantienes 120 streams abiertos en todo momento. FastAPI async maneja cientos de streams concurrentes por task, porque el trabajo es esperar I/O. Pero los connection pools (Postgres, Redis, el cliente HTTP al proveedor) deben dimensionarse para esa concurrencia. Tus resultados de k6 de la lección 11 te dan el número real por task.
+
+**3. Tu infraestructura.** CPU y memoria por task, conexiones a Postgres, ops/s de Redis. Para una API RAG rara vez son el cuello de botella. Se vuelven el cuello de botella cuando corres embeddings o re-rankers dentro del proceso.
+
+Una hoja de capacidad simple:
+
+| Input | Valor | Fuente |
+|---|---|---|
+| Rps pico | 20 | Pronóstico de producto × factor de seguridad 3 |
+| p95 de tiempo en el sistema | 6 s | Corrida de k6, proveedor mock + TTFT real |
+| Streams concurrentes | 120 | Ley de Little |
+| Streams por task (probado) | 60 | Punto de saturación en k6 |
+| Tasks en pico | 2 + 1 de repuesto | 120 / 60, más N+1 |
+| TPM de entrada en pico | 4.6M | Perfil × rps |
+| Límite del tier del proveedor | revisar la cuenta | Consola del proveedor |
+
+## Palancas de costo, ordenadas por esfuerzo
+
+1. **Limita `max_tokens`** y pide respuestas concisas. El cambio más barato. Mide la caída de tokens de salida en tus logs.
+2. **Cachea** las repeticiones exactas. Cero riesgo de calidad si la key es correcta.
+3. **Recorta el contexto**: baja `top_k` después del re-ranking, chunks más pequeños, resume el historial. Verifica con tu suite de evals que el faithfulness se mantiene.
+4. **Enruta por dificultad**: un modelo barato para preguntas simples, el modelo fuerte para las difíciles. Requiere un eval por ruta.
+5. **Prompt caching del proveedor** para system prompts largos y estables.
+6. **Batch APIs** para trabajo offline (corridas de evals, resúmenes de re-indexado), donde la latencia no importa.
+
+Todas las palancas excepto las dos primeras tocan la calidad. Corre el eval gate del Módulo 3 antes y después. Un sistema más barato que falla el umbral de faithfulness no es más barato. Está roto.
+
+## Presupuestos y alertas
+
+Modela el costo y luego hazlo cumplir:
+
+- **Presupuesto mensual por tenant** guardado con el tenant. El rate limiter de la lección 05 puede rechazar o degradar cuando se agota.
+- **Alerta de gasto diario** en tu stack de observabilidad: alerta al 80% del gasto diario esperado, page al 150%.
+- **Techo por petición**: rechaza peticiones cuyos tokens de entrada estimados excedan un límite antes de llamar al proveedor.
+- **Costo por 1k peticiones** como panel del dashboard y como objetivo estilo SLO, revisado cada semana.
+
+## Errores comunes
+
+- **Usar solo tokens promedio.** Las peticiones de cola larga mueven la factura. Sigue el p95 de tokens de entrada por tenant.
+- **Olvidar las llamadas ocultas.** Reescritura de consultas, clasificadores de guardrails, jueces online y reintentos cuestan tokens. Un reintento por timeout puede duplicar el costo de esa petición.
+- **Precios hard-coded.** Los precios cambian. Guárdalos en configuración con una fecha y un link a la fuente.
+- **Planificar capacidad según CPU.** En APIs LLM el primer techo suele ser el límite de tokens por minuto del proveedor, no tus contenedores.
+- **Optimizar costo sin evals.** Bajar `top_k` de 8 a 3 se ve genial en la factura y terrible en faithfulness.
+- **Ignorar las cancelaciones de streaming.** Si los clientes se desconectan y sigues generando, pagas tokens que nadie lee. La lección 01 mostró cómo detenerlo.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Estima el costo mensual de LLM de un asistente RAG que atiende 50,000 peticiones por día." level="senior">
+
+Descompónlo en lugar de adivinar. Por petición: system prompt (~600 tokens), contexto recuperado (`top_k` 6 × 400 = 2,400), historial (~800), pregunta (~40), o sea ~3,800 tokens de entrada y ~250 de salida. Multiplica por los precios actuales por millón del modelo para obtener el costo por petición y luego por 1k peticiones. 50k/día son 1.5M peticiones/mes, entonces 1,500 × costo por 1k. Luego aplica palancas: un hit rate de caché exacta del 30% elimina ~30% del costo de tokens; enrutar preguntas fáciles a un modelo más pequeño recorta más. Declararía los supuestos explícitamente, los validaría contra los datos de `usage` registrados en la primera semana y seguiría el p95 de tokens de entrada, porque las peticiones de cola larga dominan la factura. Por último revisaría el límite de tokens por minuto del proveedor en el pico, porque la capacidad suele fallar antes que el presupuesto.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuál es el primer recurso que se agota cuando una API LLM escala?" level="mid">
+
+Normalmente el rate limit del proveedor, medido en tokens por minuto, no tu propia CPU. El servicio pasa la mayor parte del tiempo esperando I/O, así que unos pocos contenedores async pueden mantener cientos de streams. Convierte los rps pico en tokens de entrada y salida por minuto y compáralos con el tier de la cuenta. Luego revisa los connection pools, dimensionados con la ley de Little (`concurrency = rps × latency`).
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Di la unidad en voz alta">
+
+Cita el costo como "dólares por 1k peticiones" y la latencia como "p95". Señala que has operado sistemas reales. Luego átalo a una unidad de negocio: costo por tenant al mes, o costo por ticket resuelto.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Precios y prompt caching de Anthropic: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- Rate limits de Anthropic: https://docs.anthropic.com/en/api/rate-limits
+- Guía de rate limits de OpenAI: https://platform.openai.com/docs/guides/rate-limits
+- Documentación de AWS Pricing Calculator: https://docs.aws.amazon.com/pricing-calculator/latest/userguide/what-is-pricing-calculator.html
+- Ley de Little en pruebas de rendimiento (docs de k6 sobre executors de arrival rate): https://k6.io/docs/using-k6/scenarios/executors/

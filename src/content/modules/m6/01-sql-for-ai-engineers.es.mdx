@@ -1,0 +1,244 @@
+# SQL para AI engineers: window functions, CTEs, JSONB y logs de LLM
+
+Todo sistema con LLM que pones en producción escribe datos: logs de requests, conteos de tokens, latencias, resultados de retrieval, feedback de usuarios, resultados de evals. Los dashboards que arma otra persona responden las preguntas fáciles. Las interesantes — "¿qué versión del prompt empeoró para el tenant X?", "¿qué tienen en común nuestras peores respuestas?" — necesitan SQL escrito por ti.
+
+Ya conoces PostgreSQL. Esta lección se enfoca en las cuatro herramientas de SQL que hacen la mayor parte del trabajo en AI engineering:
+
+1. **CTEs** para dividir un análisis en pasos con nombre y fáciles de probar.
+2. **Window functions** para rankings por grupo, percentiles y comparaciones entre corridas.
+3. **Operadores JSON** para explorar los payloads de request y response.
+4. **Patrones de muestreo y deduplicación** para convertir tráfico de producción en datasets de evaluación.
+
+## El esquema que usaremos
+
+Una tabla realista de logs de requests. Una fila por llamada al LLM.
+
+```sql
+CREATE TABLE llm_requests (
+  request_id     uuid PRIMARY KEY,
+  ts             timestamptz NOT NULL,
+  tenant_id      text NOT NULL,
+  model          text NOT NULL,
+  prompt_version text NOT NULL,
+  input_tokens   int NOT NULL,
+  output_tokens  int NOT NULL,
+  latency_ms     int NOT NULL,
+  status         text NOT NULL,          -- 'ok' | 'error' | 'timeout' | 'refused'
+  cost_usd       numeric(12, 6) NOT NULL,
+  request        jsonb NOT NULL,         -- {"question": "...", "route": "...", "retries": 0}
+  response       jsonb,                  -- {"answer": "...", "citations": [...]}
+  feedback       smallint                -- 1 thumbs up, -1 thumbs down, NULL none
+);
+CREATE INDEX ON llm_requests (ts);
+CREATE INDEX ON llm_requests USING gin (request jsonb_path_ops);
+```
+
+Guarda el costo en la fila, calculado al momento de escribir con la tabla de precios vigente ese día. Recalcular el costo después con los precios de hoy te da un historial incorrecto.
+
+## CTEs: el análisis como pipeline
+
+Un CTE (`WITH ... AS`) es un sub-resultado con nombre. Piénsalo como un fixture en un test: preparas los datos una vez y luego haces aserciones sobre ellos. Los análisis largos se vuelven pasos legibles de arriba hacia abajo.
+
+```sql
+WITH daily AS (
+  SELECT date_trunc('day', ts) AS day, tenant_id,
+         count(*)                               AS requests,
+         sum(cost_usd)                          AS cost,
+         avg((status <> 'ok')::int)::numeric(5,4) AS error_rate
+  FROM llm_requests
+  WHERE ts >= now() - interval '30 days'
+  GROUP BY 1, 2
+),
+ranked AS (
+  SELECT *, rank() OVER (PARTITION BY day ORDER BY cost DESC) AS cost_rank
+  FROM daily
+)
+SELECT day, tenant_id, requests, cost, error_rate
+FROM ranked
+WHERE cost_rank <= 3
+ORDER BY day DESC, cost_rank;
+```
+
+Eso responde "los tres tenants más caros por día" sin subconsultas anidadas. Cada CTE se puede ejecutar por separado mientras depuras, el mismo hábito que aislar el paso que falla en un test.
+
+## Window functions: la herramienta principal
+
+Una window function calcula sobre un conjunto de filas relacionadas con la fila actual **sin colapsarlas**. `GROUP BY` devuelve una fila por grupo. Una window devuelve cada fila más un valor a nivel de grupo.
+
+### Percentiles de latencia por modelo y por día
+
+Los promedios esconden la latencia de cola. Los usuarios sienten el p95, no la media.
+
+```sql
+SELECT date_trunc('day', ts) AS day, model,
+       count(*) AS n,
+       percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms,
+       percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99_ms
+FROM llm_requests
+WHERE status = 'ok'
+GROUP BY 1, 2
+ORDER BY 1 DESC, 2;
+```
+
+`percentile_cont` es un agregado de conjunto ordenado en Postgres. En Databricks SQL usa `percentile(latency_ms, 0.95)` o `percentile_approx(latency_ms, 0.95)`; la versión aproximada es mucho más barata sobre miles de millones de filas.
+
+### La última fila por clave con ROW_NUMBER
+
+La deduplicación y el "estado más reciente" usan el mismo patrón:
+
+```sql
+SELECT *
+FROM (
+  SELECT r.*,
+         row_number() OVER (PARTITION BY request->>'question_hash' ORDER BY ts DESC) AS rn
+  FROM llm_requests r
+) t
+WHERE rn = 1;
+```
+
+Databricks SQL soporta `QUALIFY`, que elimina la subconsulta: `... QUALIFY row_number() OVER (...) = 1`.
+
+### Comparar corridas con LAG
+
+Los resultados de evals también son una serie de tiempo. Supón que guardas una fila por corrida de evaluación:
+
+```sql
+-- eval_runs(run_id, started_at, prompt_version, dataset_version, metric, value)
+SELECT prompt_version, metric, started_at, value,
+       value - lag(value) OVER (PARTITION BY metric ORDER BY started_at) AS delta
+FROM eval_runs
+WHERE dataset_version = 'golden-v3'
+ORDER BY metric, started_at;
+```
+
+Un `delta` negativo en `faithfulness` es una regresión. Esta es la consulta detrás de un gate de "¿este PR empeoró las cosas?".
+
+## JSON: consultar payloads
+
+Los requests y responses son semiestructurados. Operadores `jsonb` de Postgres:
+
+| Operador | Significado | Ejemplo |
+|---|---|---|
+| `->` | obtiene un valor JSON | `response->'citations'` |
+| `->>` | obtiene como texto | `request->>'route'` |
+| `@>` | contención (usa índice GIN) | `request @> '{"route": "billing"}'` |
+| `jsonb_array_length` | tamaño de un arreglo | `jsonb_array_length(response->'citations')` |
+| `jsonb_path_exists` | prueba con JSONPath | `jsonb_path_exists(request, '$.retries ? (@ > 0)')` |
+
+Una consulta de salud útil: proporción de respuestas sin citas, por ruta.
+
+```sql
+SELECT request->>'route' AS route,
+       count(*) AS n,
+       avg((coalesce(jsonb_array_length(response->'citations'), 0) = 0)::int) AS no_citation_rate,
+       avg((request->>'retries')::int) AS avg_retries
+FROM llm_requests
+WHERE status = 'ok' AND ts >= now() - interval '7 days'
+GROUP BY 1
+ORDER BY no_citation_rate DESC;
+```
+
+En **Databricks SQL**, el JSON guardado como `STRING` se consulta con la sintaxis de dos puntos: `request:route`, `response:citations[0].doc_id`. También puedes convertirlo en un struct con `from_json(request, 'route STRING, retries INT')`, o usar el tipo `VARIANT` en runtimes recientes. Mismas ideas, distinta sintaxis; revisa la documentación de la versión que uses.
+
+## Construir datasets de evaluación desde producción
+
+Tu golden dataset del Módulo 3 fue escrito a mano. Se vuelve obsoleto. El tráfico de producción muestra lo que los usuarios realmente preguntan. El objetivo es una muestra **representativa, deduplicada y etiquetada**.
+
+Reglas que importan:
+
+- **Estratifica.** El muestreo aleatorio sobrerrepresenta la ruta dominante. Toma N por ruta (o por tenant, por intención).
+- **Sobremuestrea las fallas.** Thumbs-down, rechazos, timeouts y respuestas sin citas son donde viven los bugs. Mézclalos en una proporción fija, por ejemplo 30%.
+- **Deduplica sobre una pregunta normalizada.** Minúsculas, trim, colapsar espacios y luego hash. Si no, una pregunta popular domina todo.
+- **Elimina PII antes de exportar.** Más sobre esto en la próxima lección.
+- **Versiónalo.** Registra la consulta, el rango de fechas y el número de filas junto con el dataset.
+
+```sql
+WITH base AS (
+  SELECT request_id, ts, request->>'route' AS route,
+         request->>'question' AS question,
+         response->>'answer' AS answer, feedback, status,
+         md5(regexp_replace(lower(trim(request->>'question')), '\s+', ' ', 'g')) AS qhash
+  FROM llm_requests
+  WHERE ts >= now() - interval '30 days'
+),
+dedup AS (
+  SELECT DISTINCT ON (qhash) *
+  FROM base
+  ORDER BY qhash, (feedback = -1) DESC NULLS LAST, ts DESC
+),
+strata AS (
+  SELECT *,
+         CASE WHEN feedback = -1 OR status <> 'ok' THEN 'failure' ELSE 'normal' END AS bucket,
+         row_number() OVER (
+           PARTITION BY route,
+             CASE WHEN feedback = -1 OR status <> 'ok' THEN 'failure' ELSE 'normal' END
+           ORDER BY random()) AS rn
+  FROM dedup
+)
+SELECT request_id, route, bucket, question, answer
+FROM strata
+WHERE (bucket = 'normal' AND rn <= 14) OR (bucket = 'failure' AND rn <= 6)
+ORDER BY route, bucket;
+```
+
+`DISTINCT ON` conserva la copia con thumbs-down de una pregunta duplicada, así las fallas sobreviven la deduplicación. La window le da a cada ruta 14 ejemplos normales y 6 de falla. Usa `setseed(0.42)` antes de la consulta si necesitas muestras reproducibles.
+
+Luego exporta al formato que espera tu framework de evaluación. La evaluación GenAI de MLflow (lección 6) usa registros como estos:
+
+```python
+import json
+import psycopg
+
+SQL = open("sql/eval_sample.sql").read()
+
+with psycopg.connect("postgresql://localhost/llmlogs") as conn, open("eval_v1.jsonl", "w") as f:
+    for request_id, route, bucket, question, answer in conn.execute(SQL):
+        record = {
+            "inputs": {"question": question},
+            "expectations": {"expected_response": None},  # filled by a human labeler
+            "tags": {"route": route, "bucket": bucket, "source_request_id": str(request_id)},
+        }
+        f.write(json.dumps(record) + "\n")
+```
+
+Deja `expectations` vacío para un etiquetador o una sesión de revisión con expertos (SMEs). Nunca copies la respuesta de producción como respuesta esperada sin revisarla: estarías codificando los bugs de hoy como la verdad de mañana.
+
+## Errores comunes
+
+- **Promediar la latencia.** Reporta p50/p95/p99. Una llamada lenta a una herramienta arruina la cola, no la media.
+- **Mezclar errores en las estadísticas de latencia.** Los timeouts quedan en el límite y distorsionan los percentiles. Filtra por status o repórtalos aparte.
+- **Recalcular el costo con precios actuales.** Guarda el costo por fila al escribir.
+- **Muestreo aleatorio para sets de evaluación.** Obtienes 80% de una intención y cero casos borde. Estratifica y sobremuestrea fallas.
+- **No deduplicar.** La misma FAQ aparece 400 veces e infla tu tasa de aprobación.
+- **Escaneos completos sobre JSON.** Agrega un índice GIN para consultas `@>`, o promueve los campos más usados (ruta, tenant) a columnas reales.
+- **`ORDER BY random()` sin semilla** cuando importa la reproducibilidad.
+
+## Cómo aparece esto en entrevistas
+
+Las entrevistas de AI engineering incluyen cada vez más una prueba de SQL con un esquema de logs o eventos. Espera "encuentra el p95 por grupo", "la última fila por clave" y "el cambio semana contra semana".
+
+<InterviewQuestion question="Dada una tabla de requests a un LLM, ¿cómo encontrarías qué versión del prompt causó una regresión de calidad?" level="mid">
+
+Une el log de requests con el feedback o los resultados de evals, agrupa por `prompt_version` y día, y calcula una métrica de calidad (tasa de thumbs-down, tasa de aprobación en evals). Usa `LAG` sobre el tiempo, ordenado por fecha de deploy, para obtener el delta entre versiones. Controla la mezcla: compara dentro de la misma ruta o tenant, porque una versión nueva pudo salir justo cuando cambió el tráfico. Confirma con una evaluación offline de ambas versiones sobre el mismo dataset congelado antes de culpar al prompt.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo construyes un dataset de evaluación a partir de logs de producción sin sesgarlo?" level="senior">
+
+Estratifica por intención o ruta para que los segmentos pequeños estén representados. Sobremuestrea las fallas conocidas (thumbs-down, rechazos, respuestas sin citas) en una proporción fija y documentada. Deduplica sobre un hash de la pregunta normalizada. Elimina PII antes de exportar. Etiqueta las expectativas con humanos o SMEs, no copiando la respuesta del modelo. Versiona el dataset con su consulta, rango de fechas y conteos, y refréscalo periódicamente manteniendo un set de regresión congelado para CI.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Di el trade-off">
+
+Cuando menciones `percentile_approx`, agrega el porqué: los percentiles exactos necesitan ordenar todo cada grupo; los aproximados tienen error acotado y escalan a miles de millones de filas. Los entrevistadores buscan ese tipo de razonamiento.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Window functions en PostgreSQL: https://www.postgresql.org/docs/current/tutorial-window.html
+- Funciones y operadores JSON en PostgreSQL: https://www.postgresql.org/docs/current/functions-json.html
+- Databricks SQL: consultar strings JSON: https://docs.databricks.com/en/sql/language-manual/sql-ref-json-path-expression.html
+- Cláusula `QUALIFY` en Databricks SQL: https://docs.databricks.com/en/sql/language-manual/sql-ref-syntax-qry-select-qualify.html

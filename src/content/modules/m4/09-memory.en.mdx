@@ -1,0 +1,179 @@
+## Two kinds of memory
+
+LLMs are stateless. Every call sees only what you put in the context window. "Memory" in an agent is an engineering decision about **what to keep, where, for how long, and what to send back to the model**.
+
+LangGraph separates two scopes:
+
+| | Short-term memory | Long-term memory |
+|---|---|---|
+| Scope | One thread (a conversation, a ticket, a job) | Across threads (per user, per customer, per tenant) |
+| Mechanism | Graph state saved by the **checkpointer** | A **store** (`BaseStore`) with namespaces and keys |
+| Typical content | Messages, tool results, intermediate plans | Preferences, known facts, past resolutions, procedures |
+| Lifetime | Until the thread ends or is archived | Until you delete it, or a TTL expires |
+| Main risk | Context grows until it is slow, costly or truncated | Stale, wrong or sensitive facts leak into new conversations |
+
+A useful mental model from testing: short-term memory is the state of one test run; long-term memory is a shared fixture database. Shared fixtures are powerful and a classic source of flaky, order-dependent bugs. Treat long-term memory with the same suspicion.
+
+## Short-term memory: the thread
+
+You already have it. Compile with a checkpointer and reuse the same `thread_id`, and the `messages` list keeps growing turn after turn. The problem is growth. A support thread with 15 tool calls that each return 2 KB of JSON costs more on every new turn, gets slower, and eventually hits the context window.
+
+Three strategies, from simplest to most capable:
+
+1. **Trim**: send only the last N tokens of messages to the model. State keeps everything; the model sees a window.
+2. **Summarize**: replace old messages with a running summary, and delete them from state.
+3. **Compress tool results**: store a short version of large tool outputs (ids, key fields), and keep the raw payload in your database or trace.
+
+Trimming is a view over the state. It does not change what is saved:
+
+```python
+from langchain_core.messages import trim_messages
+
+
+def call_model(state: AgentState) -> dict:
+    window = trim_messages(
+        state["messages"],
+        max_tokens=6_000,
+        strategy="last",
+        token_counter=llm,          # uses the model's token counting
+        start_on="human",           # never start the window on a dangling tool result
+        include_system=True,
+    )
+    response = llm.invoke([("system", SYSTEM), *window])
+    return {"messages": [response]}
+```
+
+`start_on="human"` matters. If the window starts with a `ToolMessage` whose matching tool call was trimmed away, the provider rejects the request.
+
+## Summarization as a node
+
+Summarization changes state. A common pattern: after each agent turn, if the thread has more than K messages, a `summarize` node asks a small, cheap model to fold the oldest messages into a `summary` field, then deletes them with `RemoveMessage`.
+
+```python
+from langchain_core.messages import RemoveMessage, SystemMessage
+from langchain_anthropic import ChatAnthropic
+
+summarizer = ChatAnthropic(model="claude-haiku-5-5", max_tokens=400)
+KEEP_LAST = 8
+
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], add_messages]
+    summary: str
+
+
+def summarize(state: AgentState) -> dict:
+    old = state["messages"][:-KEEP_LAST]
+    if not old:
+        return {}
+    prompt = (
+        "Update the running summary of this logistics support case. Keep order ids, "
+        "decisions, promises made to the customer and open questions. Drop small talk.\n\n"
+        f"Current summary:\n{state.get('summary', '(none)')}"
+    )
+    new_summary = summarizer.invoke([SystemMessage(prompt), *old]).content
+    return {
+        "summary": new_summary,
+        "messages": [RemoveMessage(id=m.id) for m in old],  # add_messages deletes these
+    }
+
+
+def should_summarize(state: AgentState) -> str:
+    return "summarize" if len(state["messages"]) > 20 else "end"
+```
+
+In the agent node, prepend the summary as context: `[("system", SYSTEM + "\n\nCase summary:\n" + summary), *messages]`.
+
+Watch the boundary: do not cut between an AI message with tool calls and its tool results. Move the cut point back until the kept slice starts on a human message.
+
+## Long-term memory: the store
+
+The store is a key-value document store with **namespaces** (tuples) and optional semantic search. You pass it at compile time, and nodes receive it by declaring a `store` parameter.
+
+```python
+from langgraph.store.base import BaseStore
+from langgraph.store.memory import InMemoryStore
+from langchain_core.runnables import RunnableConfig
+
+store = InMemoryStore(index={"embed": embeddings, "dims": 1536})  # embeddings: any LangChain Embeddings
+
+
+def recall(state: AgentState, config: RunnableConfig, *, store: BaseStore) -> dict:
+    customer_id = config["configurable"]["customer_id"]
+    query = state["messages"][-1].content
+    hits = store.search(("customers", customer_id, "facts"), query=query, limit=5)
+    facts = "\n".join(f"- {h.value['fact']}" for h in hits)
+    return {"summary": state.get("summary", "") + f"\n\nKnown about customer:\n{facts}"}
+
+
+def remember(state: AgentState, config: RunnableConfig, *, store: BaseStore) -> dict:
+    customer_id = config["configurable"]["customer_id"]
+    # Facts extracted by a structured-output call earlier in the graph (not shown).
+    for fact in state.get("new_facts", []):
+        store.put(
+            ("customers", customer_id, "facts"),
+            key=fact["key"],                     # stable key -> update, not duplicate
+            value={"fact": fact["text"], "source_thread": config["configurable"]["thread_id"]},
+        )
+    return {}
+
+
+graph = builder.compile(checkpointer=checkpointer, store=store)
+graph.invoke(
+    {"messages": [("user", "Same as last time, deliver to the back dock.")]},
+    {"configurable": {"thread_id": "ticket-9001", "customer_id": "CUST-77"}},
+)
+```
+
+Design notes:
+
+- **Namespace by tenant and user** first: `("customers", customer_id, "facts")`. A missing tenant in the namespace is a data leak between customers.
+- **Stable keys** (`"delivery_preference"`) make updates overwrite old values instead of piling up contradictions.
+- **Record provenance** (source thread, timestamp). When a memory is wrong, you need to know where it came from.
+- `InMemoryStore` is for development. Use `PostgresStore` (from `langgraph.store.postgres`) with pgvector in production.
+
+## What to write, and what to forget
+
+Writing memory is easy. Writing *good* memory is a product decision. Three kinds are worth keeping:
+
+- **Semantic**: facts and preferences ("receives deliveries at the back dock", "prefers email").
+- **Episodic**: past cases and how they were resolved ("May 2026: damaged pallet, reshipped, no refund"). Good few-shot material.
+- **Procedural**: rules the agent learned or was given ("for carrier X, reschedule needs 48 h notice"). Often better kept in versioned prompts than in a store.
+
+Forgetting is a feature:
+
+- **Do not store** secrets, payment data, or sensitive personal data you do not need. Memory is a database; GDPR-style deletion requests apply to it.
+- **Expire** time-bound facts with a TTL (a delivery address for one shipment is not a permanent preference).
+- **Overwrite, do not append**, when a fact changes. Two contradictory memories confuse the model more than none.
+- **Do not store model guesses as facts.** Only write things the user stated or a tool confirmed.
+- **Give users and operators a way to view and delete** what the agent remembers.
+
+## Common mistakes
+
+- **Unbounded threads.** Cost and latency grow every turn until the context window breaks. Trim or summarize from day one.
+- **Trimming that orphans tool results.** The provider rejects a tool result without its tool call. Start windows on a human message.
+- **Using long-term memory as a log.** Storing every message in the store makes retrieval noisy. Store distilled facts; keep raw history in traces.
+- **No tenant in the namespace.** One customer's preferences show up in another customer's conversation.
+- **Summaries that drop commitments.** If the summary loses "we promised a callback on Friday", the agent breaks a promise. Tell the summarizer what must survive, and test it.
+- **Memory without tests.** Write evals that check a remembered fact is used in a later thread, and that a deleted fact is not.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you handle conversation history that grows too large for the context window?" level="mid">
+
+I separate what is stored from what is sent. The checkpointer keeps the full thread, and the model gets a window: `trim_messages` with a token budget, starting on a human message so no tool result is orphaned. For long cases I add a summarization node that runs past a threshold: a cheap model folds old messages into a running summary, and `RemoveMessage` deletes them from state. The summary prompt lists what must survive, such as ids, decisions and promises. I also shrink large tool outputs before they enter the state. Then I measure tokens per turn to confirm it stays flat.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What would you store in long-term memory for a customer-support agent, and what would you avoid?" level="senior">
+
+I would store distilled, confirmed facts: preferences, delivery constraints, past resolutions. Each one is namespaced by tenant and customer, has a stable key so updates overwrite, and records its source thread and timestamp. I would avoid raw transcripts, model guesses, payment data and anything sensitive I do not need, and I would put TTLs on time-bound facts. Procedural rules usually belong in versioned prompts, not memory, so they go through review. Operators get a way to view and delete memories, which also covers deletion requests. Finally, I test memory: a fact learned in thread A should change behavior in thread B, and a deleted fact should not.
+
+</InterviewQuestion>
+
+## Further reading
+
+- LangGraph memory concepts: https://langchain-ai.github.io/langgraph/concepts/memory/
+- LangGraph persistence (checkpointers and stores): https://langchain-ai.github.io/langgraph/concepts/persistence/
+- Anthropic context windows: https://docs.anthropic.com/en/docs/build-with-claude/context-windows
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents

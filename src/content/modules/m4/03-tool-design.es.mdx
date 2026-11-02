@@ -1,0 +1,189 @@
+## Las herramientas son una API para un cliente no determinista
+
+El modelo es un nuevo tipo de consumidor de APIs. Lee tu documentación cada vez, la toma literalmente, no puede hacer preguntas aclaratorias y de vez en cuando enviará basura. La mayoría de las fallas de agentes en producción no son "el modelo es tonto". Son bugs de diseño de herramientas: descripciones vagas, herramientas que se solapan, errores sobre los que el modelo no puede actuar, resultados demasiado grandes para la ventana de contexto.
+
+Tus instintos de SDET ayudan aquí. Una definición de herramienta es un **contrato**. Diséñala como una API pública y luego pruébala como tal.
+
+## 1. El schema: haz imposibles las llamadas inválidas
+
+El JSON schema es la primera línea de defensa. Úsalo para restringir, no solo para describir.
+
+- Usa `enum` para conjuntos cerrados (`category`, `status`).
+- Usa `pattern` para ids (`^ORD-[0-9]{6}$`), `format: date` para fechas, `minimum`/`maximum` para números.
+- Prefiere enteros en unidades menores para dinero: `amount_cents`, no un float `amount`.
+- Marca como `required` solo los campos realmente obligatorios. Da valores por defecto en código a los opcionales.
+- Mantén los parámetros planos. Objetos anidados a tres niveles invitan a llamadas mal formadas.
+
+Con Pydantic v2 escribes el modelo una vez y generas el schema:
+
+```python
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class RescheduleDeliveryInput(BaseModel):
+    """Move the delivery of ONE existing order to a new date.
+
+    Use only after get_order confirms the order is not yet delivered.
+    The new date must be a business day within the next 14 days.
+    Safe to retry with the same idempotency_key.
+    """
+    order_id: str = Field(pattern=r"^ORD-[0-9]{6}$", description="Order id, e.g. ORD-104233")
+    new_date: date = Field(description="Requested delivery date, ISO format YYYY-MM-DD")
+    idempotency_key: str = Field(min_length=8, description="Unique key per intended change; reuse it on retries")
+
+class CreateTicketInput(BaseModel):
+    """Open a support ticket for a human team. Use when no tool can resolve the issue."""
+    order_id: str = Field(pattern=r"^ORD-[0-9]{6}$")
+    category: Literal["damaged", "lost", "late", "billing", "other"]
+    summary: str = Field(max_length=500, description="One paragraph, facts only, no speculation")
+
+def to_anthropic_tool(name: str, model: type[BaseModel]) -> dict:
+    return {
+        "name": name,
+        "description": model.__doc__.strip(),
+        "input_schema": model.model_json_schema(),
+    }
+```
+
+Luego valida a la entrada. Nunca confíes en que el modelo respetó el schema. `RescheduleDeliveryInput.model_validate(block.input)` convierte una llamada mal formada en un error de validación limpio que puedes devolver.
+
+## 2. Descripciones: escribe para una persona nueva e inteligente
+
+La descripción es el prompt para seleccionar herramientas. Las buenas descripciones responden cuatro preguntas:
+
+1. **¿Qué hace?** Una frase.
+2. **¿Cuándo debe usarse y cuándo no?** "Úsala solo después de que get_order confirme..." Desambigua frente a herramientas parecidas.
+3. **¿Qué devuelve?** Nombra los campos clave para que el modelo sepa qué esperar.
+4. **¿Qué efectos secundarios tiene?** "Cambia estado visible para el cliente." "Solo lectura." "Segura para reintentar."
+
+Mala: `"get_order: gets order"`. Buena: `"Look up one order by id. Read-only. Returns status (pending|in_transit|delayed|delivered|cancelled), carrier, promised_date and items. Use list_orders to search by customer."`
+
+Nombra las herramientas con verbos y sustantivos del dominio: `get_order`, `reschedule_delivery`. Evita casi-duplicados como `get_order` y `fetch_order_details`. Si dos herramientas se solapan, el modelo elegirá al azar entre ellas, y tus evals de trayectoria serán flaky por una razón que no tiene nada que ver con el modelo.
+
+## 3. Idempotencia: los reintentos deben ser seguros
+
+Los agentes reintentan. El modelo puede llamar la misma herramienta dos veces porque no "vio" el primer resultado, tu bucle puede reintentar tras un timeout, o un humano puede reanudar un grafo después de una interrupción y repetir un nodo. Para cualquier herramienta que **cambia estado**, una llamada duplicada no debe duplicar el efecto.
+
+Patrón: la herramienta recibe un `idempotency_key`. El backend guarda la llave con el resultado. Una llave repetida devuelve el resultado guardado en lugar de actuar de nuevo.
+
+```python
+import hashlib, json
+
+async def reschedule_delivery(inp: RescheduleDeliveryInput, db) -> dict:
+    existing = await db.fetchrow(
+        "SELECT response FROM idempotency WHERE key = $1", inp.idempotency_key
+    )
+    if existing:
+        return json.loads(existing["response"]) | {"replayed": True}
+
+    order = await db.fetchrow("SELECT status FROM orders WHERE id = $1", inp.order_id)
+    if order is None:
+        return tool_error("ORDER_NOT_FOUND", f"{inp.order_id} does not exist",
+                          retryable=False, hint="Confirm the id with the customer or call list_orders.")
+    if order["status"] == "delivered":
+        return tool_error("ALREADY_DELIVERED", "Order was delivered; it cannot be rescheduled.",
+                          retryable=False, hint="Offer create_ticket with category 'other'.")
+
+    await db.execute("UPDATE orders SET promised_date = $1 WHERE id = $2", inp.new_date, inp.order_id)
+    response = {"order_id": inp.order_id, "new_date": inp.new_date.isoformat(), "status": "rescheduled"}
+    await db.execute("INSERT INTO idempotency(key, response) VALUES ($1, $2)",
+                     inp.idempotency_key, json.dumps(response))
+    return response
+```
+
+¿Quién genera la llave? Dos opciones. Dejar que el modelo pase una (simple, pero el modelo podría reutilizar una llave para otra intención). O derivarla en tu executor a partir del id del hilo más los argumentos normalizados, por ejemplo `sha256(thread_id + tool_name + canonical_json(args))`. La segunda es más robusta; convierte "la misma intención en la misma conversación" en la misma llave.
+
+Las herramientas de solo lectura son idempotentes por naturaleza. Diséñalas así: nada de escrituras ocultas en una herramienta `get_`.
+
+## 4. Contratos de error sobre los que el modelo pueda actuar
+
+Un stack trace no le sirve a un modelo. Un error debe decirle **qué salió mal, si tiene sentido reintentar y qué hacer en su lugar**. Usa una sola forma para todas las herramientas:
+
+```python
+def tool_error(code: str, message: str, *, retryable: bool, hint: str) -> dict:
+    return {"error": {"code": code, "message": message, "retryable": retryable, "hint": hint}}
+```
+
+```json
+{"error": {"code": "ORDER_NOT_FOUND", "message": "ORD-999999 does not exist",
+           "retryable": false, "hint": "Ask the customer to confirm the order id or call list_orders with their customer_id."}}
+```
+
+- `code`: estable, legible por máquina, enumerable. Tus evals y dashboards agrupan por él.
+- `retryable`: `true` para timeouts y 429, `false` para errores de validación y reglas de negocio. Esto evita que el modelo insista en un callejón sin salida.
+- `hint`: la siguiente mejor acción, en lenguaje simple. Es el campo más subestimado de la ingeniería de agentes.
+
+Devuélvelo como un `tool_result` con `is_error: true`. No lances una excepción que mate el bucle, a menos que la falla sea realmente irrecuperable (autenticación rota, configuración faltante). Esas deben detener al agente y alertarte.
+
+Maneja los errores **transitorios** dentro de la herramienta, no en el modelo. Reintenta un 503 dos veces con backoff en código. Solo muestra el error al modelo cuando tus reintentos se agoten. Cada reintento que hace el modelo cuesta una llamada completa al modelo.
+
+## 5. Paginación y tamaño de resultados
+
+Los resultados de herramientas entran en la ventana de contexto. Un `list_orders` que devuelve 2,000 pedidos costará miles de tokens, empujará fuera historial útil y degradará el razonamiento.
+
+- Usa páginas pequeñas por defecto (`limit` por defecto 20, máximo 50).
+- Devuelve un `next_cursor` y un `total` para que el modelo sepa que hay más.
+- Devuelve **resúmenes**, no registros completos. Deja que el modelo llame `get_order` para el detalle.
+- Trunca los campos de texto largos y dilo: `"notes": "...(truncated, 4,210 chars)"`.
+
+```json
+{"orders": [{"order_id": "ORD-104233", "status": "delayed", "promised_date": "2026-11-04"}],
+ "next_cursor": "eyJvZmZzZXQiOjIwfQ", "total": 87}
+```
+
+Un cursor es opaco. No dejes que el modelo calcule offsets; los calculará mal.
+
+## 6. Timeouts y latencia
+
+Cada tool call necesita un timeout. Una API de transportadora colgada no debería colgar a tu agente 60 segundos mientras el usuario mira un spinner.
+
+```python
+import asyncio
+
+async def call_with_timeout(fn, args, timeout_s: float = 8.0) -> dict:
+    try:
+        return await asyncio.wait_for(fn(args), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return tool_error("UPSTREAM_TIMEOUT", f"{fn.__name__} took longer than {timeout_s}s",
+                          retryable=True, hint="Retry once. If it fails again, create a ticket.")
+```
+
+Define timeouts por herramienta según la latencia p99 observada, no un único número global. Las tarifas de un agregador de transportadoras pueden necesitar 10 s; una consulta a base de datos debería terminar en 500 ms.
+
+## Probar herramientas como SDET
+
+- **Tests unitarios** por herramienta: camino feliz, cada código de error, replay idempotente.
+- **Tests de contrato**: snapshots del schema en CI, para que un campo renombrado sea un cambio revisado.
+- **Tests de selección**: un pequeño set de evals con solicitudes de usuario y la herramienta esperada. Ejecútalo cada vez que edites una descripción. Ahí se atrapan las descripciones vagas.
+
+## Errores comunes
+
+- **Herramientas que se solapan** con nombres y descripciones parecidas. El modelo elige al azar.
+- **Floats para dinero** y fechas en texto libre. Usa `amount_cents` y fechas ISO.
+- **Escrituras no idempotentes.** Un reembolso reintentado se convierte en dos reembolsos.
+- **Errores como excepciones o stack traces crudos.** El bucle muere o el modelo recibe ruido.
+- **Resultados de listas sin límite.** Contexto inflado y mayor costo.
+- **Sin timeout por herramienta.** Un upstream lento frena todo.
+- **Exponer APIs de bajo nivel.** Diez endpoints CRUD son peores que tres herramientas con forma de tarea.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo diseñas una herramienta para que un agente la use de forma confiable?" level="mid">
+
+La trato como un contrato de API pública. JSON schema estricto: enums, patterns, enteros en unidades menores para dinero, fechas ISO, pocos campos obligatorios. Una descripción que dice qué hace, cuándo usarla y cuándo no, qué devuelve y si tiene efectos secundarios. Las escrituras reciben una idempotency key para que los reintentos sean seguros. Cada error usa una sola forma con un código estable, un flag retryable y un hint para la siguiente acción, devuelto como tool result de error. Los resultados van paginados y resumidos, y cada llamada tiene timeout. Luego la pruebo: tests unitarios por código de error, snapshots del schema y un set de evals de selección de herramientas.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Un agente emitió el mismo reembolso dos veces. ¿Qué salió mal y cómo lo previenes?" level="senior">
+
+La herramienta de reembolso no era idempotente y algo repitió la llamada: el modelo la repitió, mi bucle reintentó tras un timeout o un grafo reanudado volvió a ejecutar el nodo. La solución es por capas. La herramienta exige una idempotency key, derivada por mi executor a partir del id del hilo más los argumentos canónicos, y el backend guarda llave y respuesta para que un replay devuelva el resultado original. Los reembolsos quedan detrás de una compuerta de aprobación humana. Una guarda de bucle marca tool calls idénticas repetidas. Y agrego un caso de regresión a la suite de evals de trayectoria que verifica exactamente una llamada de reembolso.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Anthropic — Definir herramientas (documentación de tool use): https://docs.anthropic.com/en/docs/build-with-claude/tool-use
+- Anthropic — Building effective agents, apéndice sobre prompt engineering de herramientas: https://www.anthropic.com/research/building-effective-agents
+- Pydantic JSON Schema: https://docs.pydantic.dev/latest/concepts/json_schema/
+- Referencia de JSON Schema: https://json-schema.org/understanding-json-schema/

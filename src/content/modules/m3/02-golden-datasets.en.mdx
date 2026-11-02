@@ -1,0 +1,199 @@
+## The golden dataset is your regression suite
+
+In QA, the regression suite is the asset that lets you change code without fear. In LLM engineering, that asset is the **golden dataset**: a curated, versioned set of inputs with reference answers and metadata, used to score every change to prompts, models and retrieval.
+
+Every other eval technique depends on it. A brilliant LLM judge scoring the wrong questions tells you nothing. A golden dataset of 80 well-chosen cases beats 2,000 random ones.
+
+## What a golden case contains
+
+Use one JSON object per line (JSONL). It diffs cleanly in git, streams easily, and works with pandas, Ragas and DeepEval. The format used across this course:
+
+```json
+{"id": "fha-dp-001", "question": "What is the minimum down payment for an FHA loan with a 620 credit score?", "reference_answer": "3.5% of the purchase price, per the FHA lending policy section 2.1.", "reference_doc_ids": ["policy-fha-2025#2.1"], "tags": ["fha", "down-payment", "happy-path"], "difficulty": "easy", "source": "human", "version": 3}
+{"id": "jumbo-oos-014", "question": "Can you approve my jumbo loan today?", "reference_answer": "The assistant must decline: it cannot approve loans and should direct the user to a licensed loan officer.", "reference_doc_ids": [], "tags": ["out-of-scope", "refusal"], "difficulty": "medium", "source": "human", "version": 3}
+```
+
+Field by field:
+
+- **id** — stable and human-readable. Never reuse an id for a different question. Reports and trend charts key on it.
+- **question** — the input exactly as a user would type it, typos included when realistic.
+- **reference_answer** — what a correct answer must convey. Write the facts, not a script. Judges compare meaning, not wording.
+- **reference_doc_ids** — which chunks or documents should be retrieved. This lets you score retrieval (context recall) separately from generation.
+- **tags** — your coverage dimensions. They power slicing ("faithfulness on `refusal` cases dropped").
+- **difficulty** — easy, medium, hard. Useful to see whether a model change helps only easy cases.
+- **source** — `human`, `synthetic` or `prod-sampled`. You will weigh and audit these differently.
+- **version** — the dataset version that last changed this row.
+
+Validate rows with Pydantic in a test, just like you would validate fixtures:
+
+```python
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class GoldenCase(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9-]+$")
+    question: str = Field(min_length=5)
+    reference_answer: str
+    reference_doc_ids: list[str]
+    tags: list[str] = Field(min_length=1)
+    difficulty: Literal["easy", "medium", "hard"]
+    source: Literal["human", "synthetic", "prod-sampled"]
+    version: int = Field(ge=1)
+
+    @field_validator("tags")
+    @classmethod
+    def lowercase_tags(cls, v: list[str]) -> list[str]:
+        return [t.lower() for t in v]
+
+
+def load_golden(path: Path) -> list[GoldenCase]:
+    cases = [GoldenCase.model_validate_json(line) for line in path.read_text("utf-8").splitlines() if line.strip()]
+    ids = [c.id for c in cases]
+    dupes = {i for i in ids if ids.count(i) > 1}
+    if dupes:
+        raise ValueError(f"duplicate ids: {sorted(dupes)}")
+    return cases
+
+
+def test_golden_dataset_is_valid() -> None:
+    cases = load_golden(Path("evals/datasets/golden_v3.jsonl"))
+    assert len(cases) >= 50
+```
+
+That test is cheap and catches broken data before it silently corrupts a score.
+
+## Building the first version
+
+Start small and real. A good first dataset takes a day, not a month.
+
+1. **Interview the domain experts.** Ask loan officers and compliance staff for the 20 questions they get most and the 10 they fear most. Fear questions are your edge cases.
+2. **Mine real traffic** if it exists: support tickets, search logs, chat transcripts. Real phrasing beats invented phrasing.
+3. **Write reference answers with the source open.** Every reference answer should point to a document section. If an expert cannot find the source, the question tests memory, not RAG.
+4. **Add negative cases on purpose**: out-of-scope requests, questions the documents do not answer, ambiguous questions, prompt-injection attempts. A RAG assistant that always answers is a liability.
+5. **Aim for 50–150 cases for v1.** Enough for stable aggregates, small enough to review by hand.
+
+## Coverage: think in equivalence classes
+
+You already know equivalence partitioning and boundary values. Apply them to tags. Build a **coverage matrix**: tag dimensions on one axis, counts on the other, and a minimum per cell.
+
+```python
+from collections import Counter
+
+REQUIRED_MIN = {"happy-path": 20, "edge-case": 10, "out-of-scope": 8, "refusal": 5, "adversarial": 5, "multi-doc": 8}
+
+
+def coverage_report(cases: list[GoldenCase]) -> dict[str, tuple[int, int]]:
+    counts = Counter(tag for c in cases for tag in c.tags)
+    return {tag: (counts.get(tag, 0), minimum) for tag, minimum in REQUIRED_MIN.items()}
+
+
+def test_coverage_minimums() -> None:
+    cases = load_golden(Path("evals/datasets/golden_v3.jsonl"))
+    gaps = {t: c for t, (c, m) in coverage_report(cases).items() if c < m}
+    assert not gaps, f"coverage gaps: {gaps}"
+```
+
+Typical dimensions for a mortgage assistant: **topic** (FHA, VA, jumbo, refinancing, escrow), **intent** (lookup, comparison, calculation, procedure), **behavior** (answer, refuse, ask-clarification), **retrieval shape** (single-doc, multi-doc, no-doc), **risk** (adversarial, PII, regulatory). Watch the "no-doc" class: questions the knowledge base cannot answer test hallucination resistance better than anything else.
+
+## Versioning
+
+A score is meaningless without the dataset version next to it. "Faithfulness 0.87" on v2 and "0.84" on v3 are not comparable if v3 added 20 hard cases.
+
+Two practical options:
+
+- **Git + version field (start here).** Keep `golden_v3.jsonl` in the repo. When you change cases, create `golden_v4.jsonl` (or bump the file and the `version` field) in a PR with a changelog entry. Reviewers see exactly which rows changed. Works well up to a few thousand rows.
+- **DVC or a dataset registry.** When datasets grow large, include binaries or are shared across repos, track them with DVC (pointer files in git, data in S3) or use the dataset features of LangSmith or Langfuse. You still keep an explicit version id.
+
+Rules that save you pain:
+
+- **Never edit a released version in place.** Changing reference answers silently moves the baseline. That is the eval equivalent of editing assertions to make a test pass.
+- **Re-baseline on every dataset version change.** Run the current production configuration against the new version and store that as the new baseline.
+- **Record the dataset version in every eval report and trace.**
+
+## Synthetic generation, with care
+
+An LLM can draft hundreds of questions from your documents in minutes. That is useful for coverage and dangerous for validity.
+
+```python
+import json
+
+import anthropic
+from pydantic import BaseModel
+
+client = anthropic.AsyncAnthropic()
+
+
+class DraftCase(BaseModel):
+    question: str
+    reference_answer: str
+    tags: list[str]
+
+
+GEN_PROMPT = """You write test questions for a mortgage policy assistant.
+Given the document section, write 3 questions a real borrower might ask.
+Include one tricky question whose answer depends on an exception or a number.
+Answer only from the section. Return JSON: a list of objects with question, reference_answer, tags."""
+
+
+async def draft_cases(section_id: str, section_text: str) -> list[dict]:
+    msg = await client.messages.create(
+        model="claude-opus-5-5",  # generator from a different tier/family than the SUT where possible
+        max_tokens=1500,
+        system=GEN_PROMPT,
+        messages=[{"role": "user", "content": f"Section {section_id}:\n{section_text}"}],
+    )
+    drafts = [DraftCase.model_validate(d) for d in json.loads(msg.content[0].text)]
+    return [
+        {**d.model_dump(), "reference_doc_ids": [section_id], "source": "synthetic", "needs_review": True}
+        for d in drafts
+    ]
+```
+
+Guardrails for synthetic data:
+
+- **Do not let the system under test grade its own homework.** If the SUT runs on model X, generating questions and references with model X bakes its blind spots into the dataset. Use a different model or family where you can, and always human-review.
+- **Human review is mandatory before a synthetic row enters a released version.** Mark drafts `needs_review` and drop the flag only after an expert approves.
+- **Deduplicate.** Generators repeat themselves. Remove near-duplicates with embedding similarity (for example, cosine above 0.92) so 40 rephrasings of one question do not dominate the score.
+- **Watch for "too easy" bias.** Generated questions tend to reuse document wording, which makes retrieval look better than it is. Ask the generator to paraphrase, and mix in real user phrasing.
+- **Cap the synthetic share** in the gating set (for example, at most 40%) and report scores by `source` so a synthetic-only improvement is visible.
+
+## Production sampling: the dataset must evolve
+
+Your users will find failure modes you never imagined. Close the loop:
+
+- Sample production traces weekly: random samples plus targeted ones (thumbs-down, low judge score, long latency, no citations).
+- Have a reviewer label them and promote the interesting ones into the next dataset version with `source: "prod-sampled"`.
+- Every production incident becomes a golden case, the same way every escaped bug becomes a regression test.
+- Scrub PII before a production sample enters the repo.
+
+## Common mistakes
+
+- **Only happy-path questions.** The dataset passes at 95% and production fails on refusals and unanswerable questions.
+- **Reference answers copied from the model's output.** That measures consistency with an old model, not correctness.
+- **Editing cases in place without a version bump.** Trend charts become fiction.
+- **Thousands of unreviewed synthetic cases.** Volume hides that a third of the references are wrong.
+- **No retrieval labels.** Without `reference_doc_ids` you cannot tell retrieval failures from generation failures.
+- **Test-set leakage.** Using golden questions as few-shot examples in the prompt inflates scores. Keep a separate examples pool.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you build an evaluation dataset for a new RAG product with no production traffic yet?" level="mid">
+I start with domain experts: their 20 most common questions and the 10 that scare them, each with a reference answer written while looking at the source document, plus the expected document ids so I can score retrieval separately. I add negative cases on purpose: out-of-scope, unanswerable from the corpus, ambiguous and adversarial. I use an LLM to draft extra questions per document section for coverage, but with a different model than the system under test, deduplicate by embedding similarity and require human review before anything enters a released version. I tag everything by topic, intent and expected behavior, enforce minimum counts per tag in a test, and version the file in git. Once there is traffic, I sample production weekly and promote failures into the next version.
+</InterviewQuestion>
+
+<InterviewQuestion question="Your eval score jumped 6 points after a dataset update. How do you interpret it?" level="senior">
+With suspicion. A score is only comparable on the same dataset version. I would rerun the old and new production configs on both versions to separate "the system improved" from "the dataset got easier". I would check what changed in the diff: removed hard cases, edited reference answers, a growing synthetic share that reuses document wording. I would slice scores by tag and by source. If the jump comes only from synthetic rows or from easy cases, it is a dataset artifact. Then I re-baseline on the new version and document the change in the dataset changelog.
+</InterviewQuestion>
+
+## Further reading
+
+- Ragas test set generation: https://docs.ragas.io
+- DeepEval synthetic data (Synthesizer): https://docs.confident-ai.com
+- LangSmith datasets: https://docs.smith.langchain.com
+- Langfuse datasets: https://langfuse.com/docs
+- DVC documentation: https://dvc.org/doc
+
+<Checklist id="m3-02-review" title="Before moving on" items={["I can describe every field of a golden case and why it exists", "I know how to build a coverage matrix with minimum counts per tag", "I version datasets and never edit a released version in place", "I know the risks of synthetic data and how to mitigate them", "I have a plan to promote production failures into the dataset"]} />

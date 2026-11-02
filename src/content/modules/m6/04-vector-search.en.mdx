@@ -1,0 +1,170 @@
+# Mosaic AI Vector Search: endpoints and Delta Sync indexes
+
+In Module 2 you ran pgvector yourself: you computed embeddings, wrote them to a table, built an HNSW index and kept it in sync with your documents. Mosaic AI Vector Search is Databricks' managed version of that job. Its main idea: **the index is derived from a Delta table and kept in sync automatically**, and it is governed by Unity Catalog like everything else.
+
+<Callout type="warning" title="Check the current docs">
+
+The Vector Search Python client and its parameters have changed across releases (for example, endpoint types and hybrid search options). The patterns below follow the documented API at the time of writing. Verify names and arguments on docs.databricks.com before you run them.
+
+</Callout>
+
+## Two objects: endpoints and indexes
+
+- A **Vector Search endpoint** is the compute that hosts and serves indexes. You create it once and put several indexes on it. It costs money while it exists, whether you query it or not.
+- A **Vector Search index** is the searchable structure. It is a Unity Catalog object (`catalog.schema.index_name`) with its own permissions.
+
+Think "database server" vs "table". One endpoint, many indexes.
+
+## Index types
+
+| | Delta Sync Index | Direct Vector Access Index |
+|---|---|---|
+| Source of truth | A Delta table | Your application |
+| How data gets in | Automatic sync from the table | You upsert/delete vectors via API |
+| Embeddings | Managed (Databricks computes) or self-managed (column of vectors) | Always self-managed |
+| Typical use | RAG over documents already in Delta | Real-time writes from an app, data not in Delta |
+
+**Delta Sync with managed embeddings** is the default answer for "RAG over documents in the lakehouse". You point it at a text column and an embedding model serving endpoint; Databricks embeds new and changed rows for you.
+
+**Self-managed embeddings** make sense when you already compute vectors in the pipeline (a custom or fine-tuned embedding model, or multimodal embeddings). You give the vector column and its dimension.
+
+**Direct Vector Access** is closest to running pgvector yourself: you own syncing and deletes.
+
+### Requirements for a Delta Sync index
+
+- The source table must have **Change Data Feed enabled** (`delta.enableChangeDataFeed = true`).
+- The index needs a **primary key** column, unique per row (your deterministic `chunk_id`).
+- For managed embeddings, an **embedding model endpoint** must exist (for example a Foundation Model API embedding endpoint such as `databricks-gte-large-en`; names vary by region — check your workspace).
+
+### Sync modes
+
+- **TRIGGERED**: the index updates when you call `sync()` (or a job does). Cheaper, predictable. Good when documents change in batches.
+- **CONTINUOUS**: the index follows the table with seconds-to-minutes latency. Keeps a streaming pipeline running, so it costs more. Use it when freshness is a business requirement.
+
+The exam likes this trade-off. "Policies are updated once a week" means TRIGGERED. "Support articles must be searchable within a minute of publishing" means CONTINUOUS.
+
+## Creating an endpoint and an index
+
+```python
+from databricks.vector_search.client import VectorSearchClient
+
+vsc = VectorSearchClient()  # uses notebook auth or DATABRICKS_HOST / token env vars
+
+ENDPOINT = "claims-vs-endpoint"
+SOURCE = "main.claims.chunks"
+INDEX = "main.claims.chunks_index"
+
+if ENDPOINT not in [e["name"] for e in vsc.list_endpoints().get("endpoints", [])]:
+    vsc.create_endpoint(name=ENDPOINT, endpoint_type="STANDARD")
+
+index = vsc.create_delta_sync_index(
+    endpoint_name=ENDPOINT,
+    source_table_name=SOURCE,
+    index_name=INDEX,
+    pipeline_type="TRIGGERED",
+    primary_key="chunk_id",
+    embedding_source_column="content",
+    embedding_model_endpoint_name="databricks-gte-large-en",
+)
+```
+
+For self-managed embeddings, replace the last two arguments with `embedding_vector_column="embedding"` and `embedding_dimension=1024` (matching your model).
+
+Later, after the pipeline appends new chunks:
+
+```python
+index = vsc.get_index(endpoint_name=ENDPOINT, index_name=INDEX)
+index.sync()  # TRIGGERED mode: pick up changes from the Change Data Feed
+```
+
+## Querying
+
+```python
+results = index.similarity_search(
+    query_text="Is water damage from a burst pipe covered under the HO-3 policy?",
+    columns=["chunk_id", "doc_id", "page", "content", "doc_type"],
+    num_results=5,
+    filters={"doc_type": "policy"},
+    query_type="HYBRID",
+)
+for row in results["result"]["data_array"]:
+    print(row)
+```
+
+Notes:
+
+- `columns` decides what comes back. Return lineage columns (`doc_id`, `page`) so you can cite.
+- `filters` applies metadata filtering. Use it for document type, tenant or access labels. Filter syntax supports operators on standard endpoints; check the docs for the exact grammar.
+- `query_type="HYBRID"` combines keyword and vector search, like the BM25 + vector fusion you built in Module 2. Default is approximate nearest neighbor (ANN) only.
+- With managed embeddings you pass `query_text` and Databricks embeds it with the same model. With self-managed embeddings you pass `query_vector` computed by your own model — and it **must** be the same model used for the documents.
+
+## Using it from LangChain
+
+The `databricks-langchain` package wraps the index as a vector store, so your Module 2 chains keep working:
+
+```python
+from databricks_langchain import DatabricksVectorSearch
+
+store = DatabricksVectorSearch(
+    index_name="main.claims.chunks_index",
+    columns=["chunk_id", "doc_id", "page"],
+)
+retriever = store.as_retriever(search_kwargs={"k": 5, "filter": {"doc_type": "policy"}})
+docs = retriever.invoke("What is the deductible for wind damage?")
+```
+
+In an agent you declare this index as a **resource** when logging the model (lesson 7), so the deployed endpoint gets credentials to query it automatically.
+
+## Design decisions the exam tests
+
+**Chunk size vs embedding model context.** Every embedding model has a maximum input length. Text beyond it is truncated silently, so the tail of a large chunk never gets embedded. Check the model's limit and keep chunks well below it. Smaller chunks give precise retrieval but lose context; larger ones carry context but dilute similarity. Measure with recall@k on labeled queries, as you did in Module 2.
+
+**Choosing the embedding model.** Pick one trained on your language and domain. Changing the model means re-embedding everything — plan for a new index, not an in-place swap.
+
+**Metadata for filtering.** Add columns you will filter on (document type, effective date, tenant, access group) to the source table before creating the index. Retrofitting means re-syncing.
+
+**Access control.** Users of the index need `SELECT` on the index object. For row-level restrictions (per-team documents), filter by an access column using the caller's identity — the index does not apply source-table row filters for you, so design for it.
+
+## Mapping to the local stack
+
+| Databricks | Local equivalent |
+|---|---|
+| Delta table with CDF | Postgres table or Parquet file |
+| Delta Sync index (managed embeddings) | Your ingestion job embeds + upserts into pgvector or Chroma |
+| `index.sync()` | Re-run the idempotent upsert job |
+| `filters={...}` | `WHERE` clause (pgvector) or `where=` (Chroma) |
+| `query_type="HYBRID"` | BM25 + vector with reciprocal rank fusion |
+| UC permissions on the index | Database roles |
+
+The exercise in lesson 10 uses this mapping so you can complete it with or without a workspace.
+
+## Common mistakes
+
+- **Leaving endpoints running** after experiments. They bill continuously. Delete what you do not use.
+- **No CDF or no primary key** on the source table.
+- **Different embedding models** for indexing and querying (self-managed case).
+- **Chunks longer than the embedding model's input limit**, so content is truncated.
+- **CONTINUOUS sync by default** when the data changes weekly.
+- **Not returning lineage columns**, then being unable to cite sources.
+- **Assuming filters are security.** Filters are only as safe as the code that builds them; derive them from the authenticated identity, never from user input.
+
+## How this shows up in interviews and on the exam
+
+<InterviewQuestion question="A team stores product manuals as chunks in a Delta table that is updated nightly. They want a low-maintenance retrieval layer. Which Vector Search setup do you recommend?" level="mid">
+
+A Delta Sync index with managed embeddings on a standard endpoint, in TRIGGERED mode. Enable Change Data Feed on the chunk table and use a deterministic `chunk_id` as primary key. The nightly ingestion job calls `index.sync()` after it writes, so only changed rows are re-embedded. Managed embeddings remove the need to run an embedding job, and the index is a UC object, so access is granted like any table. CONTINUOUS would cost more without benefit for nightly updates; Direct Vector Access would add sync code the team doesn't need.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="When would you choose self-managed embeddings or a Direct Vector Access index?" level="senior">
+
+Self-managed embeddings when the embedding model isn't available as a serving endpoint, when you use a fine-tuned or multimodal model, or when embeddings are already computed upstream and reused elsewhere. You still get automatic syncing from Delta. Direct Vector Access when the source of truth isn't a Delta table — for example, an application writing vectors in real time — and you accept owning upserts, deletes and consistency yourself. In both cases the query side must use exactly the same model as the documents.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Mosaic AI Vector Search: https://docs.databricks.com/en/generative-ai/vector-search.html
+- Create and query a vector search index: https://docs.databricks.com/en/generative-ai/create-query-vector-search.html
+- Databricks LangChain integration: https://docs.databricks.com/en/generative-ai/agent-framework/langchain-uc-integration.html
+- pgvector (local equivalent): https://github.com/pgvector/pgvector

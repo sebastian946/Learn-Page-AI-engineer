@@ -1,0 +1,172 @@
+## De strings a contratos
+
+Una interfaz de chat puede mostrar cualquier texto que devuelva el modelo. Un backend no. Tu router necesita una `category`, tu CRM necesita un `order_id`, tu pipeline de analítica necesita un `sentiment` de un conjunto fijo. La **salida estructurada** (structured output) es cómo conviertes un generador de texto probabilístico en un componente con una interfaz tipada.
+
+Para un SDET esto es terreno conocido: es contract testing. El JSON Schema es el contrato. Pydantic es el validador del lado del consumidor. El bucle de reparación es tu política de reintento ante violaciones del contrato.
+
+## Cuatro niveles de "dame JSON"
+
+| Nivel | Cómo | Garantía |
+|---|---|---|
+| 1. Solo prompt | "Responde con JSON como este ejemplo." | Ninguna. Funciona casi siempre y falla en producción a escala. |
+| 2. JSON mode | Flag del proveedor que fuerza JSON sintácticamente válido | JSON válido, pero con cualquier forma. |
+| 3. Decodificación restringida por schema | Envías un JSON Schema; el proveedor restringe la generación | La salida respeta la estructura del schema. |
+| 4. Schema + validación semántica | Nivel 3 más validadores Pydantic y reglas de negocio en tu código | Se verifica la estructura *y* el significado. |
+
+Los sistemas en producción usan el nivel 3 donde está disponible y **siempre** agregan el nivel 4. La decodificación restringida garantiza que `priority` sea uno de `"low" | "medium" | "high"`. No garantiza que el modelo haya elegido el correcto, que `refund_amount` no sea mayor que el total del pedido, ni que `order_id` coincida con tu formato de ID.
+
+### Soporte por proveedor de un vistazo
+
+- **Anthropic:** `output_config={"format": {"type": "json_schema", "schema": ...}}` en `messages.create`, o el helper `messages.parse(..., output_format=MyModel)` que devuelve un objeto Pydantic validado en `response.parsed_output`. Las tools también pueden poner `"strict": True` para que sus inputs cumplan el schema.
+- **OpenAI:** `response_format={"type": "json_schema", "json_schema": {"name": ..., "schema": ..., "strict": True}}`, y helpers del SDK que aceptan un modelo Pydantic. Las function tools también aceptan `"strict": True`.
+- **Bedrock / modelos abiertos:** el soporte varía por modelo. Recurre a extracción basada en tools o al nivel 1 + validación + reparación.
+
+La decodificación restringida soporta un **subconjunto** de JSON Schema. Mantén los schemas planos y aburridos: objetos, strings, números, booleanos, enums, arrays, `required`, `additionalProperties: false`. Revisa la documentación del proveedor antes de usar palabras clave avanzadas como `oneOf` complejos o patrones regex.
+
+## Pydantic v2 como única fuente de verdad
+
+Define el schema una vez, en Python. Genera el JSON Schema a partir de él. Valida las respuestas contra la misma clase.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+Category = Literal[
+    "order_status", "shipping_delay", "return_refund",
+    "damaged_item", "billing", "account_access", "other",
+]
+
+class TicketTriage(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # -> additionalProperties: false
+
+    category: Category
+    priority: Literal["low", "medium", "high", "urgent"]
+    order_id: str | None = Field(
+        default=None, description="Order id like A-12345, if present"
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+    summary: str = Field(max_length=280)
+
+    @field_validator("order_id")
+    @classmethod
+    def order_id_format(cls, v: str | None) -> str | None:
+        if v is not None and not (v.startswith("A-") and v[2:].isdigit()):
+            raise ValueError("order_id must look like A-12345")
+        return v
+
+schema = TicketTriage.model_json_schema()
+```
+
+APIs clave de Pydantic v2 que usarás constantemente:
+
+- `Model.model_json_schema()` – JSON Schema para el proveedor.
+- `Model.model_validate_json(raw)` – parsea y valida un string JSON en un paso (rápido, núcleo en Rust).
+- `Model.model_validate(dict_obj)` – valida un dict ya parseado (por ejemplo, el input de una tool).
+- `ValidationError.errors()` – lista estructurada de lo que falló, perfecta para devolvérsela al modelo.
+
+Las `description` de los campos terminan en el schema. El modelo las lee. Trátalas como parte del prompt.
+
+## Llamar con un schema
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+async def triage(ticket: str) -> TicketTriage:
+    response = await client.messages.parse(
+        model="claude-haiku-5-5",
+        max_tokens=1024,
+        system="You triage support tickets for an online store.",
+        messages=[{"role": "user", "content": ticket}],
+        output_format=TicketTriage,
+    )
+    if response.stop_reason in ("max_tokens", "refusal"):
+        raise RuntimeError(f"unusable response: {response.stop_reason}")
+    return response.parsed_output
+```
+
+El equivalente con un schema crudo es `messages.create(..., output_config={"format": {"type": "json_schema", "schema": schema}})`, y luego `TicketTriage.model_validate_json(text_block.text)`. Usa la forma cruda dentro de una abstracción de proveedores, donde quieres un único camino de código para todos los vendors.
+
+## Bucles de validación + reparación
+
+Incluso con decodificación restringida, tus validadores **semánticos** pueden fallar. Sin decodificación restringida (modelos antiguos, algunos modelos de Bedrock, modelos locales), también puede fallar la sintaxis. El patrón es un bucle de reparación acotado:
+
+1. Llama al modelo.
+2. Valida con Pydantic.
+3. Si falla, agrega la salida incorrecta del modelo y los errores de validación como un nuevo turno de usuario: "Tu respuesta anterior falló la validación: ... Devuelve solo el JSON corregido."
+4. Reintenta, como máximo N veces (1–2 es lo típico).
+5. Si sigue inválido, **falla ruidosamente** hacia un camino de respaldo: modelo más fuerte, valor por defecto o cola humana. Nunca devuelvas basura en silencio.
+
+```python
+import json
+from pydantic import BaseModel, ValidationError
+
+async def extract_with_repair(
+    llm, model_cls: type[BaseModel], messages: list[dict], max_repairs: int = 2
+) -> BaseModel:
+    history = list(messages)
+    last_error: ValidationError | None = None
+    for attempt in range(max_repairs + 1):
+        raw = await llm.complete_json(history, schema=model_cls.model_json_schema())
+        try:
+            return model_cls.model_validate_json(raw)
+        except ValidationError as exc:
+            last_error = exc
+            errors = json.dumps(exc.errors(include_url=False), default=str)
+            history += [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    f"Your answer failed validation: {errors}. "
+                    "Return only corrected JSON that satisfies the schema."
+                )},
+            ]
+    raise ExtractionFailed(attempts=max_repairs + 1) from last_error
+
+class ExtractionFailed(Exception):
+    def __init__(self, attempts: int) -> None:
+        super().__init__(f"invalid after {attempts} attempts")
+        self.attempts = attempts
+```
+
+Monitorea la **tasa de reparación** como métrica. Si el 8% de las llamadas necesita una reparación, eso es 8% extra de costo y latencia, y una señal de que tu schema o tu prompt no son claros. Una ruta sana con decodificación restringida debería estar muy por debajo del 1%.
+
+### Reparar vs. reintentar
+
+Un *reintento* reenvía el mismo request (útil para errores de red y 5xx). Una *reparación* envía un request **distinto** que incluye el error. No los confundas: reintentar una falla de validación con la misma entrada a menudo produce la misma falla.
+
+### Resultados parciales y "desconocido"
+
+Dale al modelo una forma legal de decir "no lo sé". Si `order_id` es requerido y no puede ser nulo, un modelo sin id de pedido en el texto inventará uno. Hazlo `str | None`, o agrega una categoría `"other"` / `"unknown"`. **Forzar un campo fuerza una alucinación.**
+
+## Errores comunes
+
+- **Confundir estructura con corrección.** Una respuesta válida según el schema puede estar equivocada. Valida reglas de negocio y mide precisión con evals.
+- **Dos fuentes de verdad.** Un JSON Schema escrito a mano y un modelo Pydantic separado terminan divergiendo. Genera uno a partir del otro.
+- **Bucles de reparación sin límite.** Limita siempre los intentos y registra cada reparación con el tipo de error.
+- **Sin válvula de escape.** Campos requeridos sin opción "desconocido" provocan valores inventados.
+- **Schemas enormes y muy anidados.** Cuestan tokens en cada llamada y reducen la precisión. Divide en dos llamadas si hace falta.
+- **Ignorar `stop_reason`.** La salida truncada (`max_tokens`) es la causa más común de JSON inválido. Corrige el tope; no repares para siempre.
+- **Parsear con regex.** Usa `json.loads` / `model_validate_json`. El escape de caracteres varía entre modelos.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="El proveedor garantiza JSON válido según el schema. ¿Por qué igual validas con Pydantic?" level="mid">
+
+Porque la validez del schema es estructura, no significado. La decodificación restringida asegura tipos y enums, pero no reglas de negocio: un `order_id` con formato incorrecto, un reembolso mayor que el total del pedido, una fecha en el pasado, consistencia entre campos como `priority = urgent` solo para ciertas categorías. Los validadores de Pydantic codifican esas reglas en un solo lugar, entregan objetos tipados al resto del código y producen errores estructurados que puedo usar en un bucle de reparación. También me protege cuando cambio a un proveedor o modelo sin decodificación restringida, y mantiene la validación idéntica entre vendors.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Diseña un paso de extracción que nunca devuelva datos inválidos hacia adelante." level="senior">
+
+Un único modelo Pydantic como fuente de verdad; JSON Schema generado a partir de él; decodificación restringida por schema donde el proveedor la soporte; validadores semánticos para reglas de negocio; campos nulos o un valor explícito de desconocido para que el modelo nunca esté obligado a inventar. Un bucle de reparación acotado (uno o dos intentos) que devuelve los errores de validación. Si eso falla, escalar: un modelo más fuerte, luego una dead-letter queue o cola humana, guardando la salida cruda para depuración. Métricas de tasa de fallas de validación, tasa de reparación y tasa de escalamiento por versión de prompt, más un set de evals que mide precisión por campo, no solo validez del schema.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Anthropic, structured outputs: https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+- OpenAI, structured outputs: https://platform.openai.com/docs/guides/structured-outputs
+- Documentación de Pydantic v2, modelos y validadores: https://docs.pydantic.dev/latest/concepts/models/
+- Pydantic, generación de JSON Schema: https://docs.pydantic.dev/latest/concepts/json_schema/
+- Referencia de JSON Schema: https://json-schema.org/understanding-json-schema/

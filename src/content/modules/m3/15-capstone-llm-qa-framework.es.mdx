@@ -1,0 +1,216 @@
+<ClientBrief company="Northwind Mortgage" industry="Fintech / Préstamos hipotecarios" duration="4 días" />
+
+## Contexto de la empresa
+
+Northwind Mortgage es un prestamista hipotecario mediano de Estados Unidos. Tiene unos 600 oficiales de crédito, 40 analistas de suscripción (underwriters) y un equipo de plataforma de 12 ingenieros. En el módulo 2 construiste su asistente de conocimiento interno, `mortgage-knowledge-assistant`. Responde preguntas de los oficiales de crédito sobre guías de suscripción, fichas de producto y políticas internas, con citas.
+
+El piloto duró seis semanas con 35 oficiales de crédito. La retroalimentación fue buena. Ahora la dirección quiere desplegarlo a los 600 oficiales el próximo trimestre.
+
+Hay un problema. Nadie puede demostrar que el asistente es bueno. La "evaluación" del piloto era una hoja de cálculo con 50 preguntas que un ingeniero volvía a ejecutar a mano antes de cada release. Los cambios de prompt se publicaban por intuición. Un release rompió las citas en silencio durante una semana. Compliance se enteró por un oficial de crédito, no por un dashboard.
+
+Otros dos equipos quieren lanzar funcionalidades con LLMs en los próximos seis meses: el equipo de cobranzas (un chatbot para prestatarios sobre planes de pago) y el equipo de operaciones documentales (extracción de campos de estados de cuenta bancarios). La Head of Platform no quiere tres equipos construyendo tres stacks de evals distintos.
+
+Te contratan como ingeniero de calidad de IA. Tu trabajo: construir un **framework de QA para LLMs** reutilizable, aplicarlo primero al asistente de conocimiento y publicar un reporte de calidad que compliance pueda aprobar.
+
+## Stakeholders
+
+| Stakeholder | Qué le importa | Qué te va a preguntar |
+|---|---|---|
+| Dana Okafor, Head of Platform | Un toolkit reutilizable, bajo mantenimiento, adopción por otros equipos | "¿Puede el equipo de cobranzas adoptarlo en un día?" |
+| Marcus Lee, Compliance Officer | Evidencia de calidad, trazabilidad de auditoría, cero fugas de PII, cero políticas inventadas | "Muéstrame cómo sabes que no inventa cifras de las guías." |
+| Priya Raman, Product Owner (asistente de conocimiento) | Lanzar mejoras de prompt y retrieval rápido sin romper nada | "¿Esto va a hacer más lentos los PRs de mi equipo?" |
+| Tomás García, SRE Lead | Latencia, costo, alertas, tracing que funcione con su stack de OpenTelemetry | "¿Se conecta a nuestro collector o es otro silo?" |
+
+## Objetivo de negocio
+
+Hacer que la calidad del LLM sea **medible, controlada por gates y visible**:
+
+1. Ningún cambio de prompt, modelo o retrieval llega a producción sin pasar un gate de evals automatizado.
+2. Cada respuesta en producción se puede trazar: pregunta, chunks recuperados, llamada al modelo, tokens, costo, latencia.
+3. Compliance recibe un reporte de calidad versionado y publicado por cada release.
+4. Otros equipos pueden reutilizar el mismo toolkit con sus propios datasets y métricas.
+
+El éxito en una frase: la próxima vez que un release rompa las citas, el PR se bloquea antes del merge y el reporte muestra exactamente qué casos tuvieron regresión.
+
+## Requisitos funcionales
+
+**FR1 — Gestión de datasets.** Carga golden datasets desde archivos JSONL versionados. Cada caso tiene `id`, `question`, `reference_answer`, `reference_source_ids`, `tags` (por ejemplo `product:fha`, `type:numeric`, `adversarial`) y un `expected_behavior` opcional (`answer` o `refuse`). Valida el esquema con Pydantic. Imprime la cobertura por tag.
+
+**FR2 — Golden dataset del asistente.** Parte de los 50+ pares que construiste en el módulo 2. Extiéndelo a unos 100 casos. Incluye al menos 15 casos adversariales o fuera de alcance (prompt injection dentro de una pregunta, preguntas sobre tasas de la competencia, solicitudes de PII de prestatarios, preguntas sin respuesta en el corpus). Documenta cómo se creó cada caso: escrito por humanos, extraído de logs del piloto, o sintético y revisado.
+
+**FR3 — Métricas.** Dos capas, como una pirámide de testing:
+
+- Checks deterministas: JSON/esquema válido, cita presente, los ids de fuente citados existen en el conjunto recuperado, los valores numéricos de la respuesta aparecen en el chunk citado, rechazo en casos fuera de alcance, presupuesto de longitud de respuesta.
+- Métricas evaluadas por modelo: faithfulness, relevancia de la respuesta, precisión y recall de contexto (Ragas o DeepEval, o tus propios prompts de juez).
+
+**FR4 — Juez calibrado.** Todo juez LLM propio debe incluir un reporte de calibración contra al menos 40 ejemplos etiquetados por humanos: tasa de acuerdo, kappa de Cohen, matriz de confusión y sesgos conocidos probados (sesgo de posición en comparaciones pairwise, sesgo de verbosidad). El prompt del juez y el id del modelo están versionados.
+
+**FR5 — Runner.** Ejecuta la app objetivo sobre el dataset con concurrencia acotada, reintentos y una caché de respuestas con clave por versión de prompt, id de modelo y hash de la entrada. Soporta `--sample N` para ejecuciones rápidas en PRs y una ejecución completa para nightly o release.
+
+**FR6 — Gate.** Compara una ejecución contra un baseline guardado. Falla ante: umbrales absolutos (por ejemplo faithfulness por debajo de 0.85), regresiones relativas más allá de una tolerancia (por ejemplo una caída de más de 0.03 en cualquier métrica), o cualquier falla en un tag `critical`. Genera un resultado legible por máquina y un resumen en markdown.
+
+**FR7 — CLI.** `llmqa run`, `llmqa gate`, `llmqa report`, con un único archivo `llmqa.toml` de configuración por proyecto.
+
+**FR8 — Integración con CI.** Un workflow reutilizable de GitHub Actions (`on: workflow_call`) que otros repos llaman con pocos inputs. Publica el resumen en markdown como comentario en el PR y sube la ejecución como artifact.
+
+**FR9 — Tracing.** Instrumenta el asistente con OpenTelemetry usando las convenciones semánticas GenAI: spans para retrieval, re-ranking, llamada al LLM y cualquier llamada a herramientas, con atributos de uso de tokens y de modelo. Exporta a Langfuse (o LangSmith) y al collector OTLP del equipo de SRE. Las ejecuciones de evals enlazan cada caso con su trace id.
+
+**FR10 — Suite de red-team.** Un conjunto etiquetado de ataques (prompt injection directa e indirecta mediante un documento envenenado, extracción de PII, fabricación de políticas, intentos de jailbreak) que corre como job separado, con pass/fail por categoría del OWASP LLM Top 10.
+
+**FR11 — Reporte de calidad.** Un reporte estático (HTML o markdown) generado por ejecución: puntajes resumen vs baseline, desglose por tag, los 10 peores casos con enlaces a traces, calibración del juez, resultados de red-team, costo y latencia. Publicado en GitHub Pages, una página por release, con historial.
+
+## Requisitos no funcionales
+
+| Área | Objetivo |
+|---|---|
+| Tiempo de evals en PR | menos de 10 minutos para la suite muestreada (unos 30 casos) |
+| Costo de evals en PR | por debajo de un presupuesto fijo por ejecución, por ejemplo $2 (ejemplo — calcúlalo con los precios actuales de tu proveedor y registra el real) |
+| Ejecución nightly completa | dataset completo más suite de red-team, en menos de 45 minutos |
+| Faithfulness | al menos 0.85 en el golden set completo |
+| Corrección de citas (determinista) | al menos 95% de las respuestas citan una fuente que fue recuperada |
+| Rechazo fuera de alcance | al menos 90% de rechazos correctos en casos adversariales |
+| Acuerdo del juez | kappa de Cohen de al menos 0.6 vs etiquetas humanas |
+| Latencia p95 del asistente | menos de 4 s de punta a punta, reportada por ejecución |
+| Overhead del tracing | menos de 5% de latencia añadida en p50, export asíncrono/en lotes |
+| Privacidad | nombres de prestatarios, SSNs, números de préstamo y emails redactados antes de que los traces salgan del proceso |
+| Reporte de costos | costo por 1k requests reportado para la app y para la propia suite de evals |
+| Flakiness | re-ejecutar el mismo commit con la caché desactivada no cambia ninguna decisión del gate en al menos 9 de 10 ejecuciones |
+
+## Fuera de alcance
+
+- Cambiar el retrieval o los prompts del asistente para mejorar los puntajes. Tú mides; el equipo de Priya corrige. (Un arreglo pequeño para demostrar que el gate funciona está bien.)
+- Hacer fine-tuning de cualquier modelo.
+- Construir una UI de dashboard propia. Usa Langfuse/LangSmith y el reporte estático.
+- Despliegue a producción del asistente (eso es el módulo 5).
+- Herramientas de etiquetado humano más allá de un flujo simple con CSV o notebook.
+
+## Entregables
+
+1. Repo `llm-qa-framework` con el paquete `llmqa`, CLI, tests y documentación.
+2. `examples/mortgage-knowledge-assistant/` con configuración, el golden dataset de ~100 casos, archivo de baseline y código del adaptador.
+3. Workflow reutilizable `.github/workflows/llmqa-eval.yml` y un workflow que lo llama en el repo del asistente.
+4. Reporte de calibración del juez (markdown) con el conjunto etiquetado.
+5. Suite de red-team y resultados mapeados al OWASP LLM Top 10.
+6. Reporte de calidad publicado en GitHub Pages.
+7. README con arquitectura, definiciones de métricas, análisis de costos, una guía "adóptalo en 30 minutos" para otros equipos y un GIF demo de un PR bloqueado.
+
+Estructura sugerida:
+
+```text
+llm-qa-framework/
+  llmqa/
+    datasets/        # schema, loaders, coverage
+    metrics/         # deterministic/ and model_graded/
+    judges/          # prompts, calibration
+    runners/         # async runner, cache, budget guard
+    gates/           # thresholds, baseline compare
+    tracing/         # otel setup, genai attributes, redaction, langfuse export
+    redteam/         # attack sets, scorers
+    report/          # markdown + html templates
+    cli.py
+  examples/
+    mortgage-knowledge-assistant/
+      llmqa.toml
+      golden/v2.jsonl
+      baseline.json
+      adapter.py
+  .github/workflows/
+    llmqa-eval.yml   # on: workflow_call
+    ci.yml
+  docs/
+  tests/
+```
+
+## Criterios de aceptación
+
+- `llmqa run --config examples/mortgage-knowledge-assistant/llmqa.toml --sample 30` termina en menos de 10 minutos y registra el costo total.
+- Introducir una regresión deliberada (por ejemplo quitar del prompt la instrucción "cita tus fuentes") hace que el gate de CI falle con un mensaje claro que nombra la métrica, el delta y los casos con más fallas.
+- Revertir la regresión hace que el gate pase.
+- El golden dataset tiene al menos 100 casos, al menos 15 adversariales, y la cobertura por tag aparece en el reporte.
+- El reporte de calibración del juez muestra kappa de al menos 0.6, o documenta por qué no y qué se cambió.
+- Cada caso de eval en el reporte enlaza a un trace que muestra retrieval, spans del LLM y uso de tokens.
+- Los traces no contienen PII sin redactar de un caso de prueba sembrado con un SSN y un email falsos.
+- El job de red-team corre cada noche y sus resultados aparecen en el reporte.
+- Un segundo proyecto de juguete (por ejemplo un bot "FAQ de cobranzas" de 10 casos) adopta el toolkit usando solo el README y el workflow reutilizable.
+- El reporte de calidad está publicado en GitHub Pages.
+
+## Arquitectura sugerida
+
+<Diagram caption="Framework de QA para LLMs aplicado al asistente de conocimiento hipotecario" chart={`flowchart LR
+  subgraph CI["GitHub Actions"]
+    PR["Pull request"] --> WF["Workflow reutilizable llmqa-eval"]
+    NIGHT["Programación nightly"] --> WF
+  end
+  WF --> RUN["llmqa run"]
+  DS[("Golden dataset JSONL v2")] --> RUN
+  RUN --> APP["Adaptador mortgage-knowledge-assistant"]
+  APP --> RET["Retrieval híbrido + re-rank"]
+  APP --> LLM["Llamada al LLM"]
+  RUN --> CACHE[("Caché de respuestas")]
+  RUN --> MET["Métricas: deterministas + jueces"]
+  MET --> GATE["llmqa gate vs baseline"]
+  GATE -->|falla| BLOCK["PR bloqueado + comentario"]
+  GATE -->|pasa| MERGE["Merge permitido"]
+  MET --> REP["llmqa report"]
+  REP --> PAGES["Reporte en GitHub Pages"]
+  APP -. Spans OTel GenAI .-> OTEL["Collector OTLP"]
+  OTEL --> LF["Langfuse"]
+  OTEL --> SRE["Stack de observabilidad de SRE"]
+  RT["Suite de red-team"] --> RUN`} />
+
+Notas de diseño:
+
+- El adaptador es el único código específico del proyecto. Mapea un caso del dataset a una llamada a la app y devuelve `answer`, `citations`, `contexts`, `trace_id`, `usage`. Eso es lo que hace reutilizable al toolkit.
+- Las métricas deterministas corren primero y son gratis. Las métricas evaluadas por modelo solo corren sobre los casos que pasan los checks de esquema.
+- La clave de caché incluye la versión del prompt y el id del modelo, así un cambio de prompt siempre invalida sus propios casos, pero los caminos de código sin cambios siguen siendo baratos.
+- La redacción ocurre en un span processor antes del export, no en la configuración del exporter, así cada backend recibe datos limpios.
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Cumple expectativas | Supera expectativas |
+|---|---|---|---|
+| Calidad del golden dataset | 15% | 100 casos, tags, procedencia documentada | El análisis de cobertura guía nuevos casos; casos sintéticos revisados con tasa de aceptación reportada |
+| Diseño de métricas | 15% | Capas determinista + evaluada por modelo, definiciones claras | Validez argumentada por métrica, incluyendo modos de falla conocidos |
+| Calibración del juez | 15% | Kappa reportado contra 40+ etiquetas | Experimentos de sesgo (posición, verbosidad) con mitigaciones y números antes/después |
+| Gate de CI | 20% | Bloquea una regresión real, pasa al revertir | Maneja el no determinismo con muestreo repetido o intervalos de confianza; guardia de presupuesto; comentario en el PR |
+| Tracing y privacidad | 15% | Spans GenAI exportados a Langfuse con uso de tokens | Los mismos traces llegan a un collector OTLP; redacción probada; enlaces eval-a-trace |
+| Red-teaming | 10% | Suite de ataques mapeada a categorías OWASP | Inyección indirecta mediante documento envenenado, con seguimiento de regresiones en el tiempo |
+| Reporte y documentación | 10% | Reporte publicado, README claro | Adopción demostrada por un segundo proyecto; reporte legible para alguien no técnico |
+
+## Cronograma sugerido (4 días)
+
+**Día 1 — Fundamentos y dataset.** Crea el esqueleto del paquete y la CLI. Define el esquema de casos. Porta el dataset del módulo 2 y extiéndelo a ~100 casos con tags y casos adversariales. Implementa las métricas deterministas y el runner con caché y guardia de presupuesto. Escribe el adaptador para el asistente.
+
+**Día 2 — Jueces y gate.** Agrega métricas evaluadas por modelo. Etiqueta 40+ ejemplos a mano, calibra tu juez y escribe el reporte de calibración. Implementa la comparación con baseline y los umbrales. Construye el workflow reutilizable y demuestra que bloquea una regresión deliberada.
+
+**Día 3 — Tracing y red-team.** Agrega OpenTelemetry con convenciones GenAI, el span processor de redacción y el export a Langfuse más un collector OTLP local (Docker). Enlaza los casos de eval con los traces. Construye la suite de red-team y el job nightly.
+
+**Día 4 — Reporte, adopción y pulido.** Genera el reporte HTML/markdown y publícalo en GitHub Pages. Adopta el toolkit en un segundo proyecto de juguete usando solo el README. Graba el GIF demo. Escribe el análisis de costos y el resumen para stakeholders.
+
+## Definition of Done
+
+<Checklist id="m3-15-dod" title="Definition of Done" items={["Paquete llmqa con los comandos de CLI run, gate y report, y tests unitarios para métricas y gates", "Golden dataset de 100+ casos con tags, procedencia y 15+ casos adversariales", "Métricas deterministas: esquema, cita presente, cita dentro del conjunto recuperado, grounding numérico, rechazo", "Métricas de faithfulness y relevancia evaluadas por modelo con prompts de juez versionados", "Reporte de calibración del juez contra 40+ etiquetas humanas con kappa de Cohen y pruebas de sesgo", "Comparación con baseline con umbrales absolutos, tolerancia relativa y tags críticos", "Workflow reutilizable de GitHub Actions que bloquea una regresión deliberada y pasa al revertir", "Comentario en el PR con deltas de métricas y los peores casos fallidos", "Spans OpenTelemetry GenAI para retrieval, LLM y llamadas a herramientas exportados a Langfuse y a un collector OTLP", "Redacción de PII verificada con un SSN y un email falsos sembrados", "Suite de red-team mapeada al OWASP LLM Top 10, corriendo cada noche", "Costo por 1k requests y latencia p50/p95 en el reporte", "Reporte de calidad publicado en GitHub Pages", "Un segundo proyecto de juguete adoptó el toolkit desde el README", "README con diagrama de arquitectura, definiciones de métricas, análisis de costos y GIF demo"]} />
+
+## Cómo presentar esto en una entrevista
+
+Este proyecto final es tu mayor diferenciador. La mayoría de los candidatos a AI Engineer pueden construir una demo de RAG. Pocos pueden demostrar que funciona y mantenerla funcionando. Tú puedes, porque llevas años haciéndolo con software determinista.
+
+**El pitch de 60 segundos.** "El asistente de conocimiento de un prestamista hipotecario pasaba de piloto a 600 usuarios sin forma de demostrar su calidad. Construí un framework de QA para LLMs reutilizable: un golden dataset versionado de unos 100 casos, un stack de métricas de dos capas con checks deterministas y jueces LLM calibrados, un gate de CI que bloquea PRs ante regresiones de faithfulness, tracing con OpenTelemetry y redacción de PII, una suite de red-team nightly y un reporte de calidad publicado. Una regresión deliberada en las citas se bloquea en menos de 10 minutos por unos dos dólares por ejecución." Reemplaza los números con los tuyos reales.
+
+**Mapéalo en voz alta a tu experiencia de QA.** A los entrevistadores les gusta la traducción:
+
+- La pirámide de testing se convierte en la pirámide de evals: checks deterministas baratos, luego métricas evaluadas por modelo, luego revisión humana.
+- Los tests flaky se convierten en no determinismo: fijaste la temperatura, cacheaste respuestas, muestreaste repetidamente y usaste tolerancias en lugar de coincidencias exactas.
+- La suite de regresión se convierte en el golden dataset, con versionado y cobertura por tag.
+- Los contract tests se convierten en esquemas de salida y checks de citas.
+- Los reportes de pruebas se convierten en el reporte de calidad publicado.
+
+**Espera estas preguntas de seguimiento y prepara respuestas:**
+
+- "¿Cómo sabes que tu juez tiene razón?" Habla del conjunto etiquetado, el kappa, la matriz de confusión y el sesgo que encontraste y corregiste.
+- "¿Cómo evitas un gate flaky?" Habla de bandas de tolerancia, muestreo repetido en casos límite, tags críticos y la caché.
+- "¿Cuánto cuesta?" Da el costo por ejecución en PR, por ejecución nightly y el costo por 1k requests de la app.
+- "¿Qué encontraste?" Ten una historia real: un caso que el gate atrapó, un sesgo del juez o una inyección que funcionaba antes de agregar un guardrail.
+- "¿Cómo lo adoptaría otro equipo?" Muestra la interfaz del adaptador y la llamada al workflow reutilizable. Menciona el segundo proyecto de juguete.
+
+**Muestra, no cuentes.** Abre el reporte en GitHub Pages. Luego muestra el PR donde falló el gate, el comentario con los deltas, y haz clic hasta el trace en Langfuse del peor caso. Esa historia de tres clics vale más que cualquier diapositiva.

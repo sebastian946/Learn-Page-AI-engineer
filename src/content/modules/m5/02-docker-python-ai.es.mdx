@@ -1,0 +1,189 @@
+## Qué tienen de especial las imágenes de IA en Python
+
+Ya conoces Docker. La pregunta aquí es más concreta: ¿por qué las imágenes de IA en Python terminan pesando entre 3 y 8 GB, tardan 10 minutos en construirse y aun así fallan en producción?
+
+Tres razones:
+
+1. **Dependencias pesadas.** `torch`, `transformers`, `sentence-transformers`, `numpy`, `pyarrow` y los parsers de PDF descargan cientos de megabytes de wheels. Instalar `torch` desde el índice por defecto en Linux descarga la versión CUDA, a menudo de más de 2 GB, aunque solo corras en CPU.
+2. **Las herramientas de build se filtran al runtime.** Algunos paquetes compilan extensiones en C. Si instalas `gcc` y headers en la imagen final, llegan a producción.
+3. **Pesos de modelos.** Un cross-encoder o modelo de embeddings local agrega desde 100 MB hasta varios GB. Descargarlo al iniciar el contenedor hace lentos los cold starts y ata el arranque a la disponibilidad de Hugging Face.
+
+La solución es el kit habitual aplicado con disciplina: builds multi-stage, un lockfile, cache mounts, una imagen base slim, un usuario no root y una decisión explícita sobre dónde viven los pesos.
+
+## Decide primero: ¿necesitas librerías de ML en la imagen?
+
+En `mortgage-knowledge-assistant`, la generación y los embeddings son llamadas a APIs. El único modelo local podría ser el re-ranker cross-encoder del Módulo 2. Opciones:
+
+| Opción | Impacto en la imagen | Trade-off |
+|---|---|---|
+| API de re-ranking hospedada (por ejemplo Cohere Rerank) | Ninguno | Costo por llamada, un salto de red extra |
+| Cross-encoder local en CPU con wheels CPU de `torch` | +700 MB a 1 GB | Costo fijo, agrega 50–200 ms de CPU por request |
+| Servicio de re-ranking separado | La imagen de la API sigue pequeña | Un servicio más para desplegar |
+
+Una imagen solo de API puede quedar por debajo de 250 MB. Agregar `torch` para CPU la lleva cerca de 1 GB. Agregar la versión CUDA la pasa de 3 GB. Toma esa decisión de forma consciente y escríbela en el README.
+
+Si sí necesitas `torch` en CPU, apunta uv al índice CPU en `pyproject.toml`:
+
+```toml
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+```
+
+## Un Dockerfile de producción con uv
+
+uv resuelve e instala mucho más rápido que pip, y `uv.lock` da instalaciones reproducibles. Este Dockerfile usa dos stages: un builder que crea un virtualenv y un runtime que copia solo el virtualenv y el código.
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
+
+# 1) Dependencies only: this layer is cached until the lockfile changes
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev
+
+# 2) Project code
+COPY app ./app
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+FROM python:${PYTHON_VERSION}-slim AS runtime
+RUN groupadd --system app && useradd --system --gid app --home /app app
+WORKDIR /app
+COPY --from=builder --chown=app:app /app /app
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+USER app
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+```
+
+Lo que te da cada pieza:
+
+- **`--mount=type=cache`** conserva la caché de descargas de uv entre builds en el mismo builder. Cambiar una línea de código no vuelve a descargar wheels. En CI, combínalo con la exportación de caché de BuildKit (`cache-to: type=gha`), que verás en la lección de CI/CD.
+- **Primero `--no-install-project`, luego el código.** La capa costosa de dependencias depende solo de `pyproject.toml` y `uv.lock`. Editar `app/` invalida solo la capa barata.
+- **`UV_COMPILE_BYTECODE=1`** precompila los archivos `.pyc`. El arranque es más rápido, lo que importa para el autoscaling y los cold starts.
+- **`--frozen`** hace fallar el build si el lockfile está desactualizado. Nada de resoluciones silenciosas en CI.
+- **El stage de runtime no tiene uv, ni compilador, ni caché.** Solo el venv y el código.
+- **Usuario no root.** Muchas plataformas lo exigen, y limita el radio de impacto.
+- **`HEALTHCHECK` con la stdlib de Python.** La imagen slim no trae `curl`. No lo instales solo para un health check. Ten en cuenta que ECS ignora el `HEALTHCHECK` del Dockerfile y usa el `healthCheck` de la task definition; mantén ambos consistentes.
+- **`CMD` en forma exec.** Uvicorn es el PID 1 y recibe `SIGTERM` directamente, así puede drenar los streams en curso durante un deploy.
+
+Si prefieres pip, la misma estructura funciona: construye wheels en el builder con `pip wheel -r requirements.txt -w /wheels` usando un cache mount en `/root/.cache/pip`, y luego `pip install --no-index --find-links=/wheels` en el runtime.
+
+### Workers y apagado elegante
+
+Los endpoints LLM están limitados por I/O. Un solo proceso de uvicorn con asyncio puede sostener cientos de streams concurrentes. En ECS o Kubernetes, prefiere **un proceso por contenedor y escalar contenedores**, en lugar de `--workers 4` dentro de un contenedor. Así las métricas de CPU y memoria son honestas y el autoscaling es predecible.
+
+Los streams pueden durar 30 s. Dale al orquestador un stop timeout mayor que tu stream más largo (`stopTimeout` en ECS, `terminationGracePeriodSeconds` en Kubernetes) y ejecuta uvicorn con `--timeout-graceful-shutdown` para que deje de aceptar conexiones nuevas y deje terminar las respuestas en curso.
+
+## Pesos de modelos: cuatro estrategias
+
+Si tu servicio carga un modelo local, decide de dónde vienen los pesos:
+
+1. **Incluirlos en la imagen.** Descárgalos en un stage de build y cópialos al runtime. Cold start rápido, totalmente reproducible, funciona offline. La imagen crece en el tamaño del modelo y cada cambio de modelo es una imagen nueva. Bueno para modelos pequeños (menos de ~500 MB) que cambian poco.
+2. **Descargarlos al arrancar** desde S3 o el Hugging Face Hub. Imagen pequeña, pero cold starts lentos y frágiles, y una dependencia de un servicio externo durante el scale-out. Fija la revisión.
+3. **Montar un volumen compartido** (EFS en ECS, un PVC en Kubernetes) precargado con los pesos. Bueno para modelos grandes compartidos por muchas tareas. Agrega infraestructura.
+4. **Servidor de modelos separado** (un servicio dedicado de re-ranking o embeddings, o un endpoint gestionado como SageMaker o Bedrock). La imagen de la API sigue pequeña y el modelo escala de forma independiente.
+
+Incluir un modelo pequeño en la imagen se ve así:
+
+```dockerfile
+FROM builder AS weights
+ARG RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+ARG RERANKER_REVISION=main
+ENV HF_HOME=/models
+RUN /app/.venv/bin/python -c "from huggingface_hub import snapshot_download; \
+    snapshot_download('${RERANKER_MODEL}', revision='${RERANKER_REVISION}')"
+
+FROM runtime
+COPY --from=weights --chown=app:app /models /models
+ENV HF_HOME=/models HF_HUB_OFFLINE=1
+```
+
+`HF_HUB_OFFLINE=1` hace que el runtime falle de forma ruidosa si falta el modelo, en lugar de salir silenciosamente a internet. En proyectos reales fija un hash de commit como revisión, para que la imagen sea reproducible.
+
+## .dockerignore importa más de lo que crees
+
+Sin él, `COPY . .` envía tu `.venv`, `.git`, datasets de evals, PDFs y quizás un `.env` con keys reales al contexto de build, y tal vez a la imagen.
+
+```text
+.git
+.venv
+__pycache__/
+*.pyc
+.env
+.env.*
+data/
+evals/results/
+loadtest/results/
+notebooks/
+tests/
+.pytest_cache/
+.github/
+```
+
+Prefiere un `COPY app ./app` explícito en lugar de `COPY . .`. Se documenta solo y es más seguro.
+
+## Medir el resultado
+
+```bash
+docker build -t mka:dev .
+docker image ls mka:dev
+docker history mka:dev --format "{{.Size}}\t{{.CreatedBy}}" | head -15
+docker run --rm mka:dev python -c "import app.main"   # smoke import
+docker scout cves mka:dev   # or: trivy image mka:dev
+```
+
+`docker history` muestra qué capa es pesada. Sorpresas típicas: un `COPY . .` con archivos de datos, un `pip install` sin `--no-cache-dir` o `torch` con CUDA.
+
+## Errores comunes
+
+- **Instalar `torch` con CUDA para un servicio que solo usa CPU.** Gigabytes de peso muerto y pulls más lentos en cada scale-out.
+- **`COPY . .` antes de instalar dependencias.** Cada cambio de código reinstala todo. Los builds pasan de 20 s a 5 min.
+- **Usar Alpine para IA en Python.** Muchos wheels están construidos para glibc, no para musl. Terminas compilando `numpy` desde el código fuente. Usa `-slim`.
+- **Secretos en build args o `ENV`.** Son visibles en `docker history` y en los metadatos de la imagen. Usa `--mount=type=secret` de BuildKit para secretos de build (como el token de un índice privado) e inyecta los secretos de runtime desde la plataforma. La siguiente lección cubre esto.
+- **Descargar modelos en runtime sin fijar la versión.** Una nueva revisión upstream cambia tus salidas en silencio. Tus evals dejan de significar algo.
+- **`CMD` en forma shell.** `CMD uvicorn ...` corre bajo `/bin/sh`, que no reenvía `SIGTERM`. Los deploys cortan los streams a mitad de la respuesta.
+- **Correr como root** y **usar tags `latest`** en las imágenes base. Fija `python:3.12-slim` (o un digest) y reconstruye con regularidad para recibir parches.
+
+<Callout type="tip" title="El ángulo SDET">
+Trata la imagen como un artefacto de prueba. Agrega un paso de CI que construya la imagen, la ejecute con `LLM_PROVIDER=mock`, llame a `/healthz` y a `/v1/chat` una vez, y falle si la imagen supera un presupuesto de tamaño. Es un smoke test del contenedor, igual que haces smoke tests de un ambiente desplegado.
+</Callout>
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="La imagen de tu servicio RAG en Python pesa 4 GB y tarda 8 minutos en construirse. ¿Cómo lo arreglas?" level="mid">
+Primero mide con `docker history` para encontrar las capas pesadas. Causas comunes: `torch` con CUDA en un servicio solo CPU (cambia al índice de wheels CPU o mueve el modelo detrás de una API), herramientas de build y cachés en el runtime (multi-stage: construye el venv en un builder y copia solo el venv a un runtime slim) y datos o `.venv` en el contexto de build (agrega `.dockerignore` y usa `COPY` explícitos).
+
+Para el tiempo de build: copia solo el lockfile e instala dependencias primero para que esa capa quede en caché, usa cache mounts de BuildKit para la caché de uv o pip, exporta la caché de capas en CI y usa uv en lugar de pip. Resultado típico: unos cientos de MB y builds de menos de un minuto cuando solo cambia el código.
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Dónde deberían vivir los pesos de un modelo en un servicio en contenedores?" level="senior">
+Depende del tamaño y de la frecuencia de cambio. Los modelos pequeños que cambian poco pueden ir dentro de la imagen: cold start rápido, reproducible, offline, pero imágenes más grandes. Los modelos grandes o que se actualizan seguido encajan mejor en un volumen compartido o en un servicio de model serving separado, para que la API escale de forma independiente y las imágenes sigan pequeñas. Descargarlos al arrancar es la opción más débil: scale-out lento y frágil, y una dependencia externa durante incidentes. En todos los casos fija la revisión y activa el modo offline en el runtime para nunca cargar una versión inesperada del modelo, porque un cambio silencioso de modelo invalida tus evals.
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- uv — Usar uv en Docker: https://docs.astral.sh/uv/guides/integration/docker/
+- Docker — Multi-stage builds: https://docs.docker.com/build/building/multi-stage/
+- Docker — Cache mounts y caché de build: https://docs.docker.com/build/cache/optimize/
+- Docker — Build secrets: https://docs.docker.com/build/building/secrets/
+- FastAPI — FastAPI en contenedores: https://fastapi.tiangolo.com/deployment/docker/

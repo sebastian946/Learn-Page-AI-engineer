@@ -1,0 +1,218 @@
+## El enunciado
+
+> "Diseña un sistema RAG que permita a los 10.000 empleados de una empresa hacer preguntas sobre documentos internos. Tienes 45 minutos."
+
+Este es el enunciado de system design de IA más común hoy, con variaciones (para clientes externos, multi-tenant, voz). Abajo tienes una resolución completa, al ritmo de una ronda real de 45 minutos. Léela una vez y luego hazla tú mismo en el ejercicio sin mirar.
+
+**Plan de ritmo:**
+
+| Minutos | Fase |
+|---|---|
+| 0-5 | Aclarar requisitos |
+| 5-10 | Estimaciones de capacidad |
+| 10-20 | Arquitectura de alto nivel |
+| 20-35 | Profundizaciones: modelo de datos, retrieval, evals |
+| 35-42 | Escalado, modos de falla, costo |
+| 42-45 | Resumen y qué harías después |
+
+## 1. Requisitos (minutos 0-5)
+
+Haz preguntas. Escribe las respuestas donde el entrevistador pueda verlas. Asume valores razonables cuando te digan "tú decides".
+
+**Funcionales:**
+
+- Los empleados hacen preguntas en lenguaje natural y reciben respuestas con citas a los documentos fuente.
+- Fuentes: Confluence, Google Drive, PDFs de políticas, un sistema de tickets. Alrededor de 200k documentos.
+- **Permisos:** los usuarios solo deben ver respuestas de documentos a los que tienen acceso en el sistema de origen. Este es el requisito que los candidatos olvidan con más frecuencia.
+- Chat de varios turnos con preguntas de seguimiento.
+- Los administradores pueden ver dashboards de uso, costo y calidad.
+
+**No funcionales:**
+
+- Latencia: primer token por debajo de 1.5 s en p95, respuesta completa por debajo de 6 s en p95.
+- Frescura: documentos nuevos o editados se pueden buscar en menos de 15 minutos.
+- Calidad: faithfulness de 0.9 o más en un golden set; se prefiere "no lo sé" a adivinar.
+- Disponibilidad: 99.9% en horario laboral.
+- Seguridad: SSO, los datos se quedan en la cuenta cloud de la empresa, log de auditoría de las consultas.
+- Costo: un presupuesto mensual, que vamos a estimar.
+
+**Fuera de alcance (dilo):** fine-tuning, voz, escribir de vuelta en los sistemas de origen.
+
+## 2. Estimaciones de capacidad (minutos 5-10)
+
+Haz las cuentas en voz alta. Redondea sin miedo. Lo que importa son los órdenes de magnitud.
+
+```python
+# Back-of-envelope; every input is an assumption you state out loud.
+users = 10_000
+dau_ratio = 0.4                 # 4,000 daily active users
+queries_per_dau = 10
+work_seconds = 8 * 3600
+peak_factor = 4
+
+queries_per_day = users * dau_ratio * queries_per_dau           # 40,000
+avg_qps = queries_per_day / work_seconds                         # ~1.4
+peak_qps = avg_qps * peak_factor                                 # ~5.6
+concurrent_streams = peak_qps * 6                                # ~34 (6 s per answer)
+
+in_tokens, out_tokens = 4_000, 400                               # 5 chunks x 500 + prompt + history
+monthly_in = queries_per_day * 22 * in_tokens                    # ~3.5B
+monthly_out = queries_per_day * 22 * out_tokens                  # ~350M
+
+docs, tokens_per_doc, chunk_tokens = 200_000, 5_000, 500
+chunks = docs * tokens_per_doc // chunk_tokens                   # 2M chunks
+vector_bytes = chunks * 1024 * 4                                 # 1024-dim float32: ~8 GB
+index_bytes = vector_bytes * 2                                   # HNSW overhead: ~16 GB
+```
+
+Di qué significan los números:
+
+- **El QPS es pequeño.** Unos 6 QPS en el pico. La capa de API no es la parte difícil.
+- **El LLM es el cuello de botella y el centro de costo.** 34 streams concurrentes y unos 3.500 millones de tokens de entrada al mes. Los rate limits del proveedor (tokens por minuto) importan más que la CPU.
+- **El índice vectorial cabe en una máquina.** 2 millones de chunks, unos 16 GB con el índice. pgvector en una instancia de 64 GB está bien. No hace falta una vector DB distribuida.
+- **Estimación de costo del LLM:** con precios de ejemplo de $3 por 1M de tokens de entrada y $15 por 1M de tokens de salida (solo de ejemplo; revisa los precios actuales), son unos $10.5k de entrada más $5.3k de salida, aproximadamente $16k al mes antes de caché y enrutamiento. Ese número guía varias decisiones posteriores.
+
+## 3. Arquitectura de alto nivel (minutos 10-20)
+
+Dibuja dos caminos: ingesta (cold path) y consulta (hot path).
+
+<Diagram caption="RAG para 10k empleados: caminos de ingesta y de consulta" chart={`flowchart TB
+  subgraph Ingesta
+    SRC["Conectores: Confluence, Drive, PDFs, tickets"] --> SYNC["Planificador de sync (webhooks + poll cada 15 min)"]
+    SYNC --> QU["Cola"]
+    QU --> PARSE["Parsear + limpiar + chunking"]
+    PARSE --> EMB["Embeddings (batch)"]
+    EMB --> DB[("PostgreSQL + pgvector + FTS")]
+    SYNC --> ACL["Sync de ACL (quién puede leer qué)"]
+    ACL --> DB
+  end
+  subgraph Consulta
+    U["Empleado (SSO)"] --> API["API de chat (FastAPI, streaming SSE)"]
+    API --> CACHE[("Redis: caché, rate limits, sesiones")]
+    API --> RW["Reescritura de consulta (modelo pequeño)"]
+    RW --> HYB["Retrieval híbrido con filtro de ACL"]
+    HYB --> DB
+    HYB --> RR["Re-rank del top 50 al top 5"]
+    RR --> GEN["Generar con citas"]
+    GEN --> LLM["Proveedor de LLM (regional)"]
+  end
+  API --> OBS["Tracing + métricas + eventos de uso"]
+  OBS --> EVAL["Muestreo de evals online + dashboards"]`} />
+
+Narra el camino de consulta de un tirón: SSO identifica al usuario y sus grupos; la API revisa la caché y el rate limit; un modelo pequeño reescribe la pregunta de seguimiento como una consulta autónoma; el retrieval híbrido corre BM25 y búsqueda vectorial filtradas por los grupos de ACL del usuario; RRF las combina; un cross-encoder re-rankea del top 50 al 5; el LLM responde con citas, en streaming por SSE; cada paso emite un span de trace y un evento de uso.
+
+## 4. Profundizaciones (minutos 20-35)
+
+El entrevistador elegirá una o dos. Ten las tres listas.
+
+### Modelo de datos
+
+```sql
+CREATE TABLE documents (
+  id uuid PRIMARY KEY, source text, source_id text, title text, url text,
+  updated_at timestamptz, content_hash text, UNIQUE (source, source_id)
+);
+CREATE TABLE chunks (
+  id bigserial PRIMARY KEY, doc_id uuid REFERENCES documents ON DELETE CASCADE,
+  ord int, content text, section_path text, embedding vector(1024),
+  acl_groups text[] NOT NULL,  -- denormalized from the source system
+  tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+CREATE INDEX ON chunks USING gin (acl_groups);
+CREATE TABLE usage_events (
+  ts timestamptz, user_id text, request_id uuid, model text, prompt_version text,
+  in_tokens int, out_tokens int, cached_tokens int, cost_usd numeric(12,6), latency_ms int
+);
+```
+
+Puntos clave: `content_hash` evita volver a generar embeddings de documentos sin cambios. `acl_groups` se desnormaliza en los chunks para que el filtrado ocurra dentro de la consulta de búsqueda. Cuando cambian los permisos de un documento, el sync de ACL actualiza el arreglo; no vuelve a generar embeddings.
+
+### Retrieval
+
+- Chunking: consciente del documento (encabezados en Confluence, secciones en políticas), unos 500 tokens, 10% de solapamiento, `section_path` guardado para las citas.
+- Híbrido: BM25 captura términos exactos (números de política, códigos de producto), los vectores capturan paráfrasis. Combina con reciprocal rank fusion.
+- **Filtro de permisos antes del ranking**: `WHERE acl_groups && $user_groups`. Nunca filtres después de generar.
+- Re-rank del top 50 al 5 con un cross-encoder. Presupuesto de unos 100-150 ms.
+- Generación: el system prompt exige citar ids de chunks y responder "no tengo suficiente información" cuando el contexto no alcanza.
+
+### Evals
+
+- **Offline:** golden set de 150-300 preguntas escritas con expertos del negocio, que cubra cada fuente y cada nivel de permisos, incluyendo preguntas que deben rechazarse. Métricas: context recall y precision, faithfulness, answer relevance, precisión de citas.
+- **Gate en CI:** cualquier cambio en prompts, chunking, modelos o retrieval corre la suite. Bloquea el merge si faithfulness cae más de 2 puntos.
+- **Online:** muestrea el 2% del tráfico para un juez LLM de faithfulness, recoge pulgares arriba y abajo, mide la tasa de "sin respuesta". Revisión humana semanal de 50 traces con puntaje bajo, que alimentan nuevos ejemplos del golden set.
+- **Tests de permisos:** usuarios del grupo A nunca deben recibir citas de documentos exclusivos del grupo B. Tolerancia cero.
+
+## 5. Escalado, modos de falla, costo (minutos 35-42)
+
+**Escalado:** la API no tiene estado y escala automáticamente según conexiones concurrentes, no CPU. El límite real es la cuota de tokens por minuto del proveedor; pide un aumento de cuota y reparte la carga entre dos regiones o dos proveedores detrás de la abstracción de proveedor del Módulo 1. La base de datos recibe una réplica de lectura para retrieval. Los workers de ingesta escalan según la profundidad de la cola, por separado de la API.
+
+**Modos de falla:**
+
+| Falla | Detección | Mitigación |
+|---|---|---|
+| Caída del proveedor de LLM o errores 429 | Alertas de tasa de error y latencia | Reintento con backoff, failover a modelo o región secundaria, modo "solo resultados de búsqueda" |
+| Permisos viejos o erróneos | Métrica de retraso del sync de ACL | Sync por webhook, fallar cerrado si los datos de ACL superan un umbral de antigüedad |
+| Chunking malo tras cambiar el parser | Caída del eval offline en CI | Versionar el pipeline, re-indexar en una tabla nueva, intercambiar con un alias |
+| Respuesta alucinada | Juez online, feedback de usuarios | Prompt de grounding estricto, camino de abstención, validación de citas |
+| Prompt injection dentro de un documento | Suite de red team | Tratar el texto recuperado como datos, sin herramientas con efectos secundarios en este flujo |
+| Pico de costo | Alerta diaria de costo por usuario | Rate limits por usuario, enrutamiento a un modelo más pequeño, caché |
+
+**Costo:** según la estimación, unos $16k al mes en LLM con precios de lista de ejemplo. Palancas: enrutar preguntas simples a un modelo pequeño, prompt caching del system prompt estático, caché semántica por conjunto de permisos (la clave de caché incluye el hash de los grupos de ACL, o filtras datos) y recortar el contexto de 5 chunks a 3 cuando el re-ranker tiene confianza alta. La infraestructura es pequeña en comparación: una instancia de base de datos, algunos contenedores, Redis.
+
+## 6. Resumen (minutos 42-45)
+
+Resume en 30 segundos: un diseño de dos caminos, permisos aplicados en el retrieval, calidad protegida por evals en CI y muestreo online, costo dominado por el LLM con palancas claras. Luego di qué harías después: un camino agéntico para preguntas de varios pasos, dashboards por departamento y una prueba de carga con k6 contra el endpoint de streaming.
+
+## Rúbrica de autoevaluación
+
+Califícate después del ejercicio. Sé estricto. 3 puntos cada área, 30 en total. Apunta a 24 o más.
+
+| Área | 0 | 1-2 | 3 |
+|---|---|---|---|
+| Requisitos | Saltó directo a las cajas | Algunas preguntas | Funcionales, no funcionales, fuera de alcance, permisos planteados por ti |
+| Estimaciones | Ninguna | Números parciales | QPS, concurrencia, tokens, almacenamiento, costo y qué implica cada uno |
+| Arquitectura | Un solo bloque | Solo camino de consulta | Caminos de ingesta y consulta, componentes claros |
+| Modelo de datos | No mencionado | Tablas listadas | Campos que soportan deduplicación, ACLs, citas, costo |
+| Retrieval | "Búsqueda vectorial" | Híbrido o re-rank | Chunking, híbrido, filtro de ACL antes del ranking, re-rank, citas |
+| Evals | No mencionados | "Lo probaríamos" | Set offline, gate en CI, muestreo online, tests de permisos |
+| Escalado | Autoescalado genérico | Algunos cuellos de botella | Identificó la cuota del LLM como cuello de botella, con mitigaciones |
+| Modos de falla | Ninguno | 1-2 | Tabla con detección y mitigación |
+| Costo | Ninguno | Mencionado | Estimado con supuestos explícitos, palancas priorizadas |
+| Comunicación | Dibujo en silencio | Algo de narración | Con ritmo, consultó al entrevistador, resumió |
+
+## Errores comunes
+
+- Dibujar primero una vector DB y preguntar después.
+- Olvidar los permisos de documentos. En RAG empresarial suele ser el factor decisivo.
+- Proponer una base vectorial distribuida para 2 millones de chunks.
+- Tratar el QPS como el problema de escalado cuando lo son la cuota del LLM y el costo.
+- Sin evals, o evals solo offline.
+- Filtrar permisos después del retrieval, de modo que el top-k está lleno de chunks prohibidos y la calidad colapsa.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo manejas los permisos a nivel de documento en RAG empresarial?" level="senior">
+
+Sincronizo las ACLs desde cada sistema de origen y desnormalizo los grupos permitidos en cada chunk. En tiempo de consulta, resuelvo los grupos del usuario desde SSO y filtro dentro de la consulta de retrieval, antes del ranking, para que el top-k solo contenga chunks permitidos. Las claves de caché incluyen un hash del conjunto de grupos. Los cambios de permisos actualizan el arreglo de ACL sin regenerar embeddings. Si los datos de ACL están viejos más allá de un umbral, fallo cerrado. Lo pruebo con usuarios de distintos grupos en la suite de evals, con tolerancia cero a fugas.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu estimación dice que el costo del LLM es la partida más grande. ¿Cómo lo reduces a la mitad?" level="mid">
+
+Primero mido: desglose de tokens por petición desde los traces. Luego: enruto las preguntas fáciles a un modelo más pequeño tras verificar la calidad en el golden set, uso prompt caching para el system prompt estático, agrego una caché semántica por conjunto de permisos para preguntas repetidas, reduzco los chunks recuperados cuando el puntaje del re-ranker es alto y limito el largo de la salida. Cada cambio pasa por el gate de evals para que la calidad no caiga en silencio.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Consulta al entrevistador cada 10 minutos">
+
+Pregunta "¿Quieres que profundice en retrieval o en evals?". Deja que el entrevistador te dirija hacia lo que califica y muestra que manejas el tiempo.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Filtrado y ajuste de HNSW en pgvector: https://github.com/pgvector/pgvector
+- Métricas de Ragas: https://docs.ragas.io
+- Convenciones semánticas de OpenTelemetry para IA generativa: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+- Documentación de k6: https://k6.io/docs/
+- Documentación de Anthropic sobre rate limits: https://docs.anthropic.com/en/api/rate-limits

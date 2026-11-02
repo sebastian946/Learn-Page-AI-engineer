@@ -1,0 +1,205 @@
+## Why cost is a design input, not a finance report
+
+In a classic web service, the marginal cost of one request is close to zero. You pay for servers, and servers are mostly idle. In an LLM service, every request has a **direct variable cost**: input tokens plus output tokens, multiplied by a price that depends on the model. That cost is often larger than all your infrastructure combined.
+
+So cost becomes a design input, like latency. A product manager will ask: "What does it cost us per customer per month?" A CTO will ask: "What happens to the bill if usage triples?" You need a model that answers both in five minutes, not a guess.
+
+This lesson builds that model. The core unit is **cost per 1k requests**. It is easy to compare across models, it scales linearly to any traffic level, and it is the number clients put in requirements ("under $4 per 1k requests").
+
+## The anatomy of one request
+
+Take a RAG request on the mortgage knowledge assistant. Break it into its cost drivers:
+
+| Component | Driver | Typical size (example) |
+|---|---|---|
+| System prompt | Fixed tokens per request | 600 tokens |
+| Retrieved context | `top_k` × chunk size | 6 × 400 = 2,400 tokens |
+| Conversation history | Turns kept × avg turn size | 0–2,000 tokens |
+| User question | Variable | 40 tokens |
+| Output | Answer length, capped by `max_tokens` | 250 tokens |
+| Query embedding | One embedding call | 40 tokens |
+| Re-ranking (optional) | Per-document call or per-search price | 1 call |
+
+Notice where the tokens are. The user's question is under 2% of the input. **Retrieved context and the system prompt dominate.** That is why `top_k`, chunk size and history truncation are cost levers, not just quality levers.
+
+## The formula
+
+For one model call:
+
+```text
+cost_per_request = (input_tokens  / 1_000_000) * input_price_per_mtok
+                 + (output_tokens / 1_000_000) * output_price_per_mtok
+```
+
+For the whole request, add embeddings, re-ranking and any extra LLM calls (query rewriting, guardrail classifiers, LLM-as-judge in online evals). Then:
+
+```text
+cost_per_1k_requests = 1000 * (1 - cache_hit_rate) * avg_cost_per_uncached_request
+                     + 1000 * cache_hit_rate * cost_per_cache_hit
+                     + infra_cost_per_1k_requests
+```
+
+A cache hit costs almost nothing in tokens. If 30% of traffic hits the cache, you remove roughly 30% of the token bill. That is why the exact cache from lesson 05 often pays for itself in the first week.
+
+Prompt caching at the provider (for example Anthropic's prompt caching for a long, stable system prompt) is a different lever. It discounts the repeated prefix of the input. Model it as a lower effective input price for the cached portion. Check the provider's current pricing page for the exact multipliers.
+
+## A cost model in code
+
+Keep the model in the repo, next to the code, so it changes when the code changes. Prices come from config, never hard-coded constants that silently go stale.
+
+```python
+# tools/cost_model.py
+from pydantic import BaseModel
+
+
+class ModelPrice(BaseModel):
+    name: str
+    input_per_mtok: float   # USD per 1M input tokens — read from config
+    output_per_mtok: float  # USD per 1M output tokens — read from config
+
+
+class RequestProfile(BaseModel):
+    system_tokens: int = 600
+    context_tokens: int = 2400
+    history_tokens: int = 800
+    question_tokens: int = 40
+    output_tokens: int = 250
+    extra_calls_usd: float = 0.0002  # embeddings + re-rank per request
+
+
+def cost_per_request(p: RequestProfile, m: ModelPrice) -> float:
+    input_tokens = p.system_tokens + p.context_tokens + p.history_tokens + p.question_tokens
+    llm = input_tokens / 1e6 * m.input_per_mtok + p.output_tokens / 1e6 * m.output_per_mtok
+    return llm + p.extra_calls_usd
+
+
+def cost_per_1k(
+    p: RequestProfile,
+    m: ModelPrice,
+    cache_hit_rate: float = 0.0,
+    infra_per_1k: float = 0.05,
+) -> float:
+    uncached = cost_per_request(p, m)
+    return 1000 * (1 - cache_hit_rate) * uncached + infra_per_1k
+
+
+if __name__ == "__main__":
+    # Example prices only — check the provider's current pricing page.
+    sonnet = ModelPrice(name="claude-sonnet-5-5", input_per_mtok=3.0, output_per_mtok=15.0)
+    haiku = ModelPrice(name="claude-haiku-5-5", input_per_mtok=1.0, output_per_mtok=5.0)
+    profile = RequestProfile()
+    for model in (sonnet, haiku):
+        for hit in (0.0, 0.3):
+            print(f"{model.name:20} hit={hit:.0%}  ${cost_per_1k(profile, model, hit):.2f} / 1k")
+```
+
+With these example prices, Sonnet lands around $15 per 1k uncached requests and Haiku around $5. The exact numbers matter less than the **shape**: output tokens are expensive per token, input tokens are expensive in volume, and the cache hit rate is a straight multiplier.
+
+## Measure, don't assume
+
+The profile above is a guess until you replace it with production data. Your service already logs `input_tokens` and `output_tokens` per request (from Module 1's cost logging and the `usage` field on every response). Compute the real distribution:
+
+```sql
+-- Cost per 1k requests over the last 7 days, by model and tenant
+SELECT
+  model,
+  tenant_id,
+  count(*)                                   AS requests,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY input_tokens)  AS p50_in,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY input_tokens) AS p95_in,
+  avg(output_tokens)                          AS avg_out,
+  1000 * avg(cost_usd)                        AS usd_per_1k
+FROM llm_requests
+WHERE created_at > now() - interval '7 days'
+GROUP BY model, tenant_id
+ORDER BY usd_per_1k DESC;
+```
+
+Look at p95, not just averages. A few tenants who paste 30-page documents into the chat can double your average input tokens. That is a product decision (cap the input) disguised as a cost problem.
+
+## Capacity planning
+
+Cost answers "how much". Capacity answers "how many containers, and will the provider let us". There are three ceilings, and you hit the lowest one first.
+
+**1. Provider rate limits.** Providers limit requests per minute and tokens per minute (input and output, sometimes separately). Convert your peak traffic to tokens per minute:
+
+```text
+peak_rps          = 20 requests/s
+input_tpm_needed  = 20 * 60 * 3,840 ≈ 4.6M input tokens/min
+output_tpm_needed = 20 * 60 * 250   = 300k output tokens/min
+```
+
+Compare that to your account's tier limits. If you are over, you need a higher tier, a second provider or region, a smaller context, or a cache. Find out **before** launch day.
+
+**2. Concurrency in your service.** Little's law: `concurrency = arrival_rate × time_in_system`. If requests take 6 seconds end-to-end at 20 rps, you hold 120 open streams at any moment. Async FastAPI handles hundreds of concurrent streams per task, because the work is waiting on I/O. But connection pools (Postgres, Redis, the HTTP client to the provider) must be sized for that concurrency. Your k6 results from lesson 11 tell you the real number per task.
+
+**3. Your infrastructure.** CPU and memory per task, Postgres connections, Redis ops/s. For a RAG API these are rarely the bottleneck. They become the bottleneck when you run embeddings or re-rankers in-process.
+
+A simple capacity sheet:
+
+| Input | Value | Source |
+|---|---|---|
+| Peak rps | 20 | Product forecast × 3 safety factor |
+| p95 time in system | 6 s | k6 run, mock provider + real TTFT |
+| Concurrent streams | 120 | Little's law |
+| Streams per task (tested) | 60 | k6 saturation point |
+| Tasks at peak | 2 + 1 spare | 120 / 60, plus N+1 |
+| Input TPM at peak | 4.6M | Profile × rps |
+| Provider tier limit | check account | Provider console |
+
+## Cost levers, ranked by effort
+
+1. **Cap `max_tokens`** and ask for concise answers. Cheapest change. Measure the output-token drop in your logs.
+2. **Cache** exact repeats. Zero quality risk when keyed correctly.
+3. **Trim context**: lower `top_k` after re-ranking, smaller chunks, summarize history. Verify with your eval suite that faithfulness holds.
+4. **Route by difficulty**: a cheap model for simple questions, the strong model for hard ones. Needs an eval per route.
+5. **Provider prompt caching** for long stable system prompts.
+6. **Batch APIs** for offline work (eval runs, re-indexing summaries), where latency does not matter.
+
+Every lever except the first two touches quality. Run the Module 3 eval gate before and after. A cheaper system that fails the faithfulness threshold is not cheaper. It is broken.
+
+## Budgets and alerts
+
+Model the cost, then enforce it:
+
+- **Per-tenant monthly budget** stored with the tenant. The rate limiter from lesson 05 can refuse or degrade when it is exhausted.
+- **Daily spend alert** in your observability stack: alert at 80% of the expected daily spend, page at 150%.
+- **Per-request ceiling**: reject requests whose estimated input tokens exceed a limit before calling the provider.
+- **Cost per 1k requests** as a dashboard panel and an SLO-style target, reviewed weekly.
+
+## Common mistakes
+
+- **Using average tokens only.** Long-tail requests drive the bill. Track p95 input tokens per tenant.
+- **Forgetting the hidden calls.** Query rewriting, guardrail classifiers, online judges and retries each cost tokens. A retry on a timeout can double the cost of that request.
+- **Hard-coding prices.** Prices change. Keep them in config with a date and a link to the source.
+- **Planning capacity on CPU.** For LLM APIs the first ceiling is usually the provider's tokens-per-minute limit, not your containers.
+- **Optimizing cost without evals.** Cutting `top_k` from 8 to 3 looks great on the bill and terrible on faithfulness.
+- **Ignoring streaming cancellations.** If clients disconnect and you keep generating, you pay for tokens nobody reads. Lesson 01 showed how to stop.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Estimate the monthly LLM cost of a RAG assistant serving 50,000 requests per day." level="senior">
+
+Break it down instead of guessing. Per request: system prompt (~600 tokens), retrieved context (`top_k` 6 × 400 = 2,400), history (~800), question (~40), so ~3,800 input tokens and ~250 output tokens. Multiply by the model's current per-million prices to get cost per request, then per 1k requests. 50k/day is 1.5M requests/month, so 1,500 × cost per 1k. Then apply levers: a 30% exact-cache hit rate removes ~30% of token cost; routing easy questions to a smaller model cuts more. I would state the assumptions explicitly, validate them against logged `usage` data in week one, and track p95 input tokens because long-tail requests dominate the bill. Finally I would check the provider's tokens-per-minute limit at peak, because capacity often fails before budget does.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What is the first resource you run out of when an LLM API scales up?" level="mid">
+
+Usually the provider's rate limit, measured in tokens per minute, not your own CPU. The service mostly waits on I/O, so a few async containers can hold hundreds of streams. Convert peak rps into input and output tokens per minute and compare with the account tier. Then check connection pools, sized by Little's law (`concurrency = rps × latency`).
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Say the unit out loud">
+
+Quote cost as "dollars per 1k requests" and latency as "p95". It signals you have run real systems. Then tie it to a business unit: cost per tenant per month, or cost per resolved ticket.
+
+</Callout>
+
+## Further reading
+
+- Anthropic pricing and prompt caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- Anthropic rate limits: https://docs.anthropic.com/en/api/rate-limits
+- OpenAI rate limits guide: https://platform.openai.com/docs/guides/rate-limits
+- AWS Pricing Calculator docs: https://docs.aws.amazon.com/pricing-calculator/latest/userguide/what-is-pricing-calculator.html
+- Little's law in performance testing (k6 docs on arrival-rate executors): https://k6.io/docs/using-k6/scenarios/executors/

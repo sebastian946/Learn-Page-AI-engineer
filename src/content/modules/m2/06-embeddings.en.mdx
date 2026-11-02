@@ -1,0 +1,172 @@
+## What an embedding is, operationally
+
+An embedding model maps a piece of text to a fixed-length vector of floats, for example 1,024 numbers. Texts with similar meaning land near each other. "Maximum debt-to-income ratio for conventional loans" and "What's the highest DTI we accept on a conforming loan?" share few words but produce vectors with high cosine similarity.
+
+For RAG you need to know five operational facts, not the math of transformers:
+
+1. **Same model, both sides.** Documents and queries must be embedded with the same model (and same dimensions). Vectors from different models are not comparable.
+2. **Similarity is relative.** A cosine score of 0.62 means nothing on its own. Only the ranking among candidates matters, and score distributions differ per model. Do not hard-code "relevant if above 0.8" without calibrating on your data.
+3. **Inputs have a length limit.** Text beyond the model's maximum input tokens is truncated or rejected. Check it against your chunk sizes.
+4. **Some models are asymmetric.** Several providers ask you to mark inputs as `query` or `document` (or prefix them). Getting this wrong quietly lowers recall.
+5. **Changing the model means re-embedding everything.** Plan for it from day one.
+
+## Distance metrics
+
+| Metric | Formula idea | When |
+|---|---|---|
+| Cosine similarity | angle between vectors | default for text; insensitive to vector length |
+| Dot product | cosine times lengths | equals cosine when vectors are L2-normalized; fastest |
+| Euclidean (L2) | straight-line distance | equivalent ranking to cosine for normalized vectors |
+
+Most hosted embedding models return normalized vectors, in which case all three give the same ranking. Normalize anyway if you are unsure; it costs nothing and makes dot product safe. In pgvector the operators are `<=>` (cosine distance), `<#>` (negative inner product) and `<->` (L2), and the index must be built with the matching operator class (lesson 7).
+
+## Choosing a model
+
+There is no single best embedding model. Choose with this checklist, then confirm on your own golden set:
+
+- **Retrieval quality on your domain.** Public leaderboards such as MTEB are a starting filter, not a decision. A model that tops a general benchmark can be mediocre on mortgage jargon ("50(a)(6)", "non-QM", "DTI back-end ratio"). Run your chunking benchmark from the previous exercise with two or three candidate models.
+- **Languages.** Many US lenders serve Spanish-speaking borrowers. If FAQ pages exist in both languages, or loan officers ask in Spanish about English policies, you need a multilingual model and a cross-lingual test case in the golden set.
+- **Max input length.** Must comfortably exceed your largest chunk.
+- **Dimensions.** Drives storage, memory and search speed (below).
+- **Hosting and data residency.** Hosted API (OpenAI, Voyage, Cohere, Google, Bedrock-hosted models) versus self-hosted open-weights models (for example via `sentence-transformers`). Regulated lenders often require that document text stays in a specific cloud account or region, which can rule options in or out before quality is even considered.
+- **Cost and throughput.** Index-time cost is one-off per corpus version; query-time cost is per request but tiny because queries are short.
+
+Anthropic does not offer its own embedding model; its docs point to partner providers. A common production pairing is Claude for generation plus a separate embedding provider, with both model names in config.
+
+## Dimensions, storage and Matryoshka embeddings
+
+Storage per vector is `dimensions × bytes per value`. With 4-byte floats:
+
+| Dimensions | Bytes per vector | 1M chunks (vectors only) |
+|---|---|---|
+| 384 | 1.5 KB | ~1.5 GB |
+| 1,024 | 4 KB | ~4 GB |
+| 1,536 | 6 KB | ~6 GB |
+| 3,072 | 12 KB | ~12 GB |
+
+HNSW indexes add more on top and want to live in RAM for good latency. For our lender's corpus (thousands of documents, maybe 50k–200k chunks) any of these fits easily. At tens of millions of chunks, dimensions become a real infrastructure cost.
+
+Many recent models are trained with **Matryoshka representation learning**: the first N dimensions are themselves a useful embedding. You can request a shorter vector (OpenAI's `dimensions` parameter, Voyage's `output_dimension`, or truncating and re-normalizing yourself where the model supports it) and trade a little quality for a lot of storage. Measure the trade-off on your golden set; do not assume it.
+
+You can also shrink each value: pgvector supports `halfvec` (2-byte floats, half the storage, usually negligible quality loss) and binary quantization for very large corpora, typically followed by re-scoring the top candidates with full-precision vectors.
+
+## A provider-agnostic embedder
+
+Hide the provider behind a small interface so you can benchmark models and swap them without touching the pipeline. This mirrors the provider abstraction you built in Module 1.
+
+```python
+import asyncio
+import os
+from typing import Literal, Protocol
+
+import numpy as np
+
+InputType = Literal["query", "document"]
+
+
+class Embedder(Protocol):
+    model: str
+    dimensions: int
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray: ...
+
+
+class OpenAIEmbedder:
+    def __init__(self, model: str | None = None, dimensions: int | None = None) -> None:
+        from openai import AsyncOpenAI
+        self.client = AsyncOpenAI()
+        self.model = model or os.environ["EMBEDDING_MODEL"]
+        self.dimensions = dimensions or int(os.getenv("EMBEDDING_DIM", "1536"))
+
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray:
+        # OpenAI models are symmetric; input_type is accepted for interface parity
+        resp = await self.client.embeddings.create(
+            model=self.model, input=texts, dimensions=self.dimensions)
+        return normalize(np.array([d.embedding for d in resp.data], dtype=np.float32))
+
+
+class VoyageEmbedder:
+    def __init__(self, model: str | None = None, dimensions: int | None = None) -> None:
+        import voyageai
+        self.client = voyageai.AsyncClient()
+        self.model = model or os.environ["EMBEDDING_MODEL"]
+        self.dimensions = dimensions or int(os.getenv("EMBEDDING_DIM", "1024"))
+
+    async def embed(self, texts: list[str], input_type: InputType) -> np.ndarray:
+        resp = await self.client.embed(texts, model=self.model, input_type=input_type,
+                                       output_dimension=self.dimensions)
+        return normalize(np.array(resp.embeddings, dtype=np.float32))
+
+
+def normalize(v: np.ndarray) -> np.ndarray:
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+async def embed_corpus(embedder: Embedder, texts: list[str],
+                       batch_size: int = 128, concurrency: int = 4) -> np.ndarray:
+    sem = asyncio.Semaphore(concurrency)
+    async def one(batch: list[str]) -> np.ndarray:
+        async with sem:
+            return await embedder.embed(batch, "document")
+    batches = [texts[i : i + batch_size] for i in range(0, len(texts), batch_size)]
+    return np.vstack(await asyncio.gather(*(one(b) for b in batches)))
+```
+
+Add the retry-with-backoff wrapper from Module 1 around `embed`: bulk indexing is exactly where you hit rate limits. Check each provider's maximum batch size and tokens per request; the values above are placeholders.
+
+## Estimating cost
+
+Index-time cost is easy to estimate before you spend anything. Read the price from your provider's current pricing page into config; never hard-code it.
+
+```python
+import tiktoken
+
+def estimate_index_cost(chunks: list[str], usd_per_million_tokens: float) -> dict:
+    enc = tiktoken.get_encoding("cl100k_base")   # approximation; providers tokenize differently
+    tokens = sum(len(enc.encode(c)) for c in chunks)
+    return {"chunks": len(chunks), "tokens": tokens,
+            "usd": round(tokens / 1_000_000 * usd_per_million_tokens, 4)}
+```
+
+For a corpus of 5,000 pages at roughly 500 tokens per page, that is about 2.5 million tokens per full embedding pass, plus overlap. With small embedding models this is usually a small line item compared with LLM generation. The expensive mistake is re-embedding the full corpus on every deploy or every night. Content hashes from lesson 2 prevent that.
+
+## Versioning and migration
+
+Store the embedding model and dimensions with every vector (a column, or a separate collection or table per model). When you change models:
+
+1. Create a new table or collection for the new model.
+2. Backfill it in the background from your normalized documents.
+3. Run the golden-set benchmark against both.
+4. Switch reads with a config flag; keep the old index for rollback until the new one is proven.
+
+This is a blue-green deploy for your index. Teams that store vectors without the model name end up with mixed-model indexes and mysteriously bad results.
+
+## Common mistakes
+
+- **Mixing models or dimensions** in one index, often after a "harmless" config change.
+- **Ignoring `input_type`** on asymmetric models, embedding queries as documents.
+- **Choosing by leaderboard alone** instead of by your own retrieval benchmark.
+- **Chunks longer than the model's input limit**, silently truncated.
+- **Thresholding on raw similarity** ("only use chunks above 0.75") without calibration per model. Prefer top-k plus a re-ranker (lesson 11).
+- **Embedding at request time** for documents. Index offline; only queries are embedded online.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you pick an embedding model for a mortgage knowledge assistant?" level="mid">
+
+Shortlist two or three models using public benchmarks plus constraints: languages (English and Spanish), maximum input length versus my chunk sizes, data residency requirements, and cost. Then decide with my own retrieval benchmark: a golden set of real loan-officer questions labeled with the correct section, measuring recall@k and MRR for each model at the dimensions I would actually deploy. I would also include exact-term and cross-lingual questions. Whichever wins, I store the model name and dimension with the vectors so a future change is a controlled re-index, not a silent mix.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your index has grown to 50 million chunks and memory costs are high. What are your options?" level="senior">
+
+Reduce bytes per vector before adding hardware. Options: request fewer dimensions from a Matryoshka-trained model; store `halfvec` instead of 32-bit floats; use binary or product quantization for the first-pass search and re-score the top few hundred candidates with full-precision vectors. Also reduce vector count: remove superseded document versions from the hot index, cut chunk overlap, and deduplicate near-identical chunks. Partition by tenant or doc type so each query searches a smaller index. Every change gets validated on the golden set for recall loss and on a load test for p95 latency.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [OpenAI — Embeddings guide](https://platform.openai.com/docs/guides/embeddings)
+- [Anthropic — Embeddings](https://docs.anthropic.com/en/docs/build-with-claude/embeddings)
+- [MTEB leaderboard (Hugging Face)](https://huggingface.co/spaces/mteb/leaderboard)
+- [Kusupati et al., Matryoshka Representation Learning (arXiv:2205.13147)](https://arxiv.org/abs/2205.13147)
+- [pgvector — halfvec and quantization](https://github.com/pgvector/pgvector)

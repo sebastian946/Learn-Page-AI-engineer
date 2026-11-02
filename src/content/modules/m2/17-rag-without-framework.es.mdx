@@ -1,0 +1,219 @@
+## ¿Por qué reconstruir algo que ya funciona?
+
+En la lección 01 construiste un pipeline RAG en unas 30 líneas de LangChain. Funcionó. Entonces, ¿por qué dedicar una lección a reconstruirlo con librerías simples?
+
+Porque los frameworks esconden decisiones, y las entrevistas, los incidentes y las revisiones de costos giran alrededor de esas decisiones. Cuando un ingeniero senior pregunta "¿qué SQL ejecuta tu retriever?" o "¿qué pasa cuando la API de embeddings devuelve un 429 a mitad de la ingesta?", "LangChain se encarga" no es una respuesta.
+
+Es la misma razón por la que alguna vez escribiste un test HTTP crudo antes de confiar en un helper de Playwright: necesitas saber qué hace la abstracción para poder depurarla cuando falla.
+
+La meta no es abandonar los frameworks. LangChain y LangGraph son buenas opciones en producción. La meta es poder elegir, y bajar un nivel cuando lo necesites.
+
+## Lo que LangChain hacía por ti
+
+Aquí está el pipeline de la lección 01, relacionado con lo que esconde cada abstracción.
+
+| Pieza de LangChain | Lo que realmente hace | Decisiones que tomó por ti |
+|---|---|---|
+| `Document` | Un dict con `page_content` y `metadata` | Esquema de metadata (ninguno obligatorio) |
+| `RecursiveCharacterTextSplitter` | Divide por `\n\n`, `\n`, espacio y luego caracteres | Separadores, tamaño en caracteres y no en tokens, overlap |
+| `OpenAIEmbeddings` / otros wrappers de embeddings | Agrupa textos en lotes, llama a la API, reintenta | Tamaño de lote, política de reintentos, sin caché por defecto |
+| Vector store `PGVector` | Crea tablas, inserta filas, ejecuta una consulta de distancia | Esquema de tabla, operador de distancia, tipo de índice (o ninguno) |
+| `as_retriever(search_kwargs=...)` | Llama a `similarity_search(k=...)` | k fijo, sin filtros salvo que los pases, sin búsqueda híbrida |
+| `ChatPromptTemplate` | Formateo de strings en mensajes | Dónde va el contexto, cómo se delimitan los chunks |
+| Pipe de LCEL (el operador barra) | Compone callables, agrega streaming y batching | Orden de ejecución, concurrencia |
+| `StrOutputParser` | Toma el `.content` del mensaje | Sin validación, sin citas |
+| Callbacks | Hooks para tracing | Qué se registra y dónde |
+
+Nada de esto es magia. Son quizás 200 líneas de pegamento. Escribirlo tú mismo hace que cada decisión sea visible y testeable.
+
+## El núcleo en cuatro funciones
+
+Necesitas exactamente cuatro cosas: embeber, almacenar, recuperar y generar. Todo lo demás (reescritura, re-ranking, caché) se conecta en medio.
+
+### 1. Embeber: httpx simple con lotes y reintentos
+
+Llamar directamente al endpoint de embeddings te muestra el contrato real: una lista de strings de entrada, una lista de arreglos de floats de salida, con límites de tamaño de lote y de tokens.
+
+```python
+import asyncio
+import os
+
+import httpx
+import numpy as np
+
+EMBED_URL = os.environ.get("EMBED_URL", "https://api.openai.com/v1/embeddings")
+EMBED_MODEL = os.environ["EMBED_MODEL"]  # example: text-embedding-3-small — check provider's list
+BATCH = 64
+
+
+async def _post_with_retry(client: httpx.AsyncClient, payload: dict, attempts: int = 5) -> dict:
+    for i in range(attempts):
+        resp = await client.post(EMBED_URL, json=payload)
+        if resp.status_code in (429, 500, 502, 503):
+            await asyncio.sleep(min(2**i, 30))  # exponential backoff
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError(f"embedding failed after {attempts} attempts")
+
+
+async def embed(texts: list[str]) -> np.ndarray:
+    headers = {"Authorization": f"Bearer {os.environ['EMBED_API_KEY']}"}
+    out: list[list[float]] = []
+    async with httpx.AsyncClient(headers=headers, timeout=60) as client:
+        for start in range(0, len(texts), BATCH):
+            data = await _post_with_retry(client, {"model": EMBED_MODEL, "input": texts[start : start + BATCH]})
+            # sort by index: the API contract says results map to inputs by "index"
+            out.extend(d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"]))
+    vecs = np.asarray(out, dtype=np.float32)
+    return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)  # normalize once, cosine == dot
+```
+
+Normalizar al escribir significa que la similitud coseno se vuelve un producto punto. Eso importa cuando haces búsqueda en memoria con numpy, y te permite usar el operador de producto interno de pgvector.
+
+### 2. Almacenar y 3. Recuperar: SQL que puedes leer
+
+Con psycopg 3 y el adaptador `pgvector`, el store es una tabla y el retriever es una consulta. Ves el operador de distancia, los filtros y el índice que se va a usar.
+
+```python
+import numpy as np
+import psycopg
+from pgvector.psycopg import register_vector
+from psycopg.rows import dict_row
+
+DDL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS chunks (
+  chunk_id   text PRIMARY KEY,
+  doc_id     text NOT NULL,
+  section    text,
+  page       int,
+  product    text,            -- metadata used for filtering, e.g. 'fha', 'conventional'
+  text       text NOT NULL,
+  embedding  vector(1536) NOT NULL,  -- must match your embedding model's dimension
+  tsv        tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED
+);
+CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw (embedding vector_ip_ops);
+CREATE INDEX IF NOT EXISTS chunks_tsv ON chunks USING gin (tsv);
+"""
+
+VECTOR_SQL = """
+SELECT chunk_id, doc_id, section, page, text, -(embedding <#> %(q)s) AS score
+FROM chunks
+WHERE (%(product)s::text IS NULL OR product = %(product)s)
+ORDER BY embedding <#> %(q)s
+LIMIT %(k)s
+"""
+
+KEYWORD_SQL = """
+SELECT chunk_id, doc_id, section, page, text, ts_rank_cd(tsv, query) AS score
+FROM chunks, websearch_to_tsquery('english', %(text)s) AS query
+WHERE tsv @@ query AND (%(product)s::text IS NULL OR product = %(product)s)
+ORDER BY score DESC
+LIMIT %(k)s
+"""
+
+
+def connect(dsn: str) -> psycopg.Connection:
+    conn = psycopg.connect(dsn, autocommit=True)
+    register_vector(conn)
+    return conn
+
+
+def search(conn, sql: str, params: dict) -> list[dict]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def rrf(*ranked_lists: list[dict], k: int = 60) -> list[dict]:
+    scores: dict[str, float] = {}
+    rows: dict[str, dict] = {}
+    for lst in ranked_lists:
+        for rank, row in enumerate(lst, start=1):
+            scores[row["chunk_id"]] = scores.get(row["chunk_id"], 0.0) + 1.0 / (k + rank)
+            rows[row["chunk_id"]] = row
+    return [rows[cid] for cid in sorted(scores, key=scores.get, reverse=True)]
+```
+
+`<#>` es el producto interno *negativo* de pgvector, así que el orden ascendente pone primero lo más similar, y lo negamos para tener un score legible. Con vectores normalizados esto rankea exactamente igual que coseno. El índice HNSW usa la clase de operador correspondiente (`vector_ip_ops`); si el operador de la consulta no coincide con la clase de operador del índice, Postgres cae silenciosamente a un escaneo secuencial. Un framework no te avisaría de eso.
+
+### 4. Generar: el SDK, un prompt que controlas y validación
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+SYSTEM = """Answer using ONLY the chunks. Cite chunk ids in square brackets after each sentence,
+like [uw-4.2-a1f3]. If the chunks do not contain the answer, reply exactly: NOT_FOUND."""
+
+
+async def generate(question: str, chunks: list[dict]) -> dict:
+    context = "\n\n".join(f'<chunk id="{c["chunk_id"]}">\n{c["text"]}\n</chunk>' for c in chunks)
+    msg = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=700,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"{context}\n\nQuestion: {question}"}],
+    )
+    text = msg.content[0].text.strip()
+    return {"answer": text, "found": text != "NOT_FOUND", "usage": msg.usage.model_dump()}
+```
+
+Conectarlo todo es una función async simple: embeber la consulta, ejecutar ambas búsquedas SQL, fusionar con `rrf`, opcionalmente re-rankear, tomar el top 5, generar, validar citas (lección 13) y registrar un trace. Sin estado oculto.
+
+## Qué ganas y qué pierdes
+
+**Ganas:**
+
+- Cada consulta SQL, prompt y política de reintentos es visible en un diff y en code review.
+- Menos dependencias y cold starts más rápidos (relevante para Lambda en el Módulo 5).
+- Control preciso: chunking por tokens, filtros personalizados, el formato exacto de citas que quieres.
+- Stack traces que apuntan a tu código, no a cinco capas de `Runnable`.
+
+**Pierdes:**
+
+- Integraciones listas para usar (decenas de loaders, vector stores y proveedores de modelos).
+- Streaming y batching integrados a lo largo de una cadena, y hooks de tracing que LangSmith lee automáticamente.
+- Patrones y ejemplos de la comunidad que asumen el framework.
+
+Una postura pragmática que adoptan muchos equipos: escribir tú mismo la ruta central de retrieval y generación (es pequeña y crítica para el negocio) y usar piezas del framework en los bordes (loaders de documentos, orquestación de agentes con LangGraph) donde ahorran tiempo real.
+
+## Errores comunes
+
+- **Olvidar ordenar los resultados de embeddings por índice.** La mayoría de las APIs los devuelven en orden, pero el contrato es el campo `index`. Depender del orden es un bug latente.
+- **Dimensiones que no coinciden.** La columna `vector(N)` debe coincidir con la dimensión de salida del modelo. Cambiar de modelo implica una columna o tabla nueva, y volver a generar los embeddings.
+- **Operador e índice que no coinciden.** Usar `<=>` (distancia coseno) en la consulta con un índice construido para `vector_ip_ops` se salta el índice. Verifícalo con `EXPLAIN ANALYZE`.
+- **Sin reintentos ni backoff.** La ingesta de 10,000 chunks va a recibir un 429. Sin backoff, terminas con índices parciales.
+- **Reconstruir un framework.** Si tu código "sin framework" empieza a tener registros de plugins y clases base abstractas, detente. Mantenlo aburrido.
+- **Construir SQL con strings.** Usa siempre parámetros (`%(q)s`), nunca f-strings, incluso en herramientas internas.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Qué hace realmente LangChain en una cadena RAG básica, y cuándo no lo usarías?" level="mid">
+
+Envuelve cuatro pasos: dividir documentos, llamar a una API de embeddings en lotes, almacenar y consultar vectores mediante una clase de vector store, y formatear un prompt para luego llamar a un modelo de chat. LCEL compone esos pasos y agrega streaming y hooks de tracing. Lo omitiría en la ruta central cuando necesito control total sobre el SQL, los filtros, el chunking por tokens o el formato de citas, o cuando quiero dependencias mínimas y menor tiempo de cold start, por ejemplo en Lambda. Igual lo usaría, o LangGraph, en los bordes donde las integraciones ahorran tiempo.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu consulta de pgvector se volvió 50 veces más lenta tras un cambio. ¿Qué revisas?" level="senior">
+
+Ejecuto `EXPLAIN ANALYZE` para ver si se usa el índice HNSW o IVFFlat. Causas comunes: el operador de distancia de la consulta ya no coincide con la clase de operador del índice (coseno vs producto interno), un nuevo filtro de metadata que hace que el planner elija un escaneo secuencial, o un índice faltante tras una migración. En consultas ANN filtradas reviso la selectividad; filtros muy selectivos pueden hacer que el índice devuelva muy pocas filas, así que puedo subir `hnsw.ef_search`, habilitar los escaneos iterativos de índice en versiones recientes de pgvector o usar índices parciales por producto.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Demuestra que puedes bajar un nivel">
+
+Una señal fuerte: "Primero lo construí con LangChain y luego reescribí el núcleo en unas 250 líneas con httpx, psycopg y el SDK de Anthropic. Eso hizo revisables el SQL y los prompts, y redujo nuestro árbol de dependencias". Ten esa carpeta del repo lista para mostrarla.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- README de pgvector (operadores, índices, filtrado): https://github.com/pgvector/pgvector
+- pgvector-python (adaptador para psycopg): https://github.com/pgvector/pgvector-python
+- Documentación de psycopg 3: https://www.psycopg.org/psycopg3/docs/
+- Cliente async de HTTPX: https://www.python-httpx.org/async/
+- SDK de Python de Anthropic: https://docs.anthropic.com/en/api/client-sdks
+- Búsqueda de texto completo en PostgreSQL: https://www.postgresql.org/docs/current/textsearch.html

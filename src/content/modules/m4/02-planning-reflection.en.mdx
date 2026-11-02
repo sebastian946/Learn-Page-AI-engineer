@@ -1,0 +1,160 @@
+## Why plain ReAct is not always enough
+
+A ReAct loop decides one step at a time. That is great for short tasks. It struggles when a task has many steps, because the model has to rediscover the overall goal on every iteration from a growing history. Two symptoms show up in traces:
+
+- **Drift.** After six tool calls the agent forgets that the customer also asked about a second order.
+- **Myopia.** It takes the locally obvious step (reschedule now) instead of the globally right one (check carrier rates first, the cheaper carrier delivers sooner).
+
+Two families of techniques address this: **planning** (decide the steps up front, then execute) and **reflection** (critique the output or trajectory, then revise).
+
+## Plan-and-execute
+
+Plan-and-execute splits the agent into two roles:
+
+1. A **planner** call produces an explicit list of steps from the request. Use a strong model here, once.
+2. An **executor** works through the steps one by one. Each step can be a small ReAct loop with a limited tool set, often on a cheaper model.
+3. A **replanner** (optional) looks at results after each step and either keeps the plan, edits the remaining steps, or finishes.
+
+Benefits:
+
+- **Cost.** The expensive reasoning happens once. Executors can run on `claude-haiku-5-5` for lookups.
+- **Inspectability.** The plan is an artifact. You can log it, show it to a human for approval, and evaluate it separately ("did the plan include a rate check?").
+- **Focus.** Each executor sees only its step and the relevant results, not the whole history.
+
+Costs:
+
+- **Rigidity.** If step 2 reveals the order was already delivered, a plan without a replanner wastes the remaining steps.
+- **Extra latency** for the planning call.
+- **Plans can be wrong.** A plan is still a model output. Validate it: unknown tools, too many steps, or risky actions should be rejected by code.
+
+## A structured planner
+
+Make the plan structured output, not prose. Then your code can validate it like any other contract.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from langchain_anthropic import ChatAnthropic
+
+ALLOWED_TOOLS = {"get_order", "get_carrier_rates", "reschedule_delivery", "create_ticket"}
+
+class Step(BaseModel):
+    id: int
+    tool: Literal["get_order", "get_carrier_rates", "reschedule_delivery", "create_ticket"]
+    goal: str = Field(description="What this step must find out or change")
+    depends_on: list[int] = Field(default_factory=list)
+
+class Plan(BaseModel):
+    steps: list[Step] = Field(max_length=6)
+    risky: bool = Field(description="True if any step changes customer-visible state")
+
+planner = ChatAnthropic(model="claude-sonnet-5-5", temperature=0).with_structured_output(Plan)
+
+PLANNER_PROMPT = """You plan work for a logistics support agent.
+Tools: get_order, get_carrier_rates, reschedule_delivery, create_ticket.
+Return the minimal ordered list of steps. Do not include steps you cannot justify
+from the request. Mark risky=true if anything is rescheduled or changed."""
+
+async def make_plan(request: str) -> Plan:
+    plan: Plan = await planner.ainvoke([("system", PLANNER_PROMPT), ("user", request)])
+    for step in plan.steps:
+        if any(dep >= step.id for dep in step.depends_on):
+            raise ValueError(f"step {step.id} depends on a later step")
+    return plan
+```
+
+The `Literal` type means the model physically cannot plan a call to `issue_refund`. The dependency check is a cheap invariant, like an assertion in a test fixture. If `plan.risky` is true, you can route the plan to a human before executing anything (lesson 07).
+
+The executor then loops over `plan.steps`, runs each with a small tool set, stores results in state keyed by step id, and calls a replanner every one or two steps:
+
+```python
+class Replan(BaseModel):
+    action: Literal["continue", "revise", "finish"]
+    remaining_steps: list[Step] = Field(default_factory=list)
+    final_answer: str | None = None
+```
+
+In LangGraph this becomes three nodes, `plan`, `execute_step` and `replan`, with a conditional edge from `replan` back to `execute_step` or to `END`. Lesson 06 shows how.
+
+## Reflection
+
+Reflection asks a model to critique work and then revise it. Variants:
+
+- **Self-critique**: same model, second call: "Review this reply for factual errors against the tool results. List problems, then output a fixed version."
+- **Evaluator-optimizer**: a separate evaluator prompt (or model) scores the draft against criteria; the generator revises until the score passes or a max number of rounds is reached.
+- **Reflexion**: after a failed attempt, the agent writes a short verbal lesson ("I rescheduled before checking that the new date was a business day") into memory and retries with that lesson in context.
+
+Reflection works best when the critic has **something concrete to check against**: tool results, a schema, a policy document, a unit test. "Is this good?" produces vague praise. "Does every date in the reply appear in a tool result?" produces actionable critique.
+
+```python
+class Critique(BaseModel):
+    grounded: bool = Field(description="Every fact in the draft appears in TOOL_RESULTS")
+    policy_ok: bool = Field(description="No promises of refunds or dates not confirmed by tools")
+    problems: list[str]
+
+critic = ChatAnthropic(model="claude-haiku-5-5", temperature=0).with_structured_output(Critique)
+
+async def reflect(draft: str, tool_results: str, max_rounds: int = 2) -> str:
+    for _ in range(max_rounds):
+        c: Critique = await critic.ainvoke(
+            f"TOOL_RESULTS:\n{tool_results}\n\nDRAFT:\n{draft}\n\nCheck the draft."
+        )
+        if c.grounded and c.policy_ok:
+            return draft
+        draft = await revise(draft, c.problems, tool_results)  # another LLM call
+    return draft  # caller should flag for review if still failing
+```
+
+Note the cap on rounds. Two rounds capture most of the benefit. Beyond that, you pay for loops where the model argues with itself.
+
+## Choosing between them
+
+| Situation | Technique |
+|---|---|
+| 1–3 tool calls, short tasks | Plain ReAct |
+| 4+ steps, steps are mostly independent | Plan-and-execute |
+| Need human approval of the approach | Plan-and-execute, show the plan |
+| Output quality matters more than latency (customer email, report) | Reflection with a concrete rubric |
+| Agent repeats the same mistake across attempts | Reflexion-style lessons in memory |
+
+These combine. A common production shape: plan once, execute with small ReAct loops, reflect only on the final customer-facing message.
+
+## Measuring whether it helps
+
+Do not add planning or reflection because a blog post said so. Treat it as a change under test:
+
+- Run your trajectory eval suite (lesson 13) before and after.
+- Compare task success rate, average steps, tokens and p95 latency.
+- Check the plan quality separately: did plans contain unnecessary steps? Missing steps?
+
+If reflection raises success from 82% to 84% but doubles cost per task, that may be a bad trade for a high-volume use case. Make the trade explicit in your README.
+
+## Common mistakes
+
+- **Free-text plans.** If code cannot parse and validate the plan, it cannot enforce anything.
+- **No replanning.** The world changes after step 1. A static plan executes stale steps.
+- **Reflection without ground truth.** A critic with nothing to check against approves almost anything.
+- **Unbounded critique loops.** Always cap rounds and escalate when the cap is hit.
+- **Planning trivial tasks.** A planner call for "what's the status of my order?" adds latency and cost for zero gain.
+- **Letting the planner choose risky tools freely.** Restrict tools with types and require approval for plans marked risky.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="When would you use plan-and-execute instead of a plain ReAct agent?" level="senior">
+
+When the task has many steps and the agent drifts or takes locally greedy actions. Plan-and-execute makes the strategy an explicit, validated artifact: a strong model plans once, cheaper executors run each step with a narrow tool set, and a replanner adjusts after new evidence. It cuts cost, makes the approach reviewable by a human before anything risky runs, and lets me evaluate plan quality separately from execution. The trade-off is extra latency and rigidity, so I add replanning and skip planning for short tasks. I would confirm the benefit with trajectory evals comparing success rate, steps, cost and latency.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Tie it to testing">
+
+"Reflection without a ground truth is like an assertion that always passes." Interviewers remember lines like this. Mention that you give the critic concrete checks: tool results, schema, policy rules.
+
+</Callout>
+
+## Further reading
+
+- Reflexion: Language Agents with Verbal Reinforcement Learning: https://arxiv.org/abs/2303.11366
+- Plan-and-Solve Prompting: https://arxiv.org/abs/2305.04091
+- LangGraph plan-and-execute tutorial: https://langchain-ai.github.io/langgraph/tutorials/plan-and-execute/plan-and-execute/
+- Anthropic — Building effective agents (evaluator-optimizer pattern): https://www.anthropic.com/research/building-effective-agents

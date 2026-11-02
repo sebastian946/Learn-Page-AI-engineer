@@ -1,0 +1,154 @@
+## Por qué hacer streaming
+
+Los tokens de salida se generan uno a la vez. Una respuesta de 600 tokens puede tardar muchos segundos en completarse. Sin streaming, el usuario mira un spinner durante todo ese tiempo. Con streaming, las primeras palabras aparecen tras el **tiempo al primer token (TTFT, time to first token)**, a menudo muy por debajo de un segundo, y el resto va llegando.
+
+El streaming también importa en el backend:
+
+- **Generaciones largas** evitan timeouts HTTP en conexiones inactivas. Los SDKs recomiendan o exigen streaming para valores grandes de `max_tokens`.
+- **Cancelación**: si el usuario cierra la pestaña, puedes detener la generación y dejar de pagar por tokens que nadie leerá.
+- **Procesamiento progresivo**: empezar a renderizar, enrutar o preparar tools antes de que llegue la respuesta completa.
+
+El costo es la complejidad. Ahora manejas una secuencia de eventos, datos parciales, errores que llegan después de un `200 OK` y consumidores lentos.
+
+## Server-Sent Events en un minuto
+
+Tanto Anthropic como OpenAI hacen streaming sobre **SSE**: una respuesta HTTP de larga duración con `Content-Type: text/event-stream`. El cuerpo es una serie de frames de texto separados por líneas en blanco:
+
+```text
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Your order"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" shipped"}}
+```
+
+SSE es unidireccional (del servidor al cliente), corre sobre HTTP simple y se reconecta fácilmente. Por eso es el estándar para las APIs de LLM y para tus propios endpoints LLM (módulo 5).
+
+## La secuencia de eventos de Anthropic
+
+```text
+message_start          -> message id, model, usage.input_tokens
+content_block_start    -> index 0, type text | tool_use | thinking
+content_block_delta    -> text_delta (text) or input_json_delta (partial_json)
+content_block_stop     -> block index done
+... more blocks ...
+message_delta          -> stop_reason, usage.output_tokens (cumulative)
+message_stop           -> done
+(ping events may appear anywhere; an error event can arrive mid-stream)
+```
+
+OpenAI Chat Completions hace streaming de **chunks**: cada uno tiene `choices[0].delta` con `content` o `tool_calls` parciales, y un `finish_reason` en el último. El usage solo llega si configuras `stream_options={"include_usage": True}`, en un chunk final con `choices` vacío.
+
+## Streaming de texto con el SDK
+
+El helper `messages.stream` del SDK acumula el estado por ti y aun así expone los eventos crudos:
+
+```python
+import asyncio
+from collections.abc import AsyncIterator
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+
+async def stream_answer(prompt: str, idle_timeout: float = 20.0) -> AsyncIterator[str]:
+    async with client.messages.stream(
+        model="claude-sonnet-5-5",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        it = stream.text_stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=idle_timeout)
+            except StopAsyncIteration:
+                break
+            yield chunk
+        final = await stream.get_final_message()
+        log_usage(final.model, final.usage, final.stop_reason)
+
+def log_usage(model, usage, stop_reason) -> None:
+    print(f"\n[{model}] in={usage.input_tokens} out={usage.output_tokens} stop={stop_reason}")
+```
+
+En streaming importan dos timeouts, y ninguno es el timeout simple del request:
+
+- **Timeout de TTFT**: cuánto esperas el primer token antes de rendirte o hacer failover.
+- **Timeout de inactividad (entre chunks)**: el silencio máximo entre chunks. Un stream que se congela 20 segundos a mitad de la respuesta está roto, aunque la conexión siga abierta.
+
+El `wait_for` de arriba implementa el timeout de inactividad. Salir del bloque `async with` (normalmente, por excepción o por cancelación) cierra la conexión HTTP, lo que detiene la generación.
+
+## Streaming de tool calls y JSON parcial
+
+Cuando el modelo llama a una tool durante el streaming, el input llega como eventos `input_json_delta`, cada uno con un fragmento de string `partial_json`. Los fragmentos **no** son JSON válido por sí solos:
+
+```text
+{"order_   id": "A-1   0023"}
+```
+
+Reglas:
+
+1. Concatena los fragmentos por `index` del bloque de contenido.
+2. Parsea solo después del `content_block_stop` de ese bloque, y luego valida con Pydantic.
+3. Si necesitas UI progresiva (por ejemplo, mostrar campos a medida que se llenan), usa un parser tolerante y trata el resultado como una **vista previa**, nunca como datos validados.
+
+```python
+from pydantic_core import from_json
+
+buffers: dict[int, str] = {}
+
+def on_event(event) -> None:
+    if event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+        buffers[event.index] = buffers.get(event.index, "") + event.delta.partial_json
+        preview = from_json(buffers[event.index], allow_partial=True)  # best-effort dict
+        render_preview(preview)
+    elif event.type == "content_block_stop" and event.index in buffers:
+        args = GetOrderInput.model_validate_json(buffers.pop(event.index))
+        schedule_tool(args)
+```
+
+Revisa también `stop_reason` al final: un corte por `max_tokens` durante una tool call significa que el JSON está truncado. No lo ejecutes.
+
+## Backpressure
+
+El backpressure (contrapresión) es lo que pasa cuando el productor (el LLM) es más rápido que el consumidor (un cliente móvil lento, un escritor a base de datos, un motor TTS). Tres patrones:
+
+- **Generadores async basados en pull** (como arriba) dan backpressure natural: el siguiente chunk no se lee del socket hasta que el consumidor lo pide. La ventana TCP se llena y el lado del proveedor se frena o hace buffer.
+- **Colas acotadas** entre tareas productoras y consumidoras: `asyncio.Queue(maxsize=100)`. `await queue.put(...)` se bloquea cuando está llena. Una cola sin límite es una fuga de memoria esperando a un cliente lento.
+- **Coalescencia**: en UIs, agrupa deltas pequeños en frames cada 30–50 ms. Envías menos mensajes SSE sin afectar la velocidad percibida.
+
+Y siempre propaga la **cancelación**: si tu cliente se desconecta, cancela la tarea que lee del proveedor. En FastAPI/Starlette, un cliente desconectado provoca `asyncio.CancelledError` en el generador; déjalo propagarse para que el `async with` cierre el stream upstream.
+
+## Errores a mitad del stream
+
+Un stream puede empezar con `200 OK` y fallar después: un evento `error` (por ejemplo `overloaded_error`), una conexión caída o tu timeout de inactividad. Reintentar solo es seguro **antes** de haberle enviado algo al usuario. Después de eso, o reinicias toda la respuesta con un estado visible de "reintentando", o devuelves una respuesta parcial claramente marcada como incompleta. Decide esta política desde el inicio y pruébala con un proveedor falso que falle después de N chunks.
+
+## Errores comunes
+
+- Usar solo un timeout total del request. Los streams necesitan timeouts de TTFT y de inactividad.
+- Parsear los fragmentos `partial_json` a medida que llegan y actuar sobre ellos.
+- Olvidar `stream_options={"include_usage": True}` en OpenAI, con lo que el registro de costos guarda cero en silencio.
+- Reintentar después de que los tokens ya llegaron al usuario, produciendo texto duplicado.
+- Tragarse el `CancelledError`, lo que sigue generando (y facturando) después de que el cliente se fue.
+- Buffering sin límite entre un stream rápido y un consumidor lento.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo haces streaming de una respuesta LLM a un navegador y aun así registras el costo exacto?" level="mid">
+
+El backend consume el stream del proveedor con el helper del SDK y reemite los deltas de texto al navegador por SSE, agrupando deltas pequeños. El usage viene del propio stream: tokens de entrada en `message_start` y tokens de salida acumulados en `message_delta` para Anthropic, o el chunk final de usage para OpenAI cuando `include_usage` está activado. Cuando termina el stream tomo el mensaje final, calculo el costo con el usage y la tabla de precios del modelo, y lo registro con el id del request. Si el cliente se desconecta cancelo el stream upstream y registro el usage parcial, porque esos tokens también se facturan.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Una respuesta en streaming a veces se congela a la mitad por más de 30 segundos. ¿Qué haces?" level="senior">
+
+Primero mido: registro TTFT, los intervalos entre chunks y dónde ocurren los congelamientos, por proveedor y modelo. Agrego un timeout de inactividad entre chunks para que un stream detenido falle rápido en vez de colgarse. Defino la política de recuperación: si aún no se envió nada, reintentar o hacer failover a otro modelo; si ya se mostró texto parcial, reiniciar con un estado visible de reintento o terminar con una marca clara de incompleto. Reviso si hay backpressure en mi propio pipeline (una cola sin límite o un consumidor lento bloqueando al lector) y si hay proxies haciendo buffer del SSE (desactivar el buffering, enviar comentarios keepalive). Luego pongo la tasa de congelamientos y el p95 del intervalo entre chunks en un dashboard con alertas.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Anthropic, streaming de mensajes: https://docs.anthropic.com/en/docs/build-with-claude/streaming
+- OpenAI, streaming de respuestas de la API: https://platform.openai.com/docs/guides/streaming-responses
+- MDN, Server-sent events: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+- Documentación de Python, colas de asyncio: https://docs.python.org/3/library/asyncio-queue.html
+- Pydantic core, parseo de JSON parcial: https://docs.pydantic.dev/latest/concepts/json/

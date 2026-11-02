@@ -1,0 +1,154 @@
+## Por qué este módulo es tu ventaja injusta
+
+La mayoría de los AI engineers viene de backend o de ciencia de datos. Pueden conectar un modelo a un vector store en una tarde. Lo que les cuesta es la pregunta que todo stakeholder termina haciendo: **"¿Cómo sabes que funciona?"**
+
+Tú llevas años respondiendo esa pregunta. Construiste pirámides de pruebas, peleaste con suites flaky, diseñaste gates de regresión y escribiste reportes de pruebas que los managers sí leían. Este módulo traduce esas habilidades a sistemas con LLMs. Las herramientas son nuevas. La disciplina es la que ya tienes.
+
+## Por qué los evals son la parte más difícil
+
+Construir una demo es fácil. Saber si la versión 2 es mejor que la versión 1 es difícil. Cuatro propiedades hacen que evaluar LLMs sea distinto del testing clásico.
+
+**1. No existe una única salida correcta.** Un test unitario afirma `add(2, 2) == 4`. Un LLM que responde "¿Cuál es el pago inicial mínimo para un préstamo FHA?" puede acertar con cientos de redacciones distintas. Las aserciones de coincidencia exacta se rompen con el primer sinónimo.
+
+**2. Las salidas son no deterministas.** El mismo prompt, el mismo modelo y la misma temperatura pueden producir textos distintos entre llamadas. Ni siquiera `temperature=0` es una garantía absoluta: los proveedores agrupan peticiones en batches, corren en hardware distinto y actualizan snapshots del modelo. Obtienes salidas *mayormente* estables, no idénticas bit a bit.
+
+**3. La calidad es multidimensional.** Una respuesta puede ser fiel a los documentos recuperados pero irrelevante para la pregunta. Puede ser relevante pero citar la fuente equivocada. Puede ser perfecta pero tardar 9 segundos y costar 4 veces el presupuesto. Necesitas varias métricas, y compiten entre sí.
+
+**4. El espacio de entradas es abierto.** Un endpoint REST tiene un schema. Una caja de chat acepta cualquier string en cualquier idioma, incluidos ataques. No puedes enumerar las entradas; solo puedes muestrearlas bien.
+
+Súmale que cada llamada de eval puede costar dinero y tardar segundos, y entenderás por qué los equipos se saltan los evals y despliegan "a ojo". Tu trabajo es hacer que los evals sean tan baratos, rápidos y confiables que nadie quiera saltárselos.
+
+## Tests flaky vs no determinismo
+
+Ya conoces la cura para los tests flaky: encontrar la fuente de aleatoriedad, controlarla y solo entonces confiar en la señal. Aplica el mismo playbook, con un giro. En testing clásico, la inestabilidad es un bug que se elimina. En sistemas con LLMs, cierta varianza es una **propiedad del sistema** que debes medir.
+
+Tus palancas:
+
+- **Fija todo lo que puedas.** Fija el id del snapshot del modelo, la versión del prompt, la versión del índice de retrieval y los parámetros de decodificación. Regístralos junto a cada resultado. Un id de modelo sin fijar es como una dependencia sin versión fija.
+- **Baja la temperatura en las corridas de evaluación** de tareas de extracción o clasificación. Mantén la temperatura de producción en tareas generativas, porque eso es lo que reciben los usuarios.
+- **Usa seeds donde estén disponibles**, pero trátalas como un "mejor esfuerzo". Algunos proveedores exponen un parámetro `seed`; ninguno promete salidas idénticas para siempre.
+- **Muestrea repetidamente.** Corre cada caso `k` veces (3–5 es común) y puntúa la distribución. Un caso que pasa 5/5 es sólido. Uno que pasa 3/5 es inestable, y eso ya es un hallazgo.
+- **Usa umbrales estadísticos, no aserciones únicas.** En vez de "esta respuesta debe ser fiel", afirma "el faithfulness sobre el dataset es al menos 0.85 y no bajó más de 0.03 frente al baseline".
+
+Este es el patrón en código. Ejecuta un caso varias veces y reporta una tasa de aprobación en lugar de un booleano.
+
+```python
+import asyncio
+from dataclasses import dataclass
+from statistics import mean, pstdev
+
+from mortgage_assistant import answer  # Module 2 SUT: async def answer(q) -> RagResult
+
+
+@dataclass
+class CaseStats:
+    case_id: str
+    pass_rate: float
+    scores: list[float]
+
+    @property
+    def unstable(self) -> bool:
+        return 0.0 < self.pass_rate < 1.0
+
+
+def has_citation(result) -> float:
+    """L1 deterministic check: at least one citation that points to a retrieved doc."""
+    return 1.0 if result.citations else 0.0
+
+
+async def run_repeated(case_id: str, question: str, k: int = 5) -> CaseStats:
+    results = await asyncio.gather(*(answer(question) for _ in range(k)))
+    scores = [has_citation(r) for r in results]
+    return CaseStats(case_id, pass_rate=mean(scores), scores=scores)
+
+
+async def main() -> None:
+    stats = await run_repeated("fha-down-payment-001", "What is the minimum FHA down payment?")
+    print(f"{stats.case_id}: pass_rate={stats.pass_rate:.2f} sd={pstdev(stats.scores):.2f}")
+    if stats.unstable:
+        print("UNSTABLE: quarantine and investigate, like a flaky test")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Fíjate en el vocabulario: pones el caso inestable en *cuarentena*, lo *investigas*, pero no lo borras. Exactamente como tratabas los tests de UI flaky.
+
+## La pirámide de evals
+
+Tu pirámide de pruebas tenía muchos tests unitarios rápidos, menos tests de integración y una capa delgada de tests end-to-end lentos. La pirámide de evals tiene la misma forma y la misma economía.
+
+<Diagram caption="La pirámide de evals: chequeos baratos y deterministas en la base; juicio humano costoso en la cima" chart={`flowchart TB
+  L3["L3: Revisión humana (decenas de casos, semanal)"]
+  L2["L2: Evals calificados por modelo (cientos de casos, por PR)"]
+  L1["L1: Chequeos deterministas (todos los casos, cada corrida)"]
+  L3 --- L2
+  L2 --- L1`} />
+
+**L1 — Chequeos deterministas (tipo test unitario).** Rápidos, gratis, 100% reproducibles. ¿La salida se parsea contra el schema de Pydantic? ¿Hay citas? ¿Los ids de documentos citados existen en los contextos recuperados? ¿La longitud está bajo el límite? ¿El bot se niega cuando le piden asesoría legal? ¿Un regex encuentra un patrón prohibido, como un SSN completo? Córrelos en todos los casos y en cada commit. Atrapan una parte sorprendente de las regresiones: un prompt roto suele romper primero el formato.
+
+**L2 — Evals calificados por modelo (tipo test de integración).** Un juez LLM o una librería de métricas (Ragas, DeepEval) puntúa faithfulness (fidelidad al contexto), relevancia de la respuesta y precisión del contexto. Cuestan dinero y tienen su propia tasa de error, así que los calibras (lección 03) y los corres sobre un golden dataset curado (lección 02) en cada PR o cada noche.
+
+**L3 — Revisión humana (tipo testing exploratorio / UAT).** Expertos del dominio leen una muestra de salidas, las etiquetan y detectan lo que las métricas no ven: tono, matices regulatorios, errores sutiles. Lenta y cara, así que se hace sobre muestras pequeñas y las etiquetas sirven para calibrar L2.
+
+La regla de tus días de QA sigue vigente: **baja cada chequeo al nivel más bajo posible.** Si un regex puede detectarlo, no le pagues a un juez. Si un juez puede detectarlo de forma confiable, no esperes a un humano.
+
+## Mapeo de tu experiencia en QA a evals
+
+| Concepto de QA que conoces | Equivalente en evals de LLM | Qué cambia |
+|---|---|---|
+| Pirámide de pruebas | Pirámide de evals (L1 determinista, L2 calificado por modelo, L3 humano) | La capa media es probabilística y hay que calibrarla |
+| Tests flaky | No determinismo | Cierta varianza es inherente; mídela con muestreo repetido y umbrales |
+| Suite de regresión | Golden dataset | Las salidas esperadas son referencias, no strings exactos |
+| Contract tests | Schemas de salida (JSON Schema, Pydantic, schemas de tools) | Se imponen al generar con structured outputs y se verifican en L1 |
+| Reportes de pruebas | Reportes de evals | Muestran distribuciones, deltas vs baseline, costo y peores casos |
+| Canary releases, feature flags | Evals online y A/B tests de prompts | Las señales de calidad vienen de jueces y feedback de usuarios, no solo de tasas de error |
+| Gestión de datos de prueba | Versionado de datasets y cobertura por tag | Los datasets se desactualizan cuando cambian el producto y los usuarios |
+| Testing exploratorio | Red-teaming | Creatividad adversarial contra prompts, tools y contenido recuperado |
+
+Ten esta tabla presente durante todo el módulo. Cada lección profundiza en una fila.
+
+## Cómo se ve lo "bueno"
+
+Un equipo maduro responde esto en menos de un minuto:
+
+- ¿Cuál es nuestro score de faithfulness en el golden dataset v3 y cuál era la semana pasada?
+- ¿Cuáles son los 10 peores casos ahora mismo y por qué?
+- ¿Qué cambió este PR en calidad, latencia y costo por cada 1k peticiones?
+- ¿Qué snapshot de modelo y qué versión de prompt están en producción?
+
+Si puedes construir el sistema que responde esas preguntas, estás haciendo el trabajo que a las empresas más les cuesta cubrir.
+
+## Errores comunes
+
+- **Revisar "a ojo" como único eval.** Probar cinco prompts en un playground es testing exploratorio, no una suite de regresión. Nada impide que la edición de prompt de mañana rompa el caso seis.
+- **Aserciones de coincidencia exacta sobre texto libre.** Fallan ante reformulaciones inofensivas y enseñan al equipo a ignorar los builds en rojo. Usa chequeos estructurales L1 más puntuación semántica L2.
+- **Una sola corrida por caso.** Una sola muestra oculta la inestabilidad. Un score de 0.88 puede moverse entre 0.80 y 0.95 al repetir.
+- **Ids de modelo sin fijar.** Un alias que se mueve en silencio a un snapshot nuevo cambia tu baseline sin avisar.
+- **Medir solo calidad.** La latencia y el costo son parte de "funciona". Un prompt que gana 2 puntos de faithfulness y duplica el gasto en tokens puede ser una pérdida neta.
+- **Saltarse L1 porque existe L2.** Los jueces son caros y difusos. Los chequeos deterministas son gratis y exactos.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo probarías una funcionalidad con LLM cuya salida cambia cada vez?" level="mid">
+La trato como gestión de tests flaky más estadística. Primero, fijo todo lo posible: snapshot del modelo, versión del prompt, índice de retrieval y parámetros de decodificación. Segundo, divido los chequeos en una pirámide de evals. Los chequeos deterministas L1 (validez del schema, citas presentes, longitud, comportamiento de rechazo) son exactos y corren en todos los casos. La calidad semántica va a L2: un juez LLM o métricas de Ragas sobre un golden dataset, puntuadas como agregados con umbrales en vez de coincidencias exactas por caso. Tercero, corro cada caso varias veces para medir la varianza y marcar casos inestables. El gate de CI compara el agregado contra un baseline con tolerancia, por ejemplo "faithfulness al menos 0.85 y sin caídas mayores a 0.03". Muestras pequeñas etiquetadas por humanos calibran al juez.
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu equipo dice que los evals son demasiado lentos y caros para correrlos en cada PR. ¿Qué haces?" level="senior">
+Aplico la economía de la pirámide de pruebas. Muevo todo lo posible a chequeos deterministas gratuitos que corren en cada commit. Corro la suite calificada por modelo sobre un subconjunto smoke más pequeño por PR (por ejemplo, 50 casos estratificados) y el dataset completo cada noche o antes de un release. Cacheo las respuestas del SUT y del juez con una clave de modelo, hash del prompt y entrada, para que los casos sin cambios no cuesten nada. Uso un modelo juez más barato para el filtrado y uno más fuerte solo para los casos en disputa. Solo disparo el workflow de evals cuando cambian prompts, código de retrieval o configuración del modelo. Y reporto el costo de cada corrida junto a los scores, para que el trade-off sea visible en lugar de discutido.
+</InterviewQuestion>
+
+<Callout type="interview" title="Di el mapeo en voz alta">
+En entrevistas, conecta explícitamente tu experiencia de SDET: "Los golden datasets son mi suite de regresión, los schemas de salida son mis contract tests, los evals online son mi canary." Eso te reposiciona de "persona cambiando de carrera" a "la persona que ya sabe cómo hacer medible la calidad".
+</Callout>
+
+## Lecturas recomendadas
+
+- Anthropic, "Create strong empirical evaluations": https://docs.anthropic.com/en/docs/test-and-evaluate/develop-tests
+- OpenAI, guía de evals: https://platform.openai.com/docs/guides/evals
+- Documentación de Ragas: https://docs.ragas.io
+- Documentación de DeepEval: https://docs.confident-ai.com
+- Conceptos de evaluación en LangSmith: https://docs.smith.langchain.com
+
+<Checklist id="m3-01-review" title="Antes de continuar" items={["Puedo explicar cuatro razones por las que los evals de LLM son más difíciles que los tests clásicos", "Puedo describir las tres capas de la pirámide de evals con ejemplos", "Sé manejar el no determinismo con versiones fijas, muestreo repetido y umbrales", "Puedo mapear al menos cinco conceptos de QA a sus equivalentes en evals de LLM"]} />

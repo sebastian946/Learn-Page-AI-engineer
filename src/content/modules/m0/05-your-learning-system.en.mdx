@@ -1,0 +1,172 @@
+# Your learning system
+
+The course has about 32 learning days of content. Content is not the hard part. Consistency is. This lesson explains how the platform works, proposes a daily cadence, and sets up the habits that turn reading into job-ready skill: spaced review, interview practice and shipping to GitHub.
+
+## How this platform works
+
+### Modules and lessons
+
+There are eight modules, `m0` to `m7`. Each one has four kinds of lessons:
+
+- **Concept** — explanation, code, common mistakes, interview angle, further reading. Click "Mark complete" when done.
+- **Exercise** — 30–90 minutes of hands-on work with acceptance criteria, starter code, progressive hints and a self-review checklist. Commit the result to the repo named in the "What to commit to GitHub" box.
+- **Exam** — 12–20 questions, timed. It completes automatically when you score 70% or more.
+- **Capstone** — a realistic client brief. Usually 3–5 days of work. It produces your strongest portfolio pieces.
+
+### The exam gate
+
+The next module unlocks when your best exam score in the current module is at least 70%. There is an "Unlock anyway" button. Use it only when you already know a module's content well, for example if you want to skim Module 6 early for a Databricks interview. Skipping gates because an exam feels hard defeats the purpose.
+
+Retakes shuffle questions and options. Read every explanation after an attempt, including for questions you got right. A lucky guess is not knowledge.
+
+### Hints, checklists and progress
+
+- **Hints** reveal one at a time, from gentle to specific. Try for at least 10 minutes before opening the first one. This is the same as debugging a failing test before asking a colleague.
+- **Checklists** save their state. The self-review checklist at the end of every exercise is your Definition of Done.
+- **Progress lives in your browser** (localStorage). Use "Export progress" on the dashboard every week and keep the JSON file somewhere safe, for example in a private gist. Clearing browser data or switching machines without exporting resets everything.
+
+### Dashboard
+
+The dashboard shows overall progress, your **day streak**, the current module, the next recommended action and the **portfolio tracker**. The streak counts consecutive days with at least one completed lesson. The portfolio tracker lists every repo the course expects you to publish. Paste the real GitHub URL once a repo is public. Seeing that list fill up is good motivation, and it is the exact list you will send to recruiters.
+
+### Interview prep and glossary
+
+The **Interview prep** page collects questions from every module, tagged by module and seniority (mid or senior), each with a model answer. Search and filter by module and level. The **Glossary** holds every key term in English and Spanish. Both are available at any time, not only after a module.
+
+### Language
+
+Every lesson exists in English and Spanish. Switch any time; checklist progress is shared. Since your target market is English-speaking, a good rule is: read in whichever language is faster for you, but **practice interview answers in English, out loud**.
+
+## A daily cadence
+
+Choose the plan that matches your life. Both work. What does not work is "I will study when I have time".
+
+### Full-time plan (about 6 hours a day)
+
+| Block | Time | What |
+|---|---|---|
+| Warm-up | 20 min | Spaced review: 5 interview questions out loud, re-read yesterday's notes |
+| Deep work 1 | 2 h | Concept lessons, code every example yourself |
+| Deep work 2 | 2.5 h | Exercise or capstone work, commit at least twice |
+| Wrap-up | 30 min | Update README, write 3 bullet notes, plan tomorrow's first task |
+
+At this pace one course day equals one calendar day, so the full course takes roughly 6–7 weeks.
+
+### Part-time plan (about 2 hours on weekdays, 4–5 hours on one weekend day)
+
+| Day | What |
+|---|---|
+| Mon–Thu | 15 min review + 1 lesson or half an exercise + 1 commit |
+| Fri | 15 min review + exam practice or catch-up |
+| Sat or Sun | One long block for exercises and capstones |
+
+At this pace one course day takes about three calendar days. Plan on four to five months. That is fine. Steady beats intense.
+
+<Callout type="tip" title="Commit every working day">
+
+Make at least one meaningful commit on every study day. It keeps the streak honest, builds the commit history reviewers look at, and forces you to finish small units of work.
+
+</Callout>
+
+## Spaced review
+
+You will forget most of what you read within a few weeks unless you revisit it. Spaced repetition fixes that: review an item just before you would forget it, and increase the gap each time you remember it.
+
+The simplest version is a Leitner box. Each interview question or concept lives in a box. When you answer it well, it moves to the next box, which is reviewed less often. When you miss it, it goes back to box 1. Here is a minimal script that schedules your reviews from a JSON file. Paste in question ids from the Interview prep page.
+
+```python
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from datetime import date, timedelta
+from pathlib import Path
+
+# Box number -> days until next review.
+INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}
+STATE = Path("review.json")
+
+
+@dataclass
+class Card:
+    id: str
+    box: int = 1
+    due: str = date.today().isoformat()
+
+
+def load() -> dict[str, Card]:
+    if not STATE.exists():
+        return {}
+    return {c["id"]: Card(**c) for c in json.loads(STATE.read_text(encoding="utf-8"))}
+
+
+def save(cards: dict[str, Card]) -> None:
+    STATE.write_text(json.dumps([asdict(c) for c in cards.values()], indent=2), encoding="utf-8")
+
+
+def due_today(cards: dict[str, Card]) -> list[Card]:
+    today = date.today().isoformat()
+    return sorted((c for c in cards.values() if c.due <= today), key=lambda c: c.box)
+
+
+def grade(card: Card, remembered: bool) -> None:
+    card.box = min(card.box + 1, 5) if remembered else 1
+    card.due = (date.today() + timedelta(days=INTERVALS[card.box])).isoformat()
+
+
+if __name__ == "__main__":
+    cards = load()
+    for card in due_today(cards):
+        answer = input(f"[box {card.box}] {card.id} — answered well? (y/n) ")
+        grade(card, answer.strip().lower() == "y")
+    save(cards)
+```
+
+Add new card ids by editing `review.json`, or extend the script with an `add` command as a warm-up exercise. If you prefer an app, Anki does the same thing with a better algorithm. The tool matters less than doing it daily.
+
+## Using the interview bank
+
+The interview bank is not reading material. It is practice material.
+
+1. **Answer before you read.** Look at the question, answer out loud, ideally recording yourself. Then open the model answer.
+2. **Compare structure, not words.** Did you state the main point first? Did you give a concrete example? Did you mention a trade-off?
+3. **Rewrite with your own story.** The model answers are templates. Replace the example with your own project and your own numbers.
+4. **Time yourself.** Most answers should take 60–120 seconds. Longer answers lose the interviewer.
+5. **Add missed questions to your review deck.** Anything you could not answer well goes into box 1.
+
+At the end of each module, do one mock session: 5 random questions from that module plus 2 from earlier modules.
+
+## Keep a learning log
+
+Create a `LEARNING_LOG.md` in your portfolio hub. One entry per study day, three bullets: what I learned, what confused me, what I shipped. It takes two minutes. After a month it becomes a source of interview stories ("the day I discovered my chunker was splitting tables in half") and a record that keeps you motivated.
+
+## Common mistakes
+
+- **Reading without coding.** Type every code example. Change something. Break it. You learn by doing, exactly like learning a new test framework.
+- **Skipping exercises to "save time".** The exercises build the portfolio. Skipping them saves time now and costs you interviews later.
+- **Binge then break.** Ten hours on Saturday and nothing for two weeks loses most of the value. Short daily sessions win.
+- **Never exporting progress.** One cleared browser cache can erase weeks of progress. Export weekly.
+- **Practicing interview answers silently.** Answers that sound good in your head often fall apart out loud. Speak them.
+- **Perfectionism on the first project.** Ship a working version, then improve. Commit history that shows iteration is a strength.
+
+## How this shows up in interviews
+
+Interviewers ask how you learn because the field changes every few months.
+
+<InterviewQuestion question="Why are you moving from QA to AI engineering?" level="mid">
+
+Keep it positive and forward-looking; never "I was tired of testing". Example: "Over the last years, the most interesting quality problems I saw were in LLM features: how do you test something non-deterministic, how do you catch a regression in answer quality? I realized the hardest part of AI engineering is exactly what I am good at: defining what correct means, building the harness and gating releases on it. So I went deliberately deeper. I built a cited RAG assistant, an eval harness that runs in CI and an agent with human-in-the-loop, all on my GitHub. I am not leaving quality behind; I am bringing it to the place where it is most needed right now, and adding the engineering skills to build the systems myself."
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you keep up with such a fast-moving field?" level="senior">
+
+I separate signal from noise with a fixed system. I follow a few primary sources: provider docs and changelogs, and a handful of engineering blogs, instead of social media hype. When something new looks relevant, I test it against an eval set I already have, so I judge it by measured results on my own task, not by benchmarks. For example, when a new model version comes out, I run my golden dataset on it and compare quality, latency and cost before recommending a switch. I also keep a learning log and a spaced-review deck, so concepts stick. That is the same discipline I used in QA for evaluating new tools.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [Anki — spaced repetition flashcards](https://apps.ankiweb.net/)
+- [Anthropic docs — Models overview](https://docs.anthropic.com/en/docs/about-claude/models/overview)
+- [GitHub docs — Managing your profile README](https://docs.github.com/en/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme)

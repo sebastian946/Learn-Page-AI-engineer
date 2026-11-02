@@ -1,0 +1,167 @@
+# Model Serving: Foundation Model APIs, provisioned throughput and external models
+
+Your chain needs an LLM. Your Delta Sync index needs an embedding model. Your agent needs an endpoint users can call. On Databricks, all three are **Model Serving endpoints**. Knowing which endpoint type fits a scenario is one of the most tested skills on the Generative AI Engineer Associate exam, and it is also a real architecture decision with cost consequences.
+
+<Callout type="warning" title="Endpoint names and features change">
+
+Model names on Foundation Model APIs rotate as new open models are released, and AI Gateway features keep expanding. Treat every endpoint name in this lesson as an example. Check the current list and pricing on docs.databricks.com and in your workspace's Serving page.
+
+</Callout>
+
+## Four kinds of serving
+
+| Type | What it serves | Billing shape | Typical use |
+|---|---|---|---|
+| Foundation Model APIs — pay-per-token | Databricks-hosted open models (chat, embeddings) on shared infrastructure | Per token | Prototyping, low or spiky volume, embeddings for Vector Search |
+| Foundation Model APIs — provisioned throughput | Same model families, or your fine-tuned variants, on dedicated capacity | Per hour of reserved capacity | Production SLAs, predictable high volume, fine-tuned models, data-isolation needs |
+| External models | Third-party providers (Anthropic, OpenAI, Google, Bedrock, ...) behind a Databricks endpoint | Provider's per-token price | Use frontier models with central governance |
+| Custom models | Any MLflow model: your chain, agent, classifier | Compute per hour (with scale-to-zero option) | Serving your own logic |
+
+### Pay-per-token
+
+Shared endpoints are pre-created in supported regions, named like `databricks-meta-llama-3-3-70b-instruct` or `databricks-gte-large-en` (examples — check your workspace). No setup. Good for development and for workloads where you cannot predict volume. The trade-offs: rate limits are shared and not guaranteed, and the set of models is what Databricks offers.
+
+### Provisioned throughput
+
+You reserve capacity measured in throughput units for a specific model. You get guaranteed performance and isolation. It is the documented path for serving **fine-tuned** foundation models and for production workloads with SLAs. The trade-off is that you pay for reserved capacity even when idle, so it only pays off with sustained traffic. A common pattern: pay-per-token in dev, provisioned throughput in prod once you have measured traffic.
+
+### External models
+
+An external model endpoint is a proxy: the client calls a Databricks endpoint, Databricks forwards to the provider. Why add a hop?
+
+- **Credentials live in one place** (Databricks secrets), not in every app.
+- **One API shape** for every provider, so swapping providers is a config change.
+- **AI Gateway** features apply: rate limits, usage tracking, payload logging, guardrails.
+- **Governance**: endpoint permissions control who can use which provider.
+
+This is the Databricks answer to the "provider abstraction" layer you built in Module 1.
+
+```python
+from mlflow.deployments import get_deploy_client
+
+client = get_deploy_client("databricks")
+client.create_endpoint(
+    name="claude-sonnet-gateway",
+    config={
+        "served_entities": [
+            {
+                "name": "claude-sonnet",
+                "external_model": {
+                    "name": "claude-sonnet-5-5",
+                    "provider": "anthropic",
+                    "task": "llm/v1/chat",
+                    "anthropic_config": {
+                        "anthropic_api_key": "{{secrets/llm/anthropic_api_key}}"
+                    },
+                },
+            }
+        ]
+    },
+)
+```
+
+The `{{secrets/scope/key}}` reference keeps the key out of code and out of the endpoint config visible to users.
+
+### Custom models
+
+Your chain or agent, logged with MLflow, served as a REST endpoint. Lesson 7 covers the agent version, where `agents.deploy` creates the endpoint for you. Custom endpoints can **scale to zero** for dev, at the cost of a cold start on the first request.
+
+## Querying an endpoint
+
+Chat endpoints (Foundation Model APIs and external models) speak an OpenAI-compatible API, so the OpenAI SDK works by pointing it at your workspace:
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["DATABRICKS_TOKEN"],
+    base_url=f"{os.environ['DATABRICKS_HOST']}/serving-endpoints",
+)
+
+resp = client.chat.completions.create(
+    model=os.environ.get("CHAT_ENDPOINT", "claude-sonnet-gateway"),  # the endpoint name
+    messages=[
+        {"role": "system", "content": "You answer insurance policy questions. Cite sections."},
+        {"role": "user", "content": "Is mold covered after a roof leak?"},
+    ],
+    max_tokens=400,
+    temperature=0.0,
+)
+print(resp.choices[0].message.content)
+print(resp.usage)
+```
+
+Note that `model` is the **endpoint name**, not the provider's model id. The same code calls a Llama pay-per-token endpoint or a Claude external endpoint — only the name changes. In LangChain, `databricks_langchain.ChatDatabricks(endpoint="...")` does the same.
+
+## Batch inference with `ai_query`
+
+Not everything needs a real-time endpoint. Classifying 2 million historical claims or extracting fields from every document in a table is a batch job. Databricks SQL can call a serving endpoint per row:
+
+```sql
+CREATE OR REPLACE TABLE main.claims.claim_triage AS
+SELECT
+  claim_id,
+  ai_query(
+    'claude-sonnet-gateway',
+    CONCAT('Classify this claim description into one of: water, fire, theft, wind, other. ',
+           'Answer with the label only. Description: ', description)
+  ) AS loss_type
+FROM main.claims.claims_raw
+WHERE ingested_at >= current_date() - INTERVAL 1 DAY;
+```
+
+`ai_query` also supports structured output via a response format argument on recent runtimes. For large jobs on provisioned throughput endpoints, it is often the simplest and most efficient way to do offline enrichment. There are also task-specific functions (`ai_classify`, `ai_extract`, `ai_summarize`) for quick work.
+
+## AI Gateway: production controls on any endpoint
+
+AI Gateway features can be enabled on serving endpoints:
+
+- **Rate limits** per user, per service principal or per endpoint. Protects budgets and shared capacity.
+- **Usage tracking** into system tables, so you can attribute token usage by user and team.
+- **Inference tables**: request and response payloads logged automatically to a Delta table in Unity Catalog. This is your production log for SQL analysis (lesson 1), monitoring and building eval sets (lesson 2).
+- **Guardrails**: safety filtering and PII detection on inputs and outputs.
+- **Traffic splitting and fallbacks**: route a percentage of traffic to a new model, or fall back to another served entity on errors.
+
+Inference tables deserve emphasis: they turn every endpoint into a data source. "How do we monitor quality in production?" on the exam often has the answer "enable inference tables and evaluate them with MLflow".
+
+## Choosing: an exam-style decision guide
+
+1. **Do you need a frontier proprietary model?** → External model endpoint.
+2. **Is it a fine-tuned open model or a production workload with an SLA?** → Provisioned throughput.
+3. **Prototype, low or unpredictable volume, or embeddings for Vector Search?** → Pay-per-token.
+4. **Is it your own chain/agent logic?** → Custom model endpoint (via `agents.deploy` for agents).
+5. **Is it offline, over a table?** → `ai_query` batch, not a real-time endpoint.
+
+Then reason about cost the same way you did in Module 5: tokens per request times requests per month on per-token pricing, compared with hourly reserved capacity. Do the math with the provider's **current** prices; the crossover point depends on your traffic shape.
+
+## Common mistakes
+
+- **Hard-coding provider API keys in notebooks** instead of external model endpoints with secrets.
+- **Provisioned throughput for a prototype** with ten requests a day.
+- **Pay-per-token for a strict production SLA** where shared rate limits are a risk.
+- **Using a real-time endpoint row by row from a Python loop** for a batch job. Use `ai_query` or batch inference.
+- **Not enabling inference tables**, then having no production data for evals.
+- **Passing the provider model id** as `model` instead of the endpoint name.
+
+## How this shows up in interviews and on the exam
+
+<InterviewQuestion question="A company wants its teams to use Claude and GPT models, but security requires that no team holds provider API keys and that usage is tracked per team. What do you propose on Databricks?" level="mid">
+
+Create external model endpoints for each provider, with keys stored in Databricks secrets and referenced in the endpoint config. Grant `CAN QUERY` on the endpoints to team groups or service principals. Enable AI Gateway usage tracking and per-team rate limits, plus inference tables for auditing. Teams call the endpoints with the OpenAI-compatible client using their own Databricks identity, so keys never leave the platform and switching providers is a config change.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your fine-tuned Llama variant must serve a customer-facing app with a latency SLA. Which serving option and why?" level="senior">
+
+Provisioned throughput on Foundation Model APIs. It's the supported path for fine-tuned foundation models and gives dedicated, predictable capacity instead of shared rate limits. I would size throughput from measured peak tokens per second plus headroom, load test it (as in Module 5 with k6), enable inference tables for monitoring, and keep a fallback route. If traffic is low most of the day, I'd compare reserved-capacity cost against the cost of an external API and document the crossover.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Model Serving overview: https://docs.databricks.com/en/machine-learning/model-serving/index.html
+- Foundation Model APIs: https://docs.databricks.com/en/machine-learning/foundation-models/index.html
+- External models: https://docs.databricks.com/en/generative-ai/external-models/index.html
+- AI Gateway: https://docs.databricks.com/en/ai-gateway/index.html
+- `ai_query` function: https://docs.databricks.com/en/sql/language-manual/functions/ai_query.html

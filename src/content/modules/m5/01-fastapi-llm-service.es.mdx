@@ -1,0 +1,293 @@
+## Por qué los servicios LLM son diferentes
+
+Ya has construido servicios REST. Un endpoint LLM rompe casi todas las suposiciones de esos servicios:
+
+- **La latencia es de segundos, no de milisegundos.** Una respuesta RAG tarda entre 2 y 15 s de punta a punta. Un timeout típico de API gateway es de 30 s. Una respuesta larga con un proveedor lento puede alcanzarlo.
+- **La respuesta se produce de forma incremental.** Los usuarios juzgan la velocidad por el *time to first token* (TTFT, tiempo hasta el primer token), no por el tiempo total. El streaming convierte una espera de 8 s en una de 600 ms más el tiempo de lectura.
+- **Cada request cuesta dinero real.** Una tormenta de reintentos no es solo carga. Es una factura.
+- **El upstream es inestable.** Los 429 del proveedor, los errores 529 "overloaded" y las colas lentas son normales. Tu servicio debe absorberlos.
+- **Los clientes se desconectan.** La gente cierra la pestaña a mitad de la respuesta. Si sigues generando, pagas por tokens que nadie lee.
+
+Esta lección diseña la capa FastAPI de `mortgage-knowledge-assistant` con esos hechos en mente. El objetivo es una capa HTTP delgada y aburrida que haga streaming, aplique timeouts, deduplique y delegue el trabajo lento.
+
+## La forma del servicio
+
+```text
+app/
+  main.py          # create_app(), lifespan: open/close pools
+  settings.py      # pydantic-settings (next lessons)
+  llm.py           # provider wrapper: anthropic | mock
+  api/chat.py      # /v1/chat and /v1/chat/stream
+  rag/retriever.py # hybrid retrieval from Module 2
+  rag/generator.py # prompt + streaming generation
+```
+
+Dos endpoints sirven la misma lógica:
+
+- `POST /v1/chat` devuelve JSON. Bueno para clientes batch, tests y evals.
+- `POST /v1/chat/stream` devuelve Server-Sent Events (SSE). Bueno para interfaces de usuario.
+
+Además `GET /healthz` (el proceso está vivo) y `GET /readyz` (Postgres y Redis responden). Mantenlos separados. Un load balancer que reinicia tu contenedor porque Redis tuvo un parpadeo es una caída autoinfligida.
+
+## Lifespan: crea los clientes una sola vez
+
+Los pools de base de datos, los clientes de Redis y el cliente de Anthropic son costosos de crear. Créalos una vez por proceso en el handler de lifespan y guárdalos en `app.state`.
+
+```python
+# app/main.py
+from contextlib import asynccontextmanager
+
+import anthropic
+import asyncpg
+import redis.asyncio as redis
+from fastapi import FastAPI
+
+from app.api.chat import router as chat_router
+from app.settings import get_settings
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    s = get_settings()
+    app.state.db = await asyncpg.create_pool(s.database_url, min_size=2, max_size=10)
+    app.state.redis = redis.from_url(s.redis_url, decode_responses=True)
+    app.state.llm = anthropic.AsyncAnthropic(
+        api_key=s.anthropic_api_key.get_secret_value(),
+        timeout=s.llm_timeout_s,
+        max_retries=2,
+    )
+    yield
+    await app.state.db.close()
+    await app.state.redis.aclose()
+    await app.state.llm.close()
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="mortgage-knowledge-assistant", lifespan=lifespan)
+    app.include_router(chat_router, prefix="/v1")
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()
+```
+
+Fíjate en la configuración del SDK: un `timeout` explícito y un `max_retries` pequeño. El timeout por defecto del SDK es generoso (minutos). En un request web quieres un presupuesto que tú elegiste.
+
+## Streaming con SSE y `StreamingResponse`
+
+SSE es HTTP simple. El servidor envía `text/event-stream` y escribe frames como `event: token` seguido de `data: ...` y una línea en blanco. Los navegadores lo consumen con `EventSource` o con `fetch` más un reader. Atraviesa la mayoría de los proxies, a diferencia de WebSockets, y para un chat no necesitas tráfico bidireccional.
+
+```python
+# app/api/chat.py
+import json
+import time
+from collections.abc import AsyncIterator
+
+from fastapi import APIRouter, Header, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.rag.generator import stream_answer
+from app.rag.retriever import retrieve
+
+router = APIRouter()
+
+
+class ChatRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    top_k: int = Field(default=6, ge=1, le=20)
+
+
+def sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    body: ChatRequest,
+    request: Request,
+    x_tenant_id: str = Header(...),
+) -> StreamingResponse:
+    chunks = await retrieve(request.app.state.db, x_tenant_id, body.question, body.top_k)
+
+    async def events() -> AsyncIterator[str]:
+        started = time.perf_counter()
+        ttft_ms: int | None = None
+        n_tokens = 0
+        try:
+            async for token in stream_answer(request.app.state.llm, body.question, chunks):
+                if await request.is_disconnected():
+                    break  # stop paying for tokens nobody reads
+                if ttft_ms is None:
+                    ttft_ms = int((time.perf_counter() - started) * 1000)
+                n_tokens += 1
+                yield sse("token", {"text": token})
+            yield sse("citations", {"sources": [c.source_id for c in chunks]})
+            yield sse("done", {"ttft_ms": ttft_ms, "output_tokens": n_tokens})
+        except Exception as exc:  # headers are already sent: report in-band
+            yield sse("error", {"type": type(exc).__name__})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+```
+
+Puntos clave:
+
+- **Haz el retrieval antes de que empiece el streaming.** Si el retrieval falla, todavía puedes devolver un 4xx/5xx normal con cuerpo JSON. Una vez enviado el primer byte, el status queda fijo en 200. A partir de ahí, los errores deben viajar *dentro* del stream como un evento `error`.
+- **Desactiva el buffering.** `X-Accel-Buffering: no` le indica a los proxies estilo nginx que no hagan buffer. Los load balancers y el middleware de compresión también pueden hacer buffer. Un stream que llega todo de golpe es un bug común en producción.
+- **Manejo de desconexiones.** Cuando el cliente se va, Starlette cancela la tarea de respuesta en la siguiente escritura en la mayoría de configuraciones, y `request.is_disconnected()` te permite verificarlo explícitamente. En cualquier caso, asegúrate de que la cancelación cierre el stream upstream. El context manager `async with client.messages.stream(...)` lo hace por ti.
+
+El lado del generador usa el helper de streaming de Anthropic:
+
+```python
+# app/rag/generator.py
+from collections.abc import AsyncIterator
+
+import anthropic
+
+SYSTEM = "Answer only from the provided context. Cite sources as [source_id]."
+
+
+async def stream_answer(
+    client: anthropic.AsyncAnthropic, question: str, chunks: list
+) -> AsyncIterator[str]:
+    context = "\n\n".join(f"[{c.source_id}] {c.text}" for c in chunks)
+    async with client.messages.stream(
+        model="claude-sonnet-5-5",
+        max_tokens=800,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
+    ) as stream:
+        async for text in stream.text_stream:
+            yield text
+```
+
+Si el consumidor deja de iterar, el `async with` termina y la conexión HTTP con el proveedor se cierra. Los tokens dejan de generarse y de facturarse poco después.
+
+## Timeouts de request: presupuestos, no esperanzas
+
+Define timeouts en cada capa y haz que se aniden: los internos deben ser más cortos que los externos.
+
+| Capa | Presupuesto de ejemplo |
+|---|---|
+| Idle timeout del load balancer | 120 s (debe superar el mayor hueco del stream) |
+| Request completo (sin streaming) | 30 s |
+| Retrieval (DB + re-rank) | 3 s |
+| Llamada LLM, primer token | 10 s |
+| Llamada LLM, total | 25 s |
+
+Para código sin streaming, envuelve el trabajo con `asyncio.timeout`:
+
+```python
+import asyncio
+from fastapi import HTTPException
+
+
+async def answer_with_budget(coro, seconds: float):
+    try:
+        async with asyncio.timeout(seconds):
+            return await coro
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="LLM budget exceeded") from None
+```
+
+En streams, el caso peligroso es el estancamiento: la conexión está abierta pero no llegan tokens. Mide el tiempo desde el último token y aborta si supera un presupuesto de hueco (por ejemplo 15 s). Además envía una línea de comentario SSE (`: ping`) cada ~15 s cuando no hay actividad, para que los proxies no maten una conexión silenciosa.
+
+## Idempotency keys
+
+Los clientes reintentan. Las redes móviles se caen. Un usuario hace doble clic. Sin protección, cada reintento es una nueva llamada LLM pagada, y en acciones con efectos secundarios (crear un ticket, enviar un correo) es una acción duplicada.
+
+El patrón, tomado de las APIs de pagos:
+
+1. El cliente envía `Idempotency-Key: <uuid>` con un POST.
+2. El servidor hace un `SET key "in_progress" NX EX 60` atómico en Redis, con scope por tenant.
+3. Si el set tiene éxito, procesa el request y luego guarda la respuesta final bajo la key con un TTL más largo (por ejemplo 24 h).
+4. Si la key existe con una respuesta guardada, devuélvela. Si sigue en `in_progress`, devuelve `409 Conflict` para que el cliente espere.
+
+```python
+async def run_idempotent(redis, tenant: str, key: str, handler) -> dict:
+    rkey = f"idem:{tenant}:{key}"
+    if not await redis.set(rkey, "in_progress", nx=True, ex=60):
+        cached = await redis.get(rkey)
+        if cached and cached != "in_progress":
+            return json.loads(cached)
+        raise HTTPException(status_code=409, detail="Request in progress")
+    try:
+        result = await handler()
+    except Exception:
+        await redis.delete(rkey)  # allow a clean retry
+        raise
+    await redis.set(rkey, json.dumps(result), ex=86_400)
+    return result
+```
+
+Además, calcula un hash del cuerpo del request y guárdalo junto con la key. Si la misma key llega con un cuerpo distinto, devuelve `422`. Eso detecta bugs de clientes que reutilizan keys.
+
+En los endpoints de streaming, la idempotencia normalmente se aplica a los efectos secundarios (por ejemplo, registrar el turno de la conversación) en lugar de reproducir el stream.
+
+## Background jobs
+
+Hay trabajo que no debe ocurrir dentro del request:
+
+- Ingerir un PDF nuevo de 200 páginas (minutos de parsing y embeddings).
+- Escribir traces, registros de costo y feedback en un almacenamiento lento.
+- Ejecutar un eval online sobre el 5% de las respuestas.
+
+`BackgroundTasks` de FastAPI ejecuta una función *después* de enviar la respuesta, en el mismo proceso. Sirve para trabajo pequeño y descartable, como escribir un registro de costo. No es una cola de jobs: si el contenedor se reinicia, la tarea se pierde, y las tareas largas compiten con los requests por el event loop.
+
+Para trabajo durable, encola un job y devuelve `202 Accepted` con un id de job:
+
+```python
+@router.post("/documents", status_code=202)
+async def ingest(doc: DocumentIn, request: Request) -> dict[str, str]:
+    job_id = await enqueue(request.app.state.redis, "ingest", doc.model_dump())
+    return {"job_id": job_id, "status_url": f"/v1/jobs/{job_id}"}
+```
+
+Los workers (arq, Celery, RQ, o un consumidor de SQS en ECS) toman los jobs, con reintentos y una dead-letter queue. Ejecútalos como un proceso o servicio separado a partir de la misma imagen con otro comando. Así la latencia de la API no se ve afectada por una ingesta lenta.
+
+## Errores comunes
+
+- **Llamadas bloqueantes en rutas async.** Un `requests.post` síncrono o un re-ranker pesado en CPU dentro de `async def` congela todos los requests de ese worker. Usa clientes async, o `run_in_threadpool` / un servicio separado para trabajo de CPU.
+- **Devolver errores como status HTTP después de empezar el streaming.** Es imposible. Diseña un evento `error` y haz que el cliente lo maneje.
+- **No manejar desconexiones.** Pagas respuestas completas para pestañas cerradas. En un chat con clics frecuentes en "detener" esto se acumula.
+- **Crear el cliente LLM en cada request.** Pierdes el connection pooling y agregas handshakes TLS a cada llamada.
+- **Confiar en los timeouts por defecto del SDK.** Con valores de minutos, los requests colgados se acumulan hasta agotar el pool.
+- **Readiness checks que llaman al proveedor LLM.** Un incidente del proveedor marca todas las tareas como no saludables y el orquestador las reinicia todas. Verifica solo tus propias dependencias.
+- **Usar `BackgroundTasks` para ingesta.** Funciona en dev y pierde jobs en silencio durante los deploys.
+
+<Callout type="tip" title="El ángulo SDET">
+Prueba el streaming con un contract test: verifica el orden de eventos (uno o más `token`, luego `citations`, luego `done`), verifica que una falla upstream produzca un evento `error` y verifica que el stream se detenga cuando el cliente se desconecta. `httpx.AsyncClient` con `client.stream("POST", ...)` contra la app ASGI hace que estos tests sean rápidos y deterministas con `LLM_PROVIDER=mock`.
+</Callout>
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo diseñarías un endpoint de chat con streaming para una app LLM, y qué puede fallar en producción?" level="mid">
+Usa SSE sobre HTTP con `StreamingResponse` de FastAPI y `text/event-stream`. Haz la validación, la autenticación y el retrieval **antes** del primer byte, para que las fallas todavía puedan devolver un status code correcto. Envía eventos tipados: `token`, `citations`, `done`, y un evento `error`, porque el status ya es 200 una vez que empieza el streaming.
+
+Qué falla: proxies o compresión que hacen buffer del stream (se corrige con `X-Accel-Buffering: no` y sin gzip en esa ruta), idle timeouts en los load balancers (envía comentarios keep-alive), desconexiones del cliente que siguen generando tokens pagados (revisa `is_disconnected` y cierra el stream upstream) y estancamientos donde el proveedor deja de enviar tokens (timeout entre tokens).
+</InterviewQuestion>
+
+<InterviewQuestion question="Un cliente reintenta POST /chat después de un timeout y al usuario se le cobra dos veces por una acción. ¿Cómo lo arreglas?" level="senior">
+Introduce idempotency keys. El cliente genera un UUID por operación lógica y lo envía en un header `Idempotency-Key` en cada reintento. El servidor reclama la key de forma atómica en Redis (`SET NX EX`), con scope por tenant, procesa una sola vez y guarda la respuesta. Los reintentos con la misma key reciben la respuesta guardada. Los duplicados concurrentes reciben `409`. Guarda un hash del cuerpo para rechazar la reutilización de una key con otro payload. Si hay una falla, libera la key para permitir un reintento limpio. Aplica la misma idea aguas abajo: las tool calls con efectos secundarios deben pasar la key al sistema externo si este la soporta.
+</InterviewQuestion>
+
+<Callout type="interview">
+Espera la pregunta "¿Dónde pones los timeouts?". Responde con la regla de anidamiento: cada timeout interno es más corto que su externo, y nombra las capas (load balancer, request, retrieval, primer token del LLM, total del LLM, hueco entre tokens).
+</Callout>
+
+## Lecturas recomendadas
+
+- FastAPI — Custom responses y `StreamingResponse`: https://fastapi.tiangolo.com/advanced/custom-response/
+- FastAPI — Lifespan events: https://fastapi.tiangolo.com/advanced/events/
+- FastAPI — Background tasks: https://fastapi.tiangolo.com/tutorial/background-tasks/
+- Anthropic — Streaming de mensajes: https://docs.anthropic.com/en/docs/build-with-claude/streaming
+- MDN — Uso de server-sent events: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events

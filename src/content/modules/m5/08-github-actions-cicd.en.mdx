@@ -1,0 +1,218 @@
+## What is different about CI/CD for LLM apps
+
+You have built GitHub Actions pipelines for years. Lint, test, build, push, deploy. That all still applies. LLM apps add three things:
+
+1. **Tests that cost money and are non-deterministic.** Your Module 3 eval suite calls a real model, takes minutes, and costs dollars per run. You cannot run it on every commit to every branch without thinking.
+2. **Changes that are not code.** A one-line prompt edit can drop faithfulness by 10 points. The pipeline must treat `prompts/` and retrieval config as code with its own gate.
+3. **Secrets with real blast radius.** A leaked provider key gets abused within hours. Long-lived AWS keys in GitHub secrets are a liability.
+
+The target pipeline for `mortgage-knowledge-assistant`:
+
+```text
+PR:    lint + types + unit tests  ->  eval gate (only if prompts/retrieval changed)  ->  docker build (no push)
+main:  same checks  ->  build + push image to ECR (tag = git SHA)  ->  deploy staging  ->  smoke test
+       ->  manual approval  ->  deploy production (same image digest)
+```
+
+## Fast checks first: the base of the pyramid
+
+Keep the first job fast. If lint, type checks and unit tests take more than 3–4 minutes, developers stop waiting for them. Use `uv` with its cache, and mock the LLM in unit tests. Your `LLM_PROVIDER=mock` setting from earlier lessons pays off here: unit tests never hit the network.
+
+## The eval gate: run it when it matters
+
+Module 3 gave you an eval harness that fails if faithfulness or answer relevance drops below a threshold. In CI, run it:
+
+- on PRs that touch `prompts/`, `app/rag/`, `app/llm.py`, retrieval config or the eval dataset itself,
+- on a nightly schedule against `main`, to catch provider-side drift,
+- manually via `workflow_dispatch` when you want a check.
+
+Use a `paths` filter so a README fix does not spend $4 on evals. Use a smaller "smoke" subset (say 50 golden questions) on PRs and the full set nightly. Put a **budget cap** inside the harness: it tracks token usage and aborts if the run exceeds `EVAL_MAX_USD`. A bug that loops over the dataset twice should fail, not silently double the bill.
+
+Pin the judge model and the dataset version. If either changes in the same PR as the prompt, you cannot tell which change moved the score.
+
+## Build once, deploy the same artifact
+
+The image you test in staging must be the exact image you run in production. Tag images with the **git SHA**, never only `latest`. Deploy by **digest** if you can. Use Docker Buildx with the GitHub Actions cache backend so dependency layers are reused across runs. A cold build of a Python AI image with heavy deps can take 5+ minutes; a warm one often under 1 minute.
+
+## OIDC instead of long-lived AWS keys
+
+GitHub Actions can request a short-lived OIDC token, and AWS IAM can trust it. You create an IAM role whose trust policy allows `token.actions.githubusercontent.com` for your repo, limited by branch or environment through the `sub` claim. The workflow assumes the role with `aws-actions/configure-aws-credentials`. No `AWS_ACCESS_KEY_ID` stored anywhere. Credentials expire in about an hour.
+
+Use separate roles for staging and production, each trusted only for its matching GitHub environment, for example `repo:you/mortgage-knowledge-assistant:environment:production`.
+
+## Environments and approvals
+
+GitHub **environments** give you per-environment secrets, variables, and protection rules. Configure:
+
+- `staging`: no approval, deploys automatically from `main`.
+- `production`: required reviewers (you, for a solo project), optionally a wait timer, and deploys restricted to `main`.
+
+A job with `environment: production` pauses until approved. The approval UI shows the commit and the staging result. That is your release gate.
+
+## The workflow
+
+```yaml
+# .github/workflows/ci-cd.yml
+name: ci-cd
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
+  id-token: write   # required for OIDC
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: mortgage-knowledge-assistant
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    outputs:
+      rag_changed: ${{ steps.filter.outputs.rag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --frozen
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy app
+      - run: uv run pytest -q -m "not integration"
+        env: { LLM_PROVIDER: mock }
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rag:
+              - 'prompts/**'
+              - 'app/rag/**'
+              - 'app/llm.py'
+              - 'evals/**'
+
+  eval-gate:
+    needs: checks
+    if: needs.checks.outputs.rag_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: { enable-cache: true }
+      - run: uv sync --frozen
+      - run: uv run python -m evals.run --suite smoke --min-faithfulness 0.85 --max-usd 3
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.EVAL_ANTHROPIC_API_KEY }}
+```
+
+The build and deploy jobs continue in the same file:
+
+```yaml
+  build:
+    needs: [checks, eval-gate]
+    if: always() && needs.checks.result == 'success' && needs.eval-gate.result != 'failure'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        env: { REGISTRY: "${{ steps.ecr.outputs.registry }}" }
+        run: echo "image=${REGISTRY:-local}/${ECR_REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: ./infra/deploy.sh staging "${{ needs.build.outputs.image }}"
+      - run: ./infra/smoke.sh "${{ vars.BASE_URL }}"
+
+  deploy-production:
+    needs: [build, deploy-staging]
+    environment: production   # pauses for required reviewers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - run: ./infra/deploy.sh production "${{ needs.build.outputs.image }}"
+      - run: ./infra/smoke.sh "${{ vars.BASE_URL }}"
+```
+
+A few details worth noticing:
+
+- **The `if` on `build`.** When `eval-gate` is skipped because no RAG files changed, a plain `needs` would skip `build` too. `always()` plus explicit result checks allows "eval passed or eval skipped", but blocks on failure.
+- **`vars.AWS_DEPLOY_ROLE_ARN` per environment.** The same variable name resolves to the staging role in the `staging` environment and the production role in `production`. Same for `BASE_URL`.
+- **Concurrency.** On PRs, a new push cancels the old run. On `main`, runs queue instead of cancelling, so you never cancel a half-finished production deploy.
+- **The eval API key is a separate secret** with its own spending limit at the provider, not the production key.
+- **Deploy script** (lesson 09 and exercise 10) renders a new ECS task definition with the image and waits for the service to become stable.
+
+## Smoke tests after deploy
+
+After each deploy, run a short smoke script against the real environment: `GET /readyz`, one `POST /v1/chat` with a known question, and one streaming request that checks the first `token` event arrives within a few seconds. Use a dedicated "smoke" tenant so these requests are easy to filter out of analytics. If smoke fails in staging, production never gets the approval prompt.
+
+## Rollbacks
+
+Because every image is tagged with a SHA, a rollback is "deploy the previous SHA". Keep that as a `workflow_dispatch` input on a small `rollback.yml` workflow. Also turn on the ECS deployment circuit breaker with automatic rollback (lesson 09), which handles failing health checks for you. Prompt-only regressions are often faster to roll back with a feature flag (lesson 14) than a redeploy.
+
+## Common mistakes
+
+- **Running the full eval suite on every push.** Slow, expensive, and people learn to ignore it. Use path filters, a smoke subset, and a nightly full run.
+- **Eval gate with no budget cap.** One bug and your CI spends hundreds of dollars.
+- **Using the production API key in CI.** A leaked log or a malicious PR from a fork can expose it. Note that secrets are not passed to workflows triggered from forks by default; keep it that way.
+- **Tagging only `latest`.** You cannot tell what is running and you cannot roll back reliably.
+- **Rebuilding the image for production.** Staging tested a different artifact. Promote the same image.
+- **Long-lived AWS keys in secrets.** Use OIDC with narrowly scoped roles.
+- **`cancel-in-progress: true` on `main`.** A new merge can cancel a deploy in the middle of a rollout.
+- **Flaky evals blocking merges.** Use a fixed seed where possible, temperature 0 for the system under test, a pinned judge, and thresholds with a small tolerance. Track the score trend, not just pass or fail.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you add LLM evals to CI without making the pipeline slow, flaky and expensive?" level="senior">
+
+Treat evals as the top of the test pyramid. Unit tests with a mocked LLM run on every push. The eval gate runs only when prompts, retrieval code, model config or the dataset change, using a path filter, and it runs a smoke subset of maybe 50 golden questions with a hard dollar budget cap. The full suite runs nightly against main to catch provider drift. To manage non-determinism: temperature 0, pinned model and judge versions, versioned datasets, and thresholds with a tolerance band plus trend tracking. The eval key is a separate key with a provider-side spend limit.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Why use OIDC to authenticate GitHub Actions to AWS?" level="mid">
+
+It removes long-lived access keys from GitHub. The workflow requests a short-lived token from GitHub's OIDC provider, and AWS STS exchanges it for temporary role credentials that expire in about an hour. The IAM trust policy restricts which repo, branch or environment can assume the role through the token's `sub` claim, so the production role can only be assumed by jobs running in the production environment. Nothing to rotate, nothing useful to leak.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Connect it to your SDET background">
+
+You have built CI gates before. Say it: "This is the same quality-gate thinking I used for E2E suites: fast tests on every commit, expensive tests targeted by change impact, a nightly full run, and flake management. The new parts are cost caps and non-determinism." That is a credible story for a QA-to-AI move.
+
+</Callout>
+
+## Further reading
+
+- GitHub Actions: using environments for deployment: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
+- Configuring OpenID Connect in AWS: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+- Docker build cache with GitHub Actions: https://docs.docker.com/build/ci/github-actions/cache/
+- Concurrency in GitHub Actions: https://docs.github.com/en/actions/using-jobs/using-concurrency
+- uv in GitHub Actions: https://docs.astral.sh/uv/guides/integration/github/

@@ -1,0 +1,214 @@
+# Fundamentos de Databricks: Unity Catalog, Volumes y tablas Delta
+
+Muchas empresas que contratan AI engineers ya tienen sus datos en Databricks. Cuando empiezan a construir apps de GenAI, las quieren en la misma plataforma: misma gobernanza, mismas tablas, mismo control de acceso. Por eso existe la certificación **Databricks Certified Generative AI Engineer Associate**, y por eso aparece en ofertas de trabajo junto a "RAG" y "evaluación de LLMs".
+
+Este módulo sigue las áreas principales del examen: diseño de aplicaciones, preparación de datos, desarrollo de aplicaciones, ensamblaje y deploy, gobernanza, y evaluación y monitoreo. Revisa la guía actual del examen en el sitio de Databricks para conocer los pesos exactos de cada dominio; cambian entre versiones.
+
+Esta lección cubre la base sobre la que se apoya todo lo demás: **Unity Catalog**, **Volumes** y **tablas Delta**.
+
+<Callout type="warning" title="Las APIs de Databricks evolucionan rápido">
+
+Los nombres de productos, los parámetros de los SDKs y las funciones SQL de Databricks cambian con frecuencia (la marca Mosaic AI, MLflow 2 vs 3, nuevas funciones SQL de IA). Los conceptos aquí son estables; los nombres exactos quizá no. Revisa siempre docs.databricks.com para la versión que uses antes de copiar código.
+
+</Callout>
+
+## El stack de GenAI en Databricks, en una imagen
+
+<Diagram caption="Dónde encaja cada componente de Databricks en una aplicación RAG" chart={`flowchart LR
+  A["PDFs en un Volume de UC"] --> B["Auto Loader a Delta bronze"]
+  B --> C["Parsing y chunking a Delta silver/gold"]
+  C --> D["Índice de Vector Search (Delta Sync)"]
+  D --> E["Cadena o agente (modelo MLflow)"]
+  F["Model Serving: modelos foundation / externos"] --> E
+  E --> G["Endpoint del agente + Review App"]
+  G --> H["Inference tables (Delta)"]
+  H --> I["Evaluación y monitoreo con MLflow"]
+  U["Unity Catalog: gobernanza y lineage"] -.-> A
+  U -.-> C
+  U -.-> D
+  U -.-> E`} />
+
+Cada caja está gobernada por Unity Catalog. Ese es el argumento de venta principal y un tema recurrente del examen.
+
+## Unity Catalog: un namespace, un modelo de permisos
+
+Unity Catalog (UC) es la capa de gobernanza. Todo vive en un **namespace de tres niveles**:
+
+```text
+catalog.schema.object
+main.claims.parsed_docs        -- a Delta table
+main.claims.raw_pdfs           -- a Volume
+main.claims.claims_agent       -- a registered MLflow model
+main.claims.chunks_index       -- a Vector Search index
+main.claims.lookup_policy      -- a SQL/Python function (usable as an agent tool)
+```
+
+Una organización típica usa catálogos para ambientes o unidades de negocio (`dev`, `prod` o `claims_prod`) y schemas para dominios o proyectos.
+
+**Securables** (objetos asegurables) que encontrarás en trabajo de GenAI:
+
+| Securable | Uso en GenAI |
+|---|---|
+| Tabla / vista | Documentos parseados, chunks, datasets de evaluación, logs de inferencia |
+| Volume | Archivos no estructurados crudos: PDFs, imágenes, audio |
+| Función | Lógica de negocio expuesta como herramienta de un agente |
+| Modelo registrado | Cadenas y agentes registrados con MLflow |
+| Índice de Vector Search | Retrieval sobre una tabla Delta |
+
+Como los modelos y los índices son objetos de UC, el mismo modelo de `GRANT` se aplica a ellos y a las tablas. Registrar modelos de MLflow en UC requiere una línea:
+
+```python
+import mlflow
+mlflow.set_registry_uri("databricks-uc")
+```
+
+### Permisos
+
+Los privilegios son jerárquicos. Para leer una tabla, un principal necesita `USE CATALOG` sobre el catálogo, `USE SCHEMA` sobre el schema y `SELECT` sobre la tabla.
+
+```sql
+-- Let the app's service principal read chunks and the PDFs
+GRANT USE CATALOG ON CATALOG main TO `claims-app-sp`;
+GRANT USE SCHEMA ON SCHEMA main.claims TO `claims-app-sp`;
+GRANT SELECT ON TABLE main.claims.chunks TO `claims-app-sp`;
+GRANT READ VOLUME ON VOLUME main.claims.raw_pdfs TO `claims-app-sp`;
+
+-- Let the ingestion job write new files
+GRANT WRITE VOLUME ON VOLUME main.claims.raw_pdfs TO `ingest-job-sp`;
+
+-- Let an agent call a UC function as a tool
+GRANT EXECUTE ON FUNCTION main.claims.lookup_policy TO `claims-app-sp`;
+```
+
+Dale a las apps **service principals**, no tokens personales. Otorga permisos a grupos, no a individuos. Al examen le gustan los escenarios donde la respuesta correcta es "usa permisos de UC y un service principal" en lugar de "copia los datos a otro workspace".
+
+### Lineage y auditoría
+
+UC registra el lineage automáticamente para consultas, notebooks y jobs: puedes abrir `main.claims.chunks` y ver que se construyó a partir de `parsed_docs`, que vino del Volume `raw_pdfs`. También captura logs de auditoría de quién accedió a qué. Para clientes regulados (seguros, salud, legal) esa suele ser la razón por la que eligen Databricks.
+
+## Volumes: almacenamiento gobernado para archivos
+
+Las tablas guardan datos estructurados. Los **Volumes** guardan archivos: PDFs, imágenes escaneadas, transcripciones de audio, archivos JSONL de evaluación. Son objetos de UC con una ruta estilo POSIX:
+
+```text
+/Volumes/<catalog>/<schema>/<volume>/<path>
+/Volumes/main/claims/raw_pdfs/2026/11/claim-104233.pdf
+```
+
+Puedes leerlos y escribirlos con APIs de archivos normales desde notebooks y jobs:
+
+```python
+from pathlib import Path
+
+landing = Path("/Volumes/main/claims/raw_pdfs/incoming")
+pdfs = sorted(landing.glob("*.pdf"))
+print(len(pdfs), pdfs[:3])
+```
+
+```sql
+CREATE VOLUME IF NOT EXISTS main.claims.raw_pdfs
+COMMENT 'Raw claim PDFs uploaded by the intake system';
+```
+
+Los Volumes son donde empieza la parte de "preparación de datos" del examen: los documentos crudos llegan a un Volume y luego se parsean a tablas.
+
+## Tablas Delta: tablas ACID sobre object storage
+
+Delta Lake es el formato de tabla por defecto en Databricks. Para pipelines de GenAI importan cinco características:
+
+1. **Transacciones ACID.** Escritores concurrentes no corrompen la tabla. Un job fallido no deja estado a medio escribir.
+2. **`MERGE INTO`.** Upserts para pipelines idempotentes (lección 2).
+3. **Time travel.** Consultar una versión anterior, esencial para evals reproducibles.
+4. **Change Data Feed (CDF).** Registros de cambios a nivel de fila. **Obligatorio para los índices Delta Sync de Vector Search**, para que el índice se sincronice de forma incremental.
+5. **Enforcement y evolución del schema.** Las escrituras incorrectas fallan de forma visible en lugar de agregar columnas basura en silencio.
+
+```sql
+CREATE TABLE IF NOT EXISTS main.claims.chunks (
+  chunk_id        STRING NOT NULL,
+  doc_id          STRING NOT NULL,
+  source_uri      STRING,
+  page            INT,
+  content         STRING,
+  doc_type        STRING,
+  parser_version  STRING,
+  run_id          STRING,
+  ingested_at     TIMESTAMP,
+  CONSTRAINT chunks_pk PRIMARY KEY (chunk_id)
+)
+TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+-- Time travel for reproducible evaluation
+SELECT count(*) FROM main.claims.eval_golden VERSION AS OF 7;
+SELECT * FROM main.claims.chunks TIMESTAMP AS OF '2026-10-30T00:00:00';
+DESCRIBE HISTORY main.claims.chunks;
+```
+
+Comandos de mantenimiento: `OPTIMIZE` compacta archivos pequeños (los jobs de ingesta crean muchos) y `VACUUM` borra archivos que ya no se referencian. `VACUUM` limita qué tan atrás funciona el time travel, así que configura la retención de forma consciente si la reproducibilidad de tus evals depende de versiones antiguas.
+
+## Arquitectura medallion para documentos
+
+El patrón estándar aplicado a datos no estructurados:
+
+| Capa | Contenido | Tabla de ejemplo |
+|---|---|---|
+| Bronze | Archivos crudos en binario + metadata | `bronze_pdfs` (path, content, length, modificationTime) |
+| Silver | Texto parseado por página o elemento, limpio, sin PII | `parsed_docs` |
+| Gold | Chunks listos para embeddings, con lineage | `chunks` (CDF activado) |
+
+La ingesta bronze con **Auto Loader** lee archivos nuevos de forma incremental desde un Volume:
+
+```python
+# Runs in a Databricks notebook or job (spark is provided)
+raw = (
+    spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "binaryFile")
+    .option("pathGlobFilter", "*.pdf")
+    .load("/Volumes/main/claims/raw_pdfs/incoming")
+)
+
+(
+    raw.writeStream
+    .option("checkpointLocation", "/Volumes/main/claims/checkpoints/bronze_pdfs")
+    .trigger(availableNow=True)          # process what is new, then stop
+    .toTable("main.claims.bronze_pdfs")
+)
+```
+
+El checkpoint recuerda qué archivos ya se procesaron, así el job es incremental y seguro de volver a ejecutar. `availableNow` hace que se comporte como un job batch que puedes programar.
+
+Para el parsing puedes usar una librería de Python (`pypdf`, `unstructured` o un parser que entienda el layout) dentro de una UDF, o la función SQL de IA más reciente `ai_parse_document`, que parsea documentos binarios a contenido estructurado directamente en SQL. Su disponibilidad depende de tu región y runtime; revisa la documentación antes de depender de ella.
+
+## Practicar sin el workspace de una empresa
+
+**Databricks Free Edition** te da un workspace serverless con Unity Catalog, suficiente para la mayoría de los ejercicios de este módulo. Algunas funciones (por ejemplo ciertas opciones de serving o tamaños de cómputo) pueden estar limitadas; revisa la documentación de Free Edition para conocer los límites actuales. Cada ejercicio de este módulo también tiene una alternativa local.
+
+## Errores comunes
+
+- **Usar el Hive metastore legacy o rutas DBFS** para trabajo nuevo de GenAI. Usa tablas y Volumes de UC para que apliquen la gobernanza y el lineage.
+- **Olvidar el CDF** en la tabla fuente y luego no poder crear un índice Delta Sync.
+- **Sin primary key** en la tabla de chunks. Vector Search la necesita.
+- **Tokens de acceso personales en las apps.** Usa service principals y grants de UC.
+- **`VACUUM` agresivo** que rompe el time travel del que dependen tus corridas de evaluación.
+- **Copiar los datos a un workspace separado** "para el equipo de IA". Pierdes gobernanza y lineage.
+
+## Cómo aparece esto en entrevistas y en el examen
+
+<InterviewQuestion question="Un cliente de salud quiere un asistente RAG sobre políticas clínicas, con control estricto de quién puede ver qué documentos. ¿Cómo usarías Unity Catalog?" level="mid">
+
+Guarda los PDFs crudos en un Volume de UC y los chunks parseados en una tabla Delta dentro de un catálogo y schema dedicados. Otorga acceso a grupos y al service principal de la app con `USE CATALOG`, `USE SCHEMA`, `SELECT` y `READ VOLUME` solo donde haga falta. Construye el índice de Vector Search y registra la cadena como objetos de UC para que apliquen los mismos permisos y logs de auditoría. Usa el lineage para mostrar a los auditores qué documentos alimentan cada índice y modelo. Para restricciones de documentos por usuario, incluye una etiqueta de acceso en la metadata de los chunks y filtra el retrieval según los grupos de quien llama.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Patrón del examen">
+
+Cuando una opción dice "exporta los datos a un almacén externo para que la app de LLM pueda accederlos", suele ser incorrecta. Las respuestas al estilo Databricks mantienen los datos en Delta, gobernados por Unity Catalog, y llevan el cómputo (Vector Search, Model Serving) hacia ellos.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Visión general de Unity Catalog: https://docs.databricks.com/en/data-governance/unity-catalog/index.html
+- Volumes: https://docs.databricks.com/en/volumes/index.html
+- Delta Lake en Databricks: https://docs.databricks.com/en/delta/index.html
+- Change Data Feed: https://docs.databricks.com/en/delta/delta-change-data-feed.html
+- Certificación Generative AI Engineer Associate: https://www.databricks.com/learn/certification/genai-engineer-associate

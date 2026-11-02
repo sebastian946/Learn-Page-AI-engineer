@@ -1,0 +1,224 @@
+## Objetivo
+
+Construye un agente de soporte con LangGraph para una empresa de logística que pueda consultar pedidos, reprogramar entregas y emitir reembolsos. Los reembolsos mueven dinero, así que **ningún reembolso se ejecuta sin una decisión humana**. El operador puede aprobar, rechazar o editar los argumentos (por ejemplo, bajar el monto) antes de que la herramienta se ejecute.
+
+Este es el primer commit del repo `langgraph-hitl-agent`. La lección 12 le agrega guardas de bucle y límites de costo, y la lección 14 agrega una suite de evals de trayectoria, así que mantén la estructura limpia.
+
+Vas a practicar:
+
+- Estado tipado con `add_messages`, un router propio y enrutamiento con `Command`.
+- `interrupt()` y `Command(resume=...)` con un checkpointer.
+- Reemplazar un mensaje de la IA por id para aplicar una edición.
+- Probar un agente **sin llamar a la API**, usando un modelo fake con guion. Es la versión para agentes de mockear un backend en Playwright: determinista, rápido y gratis.
+
+Tiempo estimado: de 60 a 90 minutos.
+
+## Requisitos
+
+Herramientas (en `tools.py`, decoradas con `@tool` de `langchain_core.tools`, respaldadas por un dict de pedidos en memoria):
+
+- `get_order(order_id)`: devuelve estado, transportista, fecha de entrega y total en centavos, o el contrato de error `{"error": {"code": "ORDER_NOT_FOUND", ...}}`.
+- `reschedule_delivery(order_id, new_date, idempotency_key)`: rechaza fechas pasadas con `INVALID_DATE`. La misma key dos veces devuelve el primer resultado en lugar de reprogramar otra vez.
+- `issue_refund(order_id, amount_cents, reason, idempotency_key)`: rechaza montos mayores al total del pedido con `AMOUNT_EXCEEDS_TOTAL`. Idempotente por key.
+
+Política:
+
+- Cualquier mensaje de la IA que contenga `issue_refund` va a un nodo `approval` que llama a `interrupt()`.
+- Decisiones: `{"action": "approve"}`, `{"action": "reject", "reason": "..."}`, `{"action": "edit", "args": {...}}`.
+- Rechazar produce un `ToolMessage` con código de error `REJECTED_BY_HUMAN` para **cada** tool call pendiente y luego vuelve al agente.
+- Cada tool call ejecutada se agrega a una lista de auditoría en el estado (`tool_log`) con el nombre de la herramienta, los argumentos y el código de resultado.
+
+<AcceptanceCriteria>
+
+- [ ] `build_graph(llm, checkpointer)` devuelve un grafo compilado; el modelo se inyecta para que los tests puedan pasar un fake.
+- [ ] `get_order` y `reschedule_delivery` corren sin ningún interrupt.
+- [ ] Una solicitud de reembolso pausa la ejecución: el resultado contiene `__interrupt__` con el nombre de la herramienta, los argumentos y el id de la tool call, y `graph.get_state(config).next == ("approval",)`.
+- [ ] Aprobar: el reembolso se ejecuta exactamente una vez y el último mensaje de la IA lo confirma.
+- [ ] Editar: el reembolso se ejecuta con el `amount_cents` editado y el mensaje de la IA guardado muestra los argumentos editados (mismo id de mensaje, sin duplicados).
+- [ ] Rechazar: no se ejecuta ningún reembolso; el agente recibe un resultado de herramienta `REJECTED_BY_HUMAN` y le responde al cliente.
+- [ ] Reanudar dos veces con la misma idempotency key nunca crea dos reembolsos.
+- [ ] `python -m hitl_agent.cli` ejecuta una conversación y le pregunta al operador en la terminal (aprobar / rechazar / editar).
+- [ ] `pytest` pasa sin acceso a red y sin `ANTHROPIC_API_KEY` definida.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# src/hitl_agent/state.py
+import operator
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+
+class AgentState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], add_messages]
+    step_count: int
+    cost_usd: float
+    tool_log: Annotated[list[dict], operator.add]
+```
+
+```python
+# src/hitl_agent/tools.py
+import json
+from datetime import date
+from langchain_core.tools import tool
+
+ORDERS: dict[str, dict] = {
+    "ORD-1042": {"status": "in_transit", "carrier": "FastFreight", "total_cents": 12000,
+                 "delivery_date": "2026-11-06"},
+}
+REFUNDS: dict[str, dict] = {}  # idempotency_key -> refund record
+
+
+def _error(code: str, message: str, retryable: bool = False, hint: str = "") -> str:
+    return json.dumps({"error": {"code": code, "message": message,
+                                 "retryable": retryable, "hint": hint}})
+
+
+@tool
+def get_order(order_id: str) -> str:
+    """Look up an order by id (format ORD-1234). Returns status, carrier, delivery date, total."""
+    order = ORDERS.get(order_id)
+    if order is None:
+        return _error("ORDER_NOT_FOUND", f"No order {order_id}", hint="Ask the customer to confirm the id.")
+    return json.dumps({"order_id": order_id, **order})
+
+
+@tool
+def issue_refund(order_id: str, amount_cents: int, reason: str, idempotency_key: str) -> str:
+    """Refund part or all of an order. Requires human approval. amount_cents must not exceed the total."""
+    # TODO: idempotency check, AMOUNT_EXCEEDS_TOTAL check, record the refund
+    raise NotImplementedError
+
+
+# TODO: reschedule_delivery(order_id, new_date, idempotency_key) with INVALID_DATE for past dates
+```
+
+```python
+# src/hitl_agent/graph.py
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from .state import AgentState
+from .tools import get_order, issue_refund  # , reschedule_delivery
+from .approval import approval, RISKY_TOOLS
+
+TOOLS = [get_order, issue_refund]
+SYSTEM = "You are a logistics support agent. Use tools for every fact. Refunds need a reason."
+
+
+def build_graph(llm, checkpointer):
+    """llm: anything with .invoke(messages) -> AIMessage (already bound to TOOLS)."""
+
+    def agent(state: AgentState) -> dict:
+        response = llm.invoke([("system", SYSTEM), *state["messages"]])
+        return {"messages": [response], "step_count": state.get("step_count", 0) + 1}
+
+    def route(state: AgentState) -> str:
+        # TODO: END if no tool calls, "approval" if any risky tool, else "tools"
+        raise NotImplementedError
+
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent)
+    builder.add_node("approval", approval)
+    builder.add_node("tools", ToolNode(TOOLS))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", route, ["tools", "approval", END])
+    builder.add_edge("tools", "agent")  # TODO: add an audit node between tools and agent
+    return builder.compile(checkpointer=checkpointer)
+```
+
+```python
+# tests/fakes.py
+from langchain_core.messages import AIMessage
+
+
+class ScriptedModel:
+    """Returns pre-written AIMessages in order. Records what it was called with."""
+
+    def __init__(self, responses: list[AIMessage]):
+        self.responses = list(responses)
+        self.calls: list[list] = []
+
+    def invoke(self, messages, **kwargs) -> AIMessage:
+        self.calls.append(messages)
+        return self.responses.pop(0)
+
+
+def refund_call(amount_cents: int, call_id: str = "call_1") -> AIMessage:
+    return AIMessage(content="", tool_calls=[{
+        "name": "issue_refund", "id": call_id,
+        "args": {"order_id": "ORD-1042", "amount_cents": amount_cents,
+                 "reason": "damaged", "idempotency_key": "t-1-refund"},
+    }])
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Empieza por el router y el nodo de aprobación. El nodo de aprobación solo debe leer el estado y llamar a `interrupt()`; no debe ejecutar nada. Deja que `ToolNode` haga la ejecución después de la decisión.</Hint>
+
+<Hint>Para el flujo de edición, construye un `AIMessage` nuevo con el mismo `content`, los `tool_calls` modificados e `id=last.id`. Como `add_messages` reemplaza por id, la llamada pendiente anterior desaparece y `ToolNode` ejecuta la editada.</Hint>
+
+<Hint>En los tests, usa `MemorySaver()` y un `thread_id` nuevo por test. El patrón es: `r = graph.invoke({"messages": [("user", "...")]}, config)`, verifica `"__interrupt__" in r` y luego `graph.invoke(Command(resume={"action": "edit", "args": {...}}), config)`. Programa el modelo fake con dos respuestas: la tool call de reembolso y luego una respuesta final de texto.</Hint>
+
+<Hint>Para el log de auditoría, agrega un nodo pequeño `audit` entre `tools` y `agent` que lea los `ToolMessage` finales, parsee su JSON y devuelva `{"tool_log": [...]}` con el nombre de la herramienta y `error.code` u `"OK"`. En la CLI, itera mientras `"__interrupt__"` esté en el resultado, imprime `result["__interrupt__"][0].value`, lee `a`, `r` o `e` con `input()` y reanuda.</Hint>
+
+</Hints>
+
+<CommitBox repo="langgraph-hitl-agent">
+
+Estructura de carpetas:
+
+```text
+langgraph-hitl-agent/
+  pyproject.toml          # langgraph, langchain-anthropic, pytest; package in src/
+  README.md
+  .env.example            # ANTHROPIC_API_KEY=, REFUND_APPROVAL_THRESHOLD_CENTS=
+  src/hitl_agent/
+    __init__.py
+    state.py              # AgentState with reducers
+    tools.py              # get_order, reschedule_delivery, issue_refund + error contract
+    approval.py           # RISKY_TOOLS, approval node (interrupt + Command)
+    graph.py              # build_graph(llm, checkpointer)
+    cli.py                # terminal approval loop
+  tests/
+    fakes.py              # ScriptedModel
+    test_tools.py         # idempotency, error codes
+    test_router.py        # routing policy
+    test_hitl_flows.py    # approve / edit / reject end-to-end
+  evals/                  # empty for now; lesson 14 fills it
+```
+
+Esquema del README:
+
+1. Qué hace (un párrafo + un diagrama Mermaid del grafo).
+2. Política de aprobación: qué herramientas tienen compuerta y por qué.
+3. Cómo ejecutarlo: `uv sync` (o `pip install -e .`), `python -m hitl_agent.cli`.
+4. Cómo funciona la reanudación: thread ids, checkpointer, `Command(resume=...)`.
+5. Estrategia de testing: modelo fake con guion, sin red, qué demuestra cada test.
+6. Limitaciones y próximos pasos (guardas de bucle, límites de costo, evals, checkpointer en Postgres).
+
+Commits sugeridos:
+
+```text
+feat: add order tools with error contract and idempotency keys
+feat: build LangGraph agent with tool routing
+feat: add approval node with interrupt for refunds
+feat: support edit and reject decisions
+test: cover approve/edit/reject flows with scripted model
+feat: add terminal approval CLI
+docs: README with graph diagram and approval policy
+```
+
+</CommitBox>
+
+## Retos adicionales
+
+- Aprueba automáticamente los reembolsos por debajo de `REFUND_APPROVAL_THRESHOLD_CENTS` (leído del entorno) y pon compuerta solo a los mayores. Prueba ambos lados del umbral.
+- Cambia `MemorySaver` por `PostgresSaver` con Docker Compose y demuestra que un hilo pausado sobrevive a un reinicio del proceso.
+- Agrega un comando `pending` a la CLI que liste todos los hilos pausados con `graph.get_state(...)`.
+
+<Checklist id="m4-08-review" title="Autoevaluación" items={["El nodo de aprobación no tiene efectos secundarios antes de interrupt()", "Cada tool call pendiente recibe un ToolMessage al rechazar", "Editar reemplaza el mensaje de la IA por id; no hay tool calls duplicadas en el historial", "Las herramientas de reembolso y reprogramación son idempotentes por key, con tests que lo demuestran", "Los errores de herramientas usan el contrato de error compartido con code, retryable y hint", "Los tests usan un modelo con guion y pasan sin red ni API key", "Los thread ids vienen de una clave de negocio, no de una constante", "El README explica la política de aprobación y cómo reanudar un hilo pausado"]} />

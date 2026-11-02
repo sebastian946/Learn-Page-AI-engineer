@@ -1,0 +1,177 @@
+## Objetivo
+
+Tu `mortgage-knowledge-assistant` ya corre en Docker (ejercicio 04). Ahora hazlo más barato y más seguro bajo carga. Vas a agregar:
+
+1. Una **caché exacta de respuestas** en Redis, con clave por tenant, pregunta normalizada, modelo, versión del prompt y versión del corpus.
+2. Una **caché semántica** opcional detrás de un feature flag (objetivo extra).
+3. **Rate limiting por tenant** con dos token buckets atómicos en Lua: uno para requests y otro para tokens LLM, con estimar y luego conciliar.
+4. **Métricas** de hits, misses de caché y rechazos por rate limit.
+
+Trabaja en la rama `m5/cache-rate-limit`. Tiempo máximo: 90 minutos para las partes obligatorias. La caché semántica es opcional.
+
+Por qué importa: en el ejercicio 12 harás pruebas de carga sobre este servicio. Con caché y límites, podrás mostrar la diferencia en latencia p95 y en costo por cada 1k requests. Eso da una sección fuerte para el README.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] `docker compose up` levanta Redis junto con la API, Postgres y pgvector. La API lee `REDIS_URL` desde `Settings`.
+- [ ] `POST /v1/chat` y `POST /v1/chat/stream` revisan primero la caché exacta. Un hit responde en menos de 50 ms en local y no hace llamada al LLM.
+- [ ] La clave de caché incluye el id del tenant (como prefijo), la pregunta normalizada, el id del modelo, la versión del prompt, la versión del corpus y la temperature.
+- [ ] Solo se guardan respuestas completas y exitosas. Los errores, bloqueos de guardrail y streams interrumpidos nunca se guardan.
+- [ ] Un hit de caché en streaming sigue emitiendo los eventos SSE `token`, `citations` y `done`, en ese orden.
+- [ ] Cada tenant (desde `X-Tenant-ID`) tiene un bucket de requests y un bucket de tokens. Los límites vienen de `Settings`, con un mapa opcional de overrides por tenant.
+- [ ] Las actualizaciones de los buckets corren en un solo script Lua, así que réplicas concurrentes no pueden admitir de más.
+- [ ] Los requests rechazados devuelven 429 con un header `Retry-After` y un cuerpo JSON de error. No se hace llamada al LLM.
+- [ ] Después de cada llamada al LLM, el bucket de tokens se concilia con los valores reales de `usage.input_tokens` y `usage.output_tokens`.
+- [ ] Si Redis cae, la caché falla abierta (el request continúa) y el limitador usa un limitador en memoria como respaldo. Ambos registran un warning.
+- [ ] Existen contadores de Prometheus: `cache_requests_total` con la etiqueta `result` (hit, miss, semantic_hit) y `rate_limited_total` con las etiquetas `tenant` y `bucket`.
+- [ ] Los tests cubren: la clave cambia cuando cambia la versión del prompt o del corpus, un hit de caché evita el LLM, 429 con `Retry-After`, requests concurrentes no exceden el bucket, la conciliación devuelve las sobreestimaciones.
+- [ ] Extra: caché semántica detrás de `SEMANTIC_CACHE_ENABLED`, acotada por tenant y versiones, omitida para preguntas que contienen dígitos.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```python
+# app/ratelimit.py
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+LUA = (Path(__file__).parent / "lua" / "token_bucket.lua").read_text()
+
+@dataclass
+class RateDecision:
+    allowed: bool
+    retry_after_s: int
+    remaining: int
+    bucket: str
+
+class TenantRateLimiter:
+    def __init__(self, redis: Redis, req_per_min: int, tokens_per_min: int) -> None:
+        self.redis = redis
+        self.script = redis.register_script(LUA)
+        self.req_cap, self.req_rate = req_per_min, req_per_min / 60
+        self.tok_cap, self.tok_rate = tokens_per_min, tokens_per_min / 60
+
+    async def _bucket(self, key: str, cap: int, rate: float, cost: int,
+                      force: bool = False) -> RateDecision:
+        now_ms = int(time.time() * 1000)
+        allowed, retry, remaining = await self.script(
+            keys=[key], args=[cap, rate, cost, now_ms, int(force)]
+        )
+        return RateDecision(bool(allowed), int(retry), int(remaining), key.split(":")[1])
+
+    async def reserve(self, tenant: str, estimated_tokens: int) -> RateDecision:
+        # TODO: check the request bucket, then the token bucket.
+        # TODO: on RedisError, fall back to an in-memory limiter and log a warning.
+        raise NotImplementedError
+
+    async def reconcile(self, tenant: str, estimated: int, actual: int) -> None:
+        # TODO: apply (actual - estimated) to the token bucket with force=True.
+        raise NotImplementedError
+```
+
+```python
+# app/api/chat.py (excerpt)
+@router.post("/v1/chat")
+async def chat(req: ChatRequest, tenant: str = Depends(tenant_id),
+               deps: Deps = Depends(get_deps)) -> ChatResponse:
+    s = deps.settings
+    key = cache_key(tenant_id=tenant, question=req.question, model=s.llm_model,
+                    prompt_version=s.prompt_version,
+                    corpus_version=await deps.corpus_version(tenant),
+                    temperature=s.temperature)
+    # TODO 1: cache lookup (fail open on RedisError), count hit/miss.
+    # TODO 2: estimate tokens = len(prompt chars) // 4 + s.max_tokens, then reserve.
+    # TODO 3: on denial, raise HTTPException(429, headers={"Retry-After": ...}).
+    # TODO 4: run RAG, reconcile with result.usage, cache the successful answer.
+    ...
+```
+
+```python
+# tests/test_ratelimit.py
+import asyncio
+import fakeredis
+import pytest
+from app.ratelimit import TenantRateLimiter
+
+@pytest.fixture
+async def limiter():
+    redis = fakeredis.FakeAsyncRedis()  # fakeredis supports EVAL with the lupa extra
+    yield TenantRateLimiter(redis, req_per_min=5, tokens_per_min=10_000)
+    await redis.aclose()
+
+async def test_concurrent_requests_do_not_exceed_bucket(limiter):
+    results = await asyncio.gather(*[limiter.reserve("t1", 100) for _ in range(20)])
+    assert sum(r.allowed for r in results) == 5
+```
+
+</StarterCode>
+
+El script Lua es el de la lección 05. Ponlo en `app/lua/token_bucket.lua`. Instala `fakeredis[lua]` como dependencia de desarrollo para que `EVAL` funcione en los tests. Si prefieres Redis real, usa `testcontainers[redis]` y marca esos tests como tests de integración.
+
+## Pistas
+
+<Hints>
+  <Hint>Empieza por la caché, no por el limitador. Escribe `cache_key` y tres tests unitarios antes de tocar el endpoint. Las funciones puras son el ciclo de feedback más rápido.</Hint>
+  <Hint>Para el endpoint de streaming, envuelve el generador: acumula los tokens en una lista y llama a `cache.set` solo después de emitir el evento `done` y de que el stream termine sin excepciones. Si el cliente se desconecta, el generador se cancela y nunca llegas al `set`, que es exactamente lo que quieres.</Hint>
+  <Hint>Para la versión del corpus, la opción robusta más simple es una clave de Redis `corpus_version:{tenant}` que tu job de ingesta incrementa con `INCR` después de cada corrida exitosa. Léela una vez por request. Guárdala en memoria del proceso por 30 segundos si quieres ahorrar un round trip.</Hint>
+  <Hint>Para el limitador de respaldo, basta un dict de `tenant -> (tokens, last_ts)` con la misma matemática de recarga. Es por réplica, así que el límite efectivo se vuelve límite por número de réplicas durante una caída de Redis. Escribe ese trade-off en tu README; es un buen punto para entrevistas.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="mortgage-knowledge-assistant">
+
+Rama: `m5/cache-rate-limit`
+
+```text
+mortgage-knowledge-assistant/
+  app/
+    cache.py              # cache_key, AnswerCache, optional SemanticCache
+    ratelimit.py          # TenantRateLimiter + in-memory fallback
+    lua/
+      token_bucket.lua
+    metrics.py            # Prometheus counters
+    api/
+      chat.py             # cache + limiter wired into both endpoints
+    settings.py           # REDIS_URL, rate limits, CACHE_ENABLED, SEMANTIC_CACHE_ENABLED
+  tests/
+    test_cache_key.py
+    test_cache_endpoint.py
+    test_ratelimit.py
+  docker-compose.yml      # + redis service with healthcheck
+  docs/
+    caching-and-limits.md
+```
+
+Sección del README "Caching and rate limiting":
+
+- Capas de caché y diseño de la clave (con la lista de campos de la clave y por qué está cada uno)
+- Qué nunca se guarda en caché
+- Política de rate limit: buckets de requests y de tokens, valores por defecto, overrides por tenant
+- Comportamiento ante caída de Redis y el trade-off
+- Métricas y cómo leer el hit rate
+- Impacto medido (complétalo después del ejercicio 12): latencia p95 y costo por cada 1k requests con y sin caché
+
+Commits sugeridos:
+
+- `feat(cache): add exact answer cache keyed by tenant, prompt and corpus version`
+- `feat(api): serve cache hits on JSON and SSE endpoints`
+- `feat(ratelimit): add atomic per-tenant request and token buckets in Lua`
+- `feat(ratelimit): reconcile token bucket with actual usage`
+- `feat(metrics): expose cache and rate-limit counters`
+- `test: cover cache keys, 429 responses and concurrent bucket access`
+- `docs: document caching and rate limiting policy`
+
+</CommitBox>
+
+## Autorrevisión
+
+<Checklist id="m5-07-review" title="Autorrevisión" items={["El id del tenant es el prefijo de la clave y cada entrada que cambia la respuesta está en el hash", "Los errores, bloqueos de guardrail y streams interrumpidos nunca se guardan en caché", "Los hits de caché en el endpoint SSE emiten token, citations y done en orden", "Ambos buckets se actualizan de forma atómica en una sola llamada Lua", "Las respuestas 429 incluyen Retry-After y no hacen llamada al LLM", "El bucket de tokens se concilia con el uso real después de cada llamada", "Caída de Redis: la caché falla abierta y el limitador usa respaldo, ambos registrados", "Los contadores de hit, miss y rate limit están expuestos y probados", "Un test de concurrencia demuestra que el bucket nunca admite de más", "El README documenta el diseño de la clave, los límites, el comportamiento ante fallas y los trade-offs"]} />

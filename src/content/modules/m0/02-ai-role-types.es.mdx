@@ -1,0 +1,178 @@
+# Roles AI-first, AI-support y de ML
+
+"AI Engineer" no es un solo trabajo. El mismo título cubre tareas diarias muy distintas según la empresa. Antes de aplicar a cualquier lugar necesitas saber qué tipo de rol estás mirando y cuál le encaja mejor a un SDET senior.
+
+Esta lección divide el mercado en tres familias, las compara y muestra exactamente cuáles de tus habilidades de QA se transfieren.
+
+## Tres familias de roles
+
+### 1. Empresas de producto AI-first
+
+El producto *es* la IA. Un asistente de investigación legal, un agente de programación, una plataforma de soporte al cliente con IA, una startup de inteligencia documental. Si el modelo deja de funcionar, la empresa no tiene nada que vender.
+
+Cómo es el trabajo:
+
+- Ser dueño de las funcionalidades centrales con LLM de punta a punta: prompts, retrieval, herramientas, evals, serving.
+- Iteración rápida. Salen modelos nuevos cada pocos meses y se espera que los evalúes y los adoptes.
+- Mucho énfasis en **medir la calidad**. Estos equipos viven y mueren por sus dashboards de evals.
+- Suelen ser startups o scale-ups. Equipos pequeños, alcance amplio, más ambigüedad.
+
+Lenguaje típico de la oferta: "build and ship agentic workflows", "own our evaluation framework", "push the frontier of what our product can do".
+
+### 2. Roles AI-support (habilitados por IA) en empresas establecidas
+
+La empresa ya tiene un producto: un banco, una plataforma de e-commerce, una empresa de logística, una herramienta SaaS. La IA se agrega para mejorarlo. Asistentes de conocimiento interno, ruteo de tickets, extracción de documentos, copilotos de soporte, búsqueda.
+
+Cómo es el trabajo:
+
+- Integrar LLM en sistemas existentes: APIs legacy, data warehouses, autenticación, cumplimiento normativo.
+- Más proceso: revisiones de seguridad, gobierno de datos, gestión del cambio.
+- Fuerte foco en **costo, confiabilidad y riesgo**. Una respuesta incorrecta en un asistente hipotecario es un incidente de cumplimiento.
+- Títulos frecuentes: "AI Engineer", "Software Engineer, GenAI", "Applied AI Engineer" o "LLM Engineer".
+
+Lenguaje típico de la oferta: "integrate generative AI capabilities into our platform", "partner with business stakeholders", "ensure responsible and secure use of AI".
+
+Es la familia más grande por número de ofertas. También es el punto de entrada más fácil para alguien con buenas habilidades de ingeniería y de calidad.
+
+### 3. Roles de ML Engineer / ML Scientist
+
+Estos roles entrenan y optimizan modelos. Feature engineering, pipelines de entrenamiento, entrenamiento distribuido, compresión de modelos, seguimiento de experimentos y a veces investigación.
+
+Cómo es el trabajo:
+
+- PyTorch, ciclos de entrenamiento, GPUs, pipelines de datos a gran escala.
+- La estadística y las matemáticas son centrales, no opcionales.
+- Métricas como curvas de pérdida, AUC y perplejidad, no solo la calidad de la tarea de punta a punta.
+
+Lenguaje típico de la oferta: "train and fine-tune large models", "optimize inference on GPU", "PhD or equivalent research experience preferred".
+
+<Callout type="warning" title="Mismo título, otro trabajo">
+
+Algunas empresas llaman "AI Engineer" a roles de ML Engineer. Lee siempre las responsabilidades, no el título. Si las tres primeras viñetas hablan de entrenamiento, GPUs y arquitectura de modelos, es un rol de ML, diga lo que diga el encabezado.
+
+</Callout>
+
+## Comparación lado a lado
+
+| Dimensión | AI-first | AI-support | ML Engineer |
+|---|---|---|---|
+| Resultado principal | Funcionalidades de producto con IA | Funcionalidades de IA dentro de un producto existente | Modelos entrenados u optimizados |
+| Habilidades centrales | RAG, agentes, evals, iteración rápida | Integración, RAG, seguridad, control de costos | Entrenamiento, PyTorch, matemáticas, MLOps |
+| Usa modelos fundacionales vía API | Casi siempre | Casi siempre | A veces; a menudo entrena los suyos |
+| Ritmo | Muy rápido | Moderado | Guiado por la investigación |
+| Encaje para un SDET senior | Bueno (las evals son el gancho) | Muy bueno (calidad + integración) | Débil sin experiencia en entrenamiento de ML |
+| Cobertura en el curso | M1–M5, M7 | M1–M6 | M6 solo roza los bordes |
+
+La decisión es simple para la mayoría de los SDET: **apunta primero a AI-support y después a AI-first**. Los roles de ML Engineer requieren otra formación y este curso no está diseñado para llevarte ahí.
+
+## Cómo se transfieren tus habilidades de SDET
+
+No empiezas de cero. Gran parte de la ingeniería de IA es ingeniería de calidad aplicada a software no determinista. Esta es la tabla de traducción.
+
+| Ya haces | En ingeniería de IA se convierte en |
+|---|---|
+| Suites de regresión | Golden datasets y suites de evals que corren en cada cambio de prompt |
+| Assertions | Umbrales de métricas: faithfulness igual o mayor a 0.85, validez de esquema del 100% |
+| Triage de tests flaky | Manejar el no determinismo: temperatura, sampling, ejecuciones repetidas, varianza |
+| Quality gates en CI | Bloquear un PR cuando bajan los puntajes de evals |
+| Pirámide de testing | Pirámide de evals: checks unitarios de salidas, evals de componentes sobre retrieval, evals de tarea de punta a punta |
+| Fixtures y datos de prueba | Datasets de evaluación curados, generación de datos sintéticos |
+| Contract testing | Salidas estructuradas y esquemas de herramientas como contratos |
+| Testing exploratorio | Red-teaming y pruebas de prompt injection |
+| Observabilidad de ejecuciones de tests | Tracing de llamadas a LLM con LangSmith, Langfuse, OpenTelemetry |
+| Pruebas de performance con k6 | Pruebas de carga de endpoints de LLM, seguimiento de latencia y tokens por segundo |
+
+La diferencia: en el testing clásico, una assertion es binaria. En las evals de LLM muchos checks son puntajes con umbrales, y algunos los juzga otro modelo. Tú sigues escribiendo el harness, definiendo los criterios de aprobación y siendo dueño del gate. Eso ya es tu trabajo.
+
+## De un test de Playwright a una eval
+
+Este es el puente en código: la estructura conocida de pytest aplicada a una funcionalidad con LLM. Un caso golden, una llamada al sistema bajo prueba, primero un check de contrato y luego un check de corrección contra la etiqueta golden.
+
+```python
+from __future__ import annotations
+
+import json
+
+import anthropic
+import pytest
+from pydantic import BaseModel, ValidationError
+
+client = anthropic.AsyncAnthropic()
+
+
+class TicketLabel(BaseModel):
+    category: str
+    priority: str
+
+
+GOLDEN = [
+    ("My card was charged twice for order 1182", "billing", "high"),
+    ("How do I change my delivery address?", "shipping", "low"),
+]
+
+SYSTEM = (
+    "Classify the support ticket. Reply with JSON only: "
+    '{"category": "billing|shipping|account|other", "priority": "low|medium|high"}'
+)
+
+
+async def classify(text: str) -> str:
+    msg = await client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=100,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": text}],
+    )
+    return msg.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ticket", "category", "priority"), GOLDEN)
+async def test_ticket_classifier(ticket: str, category: str, priority: str) -> None:
+    raw = await classify(ticket)
+    # 1. Contract check: the output must parse. Binary, like a schema test.
+    try:
+        label = TicketLabel.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        pytest.fail(f"Output broke the contract: {exc}\n{raw}")
+    # 2. Correctness check against the golden label.
+    assert label.category == category
+    assert label.priority == priority
+```
+
+Esta es la forma que vas a hacer crecer en el Módulo 3: más casos, métricas con puntaje, ejecuciones repetidas para medir la varianza y un job de CI que hace fallar el PR cuando la tasa de aprobación cae por debajo de un umbral. Ya sabes construir esto. Lo nuevo es el sistema bajo prueba y lo difuso del oráculo.
+
+## Errores comunes
+
+- **Aplicar a roles de ML Engineer solo por el título.** Te van a filtrar en la primera revisión o, peor, pasarás el filtro y fallarás una entrevista sobre ciclos de entrenamiento.
+- **Esconder tu experiencia en QA.** Algunas personas que cambian de carrera borran "QA" de su CV. No lo hagas. Replantéalo. Evals, confiabilidad y gates de CI son un argumento de venta para los equipos de IA.
+- **Subestimar el trabajo de integración.** Los roles AI-support valoran a quien logra que un LLM hable con una API SOAP legacy, respete la autenticación y registre todo. Eso es ingeniería senior, no "solo plomería".
+- **Asumir que AI-first es mejor.** Las startups AI-first pueden ser emocionantes, pero esperan resultados rápidos con poca estructura. Los roles AI-support suelen ofrecer mejor mentoría, un alcance más claro y una transición más suave.
+- **Creer que "AI Engineer" significa solo escribir prompts.** La mayoría de las ofertas espera un ingeniero de software completo que además sabe de LLM.
+
+## Cómo aparece esto en las entrevistas
+
+<InterviewQuestion question="¿Qué hace un AI engineer que no hace un ML engineer?" level="mid">
+
+Un ML engineer principalmente construye y mejora modelos: pipelines de entrenamiento, feature engineering, fine-tuning, optimización de inferencia. Un AI engineer principalmente construye productos sobre modelos fundacionales existentes. Mi trabajo son pipelines de retrieval, diseño de prompts y herramientas, agentes, evaluación y servir estos sistemas de forma confiable con buena latencia y costo. El solapamiento es real, por ejemplo en evaluación y despliegue, pero el centro de gravedad es distinto. El ML engineer pregunta "¿cómo hago que el modelo sea mejor?". El AI engineer pregunta "¿cómo hago que el sistema alrededor del modelo sea útil, correcto y asequible?". En la mayor parte del trabajo de AI engineer el modelo es una dependencia a la que se accede por API, y los problemas difíciles son los datos, la medición de calidad y la integración.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo te ayuda tu experiencia en QA como AI engineer?" level="senior">
+
+Lo más difícil de lanzar funcionalidades con LLM es saber si funcionan, y ese es un problema de testing. Llevo años diseñando estrategias de pruebas, construyendo frameworks y siendo dueño de gates de CI. En el trabajo con IA aplico la misma disciplina: un golden dataset es una suite de regresión, faithfulness y validez de esquema son assertions con umbrales, y un cambio de prompt pasa por CI como cualquier cambio de código. También sé lidiar con la inestabilidad de los tests flaky, que se corresponde directamente con el no determinismo del modelo: controlas lo que puedes, mides la varianza y defines tolerancias. Y estoy acostumbrado a pensar primero en los modos de falla, que es lo que quieres frente a prompt injection, alucinaciones y fallos de retrieval.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Pregunta a qué familia corresponde la entrevista">
+
+Una buena pregunta para el hiring manager: "¿La IA es el producto central aquí, o una capacidad agregada a un producto existente?". La respuesta te dice qué van a valorar más y te permite adaptar tus ejemplos.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- [Anthropic — Building effective agents](https://www.anthropic.com/research/building-effective-agents)
+- [Documentación de Anthropic — Define success criteria and build evaluations](https://docs.anthropic.com/en/docs/test-and-evaluate/define-success)
+- [Documentación de OpenAI — Evals guide](https://platform.openai.com/docs/guides/evals)
+- [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/)

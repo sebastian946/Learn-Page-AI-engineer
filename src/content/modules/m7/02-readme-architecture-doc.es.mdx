@@ -1,0 +1,192 @@
+## El README es tu entrevista antes de la entrevista
+
+Un hiring manager le da a tu repo unos 90 segundos. Un ingeniero senior del panel quizá le dé cinco minutos la noche anterior. En ese tiempo decide si construyes sistemas reales o sigues tutoriales. El README es el reporte de pruebas de tu proyecto. Escríbelo como tal: qué se probó, qué pasó, qué falló, cuánto cuesta.
+
+Armaste una plantilla de README en el Módulo 0. Ahora la llenas para el capstone final y agregas un documento de arquitectura que sobreviva una revisión de diseño.
+
+## La estructura de README que funciona
+
+El orden importa. Pon las pruebas primero y la instalación al final.
+
+```markdown
+# multi-tenant-ai-platform
+
+One-line pitch: Multi-tenant RAG + agent assistant for law firms, with tenant
+isolation, evals in CI, tracing and a per-tenant cost dashboard.
+
+![demo](docs/demo.gif)
+
+## Results at a glance
+| Metric | Target | Current (eval set v3, 120 Qs) |
+|---|---|---|
+| Faithfulness | 0.90 or higher | 0.93 |
+| Context recall | 0.85 or higher | 0.88 |
+| Cross-tenant leakage tests | 0 leaks | 0 / 40 |
+| p95 latency (first token) | under 1.5 s | 1.1 s |
+| Cost per 1k requests | under $X | $Y (see Cost analysis) |
+
+## Architecture
+(C4 container diagram + 5 bullets explaining the request path)
+
+## How to run in 5 minutes
+## Evaluation
+## Cost analysis
+## Observability
+## Design decisions (links to ADRs)
+## Limitations and next steps
+```
+
+Reglas:
+
+- **GIF de demo en la parte visible sin hacer scroll.** De 15 a 30 segundos. Muestra una pregunta real, la respuesta en streaming, las citas y una acción del agente. Sin pantallas de introducción.
+- **Una tabla de resultados con objetivos.** Un número sin objetivo no significa nada. Un objetivo no alcanzado, dicho con honestidad, genera más confianza que un puntaje perfecto.
+- **Números reales de tus propias corridas.** Indica la versión del eval set y la fecha. Nunca inventes cifras. Si no mediste algo, escribe "not measured yet" (aún no medido).
+- **Sección de limitaciones.** Los lectores senior la buscan. Demuestra criterio.
+
+## "How to run in 5 minutes"
+
+Mídelo con cronómetro en una máquina limpia o en un Codespace nuevo. Si toma 20 minutos, el revisor se rinde en el minuto 6.
+
+```bash
+git clone https://github.com/<you>/multi-tenant-ai-platform && cd multi-tenant-ai-platform
+cp .env.example .env            # add ANTHROPIC_API_KEY (or set LLM_PROVIDER=fake)
+docker compose up -d            # api, worker, postgres+pgvector, redis, langfuse
+make seed                       # 2 demo tenants, 30 docs each, eval set
+make demo                       # opens http://localhost:8000/docs and the UI
+make eval                       # runs the offline eval suite, prints the table
+```
+
+Dos detalles que impresionan: un proveedor de LLM `fake` que devuelve respuestas deterministas para que la app corra sin API key, y un `make seed` que crea dos tenants para que el aislamiento se vea en la demo.
+
+## El documento de arquitectura: C4 en la práctica
+
+Pon un documento más largo en `docs/architecture.md`. Usa los niveles del modelo C4 que realmente necesites. Para un proyecto de portafolio bastan los niveles 1 y 2, más un diagrama de secuencia.
+
+- **Nivel 1, contexto del sistema:** tu sistema como una caja, sus usuarios (abogados de los bufetes, administradores de los bufetes, tu equipo de operaciones) y los sistemas externos (proveedor de LLM, proveedor de identidad, AWS).
+- **Nivel 2, contenedores:** unidades desplegables: API, worker de ingesta, runtime del agente, PostgreSQL con pgvector, Redis, backend de tracing, dashboard.
+- **Diagrama de secuencia:** la vida de una petición, mostrando dónde se resuelve y se aplica el contexto de tenant.
+
+<Diagram caption="C4 nivel 2 (contenedores) del capstone final" chart={`flowchart LR
+  U["Usuario del bufete (navegador)"] --> GW["API gateway + auth"]
+  A["Admin del bufete"] --> GW
+  GW --> API["App FastAPI (chat, búsqueda, admin)"]
+  API --> AG["Runtime del agente (LangGraph)"]
+  API --> R[("Redis: caché, rate limits")]
+  AG --> RET["Retriever (híbrido + re-rank)"]
+  RET --> PG[("PostgreSQL + pgvector (RLS)")]
+  AG --> MCP["Servidores MCP de herramientas"]
+  AG --> LLM["Proveedor de LLM"]
+  API --> Q["Cola de ingesta"]
+  Q --> W["Worker de ingesta"]
+  W --> PG
+  API --> OBS["Tracing (Langfuse / OTel)"]
+  AG --> OBS
+  OBS --> DASH["Dashboard de costos y calidad"]`} />
+
+Debajo de cada diagrama escribe lo que el diagrama no puede decir: protocolos, síncrono vs asíncrono, dónde viven los secretos, qué pasa ante una falla.
+
+## ADRs: decisiones con sus razones
+
+Un Architecture Decision Record es un archivo markdown corto por cada decisión importante. Responde "¿por qué está así?" seis meses después. En una entrevista vale oro: puedes abrir `docs/adr/0003-pool-isolation-with-rls.md` y explicarlo.
+
+```markdown
+# ADR 0003: Pool isolation with PostgreSQL RLS for starter and pro tenants
+
+Status: Accepted (2026-11-04)
+
+## Context
+We expect 20-200 tenants, most under 5k documents. One enterprise tenant
+requires EU residency. Budget allows one shared RDS instance per region.
+
+## Decision
+Pool model: shared `chunks` table with `tenant_id`, enforced by RLS.
+Enterprise tenants with residency needs get a dedicated cell (silo).
+
+## Alternatives considered
+- Schema per tenant: stronger isolation, but migrations x N and index sprawl.
+- Pinecone namespaces: simple, but adds a vendor and moves data off our VPC.
+
+## Consequences
++ Lowest cost, one migration path.
+- HNSW post-filtering hurts small-tenant recall; mitigated with
+  ef_search tuning and per-tenant recall monitoring (see eval report).
+- Isolation depends on RLS config; covered by canary tests in CI.
+```
+
+Apunta a 4 a 6 ADRs en el capstone: modelo de aislamiento, elección de vector store, framework vs orquestación propia, enrutamiento de modelos, umbrales del gate de evals, destino de deploy.
+
+## La tabla de resultados de evals
+
+Tu sección de evaluación debe permitir que el lector reproduzca y juzgue los números.
+
+| Suite | Tamaño | Métrica | Umbral (gate de CI) | Resultado | Notas |
+|---|---|---|---|---|---|
+| Golden set de RAG | 120 Q&A | Faithfulness | 0.90 | 0.93 | Juez LLM, 5% auditado por humanos |
+| Golden set de RAG | 120 Q&A | Context recall | 0.85 | 0.88 | |
+| Trayectorias del agente | 30 tareas | Secuencia de herramientas correcta | 0.80 | 0.83 | 2 fallas: parseo de fechas |
+| Aislamiento | 40 casos | Fugas | 0 | 0 | Cadenas canario por tenant |
+| Red team | 25 prompts | Éxito de inyección | 0 | 1 | Issue abierto #42 |
+
+Fíjate en la última fila. Una falla conocida con un issue enlazado muestra que pruebas con honestidad.
+
+## Análisis de costos
+
+Muestra la cuenta, no solo el total. Un revisor debería poder cambiar un precio y recalcular.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Price:  # per 1M tokens; example values come from config, check provider pricing
+    input: float
+    output: float
+
+def cost_per_1k_requests(p: Price, in_tok: int, out_tok: int, cache_hit_rate: float,
+                         embed_cost_per_req: float, rerank_cost_per_req: float) -> float:
+    llm = (in_tok * p.input + out_tok * p.output) / 1_000_000
+    per_req = llm * (1 - cache_hit_rate) + embed_cost_per_req + rerank_cost_per_req
+    return round(per_req * 1000, 2)
+```
+
+Luego una tabla: tokens por petición (medidos desde los traces), tasa de aciertos de caché, costo por 1k peticiones por nivel de modelo y costo mensual con 10k, 100k y 1M peticiones. Agrega los costos fijos de infraestructura por separado. Cierra con una frase sobre la palanca más grande, por ejemplo "enrutar el 60% de las preguntas simples al modelo pequeño reduce el costo de LLM a cerca de la mitad en nuestra mezcla de tráfico".
+
+## Grabar el GIF de demo
+
+- Usa un grabador de pantalla (Kap, ScreenToGif, Peek u OBS más ffmpeg).
+- Graba a 1280x720, recorta a la app, de 10 a 15 fps, menos de 5 MB para que GitHub lo muestre rápido.
+- Ten un guion: pregunta, respuesta en streaming, clic en una cita, cambio de tenant, mostrar que el tenant B no encuentra el documento del tenant A, abrir el trace.
+- Convierte con ffmpeg y una paleta para mantener los colores limpios:
+
+```bash
+ffmpeg -i demo.mp4 -vf "fps=12,scale=1100:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" docs/demo.gif
+```
+
+## Errores comunes
+
+- Instrucciones de instalación primero y resultados en ningún lado.
+- Diagramas con cajas pero sin flechas etiquetadas, o sin explicar el camino de la petición.
+- "Precisión: 95%" sin dataset, tamaño, definición de la métrica ni fecha.
+- Copiar precios de memoria. Léelos de la página del proveedor el día que escribes, y dilo.
+- Un video de 4 minutos en lugar de un GIF. Enlaza el video, incrusta el GIF.
+- Sin sección de limitaciones. Se lee como ingenuo o como si ocultaras algo.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Explícame la arquitectura de tu capstone." level="mid">
+
+Uso el diagrama del README como mapa. Una frase sobre el problema de negocio. Luego el camino de la petición: el usuario se autentica, el gateway resuelve un contexto de tenant, FastAPI revisa rate limits y presupuesto en Redis, el agente de LangGraph decide entre retrieval y herramientas, el retriever corre búsqueda híbrida con RLS aplicando el tenant y un re-ranker elige el top 5, el LLM responde con citas, y cada paso queda trazado con el tenant id para que los costos se agreguen por tenant. Después el lado offline: worker de ingesta y suite de evals en CI. Termino con la decisión que revisaría y por qué. Dos o tres minutos, y me detengo para que profundicen.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Lleva un ADR a la entrevista">
+
+Cuando te pregunten "¿cuál fue una decisión difícil?", di "la dejé por escrito" y recorre un ADR: contexto, opciones, decisión, consecuencias. Convierte una historia vaga en una estructurada y demuestra que la decisión se tomó en su momento, no que se inventó después.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- El modelo C4: https://c4model.com
+- Architecture Decision Records (plantilla de Michael Nygard y ejemplos): https://adr.github.io
+- Sintaxis de flowchart y sequence en Mermaid: https://mermaid.js.org/intro/
+- Documentación de GitHub sobre READMEs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes

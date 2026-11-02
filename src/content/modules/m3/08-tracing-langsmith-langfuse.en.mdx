@@ -1,0 +1,187 @@
+## Why tracing is your new debugger
+
+In a classic web app, a failed request leaves a stack trace. In an LLM app, a "failed" request often returns HTTP 200 with a confident, wrong answer. Nothing crashes. The bug lives in the middle: the query rewrite dropped a key term, the retriever returned the wrong policy, the re-ranker pushed the right chunk to position 6, or the prompt template lost a variable.
+
+You already know the QA version of this problem. A Playwright test fails and you open the trace viewer: every action, every network call, every screenshot, in order. LLM tracing is the same idea for model pipelines. A trace is the recorded execution of one request, step by step, with inputs, outputs, timing, tokens and cost for each step.
+
+Without traces you debug by re-running the request and hoping the model behaves the same way. It won't. Sampling is non-deterministic, retrieval indexes change, and prompts get edited. The trace is the only reliable record of what actually happened.
+
+## The vocabulary: traces, spans, generations
+
+All tools use roughly the same model:
+
+| Concept | What it is | Example in the mortgage assistant |
+|---|---|---|
+| Trace | One end-to-end request | "What is the max DTI for an FHA loan?" |
+| Span | One timed step inside the trace | `rewrite_query`, `hybrid_retrieve`, `rerank` |
+| Generation | A span that is an LLM call, with model, tokens, cost | `generate` with `claude-sonnet-5-5` |
+| Session | A group of traces from one conversation | A loan officer's chat thread |
+| User | Who triggered the trace | `user_id=lo-4821` (pseudonymous) |
+| Score | A number or label attached to a trace or span | `faithfulness=0.82`, `thumbs_up=1` |
+
+Spans nest. The trace is the root. `hybrid_retrieve` can have child spans for `bm25_search` and `vector_search`. This tree is what you read when debugging.
+
+Generations carry the fields that matter for cost and quality: model id, prompt (or the messages array), completion, `input_tokens`, `output_tokens`, latency and stop reason. If you only trace one thing, trace the LLM calls.
+
+## LangSmith in five minutes
+
+LangSmith is LangChain's hosted observability and eval platform. If your app uses LangChain or LangGraph, setting environment variables is enough to get traces. For plain Python code, use the `@traceable` decorator.
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=lsv2_...
+export LANGSMITH_PROJECT=mortgage-assistant-dev
+```
+
+```python
+from anthropic import AsyncAnthropic
+from langsmith import traceable
+
+client = AsyncAnthropic()
+
+@traceable(run_type="retriever", name="hybrid_retrieve")
+async def hybrid_retrieve(query: str, k: int = 8) -> list[dict]:
+    ...  # BM25 + pgvector, returns [{"page_content": ..., "metadata": ...}]
+
+@traceable(run_type="llm", name="generate")
+async def generate(question: str, contexts: list[dict]) -> str:
+    resp = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=800,
+        system="Answer only from the provided policy excerpts. Cite sources.",
+        messages=[{"role": "user", "content": build_prompt(question, contexts)}],
+    )
+    return resp.content[0].text
+
+@traceable(name="answer")
+async def answer(question: str) -> str:
+    contexts = await hybrid_retrieve(question)
+    return await generate(question, contexts)
+```
+
+Each decorated function becomes a run, and nesting follows the call stack. LangSmith also has datasets and experiments: you upload your golden set, run your pipeline against it, and compare experiments side by side. That links tracing to the offline evals from the previous lessons.
+
+## Langfuse in five minutes
+
+Langfuse is open source (MIT core) and you can self-host it with Docker Compose or use their cloud. For regulated clients (mortgage, healthcare, legal) self-hosting is often the deciding factor: traces contain customer questions and document excerpts, and they must not leave your VPC.
+
+The Python SDK has an `@observe` decorator. Recent SDK versions are built on OpenTelemetry. Import paths changed between major versions, so check the current Langfuse docs for the exact imports. The pattern looks like this:
+
+```python
+from langfuse import get_client, observe
+
+langfuse = get_client()  # reads LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
+
+@observe(name="rerank")
+async def rerank(query: str, docs: list[dict]) -> list[dict]:
+    ...
+
+@observe(name="generate", as_type="generation")
+async def generate(question: str, contexts: list[dict]) -> str:
+    resp = await client.messages.create(model="claude-sonnet-5-5", max_tokens=800,
+                                        messages=[{"role": "user", "content": build_prompt(question, contexts)}])
+    langfuse.update_current_generation(
+        model="claude-sonnet-5-5",
+        usage_details={"input": resp.usage.input_tokens, "output": resp.usage.output_tokens},
+    )
+    return resp.content[0].text
+
+@observe(name="answer")
+async def answer(question: str, user_id: str, session_id: str) -> tuple[str, str]:
+    langfuse.update_current_trace(user_id=user_id, session_id=session_id,
+                                  tags=["prod", "prompt:v7"])
+    docs = await rerank(question, await hybrid_retrieve(question))
+    text = await generate(question, docs)
+    return text, langfuse.get_current_trace_id()
+```
+
+Langfuse also offers prompt management: prompts are versioned in the UI or API, your code fetches `prompt v7` by label, and every generation records which version produced it. That gives you the "which prompt version caused this regression?" answer for free.
+
+## Linking traces to scores and feedback
+
+A trace is most useful when it carries a verdict. There are three sources of scores:
+
+1. **User feedback.** Thumbs up/down or a correction from the UI. Return the trace id to the client, and when feedback arrives, attach it to that trace.
+2. **Online evals.** A sampled LLM judge or a cheap heuristic (citation present? answer refused?) runs on production traces asynchronously.
+3. **Offline eval runs.** Your CI harness runs the golden set and logs each case as a trace with its scores, so a failing case links straight to its full execution tree.
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Feedback(BaseModel):
+    trace_id: str
+    score: int  # 1 = helpful, 0 = not helpful
+    comment: str | None = None
+
+@app.post("/feedback")
+async def feedback(fb: Feedback) -> dict:
+    langfuse.create_score(trace_id=fb.trace_id, name="user_helpful",
+                          value=fb.score, comment=fb.comment)
+    return {"ok": True}
+```
+
+In LangSmith the equivalent is `Client().create_feedback(run_id, key="user_helpful", score=1)`.
+
+Think of this like linking a bug report to the CI run that produced the build. A low score becomes a clickable trace, and the trace shows which step failed. Then you copy that input into your golden dataset so the regression suite catches it next time. That loop (production failure, trace, new golden case) is the most valuable habit in this module.
+
+## Privacy, sampling and cost
+
+Traces are data. Treat them like production logs with PII.
+
+- **Redact before export.** Mask SSNs, account numbers, emails and phone numbers in inputs and outputs. Langfuse supports a mask function on the client; LangSmith lets you hide inputs/outputs via environment settings. Test the redaction like any other function.
+- **Sample.** Trace 100% in dev and staging. In production, 100% of errors and low-score requests plus 5–20% of the rest is a common starting point. Tune by volume and budget.
+- **Retention.** Set a retention period that matches the client's data policy (for example 30 or 90 days).
+- **Don't block the request path.** SDKs batch and send traces in a background thread. Call `flush()` on shutdown (and in short-lived scripts or Lambda) or you lose the last batch.
+
+## LangSmith vs Langfuse: how to choose
+
+| Factor | LangSmith | Langfuse |
+|---|---|---|
+| Hosting | Managed SaaS; self-host on enterprise plans | Open source, easy self-host, or cloud |
+| Best fit | Teams already on LangChain / LangGraph | Framework-agnostic, regulated data |
+| Evals | Datasets, experiments, online evaluators | Datasets, experiments, LLM-as-judge evaluators, scores |
+| Prompt management | Prompt hub | Versioned prompts with labels |
+| OpenTelemetry | Accepts OTel traces | SDK built on OTel, OTLP endpoint |
+
+Both are good. In an interview, the answer is not "X is better". It's "I chose Langfuse because the client required self-hosting and we wanted OTel compatibility" or "we were on LangGraph, so LangSmith gave us traces with zero code".
+
+## Common mistakes
+
+- **Tracing only the final LLM call.** Most RAG bugs live in retrieval. If you don't trace the retriever's inputs and returned doc ids, you can't tell a bad answer from a bad context.
+- **No trace id in the response.** Then user feedback can't be linked to anything.
+- **Logging full documents on every span.** Traces get huge and expensive. Log doc ids, scores and a short preview; keep full text only on the generation input.
+- **Forgetting `flush()`** in scripts, tests and serverless handlers.
+- **Shipping PII to a SaaS tracer** without a data processing agreement or redaction.
+- **Untagged traces.** Without prompt version, model id, environment and git SHA as tags, you can't filter "everything since the last deploy".
+
+## How this shows up in interviews
+
+<InterviewQuestion question="A user reports a wrong answer from your RAG assistant. Walk me through how you debug it." level="mid">
+
+I find the trace using the trace id from the response (or by user and timestamp). I read the span tree top-down. First, the rewritten query: did it keep the key terms? Then retrieval: were the right documents in the top-k, with what scores? Then re-ranking: did the correct chunk survive? Then the generation input: was the right context actually in the prompt? If the context was right but the answer was wrong, it's a generation or prompt issue. If the context was wrong, it's retrieval. Either way, I add the question and expected answer to the golden dataset so CI catches it next time, and fix the component that failed.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you handle PII and cost in LLM tracing at scale?" level="senior">
+
+Redact at the SDK level before export, with unit tests for the masking function. Self-host the tracer (for example Langfuse) when the data can't leave the VPC. Sample: keep all errors and low-score traces, plus a percentage of normal traffic. Log ids and previews instead of full documents on retrieval spans. Set retention to match the data policy. Make tracing asynchronous and batched so it never adds latency to the request path.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Connect it to QA">
+
+Say it directly: "Tracing is the Playwright trace viewer for LLM pipelines. Scores on traces are like test results attached to a run, and every production failure becomes a new regression case." Interviewers remember that framing.
+
+</Callout>
+
+## Further reading
+
+- LangSmith docs: https://docs.smith.langchain.com
+- Langfuse docs (tracing, scores, prompt management, self-hosting): https://langfuse.com/docs
+- Langfuse self-hosting guide: https://langfuse.com/self-hosting
+- OpenTelemetry concepts (traces and spans): https://opentelemetry.io/docs/concepts/signals/traces/
+
+<Checklist id="m3-08-review" title="Check your understanding" items={["I can explain trace, span, generation, session and score", "I can instrument a function with @traceable or @observe", "I return a trace id to the client and attach feedback to it", "I know how to redact PII and sample traces in production", "I can justify LangSmith vs Langfuse for a given client"]} />

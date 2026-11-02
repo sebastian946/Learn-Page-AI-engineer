@@ -1,0 +1,55 @@
+{
+  "id": "m4",
+  "order": 4,
+  "days": 5,
+  "hours": 30,
+  "title": { "en": "Agents & tool use", "es": "Agentes y uso de herramientas" },
+  "summary": {
+    "en": "ReAct, planning, tool design, LangGraph state machines, human-in-the-loop, memory, multi-agent patterns, MCP servers, loop guards, cost caps and trajectory evals. Build agents you can trust in production.",
+    "es": "ReAct, planificación, diseño de herramientas, máquinas de estado con LangGraph, human-in-the-loop, memoria, patrones multi-agente, servidores MCP, guardas de bucle, límites de costo y evals de trayectoria. Construye agentes en los que puedas confiar en producción."
+  },
+  "lessons": [
+    { "slug": "01-react-agent-loop", "type": "concept", "minutes": 45, "title": { "en": "ReAct and the agent loop (and when not to build an agent)", "es": "ReAct y el bucle del agente (y cuándo no construir un agente)" } },
+    { "slug": "02-planning-reflection", "type": "concept", "minutes": 40, "title": { "en": "Planning: plan-and-execute and reflection", "es": "Planificación: plan-and-execute y reflexión" } },
+    { "slug": "03-tool-design", "type": "concept", "minutes": 50, "title": { "en": "Tool design: schemas, idempotency and error contracts", "es": "Diseño de herramientas: schemas, idempotencia y contratos de error" } },
+    { "slug": "04-mcp", "type": "concept", "minutes": 50, "title": { "en": "MCP: the Model Context Protocol", "es": "MCP: el Model Context Protocol" } },
+    { "slug": "05-ex-mcp-server", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: build an orders MCP server with FastMCP", "es": "Ejercicio: construye un servidor MCP de pedidos con FastMCP" } },
+    { "slug": "06-langgraph-state-machines", "type": "concept", "minutes": 50, "title": { "en": "LangGraph state machines: state, reducers, edges and checkpointers", "es": "Máquinas de estado con LangGraph: estado, reducers, edges y checkpointers" } },
+    { "slug": "07-human-in-the-loop", "type": "concept", "minutes": 45, "title": { "en": "Human-in-the-loop: interrupts, approvals and resuming", "es": "Human-in-the-loop: interrupciones, aprobaciones y reanudación" } },
+    { "slug": "08-ex-hitl-agent", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: LangGraph agent with an approval gate", "es": "Ejercicio: agente LangGraph con compuerta de aprobación" } },
+    { "slug": "09-memory", "type": "concept", "minutes": 40, "title": { "en": "Agent memory: threads, long-term stores and summarization", "es": "Memoria de agentes: hilos, stores de largo plazo y resumen" } },
+    { "slug": "10-multi-agent", "type": "concept", "minutes": 40, "title": { "en": "Multi-agent patterns: supervisor, swarm and when it is overkill", "es": "Patrones multi-agente: supervisor, swarm y cuándo es excesivo" } },
+    { "slug": "11-failure-handling-guards", "type": "concept", "minutes": 45, "title": { "en": "Failure handling, loop guards and cost caps", "es": "Manejo de fallas, guardas de bucle y límites de costo" } },
+    { "slug": "12-ex-loop-guards", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: add loop guards and a cost budget", "es": "Ejercicio: agrega guardas de bucle y un presupuesto de costo" } },
+    { "slug": "13-agent-evals", "type": "concept", "minutes": 50, "title": { "en": "Agent evals: trajectories, tool-call accuracy and final state", "es": "Evals de agentes: trayectorias, precisión de tool calls y estado final" } },
+    { "slug": "14-ex-trajectory-eval", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: write a trajectory eval suite", "es": "Ejercicio: escribe una suite de evals de trayectoria" } },
+    { "slug": "15-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 4 exam", "es": "Examen del módulo 4" } },
+    { "slug": "16-capstone-logistics-ops-agent", "type": "project", "minutes": 1500, "title": { "en": "Capstone: operations automation agent for a logistics client", "es": "Capstone: agente de automatización de operaciones para un cliente de logística" } }
+  ],
+  "repos": [
+    {
+      "id": "m4-mcp-lab",
+      "name": "mcp-servers-lab",
+      "description": {
+        "en": "MCP servers built with the official Python SDK (FastMCP): an orders/inventory server with tools, a resource, pytest tests and MCP Inspector notes.",
+        "es": "Servidores MCP construidos con el SDK oficial de Python (FastMCP): un servidor de pedidos/inventario con tools, un resource, tests con pytest y notas de MCP Inspector."
+      }
+    },
+    {
+      "id": "m4-hitl-agent",
+      "name": "langgraph-hitl-agent",
+      "description": {
+        "en": "LangGraph agent with a human approval gate before risky tool calls, loop guards, cost caps and a trajectory eval suite.",
+        "es": "Agente LangGraph con compuerta de aprobación humana antes de tool calls riesgosas, guardas de bucle, límites de costo y una suite de evals de trayectoria."
+      }
+    },
+    {
+      "id": "m4-ops-agent",
+      "name": "logistics-ops-agent",
+      "description": {
+        "en": "Capstone: operations automation agent for a logistics client. Reads emails and orders, calls tools, logs every step, HITL for refunds and cancellations, trajectory evals in CI.",
+        "es": "Capstone: agente de automatización de operaciones para un cliente de logística. Lee correos y pedidos, llama herramientas, registra cada paso, HITL para reembolsos y cancelaciones, evals de trayectoria en CI."
+      }
+    }
+  ]
+}

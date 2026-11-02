@@ -1,0 +1,173 @@
+## Why this lesson matters
+
+Every LLM bill, every latency budget and every "the model ignored my instructions" bug traces back to three things: **tokens**, the **context window** and **how the next token is chosen**. You do not need the math of transformers to ship LLM features. You do need an engineer's mental model of these three, because they decide cost, speed and reliability.
+
+Think of it the way you think about a browser in Playwright. You don't need to know how Blink paints pixels. You do need to know what a selector resolves to, when the DOM is stable and what timeouts exist.
+
+## Tokens: the unit of everything
+
+A model never sees characters or words. A **tokenizer** splits text into **tokens**: sub-word pieces from a fixed vocabulary (usually built with byte-pair encoding). Common English words are often one token. Rare words, numbers, code and non-English text split into more pieces.
+
+Rough rules of thumb (always measure for your data):
+
+- English prose: about 3–4 characters per token.
+- Spanish and other languages: often 10–30% more tokens than the same content in English.
+- JSON, code, UUIDs, base64 and long numbers: much denser in tokens than prose. A 36-character UUID can easily be 20+ tokens.
+- Whitespace and formatting count. Pretty-printed JSON costs more than compact JSON.
+
+Tokenizers are **model-specific**. The same text produces different counts on different model families, and sometimes across generations of the same vendor. Never hard-code a "chars / 4" estimate into billing logic. Use the provider's counting endpoint.
+
+Why you care:
+
+1. **Cost.** You pay per input token and per output token. Output tokens are typically several times more expensive than input tokens.
+2. **Latency.** Input tokens are processed in parallel (fast). Output tokens are generated one at a time (slow). A response with 800 output tokens is much slower than one with 80, almost regardless of input size.
+3. **Limits.** Context windows, `max_tokens` and rate limits are all measured in tokens.
+
+### Counting tokens before you send
+
+```python
+import asyncio
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+
+SYSTEM = "You classify e-commerce support tickets. Reply with JSON only."
+
+async def estimate(ticket_text: str) -> int:
+    result = await client.messages.count_tokens(
+        model="claude-haiku-5-5",
+        system=SYSTEM,
+        messages=[{"role": "user", "content": ticket_text}],
+    )
+    return result.input_tokens
+
+async def main() -> None:
+    samples = [
+        "Where is my order #A-10023? It was due Monday.",
+        "¿Dónde está mi pedido #A-10023? Debía llegar el lunes.",
+        '{"order_id": "6f1c2a9e-4b7d-4c1e-9a3f-2d8b7e5c1a04", "status": "late"}',
+    ]
+    for s in samples:
+        print(await estimate(s), "tokens ->", s[:40])
+
+asyncio.run(main())
+```
+
+Run something like this against 50 real samples from your domain. Put the distribution (p50, p95, max) in your design doc. That number drives your cost model and your context budget.
+
+## The context window: one shared budget
+
+The **context window** is the maximum number of tokens the model can attend to in one request. It is a single budget shared by:
+
+- the system prompt,
+- tool definitions (their JSON schemas are tokens too),
+- the conversation history,
+- retrieved documents,
+- **and the output** the model generates.
+
+`max_tokens` is the cap on output tokens for this request. If the model hits it, the response stops mid-sentence and `stop_reason` is `"max_tokens"`. Current Claude models (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`) have very large windows (1M tokens at the time of writing). That does not mean you should fill them:
+
+- **Cost scales linearly** with input size. A 200K-token prompt sent 10,000 times a day is a real budget line.
+- **Latency grows** with input size (time to first token rises).
+- **Quality can drop** when the relevant fact is buried. The "lost in the middle" study showed models use information at the start and end of long contexts better than information in the middle.
+- **Some pricing is tiered** by prompt length. Check the pricing page for the model you pick.
+
+Treat context like memory in an embedded system: budget it explicitly.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class ContextBudget:
+    window: int = 200_000          # what YOU allow, not the model max
+    max_output: int = 2_000
+    system_and_tools: int = 3_000
+    history: int = 20_000
+
+    @property
+    def retrieval(self) -> int:
+        return self.window - self.max_output - self.system_and_tools - self.history
+
+budget = ContextBudget()
+print(budget.retrieval)  # tokens left for documents
+```
+
+When a budget is exceeded, you decide what to drop: oldest turns first, summarize history, or retrieve fewer chunks. You never let the provider return a 400 in production because the prompt grew.
+
+## How the next token is chosen: sampling
+
+At each step the model produces a score (logit) for every token in its vocabulary. Softmax turns scores into probabilities. Then a **sampling** strategy picks one token. Classic knobs:
+
+- **Temperature** divides the logits before softmax. Low temperature (near 0) sharpens the distribution: the top token almost always wins. High temperature (1+) flattens it: more variety, more mistakes.
+- **Top-p (nucleus sampling)** keeps the smallest set of tokens whose cumulative probability reaches p (e.g. 0.9) and samples only from that set.
+- **Top-k** keeps only the k most likely tokens.
+
+The classic advice was: temperature 0 for extraction and classification, 0.7–1.0 for creative writing, and change temperature *or* top-p, not both.
+
+### The modern reality: sampling knobs are disappearing
+
+This is where many tutorials are out of date. Reasoning models think before they answer, and vendors increasingly **remove sampling controls**:
+
+- Current Claude models reject non-default `temperature`, `top_p` and `top_k` with a 400 error. The lever you get instead is **effort** (`output_config={"effort": "low" | "medium" | "high" | ...}`), which controls how much the model thinks and how many tokens it spends.
+- Several OpenAI reasoning models also reject or ignore `temperature`. Older chat models still accept it.
+- Other providers and open-weight models (served via Bedrock, vLLM, etc.) usually still accept all three.
+
+Engineering consequence: in a multi-provider client, sampling parameters are an **optional capability per model**, not a universal field. Your abstraction must drop or reject them per model config, and your tests must not assume they exist.
+
+```python
+# Effort, not temperature, is the cost/quality lever on current Claude models.
+resp = await client.messages.create(
+    model="claude-haiku-5-5",
+    max_tokens=512,
+    output_config={"effort": "low"},  # cheap, fast classification
+    system=SYSTEM,
+    messages=[{"role": "user", "content": "Refund not received after 10 days"}],
+)
+print(resp.stop_reason, resp.usage.input_tokens, resp.usage.output_tokens)
+```
+
+### Determinism is a myth (plan for it)
+
+Even where temperature 0 is allowed, outputs are **not guaranteed identical** across calls. Batching on the provider side, floating-point non-associativity and silent model updates all introduce variation. As a QA engineer you already know this pattern: it is a flaky test. The fix is the same:
+
+- Assert on **properties** (valid schema, label in allowed set, contains citation), not exact strings.
+- Run evals over many samples and track **rates**, not single outcomes.
+- Pin model versions in config and record the model id in every log line.
+
+## Common mistakes
+
+- **Estimating cost with "words × 1.3".** Use the counting endpoint and real samples. Non-English and JSON payloads break naive estimates.
+- **Setting `max_tokens` too low "to save money".** You pay for what is generated, not for the cap. A cap that is too low truncates JSON and costs a retry. Set it with headroom and control length in the prompt or with effort.
+- **Ignoring `stop_reason`.** Always check it. `"max_tokens"` means truncated output. `"refusal"` means the model declined. Neither is a valid answer.
+- **Filling the window because you can.** Bigger prompts are slower, pricier and sometimes worse.
+- **Hard-coding `temperature=0` in a shared client.** It will 400 on models that don't support it.
+- **Forgetting tool schemas count.** Ten verbose tool definitions can cost thousands of tokens on every call.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your summarization endpoint costs 3x what you estimated. How do you investigate?" level="mid">
+
+Start from data, not guesses. Log `usage.input_tokens` and `usage.output_tokens` per request and look at the distribution. Typical causes: the prompt carries full conversation history or oversized retrieved context; JSON or non-English input tokenizes worse than the estimate assumed; outputs are longer than needed (no length instruction, high effort); retries double-count calls; tool definitions are sent on every call. Fix the biggest contributor first: trim context with an explicit budget, cap output length, use a cheaper model or lower effort for the route, and add prompt caching for the stable prefix. Then add a cost-per-request dashboard so regressions are caught early.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you make LLM output reproducible enough to test?" level="senior">
+
+You accept that exact reproducibility is not available, even at temperature 0, because provider batching and floating-point effects introduce variation, and many current models no longer expose temperature at all. So you design tests around invariants: schema validity, labels in an allowed set, required fields present, numeric ranges. You pin model ids, version prompts, and run evaluation sets of dozens or hundreds of examples, tracking pass rates with thresholds in CI rather than single assertions. For pure regression of plumbing code, you record and replay responses with a fake provider.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="One-liner worth memorizing">
+
+"Input tokens drive cost, output tokens drive latency, and the context window is one budget shared by system prompt, tools, history, documents and the answer."
+
+</Callout>
+
+## Further reading
+
+- Anthropic, token counting: https://docs.anthropic.com/en/docs/build-with-claude/token-counting
+- Anthropic, models overview and context windows: https://docs.anthropic.com/en/docs/about-claude/models/overview
+- Anthropic, effort and extended thinking: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+- OpenAI, text generation and reasoning models: https://platform.openai.com/docs/guides/reasoning
+- Liu et al., "Lost in the Middle: How Language Models Use Long Contexts": https://arxiv.org/abs/2307.03172
+- Holtzman et al., "The Curious Case of Neural Text Degeneration" (nucleus sampling): https://arxiv.org/abs/1904.09751

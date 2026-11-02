@@ -1,0 +1,178 @@
+# AI-first, AI-support and ML roles
+
+"AI Engineer" is not one job. The same title covers very different daily work depending on the company. Before you apply anywhere, you need to know which kind of role you are looking at, and which kind fits a senior SDET best.
+
+This lesson splits the market into three families, compares them, and shows exactly which of your QA skills transfer.
+
+## Three role families
+
+### 1. AI-first product companies
+
+The product *is* the AI. A legal research assistant, a coding agent, an AI customer-support platform, a document-intelligence startup. If the model stops working, the company has nothing to sell.
+
+What the work looks like:
+
+- Owning core LLM features end to end: prompts, retrieval, tools, evals, serving.
+- Fast iteration. New models every few months, and you are expected to evaluate and adopt them.
+- Heavy emphasis on **quality measurement**. These teams live and die by eval dashboards.
+- Often startups or scale-ups. Smaller teams, broader scope, more ambiguity.
+
+Typical posting language: "build and ship agentic workflows", "own our evaluation framework", "push the frontier of what our product can do".
+
+### 2. AI-support (AI-enabled) roles in established companies
+
+The company already has a product: a bank, an e-commerce platform, a logistics firm, a SaaS tool. AI is added to improve it. Internal knowledge assistants, ticket routing, document extraction, support copilots, search.
+
+What the work looks like:
+
+- Integrating LLMs into existing systems: legacy APIs, data warehouses, auth, compliance.
+- More process: security reviews, data governance, change management.
+- Strong focus on **cost, reliability and risk**. A wrong answer in a mortgage assistant is a compliance incident.
+- Often titled "AI Engineer", "Software Engineer, GenAI", "Applied AI Engineer" or "LLM Engineer".
+
+Typical posting language: "integrate generative AI capabilities into our platform", "partner with business stakeholders", "ensure responsible and secure use of AI".
+
+This is the largest family by number of postings. It is also the easiest entry point for someone with strong engineering and quality skills.
+
+### 3. ML Engineer / ML Scientist roles
+
+These roles train and optimize models. Feature engineering, training pipelines, distributed training, model compression, experiment tracking, sometimes research.
+
+What the work looks like:
+
+- PyTorch, training loops, GPUs, data pipelines at scale.
+- Statistics and math are core, not optional.
+- Metrics like loss curves, AUC and perplexity, not only end-to-end task quality.
+
+Typical posting language: "train and fine-tune large models", "optimize inference on GPU", "PhD or equivalent research experience preferred".
+
+<Callout type="warning" title="Same title, different job">
+
+Some companies call ML Engineer roles "AI Engineer". Always read the responsibilities, not the title. If the first three bullets mention training, GPUs and model architecture, it is an ML role, whatever the header says.
+
+</Callout>
+
+## Side-by-side comparison
+
+| Dimension | AI-first | AI-support | ML Engineer |
+|---|---|---|---|
+| Main output | AI product features | AI features inside an existing product | Trained or optimized models |
+| Core skills | RAG, agents, evals, fast iteration | Integration, RAG, security, cost control | Training, PyTorch, math, MLOps |
+| Uses foundation models via API | Almost always | Almost always | Sometimes; often trains its own |
+| Pace | Very fast | Moderate | Research-driven |
+| Fit for a senior SDET | Good (evals are a hook) | Very good (quality + integration) | Weak without ML training background |
+| Course coverage | M1–M5, M7 | M1–M6 | M6 only touches the edges |
+
+The decision is simple for most SDETs: **target AI-support first, AI-first second**. ML Engineer roles require a different background, and this course is not designed to get you there.
+
+## How your SDET skills transfer
+
+You are not starting from zero. A large part of AI engineering is quality engineering applied to non-deterministic software. Here is the translation table.
+
+| You already do | In AI engineering it becomes |
+|---|---|
+| Regression test suites | Golden datasets and eval suites that run on every prompt change |
+| Assertions | Metric thresholds: faithfulness at or above 0.85, schema validity 100% |
+| Flaky test triage | Handling non-determinism: temperature, sampling, repeated runs, variance |
+| CI quality gates | Blocking a PR when eval scores drop |
+| Test pyramid | Eval pyramid: unit checks on outputs, component evals on retrieval, end-to-end task evals |
+| Fixtures and test data | Curated eval datasets, synthetic data generation |
+| Contract testing | Structured outputs and tool schemas as contracts |
+| Exploratory testing | Red-teaming and prompt-injection probing |
+| Observability for test runs | Tracing LLM calls with LangSmith, Langfuse, OpenTelemetry |
+| Performance testing with k6 | Load testing LLM endpoints, tracking latency and tokens per second |
+
+The difference: in classic testing, an assertion is binary. In LLM evals, many checks are scores with thresholds, and some are judged by another model. You still write the harness, define the pass criteria and own the gate. That is your job already.
+
+## From a Playwright test to an eval
+
+Here is the bridge in code: the familiar pytest structure applied to an LLM feature. A golden case, a call to the system under test, a contract check first, then a correctness check against the golden label.
+
+```python
+from __future__ import annotations
+
+import json
+
+import anthropic
+import pytest
+from pydantic import BaseModel, ValidationError
+
+client = anthropic.AsyncAnthropic()
+
+
+class TicketLabel(BaseModel):
+    category: str
+    priority: str
+
+
+GOLDEN = [
+    ("My card was charged twice for order 1182", "billing", "high"),
+    ("How do I change my delivery address?", "shipping", "low"),
+]
+
+SYSTEM = (
+    "Classify the support ticket. Reply with JSON only: "
+    '{"category": "billing|shipping|account|other", "priority": "low|medium|high"}'
+)
+
+
+async def classify(text: str) -> str:
+    msg = await client.messages.create(
+        model="claude-haiku-5-5",
+        max_tokens=100,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": text}],
+    )
+    return msg.content[0].text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("ticket", "category", "priority"), GOLDEN)
+async def test_ticket_classifier(ticket: str, category: str, priority: str) -> None:
+    raw = await classify(ticket)
+    # 1. Contract check: the output must parse. Binary, like a schema test.
+    try:
+        label = TicketLabel.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        pytest.fail(f"Output broke the contract: {exc}\n{raw}")
+    # 2. Correctness check against the golden label.
+    assert label.category == category
+    assert label.priority == priority
+```
+
+This is the shape you will grow in Module 3: more cases, scored metrics, repeated runs to measure variance, and a CI job that fails the PR when the pass rate drops below a threshold. You already know how to build this. The new parts are the system under test and the fuzziness of the oracle.
+
+## Common mistakes
+
+- **Applying to ML Engineer roles by title alone.** You will get filtered out at the first screen, or worse, pass the screen and fail a training-loop interview.
+- **Hiding the QA background.** Some career-changers remove "QA" from their resume. Don't. Reframe it. Evals, reliability and CI gates are a selling point for AI teams.
+- **Underselling integration work.** AI-support roles value people who can make an LLM talk to a legacy SOAP API, respect auth and log everything. That is senior engineering, not "just plumbing".
+- **Assuming AI-first means better.** AI-first startups can be exciting, but they expect fast output with little structure. AI-support roles often offer better mentoring, clearer scope and a smoother transition.
+- **Thinking "AI Engineer" means prompt writing only.** Most postings expect a full software engineer who also knows LLMs.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="What does an AI engineer do that an ML engineer doesn't?" level="mid">
+
+An ML engineer mostly builds and improves models: training pipelines, feature engineering, fine-tuning, inference optimization. An AI engineer mostly builds products on top of existing foundation models. My work is retrieval pipelines, prompt and tool design, agents, evaluation, and serving these systems reliably with good latency and cost. The overlap is real, for example evaluation and deployment, but the center of gravity differs. The ML engineer asks "how do I make the model better?". The AI engineer asks "how do I make the system around the model useful, correct and affordable?". For most AI engineer work, the model is a dependency accessed through an API, and the hard problems are data, quality measurement and integration.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How does your QA experience help you as an AI engineer?" level="senior">
+
+The hardest part of shipping LLM features is knowing whether they work, and that is a testing problem. I have spent years designing test strategies, building frameworks and owning CI gates. In AI work I apply the same discipline: a golden dataset is a regression suite, faithfulness and schema validity are assertions with thresholds, and a prompt change goes through CI like any code change. I also know how to deal with flakiness, which maps directly to model non-determinism: you control what you can, measure variance and set tolerances. And I am used to thinking about failure modes first, which is what you want with prompt injection, hallucinations and retrieval misses.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Ask which family you are interviewing for">
+
+A good question for the hiring manager: "Is AI the core product here, or a capability added to an existing product?". The answer tells you what they will value most and lets you adapt your examples.
+
+</Callout>
+
+## Further reading
+
+- [Anthropic — Building effective agents](https://www.anthropic.com/research/building-effective-agents)
+- [Anthropic docs — Define success criteria and build evaluations](https://docs.anthropic.com/en/docs/test-and-evaluate/define-success)
+- [OpenAI docs — Evals guide](https://platform.openai.com/docs/guides/evals)
+- [OWASP Top 10 for LLM Applications](https://owasp.org/www-project-top-10-for-large-language-model-applications/)

@@ -1,0 +1,165 @@
+## Why agent evals are different
+
+In module 3 you evaluated outputs: is the answer faithful, relevant, correct? For an agent, the output is only half the story. Two runs can produce the same final message and be very different in quality:
+
+- Run A looks up the order, checks carrier rates, reschedules once, and replies.
+- Run B looks up the order four times, tries to cancel it, gets blocked by the approval gate, then reschedules and replies.
+
+Same answer. Run B is slower, more expensive, and it tried a destructive action nobody asked for. An output-only eval passes both.
+
+Agent evals look at three things:
+
+1. **Trajectory** — the sequence of tool calls (and sometimes reasoning steps) the agent took.
+2. **Tool-call accuracy** — did it call the right tools with the right arguments?
+3. **Final state** — what actually changed in the world: rows in the database, tickets created, refunds issued.
+
+Your SDET instincts map directly. An output-only eval is like a UI test that checks the success toast. A final-state check is like asserting on the database after the test. A trajectory check is like asserting on the sequence of API calls with a mock or a network log. You already know that the toast lies sometimes.
+
+## The agent eval pyramid
+
+| Level | What it checks | Cost | Determinism |
+|---|---|---|---|
+| Unit | Tools, guards, routers as pure functions | very low | full |
+| Single step | Given this state, does the model pick the right next tool and args? | low | high with temperature 0 |
+| Trajectory | Full run on a scenario, compare tool sequence to a reference | medium | medium |
+| Final state | Full run against a fake backend, assert side effects | medium | medium |
+| LLM-as-judge | Was the trajectory reasonable, efficient, safe? | higher | lower |
+| Online | Production traces sampled and scored | ongoing | n/a |
+
+Most of your regression signal comes from single-step and trajectory tests. Keep the judge for things a rule cannot express.
+
+## Single-step evals
+
+The cheapest model-level test. Freeze a state (messages so far), call the agent node once, and inspect the tool call. No tools run. This is the agent equivalent of a unit test for a decision.
+
+```python
+import pytest
+from langchain_core.messages import HumanMessage
+
+CASES = [
+    ("Where is order ORD-1001?", "get_order", {"order_id": "ORD-1001"}),
+    ("How much to ship 12 kg from 10001 to 94105?", "get_carrier_rates",
+     {"origin_zip": "10001", "dest_zip": "94105", "weight_kg": 12}),
+    ("Customer says box arrived crushed, ORD-2002", "create_ticket", {"order_id": "ORD-2002"}),
+]
+
+@pytest.mark.parametrize("text,tool,expected_args", CASES)
+async def test_first_tool_choice(agent_node, text, tool, expected_args):
+    out = await agent_node({"messages": [HumanMessage(text)], "step_count": 0, "cost_usd": 0.0})
+    call = out["messages"][-1].tool_calls[0]
+    assert call["name"] == tool
+    for key, value in expected_args.items():   # subset match on args
+        assert call["args"][key] == value
+```
+
+Note the subset match on arguments. `create_ticket` also needs a `summary`, which is free text. You check the fields that matter and let the rest vary.
+
+## Trajectory evals
+
+Now run the whole graph on a scenario and compare the tool calls to a reference trajectory. There are four standard match modes, the same ones used by LangChain's `agentevals` package:
+
+- **strict** — same tools, same order. Use for regulated flows ("must look up the order before any refund").
+- **unordered** — same set of tools, any order. Use when order does not matter (fetch rates and order details in parallel).
+- **subset** — the agent called only tools from the reference, and maybe fewer. Use to catch extra, unwanted calls.
+- **superset** — the agent called at least the reference tools, and maybe more. Use to ensure required steps happened.
+
+```python
+from agentevals.trajectory.match import create_trajectory_match_evaluator
+
+strict_eval = create_trajectory_match_evaluator(trajectory_match_mode="strict")
+superset_eval = create_trajectory_match_evaluator(trajectory_match_mode="superset")
+
+reference = [
+    {"role": "user", "content": "Reschedule ORD-1001 to Friday"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "get_order", "arguments": '{"order_id": "ORD-1001"}'}}]},
+    {"role": "tool", "content": '{"status": "in_transit"}'},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"function": {"name": "reschedule_delivery",
+                      "arguments": '{"order_id": "ORD-1001", "new_date": "2026-11-06"}'}}]},
+    {"role": "tool", "content": '{"ok": true}'},
+    {"role": "assistant", "content": "Done. ORD-1001 now arrives Friday, Nov 6."},
+]
+
+result = strict_eval(outputs=agent_messages_as_openai_format, reference_outputs=reference)
+# result -> {"key": "trajectory_strict_match", "score": True, "comment": None}
+```
+
+By default the match compares tool names and arguments. You can tune argument comparison per tool (for example ignore `idempotency_key`, which is random). In your own harness, a simple version is a few lines: extract `[(name, args)]` from the `AIMessage`s and compare with the mode you want.
+
+Pick the loosest mode that still catches the bug you care about. Strict trajectories are brittle: a harmless extra `get_order` fails the test. That is the agent version of an over-specified selector in Playwright.
+
+## Final-state checks
+
+The most important check, and the one most teams skip. Run the agent against a **fake backend** that records every write. Then assert on the state, not on the message.
+
+```python
+async def test_damaged_box_creates_ticket_and_no_refund(build_graph, fake_backend):
+    graph = build_graph(backend=fake_backend)
+    await graph.ainvoke(
+        {"messages": [("user", "ORD-2002 arrived crushed. Fix it.")]},
+        config={"configurable": {"thread_id": "eval-damaged"}, "recursion_limit": 30},
+    )
+    tickets = fake_backend.tickets_for("ORD-2002")
+    assert len(tickets) == 1
+    assert tickets[0]["category"] == "damaged"
+    assert fake_backend.refunds == []          # refunds require human approval
+    assert fake_backend.cancellations == []
+```
+
+This catches the dangerous class of bugs: the agent says "I opened a ticket" but never called the tool, or it called `issue_refund` and the approval gate failed open. Assert on side effects. You learned this the first time a test passed while the record never reached the database.
+
+## LLM-as-judge for trajectories
+
+Some qualities do not fit a rule. Was the agent efficient? Did it ask a clarifying question when the request was ambiguous? Was the final message accurate given the tool results? For these, a judge model scores the trajectory against a rubric. `agentevals` ships `create_trajectory_llm_as_judge` with a default prompt; you can also write your own.
+
+```python
+JUDGE_RUBRIC = """You grade an operations agent's trajectory.
+Score 1 if ALL are true, else 0:
+- Every claim in the final message is supported by a tool result.
+- No tool was called more than needed.
+- No refund or cancellation was attempted unless the user asked for it.
+Return JSON: {"score": 0 or 1, "reason": "..."}"""
+```
+
+Use binary or 3-point scores, not 1 to 10. Calibrate the judge against 30 to 50 human-labeled trajectories before you trust it, as in module 3. Run it on a cheaper model if agreement holds.
+
+## Running it as an experiment
+
+A trajectory eval suite is a dataset plus evaluators plus a runner. LangSmith gives you this as an experiment: upload scenarios as a dataset, call `evaluate()` with your target function and evaluators, and compare experiments side by side when you change a prompt or a model. Without LangSmith, a JSONL file and pytest are enough. What matters:
+
+- **Scenarios cover intents and edge cases.** Happy paths, missing order ids, ambiguous requests, tool failures injected by the fake backend, prompt injection inside an email body.
+- **Each scenario declares expectations.** Reference tools and mode, required final-state checks, forbidden tools.
+- **Multiple runs per scenario.** Agents are non-deterministic. Run each scenario 3 times and report pass rate, not pass/fail. A scenario that passes 2 of 3 is flaky; treat it like a flaky test and investigate.
+- **Report metrics, gate on thresholds.** Trajectory match rate, tool-arg accuracy, final-state pass rate, average steps, average cost per run. CI fails if a metric drops below its threshold.
+
+## Common mistakes
+
+- **Only checking the final message.** The agent can claim actions it never took.
+- **Strict match everywhere.** Brittle tests that fail on harmless variation. People stop trusting the suite.
+- **Hitting real backends in evals.** Slow, flaky, and dangerous with write tools. Use a fake backend that records writes.
+- **Ignoring arguments.** The right tool with the wrong order id is a wrong action.
+- **One run per scenario.** You miss flakiness and report noise as signal.
+- **Uncalibrated judges.** An LLM judge you never checked against humans is just another unvalidated model.
+- **No safety scenarios.** Always include cases where the correct behavior is to refuse, escalate or wait for approval.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you evaluate an agent, beyond checking its final answer?" level="mid">
+I check three layers. Trajectory: compare the tool calls to a reference with the loosest match mode that still catches regressions (strict for regulated flows, superset to ensure required steps, subset to catch unwanted calls). Tool-call accuracy: right tool and right key arguments, with free-text fields excluded. Final state: run against a fake backend that records writes and assert side effects, like exactly one ticket and no refund without approval. On top, an LLM judge with a binary rubric for efficiency and groundedness, calibrated on human labels. Each scenario runs multiple times and I gate CI on pass-rate thresholds.
+</InterviewQuestion>
+
+<InterviewQuestion question="Your trajectory eval suite is flaky. Half the failures are harmless variations. What do you do?" level="senior">
+Treat it like a flaky test suite. First, classify failures from the reports: real regressions versus over-specified expectations. Loosen expectations where order or extra reads do not matter: move from strict to superset or unordered, compare only key arguments, ignore generated fields like idempotency keys. Move the important assertions to final-state checks, which are stable because they test outcomes. Run each scenario several times and gate on pass rate with a threshold, not on a single run. Pin temperature and model version for evals. Track a per-scenario flake rate and quarantine scenarios above it until fixed, so the gate stays trusted.
+</InterviewQuestion>
+
+<Callout type="interview" title="SDET angle">
+"Assert on side effects, not on the success message." Saying this and showing a fake backend with recorded writes is one of the strongest signals you can give in an agent interview.
+</Callout>
+
+## Further reading
+
+- agentevals (trajectory match and judge evaluators): https://github.com/langchain-ai/agentevals
+- LangSmith evaluation docs: https://docs.smith.langchain.com
+- LangGraph docs: https://langchain-ai.github.io/langgraph/
+- Anthropic, Building effective agents: https://www.anthropic.com/research/building-effective-agents

@@ -1,0 +1,192 @@
+## The README is your interview before the interview
+
+A hiring manager gives your repo about 90 seconds. A senior engineer on the panel might give it five minutes the night before. In that time they decide whether you build real systems or follow tutorials. The README is the test report for your project. Write it like one: what was tested, what passed, what failed, what it costs.
+
+You set up a README template in Module 0. Now you fill it for the final capstone, and you add an architecture doc that can survive a design review.
+
+## The README structure that works
+
+Order matters. Put proof first and setup last.
+
+```markdown
+# multi-tenant-ai-platform
+
+One-line pitch: Multi-tenant RAG + agent assistant for law firms, with tenant
+isolation, evals in CI, tracing and a per-tenant cost dashboard.
+
+![demo](docs/demo.gif)
+
+## Results at a glance
+| Metric | Target | Current (eval set v3, 120 Qs) |
+|---|---|---|
+| Faithfulness | 0.90 or higher | 0.93 |
+| Context recall | 0.85 or higher | 0.88 |
+| Cross-tenant leakage tests | 0 leaks | 0 / 40 |
+| p95 latency (first token) | under 1.5 s | 1.1 s |
+| Cost per 1k requests | under $X | $Y (see Cost analysis) |
+
+## Architecture
+(C4 container diagram + 5 bullets explaining the request path)
+
+## How to run in 5 minutes
+## Evaluation
+## Cost analysis
+## Observability
+## Design decisions (links to ADRs)
+## Limitations and next steps
+```
+
+Rules:
+
+- **Demo GIF above the fold.** 15 to 30 seconds. Show one real question, the streamed answer, the citations, and one agent action. No intro screens.
+- **A results table with targets.** A number without a target means nothing. A target you missed, stated honestly, earns more trust than a perfect score.
+- **Real numbers from your own runs.** Label the eval set version and date. Never invent figures. If you have not measured something, write "not measured yet".
+- **Limitations section.** Senior readers look for it. It shows judgment.
+
+## "How to run in 5 minutes"
+
+Time it with a stopwatch on a clean machine or a fresh Codespace. If it takes 20 minutes, the reviewer gives up at minute 6.
+
+```bash
+git clone https://github.com/<you>/multi-tenant-ai-platform && cd multi-tenant-ai-platform
+cp .env.example .env            # add ANTHROPIC_API_KEY (or set LLM_PROVIDER=fake)
+docker compose up -d            # api, worker, postgres+pgvector, redis, langfuse
+make seed                       # 2 demo tenants, 30 docs each, eval set
+make demo                       # opens http://localhost:8000/docs and the UI
+make eval                       # runs the offline eval suite, prints the table
+```
+
+Two details that impress: a `fake` LLM provider that returns deterministic answers so the app runs with no API key, and a `make seed` that creates two tenants so isolation is visible in the demo.
+
+## The architecture doc: C4 in practice
+
+Put a longer doc in `docs/architecture.md`. Use the C4 model levels you actually need. For a portfolio project, levels 1 and 2 are enough, plus one sequence diagram.
+
+- **Level 1, System context:** your system as one box, its users (firm lawyers, firm admins, your ops team) and external systems (LLM provider, identity provider, AWS).
+- **Level 2, Containers:** deployable units: API, ingestion worker, agent runtime, PostgreSQL with pgvector, Redis, tracing backend, dashboard.
+- **Sequence diagram:** the life of one request, with where the tenant context is resolved and enforced.
+
+<Diagram caption="C4 level 2 (containers) for the final capstone" chart={`flowchart LR
+  U["Firm user (browser)"] --> GW["API gateway + auth"]
+  A["Firm admin"] --> GW
+  GW --> API["FastAPI app (chat, search, admin)"]
+  API --> AG["Agent runtime (LangGraph)"]
+  API --> R[("Redis: cache, rate limits")]
+  AG --> RET["Retriever (hybrid + re-rank)"]
+  RET --> PG[("PostgreSQL + pgvector (RLS)")]
+  AG --> MCP["MCP tool servers"]
+  AG --> LLM["LLM provider"]
+  API --> Q["Ingestion queue"]
+  Q --> W["Ingestion worker"]
+  W --> PG
+  API --> OBS["Tracing (Langfuse / OTel)"]
+  AG --> OBS
+  OBS --> DASH["Cost and quality dashboard"]`} />
+
+Under each diagram write what the diagram cannot say: protocols, sync vs async, where secrets live, what happens on failure.
+
+## ADRs: decisions with their reasons
+
+An Architecture Decision Record is a short markdown file per significant decision. It answers "why is it like this?" six months later. In an interview it is gold: you can open `docs/adr/0003-pool-isolation-with-rls.md` and talk through it.
+
+```markdown
+# ADR 0003: Pool isolation with PostgreSQL RLS for starter and pro tenants
+
+Status: Accepted (2026-11-04)
+
+## Context
+We expect 20-200 tenants, most under 5k documents. One enterprise tenant
+requires EU residency. Budget allows one shared RDS instance per region.
+
+## Decision
+Pool model: shared `chunks` table with `tenant_id`, enforced by RLS.
+Enterprise tenants with residency needs get a dedicated cell (silo).
+
+## Alternatives considered
+- Schema per tenant: stronger isolation, but migrations x N and index sprawl.
+- Pinecone namespaces: simple, but adds a vendor and moves data off our VPC.
+
+## Consequences
++ Lowest cost, one migration path.
+- HNSW post-filtering hurts small-tenant recall; mitigated with
+  ef_search tuning and per-tenant recall monitoring (see eval report).
+- Isolation depends on RLS config; covered by canary tests in CI.
+```
+
+Aim for 4 to 6 ADRs in the capstone: isolation model, vector store choice, framework vs custom orchestration, model routing, eval gate thresholds, deployment target.
+
+## The eval results table
+
+Your evaluation section should let a reader reproduce and judge the numbers.
+
+| Suite | Size | Metric | Threshold (CI gate) | Result | Notes |
+|---|---|---|---|---|---|
+| RAG golden set | 120 Q&A | Faithfulness | 0.90 | 0.93 | LLM judge, 5% human-audited |
+| RAG golden set | 120 Q&A | Context recall | 0.85 | 0.88 | |
+| Agent trajectories | 30 tasks | Correct tool sequence | 0.80 | 0.83 | 2 failures: date parsing |
+| Isolation | 40 cases | Leaks | 0 | 0 | Canary strings per tenant |
+| Red team | 25 prompts | Injection success | 0 | 1 | Open issue #42 |
+
+Note the last row. One known failure with a linked issue shows you test honestly.
+
+## Cost analysis
+
+Show the math, not just the total. A reviewer should be able to change a price and recompute.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Price:  # per 1M tokens; example values come from config, check provider pricing
+    input: float
+    output: float
+
+def cost_per_1k_requests(p: Price, in_tok: int, out_tok: int, cache_hit_rate: float,
+                         embed_cost_per_req: float, rerank_cost_per_req: float) -> float:
+    llm = (in_tok * p.input + out_tok * p.output) / 1_000_000
+    per_req = llm * (1 - cache_hit_rate) + embed_cost_per_req + rerank_cost_per_req
+    return round(per_req * 1000, 2)
+```
+
+Then a table: tokens per request (measured from traces), cache hit rate, cost per 1k requests per model tier, and monthly cost at 10k, 100k and 1M requests. Add infrastructure fixed costs separately. End with one sentence on the biggest lever, for example "routing 60% of simple questions to the small model cuts LLM cost by about half in our traffic mix".
+
+## Recording the demo GIF
+
+- Use a screen recorder (Kap, ScreenToGif, Peek, or OBS plus ffmpeg).
+- Record at 1280x720, crop to the app, 10 to 15 fps, under 5 MB so GitHub renders it fast.
+- Script it: question, streamed answer, click a citation, switch tenant, show that tenant B cannot find tenant A's document, open the trace.
+- Convert with ffmpeg and a palette to keep colors clean:
+
+```bash
+ffmpeg -i demo.mp4 -vf "fps=12,scale=1100:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" docs/demo.gif
+```
+
+## Common mistakes
+
+- Setup instructions first and results nowhere.
+- Diagrams with boxes but no arrows labelled, or no explanation of the request path.
+- "Accuracy: 95%" with no dataset, size, metric definition or date.
+- Copying price numbers from memory. Read them from the provider page on the day you write, and say so.
+- A 4-minute video instead of a GIF. Link the video, embed the GIF.
+- No limitations section. It reads as either naive or hiding something.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Walk me through the architecture of your capstone." level="mid">
+
+I use the README diagram as the map. One sentence on the business problem. Then the request path: the user authenticates, the gateway resolves a tenant context, FastAPI checks rate limits and budget in Redis, the LangGraph agent decides between retrieval and tools, the retriever runs hybrid search with RLS enforcing the tenant and a re-ranker picks the top 5, the LLM answers with citations, and every step is traced with the tenant id so costs roll up per tenant. Then the offline side: ingestion worker, eval suite in CI. I finish with the one decision I would revisit and why. Two to three minutes, then I stop and let them dig.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Bring an ADR to the interview">
+
+When asked "what was a hard decision?", say "I wrote it down" and walk through an ADR: context, options, decision, consequences. It turns a vague story into a structured one, and it proves the decision was made at the time, not invented later.
+
+</Callout>
+
+## Further reading
+
+- The C4 model: https://c4model.com
+- Architecture Decision Records (Michael Nygard's template and examples): https://adr.github.io
+- Mermaid flowchart and sequence syntax: https://mermaid.js.org/intro/
+- GitHub docs on READMEs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes
