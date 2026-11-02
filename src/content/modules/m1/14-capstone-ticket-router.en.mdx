@@ -1,0 +1,160 @@
+<ClientBrief company="Cartwheel Outfitters" industry="E-commerce / Outdoor gear retail" duration="4 days" />
+
+## Company context
+
+Cartwheel Outfitters is a fictional mid-size online retailer of outdoor gear (tents, boots, jackets, climbing equipment) shipping to the US and Canada. It processes around 9,000 orders a day and receives about **40,000 support tickets a month** by email and chat, in English and Spanish. Volume doubles in November and December.
+
+Today, a team of 6 "triage agents" reads every ticket and moves it to one of seven queues in their helpdesk. Median time-to-queue is 3.5 hours, and over 20 hours on Mondays and during peak season. Misrouted tickets bounce between teams. Customers with safety issues (a stove that leaked gas, a harness with a frayed strap) sometimes wait a full day before a specialist sees them.
+
+The company already uses Claude through the Anthropic API for internal tools, and has an OpenAI account through a marketing vendor. Their platform team wants nothing that locks them into one provider.
+
+## Stakeholders
+
+| Name | Role | What they care about |
+|---|---|---|
+| Dana Whitfield | VP Customer Experience (sponsor) | Time-to-queue under 1 minute, fewer bounced tickets, safety tickets never delayed |
+| Marcus Oyelaran | Support Operations Lead | Agents trust the routing; easy override; a clear human review queue |
+| Priya Raman | Head of Platform Engineering | Provider-agnostic design, observability, no surprise bills |
+| Luis Carrasco | Finance Business Partner | A monthly cost forecast and cost per 1,000 tickets |
+| Helena Brandt | Trust & Safety Manager | Fraud and safety tickets detected with very high recall |
+
+## Business goal
+
+Automatically classify and route incoming tickets in **under a minute**, with accuracy at least as good as the human triage team, so the 6 triage agents can move to resolving tickets. Uncertain or high-risk tickets must go to a human review queue rather than be guessed. Leadership wants proof, with numbers, that the system is accurate, cheap and safe before turning it on.
+
+## Functional requirements
+
+1. **Classification with structured output.** For each ticket, produce a validated object:
+   - `category`: one of `order_status`, `shipping_delay`, `return_refund`, `damaged_item`, `billing`, `account_access`, `fraud_report`, `product_question`, `other`
+   - `priority`: `low`, `medium`, `high`, `urgent`
+   - `safety_flag`: boolean (injury, fire, gas, structural failure of safety gear)
+   - `language`: `en`, `es`, or `other`
+   - `order_id`: string matching `A-12345`, or null
+   - `confidence`: number between 0 and 1
+   - `rationale`: one short sentence (for agents, not for customers), no PII
+2. **Routing.** Map category to queue: logistics (`order_status`, `shipping_delay`), returns (`return_refund`, `damaged_item`), payments (`billing`), accounts (`account_access`), trust_safety (`fraud_report`, and anything with `safety_flag`), presales (`product_question`), general (`other`).
+3. **Fallback strategy (model cascade).**
+   - Tier 1: classify with the cheap model (`claude-haiku-5-5`, logical name `fast`).
+   - Escalate to Tier 2 (`claude-sonnet-5-5`, logical name `smart`) when: confidence is below a **calibrated** threshold, validation needed a repair, or the predicted category is high-risk (`fraud_report`, `billing`) or `safety_flag` is true.
+   - Send to the **human review queue** when Tier 2 confidence is still below its threshold, both tiers disagree on a high-risk category, or both tiers fail.
+   - If all providers are unavailable, route to `general` with a `needs_review` tag. Never drop a ticket.
+4. **Provider failover.** If Anthropic is unavailable (after retries), Tier 1 fails over to an OpenAI model configured in `models.toml`, which must have passed the same eval.
+5. **Batch and single mode.** `route_ticket(ticket)` for one ticket, and a CLI that processes a JSONL file concurrently with progress and resumability.
+6. **Cost report.** A command that reads the cost log and produces `reports/cost_report.md`: total spend, cost per 1k tickets, split by tier and provider, escalation rate, human queue rate, overhead from retries and repairs, and a monthly forecast at 40k and 80k tickets.
+7. **Evaluation report.** A command that runs the labeled test set and produces `reports/eval_report.md` with per-category precision/recall/F1, macro-F1, routing accuracy, safety/fraud recall, confusion matrix and calibration table.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Latency | p95 under 4 s for Tier-1-only tickets, under 10 s for escalated tickets, measured end to end per ticket |
+| Throughput | Sustain 2,000 tickets per hour in batch mode within your rate limits |
+| Cost | Under **$1.50 per 1,000 tickets** all-in (both tiers, retries, repairs), computed from your dated pricing config. Recompute and state your assumptions if prices differ |
+| Accuracy | Category macro-F1 at least 0.85 on the test set; routing accuracy at least 0.92 on auto-routed tickets |
+| Safety | Recall at least 0.95 for `safety_flag` and for `fraud_report` |
+| Human load | Human review queue at most 12% of tickets |
+| Reliability | No ticket lost; every ticket ends in a queue with a reason code (auto, escalated, human, degraded) |
+| Observability | Per-ticket JSON log with request id, tiers used, models, prompt version, latency, tokens and cost |
+| Privacy | No email addresses, phone numbers or card fragments in `rationale` or logs |
+
+## Data
+
+Cartwheel cannot share real tickets. Create a **synthetic but realistic labeled dataset** of at least 300 tickets:
+
+- Cover all 9 categories, with realistic imbalance (order status and shipping delay are about half of real traffic).
+- At least 15% in Spanish, plus some mixed-language tickets.
+- Include hard cases: sarcasm, two issues in one ticket, missing order ids, a refund dispute that is really fraud, a "the zipper broke" that is `damaged_item` and a "the stove leaked gas" that is `safety_flag`.
+- Label each ticket with category, priority, safety flag and queue. Have a second pass where you re-label 30 tickets blind and compute your own agreement: that is your human baseline.
+- Split into **calibration (100)** and **test (200)**. Thresholds are tuned only on calibration. The test set is touched once per prompt version.
+
+## Out of scope
+
+- Generating replies to customers (a later module covers response drafting).
+- Integrating with a real helpdesk API. Simulate queues as output fields or a local SQLite table.
+- A web UI. A CLI and JSON outputs are enough. A FastAPI endpoint is optional (module 5 covers serving).
+- Fine-tuning any model.
+- Attachments and images.
+
+## Deliverables
+
+1. Public GitHub repo `support-ticket-router` that depends on your `llm-provider-client` package (path or git dependency).
+2. Versioned prompt files with a changelog, and the Pydantic schema as the single source of truth.
+3. Router with cascade, calibrated thresholds, human queue and degraded mode.
+4. Labeled dataset (`data/tickets.jsonl`) with a data card describing how it was built.
+5. `reports/eval_report.md` and `reports/cost_report.md`, generated by commands, not written by hand.
+6. Tests that run offline with the fake provider, covering every routing path.
+7. README with architecture diagram, results, cost analysis, trade-offs and a demo GIF or terminal recording.
+
+## Acceptance criteria
+
+- Running `make eval` regenerates the eval report and meets the accuracy and safety targets on the test set.
+- Running `make cost-report` reproduces the cost numbers from the logged run, and cost per 1k tickets is under target.
+- Every routing path (auto, escalated, human, degraded, provider failover) is covered by an offline test.
+- Thresholds live in config with a note showing how they were derived from the calibration set.
+- No vendor SDK types appear outside the `llm-provider-client` adapters.
+- Logs contain prompt version and tiers for every ticket; no PII appears in logs or rationales (tested).
+
+## Suggested architecture
+
+<Diagram caption="Support ticket router with model cascade and human fallback" chart={`flowchart TD
+  T["Incoming ticket (email or chat)"] --> P["Pre-process: language, PII masking, truncate"]
+  P --> F["Tier 1: fast model, structured output"]
+  F --> V1{"Valid and confident and not high-risk?"}
+  V1 -->|yes| R["Route to queue"]
+  V1 -->|no| S["Tier 2: smart model, structured output"]
+  S --> V2{"Valid and confident and tiers agree on risk?"}
+  V2 -->|yes| R
+  V2 -->|no| H["Human review queue"]
+  F -.->|"provider down after retries"| FO["Failover model (OpenAI)"]
+  FO --> V1
+  S -.->|"all providers down"| D["Degraded: general queue + needs_review"]
+  R --> L[("Per-ticket log: tiers, models, tokens, cost")]
+  H --> L
+  D --> L
+  L --> CR["Cost report"]
+  L --> ER["Eval report"]`} />
+
+Implementation notes:
+
+- **Confidence is not calibrated by default.** A model saying 0.9 is not right 90% of the time. Bucket calibration-set predictions by stated confidence (for example 0–0.5, 0.5–0.7, 0.7–0.85, 0.85–1.0), compute actual accuracy per bucket, and pick the Tier 1 threshold as the lowest bucket edge where accuracy meets your target. Show the table in the eval report.
+- **Choose thresholds by cost/accuracy curve.** Sweep the Tier 1 threshold and plot escalation rate, cost per 1k and macro-F1. Pick the knee, and justify it in the README.
+- **High-risk rules are code, not prompt.** Escalation for fraud, billing and safety is decided in Python from the structured output, so a prompt change cannot weaken it.
+- **Effort is a lever.** Try Tier 1 at low effort and Tier 2 at medium effort. Measure, don't assume.
+- **Pre-processing.** Mask emails and phone numbers before sending to the model where the task does not need them, and truncate very long email threads to the latest message plus a short history.
+
+## Evaluation rubric
+
+| Criterion | Weight | Excellent (5) | Adequate (3) | Weak (1) |
+|---|---|---|---|---|
+| Accuracy and safety | 25% | All targets met on a clean test set; errors analyzed by category | Most targets met; some analysis | Targets missed or measured on calibration data |
+| Cascade and fallback design | 20% | Calibrated thresholds, code-level risk rules, all paths tested, degraded mode works | Cascade works with hand-picked thresholds | Single model or untested fallbacks |
+| Cost engineering | 20% | Generated report, cost per 1k under target, cost per correct routing, forecast with assumptions | Cost logged and summarized | No cost data or hand-computed numbers |
+| Code quality and tests | 15% | Typed, provider-agnostic, offline tests for every path, CI runs them | Reasonable structure, partial tests | Vendor code everywhere, no tests |
+| Prompt and schema contract | 10% | Versioned prompt with changelog, schema single source, contract tests | Versioned prompt, schema present | Inline prompt strings |
+| Documentation and demo | 10% | README tells the story: problem, architecture, results, trade-offs, demo | README covers setup and results | Setup only |
+
+## Suggested timeline (4 days)
+
+**Day 1 – Data and contract.** Write the dataset (300 tickets) and the data card. Define the Pydantic schema and category definitions. Write prompt v1.0.0. Wire the router skeleton on top of `llm-provider-client` with the fake provider and the routing table. Offline tests for routing paths.
+
+**Day 2 – Tier 1 and evaluation.** Run Tier 1 on the calibration set. Build the eval command (per-category metrics, confusion matrix, calibration buckets). Iterate the prompt to v1.1.0 based on errors, logging changes in the changelog.
+
+**Day 3 – Cascade and cost.** Add Tier 2, risk rules, human queue and degraded mode. Sweep thresholds on the calibration set and pick them. Add provider failover and test it. Build the cost report command.
+
+**Day 4 – Final test run and story.** Run once on the test set. Generate both reports. Write the README with architecture, results, cost analysis and trade-offs. Record the demo. Clean up and tag `v1.0.0`.
+
+## Definition of Done
+
+<Checklist id="m1-14-dod" title="Definition of Done" items={["Labeled dataset of 300+ tickets with data card and calibration/test split", "Pydantic schema is the single source of truth; JSON Schema generated from it", "Prompt files are versioned with a changelog and logged with every call", "Tier 1 to Tier 2 escalation uses calibrated thresholds and code-level risk rules", "Human review queue and degraded mode are implemented and tested", "Provider failover works and the failover model passed the same eval", "Eval report meets macro-F1, routing accuracy and safety recall targets on the test set", "Cost report shows cost per 1k tickets under target, by tier and provider, with a monthly forecast", "Offline tests cover every routing path and run in CI", "No PII in logs or rationales, verified by a test", "README includes architecture diagram, results tables, trade-offs and a demo recording"]} />
+
+## How to present this in an interview
+
+Use a 3-minute story, then let the interviewer dig in.
+
+1. **Problem in business terms.** "40k tickets a month, 3.5-hour median time-to-queue, safety tickets waiting a day. Goal: under a minute, as accurate as humans, safe by design."
+2. **Architecture in one sentence.** "A cheap model classifies with structured output; low confidence, repairs or high-risk categories escalate to a stronger model; anything still uncertain goes to humans; everything runs through my provider-agnostic client with retries, rate limits and cost logging."
+3. **The numbers.** Macro-F1, safety recall, routing accuracy, human queue rate, cost per 1k tickets, p95 latency. Say which targets you missed, if any, and why.
+4. **The interesting decision.** Calibration. "The model's stated confidence was overconfident in the 0.7–0.85 band, so I set the threshold at 0.85 using the calibration set. That raised escalations from 9% to 14% but brought routing accuracy above target, and cost stayed under budget."
+5. **What you'd do next.** Online monitoring of human override rate per prompt version, a CI eval gate (module 3), and serving it behind an API with a queue (module 5).
+
+Expect follow-ups such as: "Why not just use the strong model for everything?" (show the cost/accuracy curve), "How do you know your synthetic data is representative?" (data card, hard cases, plan to validate on real samples), "What happens when the provider is down?" (failover and degraded mode, with tests), and "How would you detect drift?" (category distribution and confidence shifts per week, override rate). Have the eval and cost reports open; numbers you can show beat numbers you remember.

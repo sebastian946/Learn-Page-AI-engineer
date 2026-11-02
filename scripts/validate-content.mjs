@@ -66,6 +66,15 @@ for (const id of moduleIds) {
       } catch (e) {
         err(`modules/${id}/${lesson.slug}.${locale}.mdx`, `MDX compile error: ${e.message}`)
       }
+      // The page renders the title from module.json; an H1 in the MDX duplicates it.
+      let inFence = false
+      for (const line of source.split(/\r?\n/)) {
+        if (/^\s*(```|~~~)/.test(line)) inFence = !inFence
+        else if (!inFence && /^# /.test(line)) {
+          err(`modules/${id}/${lesson.slug}.${locale}.mdx`, `remove the H1 "${line.slice(0, 50)}" (the page already shows the title; start at ##)`)
+          break
+        }
+      }
       ids[locale] = [...source.matchAll(/<Checklist\s+id="([^"]+)"/g)].map((m) => m[1]).sort()
       if (source.trim().split(/\s+/).length < 150 && lesson.type !== 'exam') warn(lw, `${locale} file looks short`)
     }

@@ -1,0 +1,212 @@
+<ClientBrief company="Harborline Mutual" industry="Insurance / Property & casualty claims" duration="5 days" />
+
+You are a contract AI engineer. Harborline Mutual wants a pipeline that reads claim documents, extracts the fields adjusters type by hand today, and answers adjusters' questions about a claim with citations. Their data platform is Databricks, governed by Unity Catalog. If you do not have a workspace, build the same system on the local stack described below — the brief, the requirements and the rubric do not change.
+
+<Callout type="warning" title="Databricks APIs evolve">
+
+Vector Search, Model Serving, MLflow 3 and the Agent Framework change frequently. Design with the concepts from this module and check docs.databricks.com and mlflow.org/docs for current function names and parameters while you build. Note in your README which versions you used.
+
+</Callout>
+
+## Company context
+
+Harborline Mutual is a regional property and casualty insurer (fictional) with about 1,200 employees and 400,000 active homeowner and auto policies. It handles roughly 6,000 new claims per month. Each claim arrives as a bundle of PDFs: a **first notice of loss (FNOL) form**, **adjuster field reports**, **repair estimates**, photos with captions, and the relevant **policy document** with its endorsements.
+
+Today, intake staff open each PDF and type 15–20 fields into the claims system. It takes 12–20 minutes per claim and errors are common (wrong policy number, missed date of loss). When adjusters need to know "is this covered?", they search 40-page policy PDFs by hand.
+
+Harborline already lands documents in cloud storage and runs its data warehouse on Databricks. Security insists that claim data stays inside the governed platform, that access is auditable, and that no personal data is sent to systems outside approved endpoints.
+
+## Stakeholders
+
+| Person | Role | What they care about |
+|---|---|---|
+| Dana Okafor | VP Claims Operations (sponsor) | Intake time per claim, adjuster productivity |
+| Luis Herrera | Senior Claims Adjuster (SME) | Correct answers with page citations; no invented coverage statements |
+| Priya Raman | Data Platform Lead | Unity Catalog governance, lineage, cost on the shared workspace |
+| Martin Cole | Information Security / Privacy | PII handling, access control, audit logs |
+| Ana Petrov | Claims QA Manager | Measurable accuracy, regression protection when prompts change |
+
+## Business goal
+
+Cut manual intake time by at least 60% by pre-filling structured claim fields from documents, and give adjusters a cited Q&A assistant over each claim's documents and policy. Success in a 4-week pilot means intake staff only review and correct extracted fields, and adjusters use the assistant for coverage lookups with no unsupported coverage statements found in QA review.
+
+## Functional requirements
+
+1. **Ingestion.** Claim PDFs land in a Unity Catalog Volume (`/Volumes/<catalog>/claims/raw_docs/`). An incremental job (Auto Loader with `binaryFile`, `availableNow` trigger) loads new files into a bronze Delta table with path, size, modification time and `claim_id` parsed from the folder name.
+2. **Parsing and chunking.** Parse each PDF to text per page (a Python parser or `ai_parse_document` if available), classify document type (`fnol`, `adjuster_report`, `estimate`, `policy`, `endorsement`), and write a silver table. Chunk to a gold table with deterministic `chunk_id`, `claim_id`, `doc_id`, `doc_type`, `page`, `content` and lineage columns (`parser_version`, `chunker_config`, `run_id`). Change Data Feed enabled, primary key set.
+3. **PII handling.** Detect and pseudonymize names, phone numbers, emails and SSNs in text sent to the Q&A index and logs. Keep the original values only in the governed extraction table that intake needs, restricted by UC grants.
+4. **Vector Search.** Delta Sync index on the gold chunks with managed embeddings, `TRIGGERED` sync after each ingestion run, filterable by `claim_id` and `doc_type`.
+5. **Extraction chain.** For each claim, extract into a Pydantic model and write to `claims.extracted_fields`:
+   - `claim_number`, `policy_number`, `date_of_loss`, `date_reported`, `loss_type` (enum: water, fire, wind, theft, collision, liability, other), `loss_location`, `claimed_amount`, `estimate_total`, `insured_name`, `adjuster_name`, `police_report_number` (nullable)
+   - a per-field `source` (`doc_id`, `page`) and `confidence` (`high` | `low`)
+   - validation: dates parse, `date_of_loss` not after `date_reported`, policy number matches `POL-` plus 8 digits, amounts non-negative. Failing fields are set to `null` with `confidence = low`, never guessed.
+6. **Q&A chain.** Given `claim_id` and a question, retrieve only that claim's chunks plus its policy, answer with citations `[doc_id p.N]`, and say "not enough information" when the documents do not answer it. It must never state that a claim is approved or will be paid.
+7. **Evaluation.** MLflow traces for both chains. `mlflow.genai.evaluate` with:
+   - extraction: custom code scorers for field-level exact match (normalized) on a golden set of at least 40 claims
+   - Q&A: `Correctness`, `RetrievalGroundedness`, `RelevanceToQuery`, `Safety`, a `Guidelines` scorer for the "no approval promises" rule, and a citation code scorer, on at least 40 golden questions
+8. **Serving.** Log the Q&A agent with models from code and declared resources, register it in Unity Catalog, and deploy with `agents.deploy` (or a Model Serving endpoint). Inference tables or trace logging enabled. Extraction runs as a batch job (or `ai_query` over the silver table).
+9. **Monitoring.** A SQL dashboard or notebook over inference/extraction tables: requests per day, p95 latency, low-confidence field rate, thumbs-down rate.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Q&A latency | p95 under 6 s end to end for a single question |
+| Extraction throughput | A 10-page claim bundle extracted in under 60 s in batch |
+| Extraction accuracy | ≥ 95% field-level exact match on key fields (claim number, policy number, date of loss, loss type, claimed amount); ≥ 85% on all fields |
+| Q&A quality | Groundedness ≥ 0.90, correctness ≥ 0.80, zero "approval promise" violations on the golden set |
+| Cost | Measure and report cost per 1k documents processed and per 1k questions answered, from token usage and current provider/platform prices. Set a target after the first measurement and explain it |
+| Freshness | New documents searchable within 30 minutes of landing (scheduled job) |
+| Governance | All tables, Volume, index and model in one UC schema; apps use a service principal; no personal tokens in code |
+| Privacy | PII scrubber recall ≥ 0.95 on a labeled sample of 50 snippets |
+
+## Out of scope
+
+- Fraud detection or claim approval decisions.
+- OCR model training. Use an off-the-shelf parser; scanned images may be skipped and logged.
+- Integration with the real claims management system — write to Delta tables only.
+- A custom web front end. The Review App (or a simple notebook/Streamlit demo) is enough.
+- Fine-tuning. Document why you did not need it.
+
+## Local fallback
+
+| Databricks | Local equivalent |
+|---|---|
+| UC Volume | `data/raw_docs/<claim_id>/` folder |
+| Auto Loader + bronze Delta | Python job with a processed-files manifest, writing Parquet (DuckDB) or Postgres |
+| Silver/gold Delta with CDF | Postgres tables with `run_id` and upserts, or DuckDB over Parquet |
+| Vector Search (Delta Sync) | pgvector or Chroma with an idempotent upsert job |
+| Model Serving / external models | Direct Anthropic or OpenAI SDK, models from config |
+| `agents.deploy` endpoint | FastAPI service in Docker (Module 5) |
+| MLflow on Databricks | Local `mlflow server` with SQLite backend |
+| Inference tables | Request log table in Postgres (lesson 1 schema) |
+| UC grants | Postgres roles; document the mapping |
+
+## Deliverables
+
+1. Repo `doc-intelligence-pipeline` with code, notebooks (or jobs) and tests.
+2. Golden datasets: 40+ annotated claims for extraction, 40+ Q&A pairs, 50 PII snippets.
+3. MLflow experiment with at least two evaluation runs (baseline and improved).
+4. Deployed endpoint (or local FastAPI service) and a 3-minute demo GIF/video.
+5. README with architecture, design decisions, evaluation results, cost report and runbook.
+6. A one-page summary for Dana (business outcome, accuracy, cost, risks).
+
+## Acceptance criteria
+
+- Re-running ingestion on the same files produces no duplicate rows (proved by a test or a query in the README).
+- Updating one document and re-running the pipeline updates its chunks and removes stale ones from the index.
+- Extraction meets the accuracy targets on the golden set, reported per field from an MLflow run.
+- Q&A meets groundedness, correctness and safety targets; violations are listed and explained.
+- Q&A retrieval is scoped by `claim_id`: a test shows a question about claim A never returns chunks from claim B.
+- p95 latency and cost per 1k are measured and reported, with the method explained.
+- Endpoint or service is reachable and traced; inference logging verified with a query.
+- No secrets in the repo; access via service principal or environment configuration.
+
+## Suggested architecture
+
+<Diagram caption="Harborline document intelligence pipeline" chart={`flowchart LR
+  subgraph Ingest
+    A["Claim PDFs"] --> B["UC Volume raw_docs"]
+    B --> C["Auto Loader to bronze_docs"]
+  end
+  subgraph Prepare
+    C --> D["Parse + classify to silver_pages"]
+    D --> E["PII pseudonymize"]
+    E --> F["Chunk to gold_chunks (CDF, PK)"]
+  end
+  subgraph Serve
+    F --> G["Vector Search Delta Sync index"]
+    D --> H["Extraction job (Pydantic + LLM)"]
+    H --> I["extracted_fields Delta"]
+    G --> J["Q&A agent (MLflow model)"]
+    K["Model Serving: LLM endpoint"] --> H
+    K --> J
+    J --> L["Agent endpoint + Review App"]
+  end
+  subgraph Evaluate
+    L --> M["Inference tables / traces"]
+    M --> N["MLflow GenAI evaluate"]
+    O["Golden sets in UC"] --> N
+    N --> P["Dashboard + regression gate"]
+  end`} />
+
+## Evaluation rubric
+
+| Criterion | Weight | Excellent | Acceptable | Needs work |
+|---|---|---|---|---|
+| Data pipeline | 20% | Incremental, idempotent, stale-chunk handling, row-level lineage, tests | Incremental and idempotent | Full reloads, duplicates possible |
+| Extraction quality | 20% | Meets all accuracy targets, validation and per-field sources | Meets key-field target | Below target or no field-level metrics |
+| Q&A quality and safety | 20% | Meets targets, scoped retrieval, refusals correct, rationales analyzed | Meets most targets | No groundedness eval or cross-claim leakage |
+| Evaluation rigor | 15% | Versioned golden sets, judge calibrated against human labels, baseline vs improved runs | One evaluation run with mixed scorers | Ad-hoc manual checks |
+| Governance and privacy | 15% | UC grants, service principal, PII recall measured, audit story | UC objects used, basic scrubbing | Personal tokens, PII in index or logs |
+| Communication | 10% | Clear README, cost report, runbook, stakeholder summary | README with results | Missing results or decisions |
+
+## Suggested timeline
+
+| Day | Focus |
+|---|---|
+| 1 | UC schema, Volume, bronze ingestion, parsing to silver, document-type classification. Start annotating the golden extraction set |
+| 2 | PII scrubbing with measured recall, chunking to gold with lineage, Vector Search index, scoped retrieval test |
+| 3 | Extraction chain with Pydantic validation, batch job, field-level scorers, first MLflow evaluation run |
+| 4 | Q&A agent with citations and refusal rules, tracing, judges + guidelines + code scorers, improve and re-run |
+| 5 | Log, register and deploy; inference logging; monitoring queries; cost and latency measurement; README, demo and stakeholder summary |
+
+<CommitBox repo="doc-intelligence-pipeline">
+
+```text
+doc-intelligence-pipeline/
+  README.md
+  docs/
+    architecture.md
+    cost-report.md
+    runbook.md
+    stakeholder-summary.md
+  config/
+    settings.yaml               # catalog, schema, endpoints, model names, chunking
+  pipeline/
+    ingest.py                   # Auto Loader job / local manifest loader
+    parse.py
+    pii.py
+    chunk.py
+    index.py                    # Vector Search or pgvector/Chroma
+  chains/
+    schemas.py                  # Pydantic ClaimFields
+    extract.py
+    qa_agent.py                 # ResponsesAgent, models from code
+  evaluation/
+    golden/                     # extraction, qa, pii datasets (versioned)
+    scorers.py
+    run_eval.py
+  deploy/
+    log_and_register.py
+    deploy_agent.py
+  sql/
+    monitoring.sql
+  tests/
+```
+
+README outline: problem and outcome, architecture diagram, Databricks vs local path, data model (bronze/silver/gold), PII approach and measured recall, extraction design, Q&A design, evaluation results table (baseline vs final), latency and cost per 1k, governance, how to run, limitations and next steps.
+
+Suggested commits: `feat(ingest): incremental bronze ingestion from UC Volume`, `feat(prepare): parsing, PII pseudonymization and chunking with lineage`, `feat(index): delta sync vector index with claim-scoped retrieval`, `feat(extract): validated claim field extraction job`, `feat(qa): cited Q&A agent with refusal rules`, `feat(eval): golden sets and MLflow evaluation`, `feat(deploy): register in UC and deploy agent`, `docs: cost report, runbook and results`.
+
+</CommitBox>
+
+## Definition of Done
+
+<Checklist id="m6-13-dod" title="Definition of Done" items={["Ingestion is incremental and idempotent, proved by a re-run", "Stale chunks are removed when a document changes", "Gold chunk table has CDF, primary key and lineage columns", "PII scrubber recall measured on 50 labeled snippets and at least 0.95", "Extraction meets the field-level accuracy targets in an MLflow run", "Q&A meets groundedness, correctness and safety targets with zero approval promises", "Retrieval is scoped by claim_id, with a test proving no cross-claim leakage", "Agent logged with declared resources, registered in Unity Catalog and deployed (or local FastAPI equivalent)", "Inference logging verified and monitoring queries written", "p95 latency and cost per 1k documents and per 1k questions measured and documented", "README, runbook, cost report, stakeholder summary and demo GIF committed"]} />
+
+## How to present this in an interview
+
+Lead with the business problem in one sentence: "An insurer spent 15 minutes per claim typing fields from PDFs; I built a governed pipeline that extracts them at 95%+ field accuracy and answers adjuster questions with citations."
+
+Then walk the diagram left to right, pausing on decisions:
+
+- **Why Delta Sync with TRIGGERED mode** — documents arrive in batches; 30-minute freshness doesn't justify continuous sync cost.
+- **Why extraction is a batch job and Q&A is an endpoint** — different latency needs and cost profiles.
+- **How you prevent cross-claim leakage** — `claim_id` filter derived from the request context, plus a test.
+- **How you measured quality** — field-level code scorers for extraction, judges plus a calibrated sample for Q&A, two MLflow runs showing improvement.
+- **Where PII lives** — originals only in the restricted extraction table; pseudonyms everywhere else; measured recall.
+- **What it costs** — your measured cost per 1k documents and questions, and the biggest lever you found.
+- **Why no fine-tuning** — prompting plus validation met the targets; fine-tuning would add retraining and serving cost.
+
+Expect follow-ups like "what breaks at 10x volume?" (parsing throughput, provisioned throughput for the LLM, index size and endpoint sizing) and "how would you catch a regression after a prompt change?" (golden sets as a CI gate plus scheduled scorers on production traces). If you used the local stack, say so directly and show the mapping table — the design reasoning is the same, and interviewers value that honesty.

@@ -1,0 +1,219 @@
+## El framework es un test runner, no tu eval
+
+A estas alturas has visto Ragas y DeepEval (módulo 2), un harness con pytest (módulo 3) y MLflow (módulo 6). Hay muchos más. Cada uno promete "evals en 5 minutos". La trampa es dejar que un framework defina el formato de tu dataset, tus métricas y el almacenamiento de tus resultados. Entonces cambiar de framework significa reescribirlo todo, y comparar resultados viejos con nuevos se vuelve imposible.
+
+La analogía SDET es exacta. Playwright, Cypress y Selenium son runners. Tus casos de prueba, page objects y aserciones son el activo. Una buena arquitectura de pruebas te permite cambiar el runner sin reescribir la intención de las pruebas. Haz lo mismo con los evals.
+
+Esta lección compara de forma práctica cinco opciones populares y luego muestra cómo mantenerte independiente del framework.
+
+## promptfoo
+
+**Qué es:** una CLI open source (basada en Node, funciona desde cualquier lenguaje) que se maneja con YAML. Declaras prompts, proveedores y casos de prueba con aserciones. Corre la matriz, guarda resultados en caché y te da un visor web local para comparar lado a lado.
+
+**Fortalezas:** se empieza muy rápido; excelente para comparar prompts o modelos lado a lado; muchas aserciones integradas (`equals`, `contains`, `regex`, `is-json`, `javascript`, `python`, `similar`, `llm-rubric`, `latency`, `cost`); plugins de red-teaming integrados; amigable con CI.
+
+**Debilidades:** el YAML se vuelve difícil de manejar con lógica compleja; los escenarios multi-turno y de agentes necesitan proveedores personalizados; la estadística más allá de las tasas de aprobación corre por tu cuenta.
+
+```yaml
+# promptfooconfig.yaml
+description: Ticket router - model comparison
+prompts:
+  - file://prompts/router_v2.txt
+providers:
+  - id: anthropic:messages:claude-sonnet-5-5
+    config: { temperature: 0, max_tokens: 20 }
+  - id: anthropic:messages:claude-haiku-5-5
+    config: { temperature: 0, max_tokens: 20 }
+defaultTest:
+  options:
+    transform: output.trim().toLowerCase()
+  assert:
+    - type: latency
+      threshold: 3000
+tests:
+  - vars:
+      ticket: "I was charged twice for order 88123, refund me today."
+    assert:
+      - type: equals
+        value: billing_refund
+  - vars:
+      ticket: "My lawyer will contact you about the damaged sofa."
+    assert:
+      - type: equals
+        value: legal_threat
+  - file://tests/router_cases.yaml
+```
+
+Córrelo con `npx promptfoo@latest eval -c promptfooconfig.yaml --repeat 3 -o results/run.json` y luego `npx promptfoo@latest view`.
+
+## DeepEval
+
+**Qué es:** un framework de Python con un runner al estilo pytest (`deepeval test run`) y muchas métricas evaluadas por LLM (G-Eval, faithfulness, answer relevancy, hallucination, métricas conversacionales). Las métricas personalizadas heredan de `BaseMetric`.
+
+**Fortalezas:** se siente como pytest; biblioteca de métricas rica; métricas personalizadas fáciles; se integra con la plataforma Confident AI si quieres dashboards alojados.
+
+**Debilidades:** las métricas integradas se basan en jueces y necesitan calibración como cualquier juez; la lógica interna de las métricas cambia entre versiones, así que fija la versión.
+
+```python
+import json
+from deepeval import assert_test
+from deepeval.metrics import BaseMetric
+from deepeval.test_case import LLMTestCase
+
+class FieldF1Metric(BaseMetric):
+    def __init__(self, fields: list[str], threshold: float = 0.9):
+        self.fields = fields
+        self.threshold = threshold
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        gold = json.loads(test_case.expected_output)
+        try:
+            pred = json.loads(test_case.actual_output)
+        except json.JSONDecodeError:
+            self.score, self.success, self.reason = 0.0, False, "actual_output is not valid JSON"
+            return self.score
+        tp = sum(1 for f in self.fields if gold.get(f) is not None and pred.get(f) == gold.get(f))
+        fp = sum(1 for f in self.fields if pred.get(f) is not None and pred.get(f) != gold.get(f))
+        fn = sum(1 for f in self.fields if gold.get(f) is not None and pred.get(f) != gold.get(f))
+        self.score = 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 1.0
+        self.success = self.score >= self.threshold
+        self.reason = f"tp={tp} fp={fp} fn={fn}"
+        return self.score
+
+    async def a_measure(self, test_case: LLMTestCase) -> float:
+        return self.measure(test_case)
+
+    def is_successful(self) -> bool:
+        return self.success
+
+    @property
+    def __name__(self) -> str:
+        return "Field F1"
+
+def test_nda_extraction() -> None:
+    case = LLMTestCase(
+        input="Extract fields from contract nda-0007",
+        actual_output=extract("nda-0007"),          # your system under test
+        expected_output=json.dumps(GOLD["nda-0007"]),
+    )
+    assert_test(case, [FieldF1Metric(["governing_law", "term_months", "notice_days"])])
+```
+
+## Inspect AI
+
+**Qué es:** un framework open source de Python del UK AI Security Institute, hecho para evaluaciones rigurosas de modelos (capacidades y seguridad). Un `Task` combina un dataset de `Sample`s, un pipeline de solvers (mensaje de sistema, generación, uso de herramientas, agentes) y un scorer. Trae soporte integrado para epochs (corridas repetidas), ejecución de herramientas en sandbox y un visor de logs.
+
+**Fortalezas:** diseñado para evals agénticos y multi-paso; logging sólido; epochs repetidos y métricas de error estándar integradas; soporta muchos proveedores; existen muchas implementaciones de benchmarks públicos para él.
+
+**Debilidades:** más conceptos que aprender; está orientado a evaluar modelos, así que conectarlo a una app de producción completa (RAG, bases de datos) requiere un solver personalizado.
+
+```python
+from inspect_ai import Task, task
+from inspect_ai.dataset import Sample
+from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, scorer, stderr
+from inspect_ai.solver import TaskState, generate, system_message
+
+@scorer(metrics=[accuracy(), stderr()])
+def label_match():
+    async def score(state: TaskState, target: Target) -> Score:
+        answer = state.output.completion.strip().lower()
+        return Score(value=CORRECT if answer == target.text else INCORRECT, answer=answer)
+    return score
+
+@task
+def ticket_router() -> Task:
+    return Task(
+        dataset=[
+            Sample(input="I was charged twice, refund me.", target="billing_refund"),
+            Sample(input="My lawyer will contact you.", target="legal_threat"),
+        ],
+        solver=[system_message(open("prompts/router_v2.txt").read()), generate()],
+        scorer=label_match(),
+        epochs=3,
+    )
+```
+
+Córrelo con `inspect eval router_task.py --model anthropic/claude-haiku-5-5` y revisa los logs con `inspect view`.
+
+## OpenAI Evals y herramientas de eval de proveedores
+
+**OpenAI Evals** existe en dos formas: el registro open source original `openai/evals` (evals y plantillas definidos en YAML) y la **Evals API** alojada en la plataforma de OpenAI, donde defines un esquema de datos y criterios de prueba (graders como verificaciones de strings, similitud de texto y puntuación por modelo), los corres contra modelos y revisas los resultados en el dashboard. Otros proveedores ofrecen herramientas similares, por ejemplo la evaluación de prompts en la Anthropic Console y los jobs de evaluación de modelos en Amazon Bedrock.
+
+**Fortalezas:** cero infraestructura, buena UI, cerca de los modelos. **Debilidades:** atadas a un proveedor, que es justo la propiedad equivocada cuando la decisión es "¿deberíamos cambiar de proveedor?". Úsalas para explorar rápido, no como tu sistema de registro.
+
+## Evaluación GenAI de MLflow
+
+**Qué es:** la evaluación integrada en MLflow (módulo 6). En MLflow 3, `mlflow.genai.evaluate()` corre una función de predicción sobre un dataset con scorers juez integrados y funciones `@scorer` personalizadas, y registra todo en un experimento con trazas. Es de primera clase en Databricks.
+
+**Fortalezas:** seguimiento de experimentos, linaje y trazas en un solo lugar; natural si tu organización ya usa MLflow o Databricks. **Debilidades:** configuración más pesada si no los usas; la API ha cambiado entre versiones mayores.
+
+```python
+import mlflow
+from mlflow.genai.scorers import Guidelines, scorer
+
+@scorer
+def exact_label(outputs: str, expectations: dict) -> bool:
+    return outputs.strip().lower() == expectations["label"]
+
+data = [
+    {"inputs": {"ticket": "I was charged twice, refund me."}, "expectations": {"label": "billing_refund"}},
+    {"inputs": {"ticket": "My lawyer will contact you."}, "expectations": {"label": "legal_threat"}},
+]
+
+results = mlflow.genai.evaluate(
+    data=data,
+    predict_fn=lambda ticket: route(ticket),     # your system under test
+    scorers=[exact_label, Guidelines(name="no_pii", guidelines="The output must not contain personal data.")],
+)
+```
+
+## Cuándo usar cuál
+
+| Necesidad | Buena opción |
+|---|---|
+| Comparar prompts o modelos lado a lado, rápido, con un visor | promptfoo |
+| Gates al estilo pytest en un código Python con métricas de juez | DeepEval (o tu propio harness con pytest) |
+| Evals rigurosos de modelos o agentes, epochs, herramientas en sandbox, evals de seguridad | Inspect AI |
+| La organización ya estandarizó MLflow o Databricks | Evaluación GenAI de MLflow |
+| Exploración rápida dentro de la plataforma de un proveedor | Herramientas de eval del proveedor |
+| Escaneos de red-teaming | Plugins de red-team de promptfoo, más tu propia suite (módulo 3) |
+
+## Mantenerte independiente del framework
+
+Sé dueño de tres cosas y deja que los frameworks sean adaptadores:
+
+1. **Formato del dataset.** JSONL con ids estables, entrada, referencia o expectativas, etiquetas de segmento, origen y versión. Guardado en tu repo o plataforma de datos, no en la UI de un proveedor.
+2. **Funciones de puntuación.** Funciones Python puras como `field_f1(gold, pred)` y `judge_accuracy(item, output)`, con pruebas unitarias. Cada framework recibe un wrapper delgado: un `BaseMetric` de DeepEval, un `@scorer` de Inspect, un `@scorer` de MLflow, una aserción `python` de promptfoo.
+3. **Esquema de resultados.** Una fila por (run id, item id, métrica) con la configuración del sistema (model id, prompt hash, judge id, rubric hash). Exporta la salida de cada framework a ese esquema. Tu estadística (lección 02) y tus dashboards leen solo esto.
+
+Con eso, migrar de framework cuesta unos cuantos adaptadores, y puedes comparar resultados a lo largo de los años.
+
+## Errores comunes
+
+- **Guardar el golden set solo dentro de la plataforma de un proveedor.** No puedes hacer diff, revisarlo ni migrarlo.
+- **Confiar en métricas juez integradas sin calibración.** "Faithfulness 0.87" de una biblioteca sigue siendo un puntaje de juez.
+- **Versiones de framework sin fijar.** Una actualización menor cambió una métrica y tu línea de tendencia saltó.
+- **Comparar números entre frameworks.** Dos métricas "answer relevancy" con el mismo nombre pueden tener prompts y escalas distintas.
+- **Usar la herramienta de eval de un solo proveedor para decidir un cambio de proveedor.**
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Qué framework de evals elegirías para un equipo nuevo y cómo evitas el lock-in?" level="senior">
+
+Depende del trabajo. Para comparaciones rápidas de prompts y modelos con un visor me gusta promptfoo. Para gates de CI al estilo pytest en Python, DeepEval o un harness propio delgado. Para evals agénticos o de seguridad con epochs repetidos y herramientas en sandbox, Inspect AI. Si la organización está en Databricks, la evaluación de MLflow. Elijamos lo que elijamos, somos dueños del formato del dataset, de las funciones de puntuación y del esquema de resultados. Los frameworks son adaptadores alrededor de funciones de puntuación puras y probadas, y todas las salidas se exportan a una sola tabla de resultados que leen nuestra estadística y nuestros dashboards. Eso abarata el cambio y mantiene el historial comparable.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo escribes una métrica personalizada en DeepEval?" level="mid">
+
+Heredo de `BaseMetric`, defino un umbral en el constructor e implemento `measure` para calcular un puntaje a partir de los campos del `LLMTestCase`, asignando `self.score`, `self.success` y `self.reason`. Implemento `a_measure` para corridas async, `is_successful` y una propiedad `__name__`. Manejo explícitamente las entradas malas; por ejemplo, un JSON inválido devuelve puntaje 0 con una razón en lugar de romperse. La lógica real de puntuación vive en una función simple con pruebas unitarias, así que la clase de la métrica es solo un wrapper.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Documentación de promptfoo: https://www.promptfoo.dev/docs/intro/
+- Métricas personalizadas de DeepEval: https://docs.confident-ai.com
+- Documentación de Inspect AI: https://inspect.aisi.org.uk/
+- Guía de evals de OpenAI: https://platform.openai.com/docs/guides/evals
+- Evaluación GenAI de MLflow: https://mlflow.org/docs/latest/genai/

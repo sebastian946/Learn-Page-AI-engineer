@@ -1,0 +1,182 @@
+## Goal
+
+Build a promptfoo suite for a ticket triage prompt that returns JSON with `category` and `priority`. The suite has two layers:
+
+1. **Example-based tests** with gold labels, like the ones you know from Module 3.
+2. **Metamorphic tests** generated from source cases by code: invariance relations (name swap, typos, polite filler, reordered sentences, translation) and directional relations (adding a legal threat or an outage keyword must not lower priority; adding "I do not want a refund" must not produce `billing_refund`).
+
+Then you run the suite against two models and compare not just accuracy but **violation rates per relation**. That is the kind of evidence the capstone needs: a cheaper model that matches on clean inputs but breaks invariance on noisy ones is a migration risk.
+
+This is folder `03-metamorphic/` of `llm-eval-lab`. If you prefer Inspect AI, you may implement the same design with a custom scorer; the acceptance criteria stay the same.
+
+## Context
+
+Your triage prompt returns exactly this JSON:
+
+```json
+{"category": "billing_refund", "priority": "high"}
+```
+
+Categories: `billing_refund`, `shipping`, `account`, `product_question`, `legal_threat`. Priorities: `low`, `normal`, `high`, `urgent`.
+
+Start with 40 hand-labeled **source cases** in `sources.jsonl` (reuse tickets from exercise 03 and add priorities). Then generate follow-up cases with code. Some relations can be checked inside promptfoo because the expected value follows from the source's gold label (for example, a name swap must keep the gold category). Others compare the **two outputs** with no gold label at all (for example, priority after adding a legal threat must be greater than or equal to priority before). promptfoo evaluates one test at a time, so you check those with a small script over the results file.
+
+<AcceptanceCriteria>
+
+- [ ] `prompts/triage.txt` and `promptfooconfig.yaml` run against two models (two providers, or two tiers of one provider) with temperature 0
+- [ ] At least 40 source cases with gold category and priority; at least 8 relations implemented in `generate_mr_tests.py` (at least 5 invariance and 3 directional)
+- [ ] Transforms are deterministic code (seeded); any LLM-generated paraphrase or translation is cached and at least 20 of them were spot-checked by you, with results noted in the README
+- [ ] Generated tests carry `metadata` with `source_id`, `relation` and `kind` (`source`, `invariance`, `directional`)
+- [ ] Every test asserts valid JSON with allowed values; gold-anchored relations assert the expected category with a `javascript` assertion
+- [ ] `check_relations.py` reads the promptfoo output file, pairs follow-up results with their source result per provider, and computes the violation rate per relation with a Wilson CI
+- [ ] A self-consistency baseline is reported: each source case run twice (`--repeat 2`), and the rate at which the output changes with no transform
+- [ ] `REPORT.md` has a table of accuracy and violation rate per relation per model, highlights relations where the models differ beyond their CIs, and lists 5 concrete violation examples
+- [ ] The suite runs in CI on changes to `prompts/` with a cost-bounded subset (for example 10 sources × all relations)
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```yaml
+# 03-metamorphic/promptfooconfig.yaml
+description: Ticket triage - example-based and metamorphic tests
+prompts:
+  - file://prompts/triage.txt
+providers:
+  - id: anthropic:messages:claude-sonnet-5-5
+    label: baseline
+    config: { temperature: 0, max_tokens: 60 }
+  - id: anthropic:messages:claude-haiku-5-5
+    label: candidate
+    config: { temperature: 0, max_tokens: 60 }
+defaultTest:
+  assert:
+    - type: is-json
+    - type: javascript
+      value: |
+        const o = JSON.parse(output);
+        const cats = ['billing_refund', 'shipping', 'account', 'product_question', 'legal_threat'];
+        const pris = ['low', 'normal', 'high', 'urgent'];
+        return cats.includes(o.category) && pris.includes(o.priority);
+tests:
+  - file://tests/generated.yaml
+```
+
+```python
+# 03-metamorphic/generate_mr_tests.py
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Literal
+
+import yaml
+
+rng = random.Random(42)
+
+
+@dataclass
+class Relation:
+    name: str
+    kind: Literal["invariance", "directional"]
+    transform: Callable[[str], str]
+    expected_category: Callable[[str], str | None]  # from gold; None = checked offline only
+
+
+def typos(text: str, rate: float = 0.05) -> str:
+    chars = list(text)
+    for i in range(len(chars) - 1):
+        if chars[i].isalpha() and rng.random() < rate:
+            chars[i], chars[i + 1] = chars[i + 1], chars[i]
+    return "".join(chars)
+
+
+RELATIONS: list[Relation] = [
+    Relation("typos_5pct", "invariance", typos, lambda gold: gold),
+    Relation("polite_filler", "invariance", lambda t: "Hello team, hope you are well. " + t, lambda gold: gold),
+    Relation("legal_threat_priority", "directional",
+             lambda t: t + " If this is not solved by Friday my lawyer will contact you.", lambda gold: None),
+    # TODO(you): name swap, sentence reorder, translation (cached LLM call), outage keyword,
+    #            explicit negation of refund, ALL CAPS
+]
+
+
+def test_case(vars_text: str, meta: dict, expected_category: str | None) -> dict:
+    asserts = []
+    if expected_category:
+        asserts.append({"type": "javascript",
+                        "value": f"JSON.parse(output).category === '{expected_category}'"})
+    return {"vars": {"ticket": vars_text}, "metadata": meta, "assert": asserts}
+
+
+def main() -> None:
+    sources = [json.loads(l) for l in Path("sources.jsonl").read_text("utf-8").splitlines()]
+    tests = []
+    for s in sources:
+        tests.append(test_case(s["text"], {"source_id": s["id"], "relation": "none", "kind": "source"},
+                               s["category"]))
+        for r in RELATIONS:
+            new_text = r.transform(s["text"])
+            if new_text == s["text"]:
+                continue
+            meta = {"source_id": s["id"], "relation": r.name, "kind": r.kind}
+            tests.append(test_case(new_text, meta, r.expected_category(s["category"])))
+    Path("tests/generated.yaml").write_text(yaml.safe_dump(tests, sort_keys=False), "utf-8")
+    print(f"wrote {len(tests)} tests")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Not every relation applies to every source. A name swap does nothing on a ticket without a name, and "add a legal threat" makes no sense on a ticket that already is one. Skip unchanged texts (the starter already does) and add an `applies(source)` predicate to `Relation` for the rest. Report how many pairs each relation produced; a relation with 4 pairs has a huge CI.</Hint>
+  <Hint>Write promptfoo output with `-o results/run.json` and open the file before writing the parser: find where each row keeps the provider label, the test metadata and the raw output. Build a dict keyed by `(provider, source_id, relation)` and pair every follow-up with its `(provider, source_id, "none")` row.</Hint>
+  <Hint>Measure self-consistency with `--repeat 2` on the source cases only (a separate small config or a filter). If 4% of source outputs change between two identical calls, an invariance violation rate of 5% is barely above noise. Put the self-consistency rate as the first row of your table.</Hint>
+  <Hint>For the CI job, generate a fixed subset with a seed (for example 10 sources) so the cost per run is predictable, cache with promptfoo's built-in cache, and fail the job only on gold-anchored assertions. Report directional violation rates as a PR comment rather than a hard gate until you know their noise level.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  03-metamorphic/
+    README.md
+    prompts/
+      triage.txt
+    sources.jsonl          # 40 hand-labeled source cases
+    generate_mr_tests.py
+    relations.py           # transforms + applies() predicates, unit-tested
+    tests/
+      generated.yaml       # generated, committed for review
+      test_relations.py    # transforms are deterministic and meaning-preserving on fixtures
+    promptfooconfig.yaml
+    promptfooconfig.ci.yaml
+    check_relations.py
+    results/               # gitignored except the summary
+    REPORT.md
+  .github/workflows/metamorphic.yml
+```
+
+`03-metamorphic/README.md` outline:
+
+- Why metamorphic testing: the oracle problem in one paragraph
+- Relation catalog: name, kind, transform, expected relation, number of applicable pairs
+- How to run: `python generate_mr_tests.py`, `npx promptfoo@latest eval -o results/run.json`, `python check_relations.py results/run.json`
+- Spot-check notes for LLM-generated transforms
+- Results table per model and the main findings
+- CI subset and cost per run
+
+Suggested commits:
+
+- `feat(metamorphic): source cases and triage prompt`
+- `feat(metamorphic): relation catalog with deterministic transforms`
+- `feat(metamorphic): promptfoo config for two models`
+- `feat(metamorphic): offline relation checker with Wilson CIs`
+- `ci(metamorphic): cost-bounded suite on prompt changes`
+
+</CommitBox>
+
+<Checklist id="m9-09-review" title="Self-review" items={["Transforms are code, seeded and unit-tested; LLM paraphrases are cached and spot-checked", "Each relation reports its number of applicable pairs", "Gold-anchored relations are asserted in promptfoo; output-vs-output relations are checked offline", "Self-consistency is measured and shown as the noise floor", "Violation rates have Wilson CIs, and model differences are judged against them", "The report shows concrete violation examples a developer can reproduce", "The CI subset has a predictable cost and only hard-fails on gold-anchored checks"]} />

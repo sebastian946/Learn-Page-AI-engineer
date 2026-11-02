@@ -33,7 +33,7 @@ class CitedAnswer(BaseModel):
 def format_context(chunks: list[dict]) -> str:
     # Stable, short IDs keep the prompt compact and easy to validate
     return "\n\n".join(
-        f'<chunk id="{c["chunk_id"]}" source="{c["source"]}" page="{c["page"]}">\n{c["text"]}\n</chunk>'
+        f'<chunk id="{c["chunk_id"]}" doc="{c["doc_id"]}" section="{c["section"]}" page="{c["page"]}">\n{c["content"]}\n</chunk>'
         for c in chunks
     )
 
@@ -50,7 +50,7 @@ Luego valida después de la generación. Esta es la parte que la mayoría de los
 
 ```python
 def validate_citations(answer: CitedAnswer, chunks: list[dict]) -> list[str]:
-    by_id = {c["chunk_id"]: c["text"] for c in chunks}
+    by_id = {c["chunk_id"]: c["content"] for c in chunks}
     problems: list[str] = []
     for i, claim in enumerate(answer.claims):
         unknown = [cid for cid in claim.chunk_ids if cid not in by_id]
@@ -88,7 +88,7 @@ Una respuesta RAG pasa por muchas etapas. Cada una puede fallar de forma indepen
 | 7 | No extraído | Generación | La respuesta está en el contexto, el modelo la ignora | Instrucciones más claras, citas por afirmación |
 | 8 | Alucinación | Generación | Afirmaciones que no están en ningún chunk | Validación de citas, evals de faithfulness |
 | 9 | Formato incorrecto o incompleto | Generación | Lista solo 2 de 4 condiciones | Salida estructurada, verificaciones de completitud |
-| 10 | Fuentes obsoletas o en conflicto | Corpus | La respuesta cita una política reemplazada | Versionado, metadata `effective_from` y `superseded_by` |
+| 10 | Fuentes obsoletas o en conflicto | Corpus | La respuesta cita una política reemplazada | Versionado con `effective_date` e `is_current`, filtrado dentro del retrieval |
 
 Varios de estos están adaptados del paper "Seven Failure Points When Engineering a Retrieval Augmented Generation System" (Barnett et al., 2024), más algunos que aparecen constantemente en dominios regulados.
 
@@ -128,7 +128,7 @@ La falla más dañina en un contexto de préstamos es una respuesta segura a una
 - **Confiar en las citas sin revisarlas.** Los modelos pueden inventar IDs de chunk plausibles o citar mal. Valida cada una.
 - **Usar IDs inestables.** Si los IDs de chunk cambian en cada re-indexado, los traces viejos y los golden datasets se rompen. Deriva los IDs del ID del documento + sección + hash del contenido.
 - **No tener preguntas sin respuesta en los tests.** Tu sistema se verá genial hasta que un usuario real pregunte algo fuera del corpus.
-- **Ignorar versiones de documentos.** Las políticas cambian. Sin metadata `effective_from`, el retriever mezcla felizmente reglas de 2023 y 2026.
+- **Ignorar versiones de documentos.** Las políticas cambian. Sin filtros de `effective_date` e `is_current`, el retriever mezcla felizmente las reglas de fondos de regalo de FHA de 2024 (v2) y 2026 (v3) y el modelo cita la que quede más arriba.
 - **Arreglar la generación cuando el retrieval está roto.** Ajustar el prompt no puede hacer aparecer un chunk que nunca se recuperó. Diagnostica primero.
 
 ## Cómo aparece en entrevistas

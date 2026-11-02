@@ -1,0 +1,171 @@
+## De dónde salen los buenos casos de prueba
+
+El módulo 3 cubrió lo básico de los golden datasets, incluido cuándo son aceptables los datos sintéticos, y lo básico del red-teaming. Esta lección va más lejos en tres preguntas que el dueño de los evals enfrenta cada semana:
+
+1. ¿Cómo genero muchos casos de prueba con un LLM **sin engañarme a mí mismo**?
+2. ¿Cómo me aseguro de cubrir los casos borde y no solo el happy path?
+3. ¿Cómo pruebo el comportamiento cuando **no tengo una respuesta correcta** para cada entrada?
+
+La tercera pregunta es el clásico problema del oráculo de pruebas. Los testers lo resolvieron hace décadas con **metamorphic testing** (pruebas metamórficas), y encaja perfecto con los sistemas LLM.
+
+## Datos sintéticos sin autoengaño
+
+Los casos de prueba generados por LLM son baratos y rápidos. También tienen sesgos predecibles:
+
+- **Demasiado fáciles y limpios.** Los tickets generados se leen como prompts bien escritos. Los usuarios reales escriben "hola mi cosa no sirve desde el martes??".
+- **Sesgo de la misma familia.** Si el generador y el sistema bajo prueba vienen de la misma familia de modelos, los casos coinciden con el estilo y la redacción del propio sistema. Los puntajes se ven geniales y significan poco.
+- **Fuga de etiquetas.** Si el generador también escribe la respuesta esperada, estás probando si el modelo B coincide con el modelo A, no si tiene razón.
+- **Colapso de modos.** Pides 500 casos y obtienes 40 ideas con 12 reformulaciones cada una.
+
+Contramedidas que funcionan:
+
+1. **Siembra desde la realidad.** Parte de entradas reales (anonimizadas) y pídele al generador variaciones, no invenciones.
+2. **Genera desde una taxonomía.** Define ejes (intención × persona × dificultad × tipo de caso borde) y genera por celda. Así puedes medir la cobertura por celda en lugar de tener esperanza.
+3. **Usa una familia de modelos distinta** para generar que la del sistema bajo prueba y la del juez.
+4. **Deduplica.** Duplicados exactos, casi-duplicados dentro del set sintético y casi-duplicados contra tu golden set existente y contra cualquier ejemplo few-shot del prompt. Un caso de prueba que parafrasea un ejemplo few-shot está contaminado.
+5. **Trata las etiquetas generadas como hipótesis.** Un humano revisa una muestra aleatoria. Estima la tasa de error de las etiquetas con un intervalo de Wilson (lección 02). Si 6 de 60 etiquetas revisadas están mal, el intervalo al 95% va aproximadamente de 5% a 20%. Eso es demasiado alto para un gate de release, así que revisas todo o arreglas el generador.
+6. **Etiqueta la procedencia y reporta por separado.** Cada ítem lleva `source: real | synthetic | perturbed`. Reporta métricas por origen. Si los puntajes sintéticos son mucho más altos que los reales, tus datos sintéticos son demasiado fáciles.
+
+```python
+import itertools
+import json
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+TAXONOMY = {
+    "intent": ["billing_refund", "shipping", "account", "legal_threat"],
+    "persona": ["terse mobile user", "angry repeat customer", "non-native English speaker"],
+    "edge": ["none", "two intents in one message", "typos and no punctuation", "negation"],
+}
+
+def generation_jobs() -> list[dict]:
+    keys = list(TAXONOMY)
+    return [dict(zip(keys, combo)) for combo in itertools.product(*TAXONOMY.values())]
+
+def near_duplicates(new: list[str], existing: list[str], threshold: float = 0.85) -> set[int]:
+    """Indexes in `new` that are near-duplicates of each other or of `existing` (golden set, few-shots)."""
+    vec = TfidfVectorizer(ngram_range=(1, 2)).fit(new + existing)
+    a = vec.transform(new)
+    drop: set[int] = set()
+    if existing:
+        sims = cosine_similarity(a, vec.transform(existing)).max(axis=1)
+        drop |= {i for i, s in enumerate(sims) if s >= threshold}
+    within = cosine_similarity(a)
+    for i in range(len(new)):
+        if i in drop:
+            continue
+        for j in range(i + 1, len(new)):
+            if within[i, j] >= threshold:
+                drop.add(j)
+    return drop
+
+jobs = generation_jobs()   # 4 x 3 x 4 = 48 cells; generate 3-5 cases per cell with a different model family
+print(len(jobs), json.dumps(jobs[0]))
+```
+
+TF-IDF atrapa casi-duplicados léxicos de forma barata. Agrega una pasada basada en embeddings para las paráfrasis si tu set es grande.
+
+## Taxonomías de casos borde
+
+Una taxonomía convierte "piensa en casos borde" en una checklist contra la cual puedes medir cobertura. Un punto de partida práctico para funcionalidades con LLM:
+
+| Categoría | Ejemplos |
+|---|---|
+| Forma de la entrada | Vacía, una palabra, muy larga, hilo de correo pegado, HTML, ruido de OCR, emojis, idiomas mezclados |
+| Calidad del lenguaje | Errores de tipeo, sin puntuación, jerga, gramática de no nativo, todo en mayúsculas |
+| Semántica | Negación ("NO quiero un reembolso"), múltiples intenciones, ambigüedad, sarcasmo, hipotéticos |
+| Números y entidades | Fechas en distintos formatos, monedas, unidades, nombres raros, IDs que parecen números |
+| Alcance | Preguntas fuera del dominio, preguntas respondibles en parte, preguntas que los documentos no pueden responder |
+| Contexto (RAG) | Ningún documento relevante, documentos en conflicto, documento desactualizado, documento muy largo |
+| Conversación | Cambio de tema, el usuario se corrige, hace referencia a tres turnos atrás, repite la pregunta |
+| Adversarial | Prompt injection, jailbreaks con role-play, intentos de exfiltración de datos (ver módulo 3) |
+
+Para cada categoría, registra cuántos ítems tienes y la tasa de aprobación. Las celdas vacías son tus huecos de cobertura. Es partición de equivalencia y análisis de valores límite aplicados al lenguaje.
+
+## Metamorphic testing
+
+Muchas veces no puedes decir cuál es la salida *correcta* para una entrada nueva. Pero sí puedes decir cómo **debería relacionarse** la salida con la salida de una entrada modificada. Esa relación es una **relación metamórfica (MR)**. Si la relación se viola, al menos una de las dos salidas está mal, y encontraste un bug sin oráculo.
+
+El paper de CheckList (Ribeiro et al., 2020) llevó esto a NLP con tres tipos de prueba: pruebas de funcionalidad mínima, pruebas de invariancia y pruebas de expectativa direccional. Para apps LLM, relaciones útiles son:
+
+- **Invariancia:** la etiqueta de salida o el valor extraído no deben cambiar. Parafrasea la pregunta; agrega errores de tipeo; cambia el nombre de un cliente ("Maria" por "John"); reordena los pasajes recuperados; agrega cortesía irrelevante; traduce la entrada.
+- **Direccional:** la salida debe moverse en una dirección conocida. Agrega "mi abogado los contactará" y la prioridad no debe bajar. Quita el único pasaje relevante y la respuesta del RAG debe convertirse en un rechazo. Aumenta el monto del préstamo y la cuota mensual debe aumentar.
+- **Equivalencia entre formatos:** el mismo contrato como texto de PDF y como texto de DOCX debe producir los mismos campos extraídos.
+- **Consistencia:** preguntar "¿el plazo de preaviso es de 30 días?" debe coincidir con el `notice_days` extraído.
+
+```python
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class MR:
+    name: str
+    transform: Callable[[str], str]
+    relation: Callable[[str, str], bool]   # (source_output, followup_output) -> holds?
+
+PRIORITY = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
+
+RELATIONS = [
+    MR("name_swap_invariance", lambda t: t.replace("Maria", "John"), lambda a, b: a == b),
+    MR("polite_suffix_invariance", lambda t: t + " Thanks so much, have a great day!", lambda a, b: a == b),
+    MR(
+        "legal_threat_raises_priority",
+        lambda t: t + " If this is not fixed my lawyer will contact you.",
+        lambda a, b: PRIORITY[b] >= PRIORITY[a],
+    ),
+]
+
+def run_mrs(system: Callable[[str], str], sources: list[str]) -> dict[str, float]:
+    """Returns violation rate per relation. Each violation is a bug candidate to triage."""
+    out: dict[str, float] = {}
+    for mr in RELATIONS:
+        pairs = [(system(s), system(mr.transform(s))) for s in sources if mr.transform(s) != s]
+        violations = [p for p in pairs if not mr.relation(*p)]
+        out[mr.name] = len(violations) / len(pairs) if pairs else float("nan")
+    return out
+```
+
+Dos advertencias. Primero, el no determinismo puede violar una relación de invariancia por sí solo. Corre la entrada fuente dos veces y mide la tasa de auto-inconsistencia; ese es el piso para cada MR de invariancia. Segundo, una transformación puede cambiar el significado por accidente (una paráfrasis "inofensiva" que pierde una negación). Genera las transformaciones con código cuando puedas y revisa por muestreo las paráfrasis generadas por LLM.
+
+## Pruebas de perturbación y robustez
+
+Las pruebas de robustez son pruebas de invariancia a escala. Aplica una familia de perturbaciones (errores de tipeo en el 5% de los caracteres, mayúsculas, espacios, sinónimos, confusiones de caracteres estilo OCR como `0` por `O`) y reporta la **tasa de cambio** (flip rate): la fracción de ítems cuya salida cambia. Repórtala por tipo de perturbación y por segmento. Un modelo que cambia el 2% de las etiquetas con errores de tipeo está bien. Uno que cambia el 15% fallará con el tráfico móvil real.
+
+Los números de robustez son especialmente útiles en migraciones de modelo: un modelo más barato suele igualar al caro con entradas limpias y degradarse más rápido con entradas ruidosas. Ese es un riesgo que tu golden set limpio nunca mostrará.
+
+<Callout type="tip" title="Lente SDET">
+
+Metamorphic testing es property-based testing para el lenguaje. Ya conoces el patrón de Hypothesis o fast-check: no afirmas una salida específica, afirmas una propiedad que debe cumplirse sobre entradas generadas. Cada relación violada es un reporte de bug reproducible: entrada fuente, entrada transformada y ambas salidas.
+
+</Callout>
+
+## Errores comunes
+
+- **Generar casos y etiquetas con el mismo modelo que evalúas.** Mides el acuerdo contigo mismo.
+- **Sin deduplicar contra los ejemplos few-shot o el golden set existente.** La contaminación infla los puntajes.
+- **Mezclar ítems sintéticos y reales en un solo número.** Reporta por origen.
+- **Pruebas de invariancia sin un baseline de auto-consistencia.** Culpas a la transformación por simple no determinismo.
+- **Transformaciones de paráfrasis que cambian el significado.** Revísalas por muestreo, o las "violaciones" serán falsas alarmas.
+- **Casos borde sin contabilidad de cobertura.** Sin una taxonomía no puedes decir qué falta.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo pruebas una funcionalidad LLM cuando no tienes la respuesta correcta para la mayoría de las entradas?" level="senior">
+
+Uso metamorphic testing. Defino relaciones entre las salidas de una entrada y de una versión transformada de ella. Relaciones de invariancia: las paráfrasis, los errores de tipeo, los cambios de nombre o el reordenamiento de pasajes no deben cambiar la etiqueta ni el valor extraído. Relaciones direccionales: agregar una amenaza legal no debe bajar la prioridad; quitar el único pasaje relevante debe convertir la respuesta en un rechazo. Cada violación es un candidato a bug con un par reproducible. Primero mido la tasa de auto-inconsistencia del sistema, porque el no determinismo por sí solo puede violar la invariancia. Reporto las tasas de violación por relación y por segmento, y convierto las violaciones confirmadas en casos de regresión.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuáles son los riesgos de los datos de eval generados por LLM y cómo los mitigas?" level="mid">
+
+Los datos generados tienden a ser demasiado limpios, repetitivos y estilísticamente cercanos al generador. Si la misma familia genera los casos y las etiquetas y además corre el sistema, los puntajes se inflan. Siembro la generación desde entradas reales anonimizadas, genero por celda de una taxonomía de casos borde, uso otra familia de modelos para generar, deduplico contra el propio set, el golden set y los ejemplos few-shot del prompt, y hago que humanos revisen una muestra aleatoria de etiquetas con un intervalo para la tasa de error. Cada ítem lleva su origen y reporto las métricas por separado para reales y sintéticos.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Ribeiro et al., "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList": https://arxiv.org/abs/2005.04118
+- Chen et al., "Metamorphic Testing: A Review of Challenges and Opportunities" (ACM Computing Surveys, 2018): https://dl.acm.org/doi/10.1145/3143561
+- Configuración de casos de prueba en promptfoo: https://www.promptfoo.dev/docs/configuration/test-cases/
+- Hypothesis (property-based testing para Python): https://hypothesis.readthedocs.io

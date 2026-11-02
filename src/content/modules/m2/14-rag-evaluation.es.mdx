@@ -37,7 +37,7 @@ El valor está en leer las métricas juntas:
 | Faithfulness alta, answer relevance baja | El modelo tiene grounding pero responde otra pregunta (a menudo por mala reescritura de consultas) |
 | Context precision baja, recall alto | Los chunks correctos están pero enterrados; agrega o ajusta un re-ranker |
 
-Si tienes IDs de chunks etiquetados, calcula también métricas deterministas de retrieval: **recall@k** y **MRR**. Son gratis, rápidas y sin ruido. Usa métricas juzgadas por LLM para lo que las deterministas no pueden capturar.
+Si tus ítems están etiquetados con el documento y la sección esperados, calcula también métricas deterministas de retrieval: **hit@k** (o recall@k) y **MRR**. Son gratis, rápidas y sin ruido. Usa métricas juzgadas por LLM para lo que las deterministas no pueden capturar.
 
 ## Ejecutar las métricas con Ragas
 
@@ -130,12 +130,14 @@ Ejecútalo con `deepeval test run tests/test_rag_golden.py`. Por defecto DeepEva
 
 ## Golden datasets
 
-El dataset importa más que la librería. Un ítem golden se ve así:
+El dataset importa más que la librería. Lo has ido construyendo desde `02-chunking/` (preguntas etiquetadas con `expected_doc_id` y `expected_section`, y luego `category` y `filters` en `04-hybrid/`). Para las métricas de generación, cada ítem necesita además una respuesta de referencia escrita en `reference`:
 
 ```json
-{"id": "dti-007", "question": "Can a borrower exceed 45% DTI on a conventional loan?",
- "reference": "Yes, up to 50% with compensating factors such as 6 months of reserves.",
- "relevant_chunk_ids": ["uw-guide-4.2-a1f3"], "tags": ["dti", "conventional"], "answerable": true}
+{"id": "gift-004", "question": "Under the current FHA policy, can a gift come from the borrower's employer?",
+ "expected_doc_id": "fha-gift-funds_v3", "expected_section": "3.2 Acceptable Donors",
+ "category": "paraphrase", "filters": {"jurisdictions": ["US"]},
+ "reference": "Yes. The 2026 policy (v3) accepts gifts from an employer, documented with a signed gift letter.",
+ "difficulty": "lookup", "answerable": true}
 ```
 
 Constrúyelo como un plan de pruebas:
@@ -174,7 +176,7 @@ Faithfulness verifica si cada afirmación de la respuesta está respaldada por e
 
 <InterviewQuestion question="¿Cómo construirías el primer dataset de evaluación para un nuevo producto RAG?" level="senior">
 
-Empiezo con 30–50 ítems escritos junto a un experto del dominio, cubriendo los temas principales, varios tipos de dificultad (búsqueda, multi-hop, numérica) y un 10–20% de preguntas sin respuesta. Cada ítem tiene una respuesta de referencia y los IDs de chunks relevantes para calcular recall@k determinista junto a las métricas juzgadas por LLM. Puedo arrancar con generación sintética, pero cada ítem se revisa. El dataset vive en git con versionado, cada bug de producción se vuelve un nuevo ítem y, cuando hay tráfico, tomo muestras de preguntas reales. Fijo el modelo juez y las versiones de la librería de métricas para que los scores sean comparables en el tiempo.
+Empiezo con 30–50 ítems escritos junto a un experto del dominio, cubriendo los temas principales, varios tipos de dificultad (búsqueda, multi-hop, numérica) y un 10–20% de preguntas sin respuesta. Cada ítem tiene una respuesta de referencia y el documento y la sección esperados para calcular recall@k determinista junto a las métricas juzgadas por LLM. Puedo arrancar con generación sintética, pero cada ítem se revisa. El dataset vive en git con versionado, cada bug de producción se vuelve un nuevo ítem y, cuando hay tráfico, tomo muestras de preguntas reales. Fijo el modelo juez y las versiones de la librería de métricas para que los scores sean comparables en el tiempo.
 
 </InterviewQuestion>
 

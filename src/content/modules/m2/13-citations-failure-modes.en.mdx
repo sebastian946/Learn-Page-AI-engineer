@@ -33,7 +33,7 @@ class CitedAnswer(BaseModel):
 def format_context(chunks: list[dict]) -> str:
     # Stable, short IDs keep the prompt compact and easy to validate
     return "\n\n".join(
-        f'<chunk id="{c["chunk_id"]}" source="{c["source"]}" page="{c["page"]}">\n{c["text"]}\n</chunk>'
+        f'<chunk id="{c["chunk_id"]}" doc="{c["doc_id"]}" section="{c["section"]}" page="{c["page"]}">\n{c["content"]}\n</chunk>'
         for c in chunks
     )
 
@@ -50,7 +50,7 @@ Then validate after generation. This is the part most tutorials skip:
 
 ```python
 def validate_citations(answer: CitedAnswer, chunks: list[dict]) -> list[str]:
-    by_id = {c["chunk_id"]: c["text"] for c in chunks}
+    by_id = {c["chunk_id"]: c["content"] for c in chunks}
     problems: list[str] = []
     for i, claim in enumerate(answer.claims):
         unknown = [cid for cid in claim.chunk_ids if cid not in by_id]
@@ -88,7 +88,7 @@ A RAG answer passes through many stages. Each can fail independently, and the sy
 | 7 | Not extracted | Generation | Answer is in context, model ignores it | Clearer instructions, claim-level citation |
 | 8 | Hallucination | Generation | Claims not in any chunk | Citation validation, faithfulness evals |
 | 9 | Wrong format or incomplete | Generation | Lists only 2 of 4 conditions | Structured output, completeness checks |
-| 10 | Stale or conflicting sources | Corpus | Answer cites a superseded policy | Versioning, `effective_from` and `superseded_by` metadata |
+| 10 | Stale or conflicting sources | Corpus | Answer cites a superseded policy | Versioning with `effective_date` and `is_current`, filtered inside retrieval |
 
 Several of these are adapted from the paper "Seven Failure Points When Engineering a Retrieval Augmented Generation System" (Barnett et al., 2024), plus a few that show up constantly in regulated domains.
 
@@ -128,7 +128,7 @@ The most damaging failure in a lending context is a confident answer to a questi
 - **Trusting citations without checking.** Models can invent plausible chunk IDs or misquote. Validate every one.
 - **Using unstable IDs.** If chunk IDs change on every re-index, old traces and golden datasets break. Derive IDs from document ID + section + content hash.
 - **No unanswerable questions in tests.** Your system will look great until a real user asks something off-corpus.
-- **Ignoring document versions.** Policies change. Without `effective_from` metadata, the retriever happily mixes 2023 and 2026 rules.
+- **Ignoring document versions.** Policies change. Without `effective_date` and `is_current` filters, the retriever happily mixes the 2024 (v2) and 2026 (v3) FHA gift-funds rules and the model cites whichever ranks higher.
 - **Fixing generation when retrieval is broken.** Prompt tweaking cannot surface a chunk that was never retrieved. Diagnose first.
 
 ## How this shows up in interviews

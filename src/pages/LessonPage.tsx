@@ -9,6 +9,7 @@ import { useProgress } from '../store/progress'
 import { mdxComponents } from '../components/mdx'
 import { LessonTypeIcon } from '../components/LessonTypeIcon'
 import { ExamRunner } from '../components/ExamRunner'
+import { ErrorBoundary } from '../components/ErrorBoundary'
 import { NotFound } from './NotFound'
 
 export function LessonPage() {
@@ -81,9 +82,11 @@ export function LessonPage() {
       {Content && (
         <div className="prose prose-slate max-w-none dark:prose-invert prose-headings:scroll-mt-20 prose-a:text-indigo-600 dark:prose-a:text-indigo-400">
           <MDXProvider components={mdxComponents}>
-            <Suspense fallback={<p className="text-slate-500">{t('lesson.loading')}</p>}>
-              <Content />
-            </Suspense>
+            <ErrorBoundary key={`${moduleId}/${slug}/${locale}`} fallback={t('lesson.error')}>
+              <Suspense fallback={<p className="text-slate-500">{t('lesson.loading')}</p>}>
+                <Content />
+              </Suspense>
+            </ErrorBoundary>
           </MDXProvider>
         </div>
       )}

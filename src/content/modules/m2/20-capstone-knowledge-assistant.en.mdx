@@ -30,9 +30,9 @@ Cut the median time to a correct policy answer from hours to under a minute, whi
 ## Functional requirements
 
 1. **Ingestion** of the Underwriting Guide, bulletins, product matrices (PDF) and FAQ pages (HTML). Extract text and tables, keep section numbers, page numbers and titles.
-2. **Document versioning:** each document and chunk has `effective_from` and, when applicable, `superseded_by`. Retrieval only returns chunks in force on the query date (default: today).
-3. **Metadata filters:** loan program (conventional, FHA, VA), state, document type. The user can set them, and the assistant can infer them from the question.
-4. **Hybrid retrieval:** pgvector similarity plus Postgres full-text search, fused with RRF.
+2. **Document versioning:** every document row carries `doc_type`, `jurisdiction`, `effective_date`, `is_current` and `content_hash`, the same metadata contract as `rag-lab`. By default retrieval only returns current versions; an `as_of` date selects the version that was in force on that date. Superseded versions stay in the database for audit.
+3. **Metadata filters:** jurisdiction (`US` plus the officer's state, such as `US-TX`), loan program (conventional, FHA, VA) and document type, applied inside each retrieval leg before fusion. They come from the request context first; the assistant may refine them from the question after validation.
+4. **Hybrid retrieval:** pgvector cosine similarity plus Postgres full-text search, 40 candidates per leg, fused with RRF (k = 60).
 5. **Re-ranking** of the fused candidates with a cross-encoder (local by default; a hosted re-ranker can be a configurable option).
 6. **Query rewriting:** conversation condensation for follow-ups; multi-query optional behind a flag.
 7. **Cited answers:** every factual sentence cites at least one chunk, showing document, section and page. Citations are validated before the answer is shown.
@@ -50,7 +50,7 @@ Cut the median time to a correct policy answer from hours to under a minute, whi
 | Cost | Under a target you define per 1,000 requests, computed from logged token usage and current provider pricing; document the assumption |
 | Faithfulness | ≥ 0.90 average on the golden set (Ragas or DeepEval), no answerable item below 0.5 without an explanation |
 | Context recall | ≥ 0.85 average on answerable items |
-| Retrieval | recall@5 ≥ 0.85 on items with labeled chunk IDs |
+| Retrieval | hit@5 ≥ 0.85 on items labelled with `expected_doc_id` and `expected_section` |
 | Abstention | ≥ 90% of unanswerable items correctly answered "not found" |
 | Citation validity | 100% of displayed citations point to retrieved chunks with matching quotes |
 | Security | No borrower PII in the corpus or logs; secrets via environment variables; no data sent to providers without an approved agreement (document which providers you use) |
@@ -66,8 +66,8 @@ Cut the median time to a correct policy answer from hours to under a minute, whi
 
 ## Deliverables
 
-1. Repository `mortgage-knowledge-assistant` with source code, `docker-compose.yml` (Postgres with pgvector, the API, optional Redis) and a one-command setup.
-2. A **synthetic corpus** you create: an underwriting guide (at least 30 pages), at least 8 bulletins with effective dates (at least 2 superseding earlier rules), 3 product matrices and 15 FAQ pages. Do not use any real lender's documents.
+1. Repository `mortgage-knowledge-assistant` with source code, `docker-compose.yml` (Postgres from the `pgvector/pgvector:pg17` image, the API, optional Redis) and a one-command setup.
+2. A **synthetic corpus** you create, extending the `rag-lab` corpus and its naming convention (`policies/TX/slug_vN_YYYY-MM-DD.pdf`): an underwriting guide (at least 30 pages), at least 8 bulletins with effective dates (at least 2 superseding earlier rules, including the FHA gift-funds v2 2024 and v3 2026 pair), 3 product matrices and 15 FAQ HTML pages. Do not use any real lender's documents.
 3. The golden dataset (`evals/golden.jsonl`) and the eval runner with a saved report.
 4. The dashboard (a notebook, Streamlit page or Grafana board reading your request logs).
 5. A README with architecture, design decisions, eval results, cost analysis and a demo GIF.
@@ -88,7 +88,7 @@ Cut the median time to a correct policy answer from hours to under a minute, whi
   subgraph Offline["Offline ingestion"]
     D["PDFs, bulletins, FAQ HTML"] --> P["Parse and clean (tables, sections)"]
     P --> C["Structure-aware chunking"]
-    C --> M["Metadata: program, state, effective_from, superseded_by"]
+    C --> M["Metadata: doc_type, jurisdiction, effective_date, is_current"]
     M --> E["Embed (cached by hash)"]
     E --> PG[("Postgres: pgvector + tsvector")]
   end
@@ -116,7 +116,7 @@ Notes:
 
 | Criterion | Weight | Excellent | Acceptable | Needs work |
 |---|---|---|---|---|
-| Retrieval quality | 20% | Hybrid + filters + versioning + re-rank; recall@5 and context recall meet targets with evidence | Hybrid works, one target missed with a diagnosis | Vector-only or no filtering by effective date |
+| Retrieval quality | 20% | Hybrid + filters + versioning + re-rank; hit@5 and context recall meet targets with evidence | Hybrid works, one target missed with a diagnosis | Vector-only or no filtering by effective date |
 | Grounding and citations | 20% | Claim-level citations validated; abstention meets target | Citations shown and mostly valid | Citations not validated or answers from general knowledge |
 | Evaluation suite | 20% | 50+ reviewed pairs, unanswerable and multi-turn items, per-item analysis, pinned judge | 50 pairs with aggregate scores | Fewer pairs, references copied from system output |
 | Observability, latency and cost | 15% | Per-stage traces, dashboard with p50/p95 and cost per 1k, documented assumptions | Dashboard with totals only | No cost or latency data |
@@ -127,7 +127,7 @@ Notes:
 
 **Day 1 — Corpus and ingestion.** Write the synthetic corpus, including superseding bulletins and tables. Build parsing, structure-aware chunking and metadata extraction. Load into pgvector with HNSW and full-text indexes. Start drafting golden questions while you write the documents; that is when you know the answers best.
 
-**Day 2 — Retrieval.** Hybrid search with RRF, metadata and effective-date filters, cross-encoder re-ranking, conversation condensation. Build the retrieval benchmark (recall@5, MRR) on labeled chunk IDs and tune fetch size and top-k.
+**Day 2 — Retrieval.** Hybrid search with RRF, metadata and effective-date filters, cross-encoder re-ranking, conversation condensation. Build the retrieval benchmark (hit@5, MRR per category) on the golden items labelled with document and section, reusing the `rag-lab` golden set as a starting point, and tune fetch size and top-k.
 
 **Day 3 — Generation and API.** Citation prompt, structured output, citation validation, abstention. FastAPI `POST /ask` with trace IDs and request logging. Response and embedding caches. Minimal UI.
 
@@ -137,7 +137,7 @@ Notes:
 
 ## Definition of Done
 
-<Checklist id="m2-20-dod" title="Definition of Done" items={["Synthetic corpus committed, including superseding bulletins and product matrix tables", "Ingestion keeps section, page, program, state and effective dates for every chunk", "Hybrid retrieval with RRF, metadata filters and effective-date filtering", "Cross-encoder re-ranking with a measured before/after comparison", "Follow-up questions are condensed before retrieval", "Every displayed citation is validated against retrieved chunks", "Unanswerable questions return 'not found' with links to the closest sections", "Golden dataset has 50+ reviewed pairs, 8+ unanswerable and 5+ multi-turn items", "Eval report with pinned judge, per-item analysis and targets met or explained", "Dashboard shows p50/p95 latency per stage and cost per 1,000 requests", "Every request has a reconstructable trace", "docker compose setup works on a clean machine", "README with architecture diagram, decisions, eval results, cost analysis and demo GIF", "At least three ADRs committed"]} />
+<Checklist id="m2-20-dod" title="Definition of Done" items={["Synthetic corpus committed, including superseding bulletins and product matrix tables", "Ingestion keeps section, page, doc_type, jurisdiction, effective_date, is_current and content_hash", "Hybrid retrieval with RRF, metadata filters and effective-date filtering", "Cross-encoder re-ranking with a measured before/after comparison", "Follow-up questions are condensed before retrieval", "Every displayed citation is validated against retrieved chunks", "Unanswerable questions return 'not found' with links to the closest sections", "Golden dataset has 50+ reviewed pairs, 8+ unanswerable and 5+ multi-turn items", "Eval report with pinned judge, per-item analysis and targets met or explained", "Dashboard shows p50/p95 latency per stage and cost per 1,000 requests", "Every request has a reconstructable trace", "docker compose setup works on a clean machine", "README with architecture diagram, decisions, eval results, cost analysis and demo GIF", "At least three ADRs committed"]} />
 
 ## How to present this in an interview
 

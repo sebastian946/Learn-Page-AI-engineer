@@ -1,0 +1,592 @@
+{
+  "moduleId": "m1",
+  "title": {
+    "en": "Module 1 exam",
+    "es": "Examen del módulo 1"
+  },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "Which statement about the context window is correct?",
+        "es": "¿Qué afirmación sobre la ventana de contexto es correcta?"
+      },
+      "options": {
+        "en": [
+          "It is one token budget shared by the system prompt, tool definitions, history, documents and the generated output.",
+          "It only limits the input; output tokens are budgeted separately by max_tokens and never count against the window.",
+          "Tool definitions are free: they are not counted as tokens.",
+          "Filling the window is recommended because larger prompts always improve accuracy."
+        ],
+        "es": [
+          "Es un único presupuesto de tokens compartido por el system prompt, las definiciones de tools, el historial, los documentos y la salida generada.",
+          "Solo limita la entrada; los tokens de salida se presupuestan aparte con max_tokens y nunca cuentan contra la ventana.",
+          "Las definiciones de tools son gratis: no se cuentan como tokens.",
+          "Se recomienda llenar la ventana porque los prompts más grandes siempre mejoran la precisión."
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "The window is a single budget: system prompt, tool schemas, history, retrieved documents and the output all share it. Bigger prompts cost more, add latency and can reduce quality when relevant facts are buried.",
+        "es": "La ventana es un solo presupuesto: system prompt, schemas de tools, historial, documentos recuperados y la salida lo comparten. Los prompts más grandes cuestan más, agregan latencia y pueden reducir la calidad cuando los datos relevantes quedan enterrados."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "Your shared client sends temperature=0 on every call. After pointing the \"fast\" route to claude-haiku-5-5, every call fails with HTTP 400. What is the best fix?",
+        "es": "Tu cliente compartido envía temperature=0 en cada llamada. Después de apuntar la ruta \"fast\" a claude-haiku-5-5, todas las llamadas fallan con HTTP 400. ¿Cuál es la mejor solución?"
+      },
+      "options": {
+        "en": [
+          "Treat sampling parameters as a per-model capability in config, drop them when unsupported, and use effort as the cost/quality lever on current Claude models.",
+          "Retry the 400 with exponential backoff until it succeeds.",
+          "Send temperature=0.01 instead, since only exactly zero is rejected.",
+          "Switch to top_p=0 because top_p is always accepted when temperature is not."
+        ],
+        "es": [
+          "Tratar los parámetros de sampling como una capacidad por modelo en la configuración, descartarlos cuando no se soportan y usar effort como palanca de costo/calidad en los modelos actuales de Claude.",
+          "Reintentar el 400 con backoff exponencial hasta que funcione.",
+          "Enviar temperature=0.01, ya que solo se rechaza exactamente cero.",
+          "Cambiar a top_p=0 porque top_p siempre se acepta cuando temperature no."
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "Current Claude models reject non-default temperature, top_p and top_k. A 400 is never retryable. A provider abstraction should carry capability flags per model and drop unsupported parameters; effort is the lever for these models.",
+        "es": "Los modelos actuales de Claude rechazan valores no predeterminados de temperature, top_p y top_k. Un 400 nunca es reintentable. Una abstracción de proveedores debe llevar flags de capacidad por modelo y descartar parámetros no soportados; effort es la palanca para estos modelos."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "multi",
+      "prompt": {
+        "en": "Which errors should your retry layer retry? Select all that apply.",
+        "es": "¿Qué errores debe reintentar tu capa de reintentos? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "429 Too Many Requests",
+          "529 Overloaded",
+          "401 Unauthorized",
+          "Connection timeout",
+          "400 Bad Request: unknown parameter"
+        ],
+        "es": [
+          "429 Too Many Requests",
+          "529 Overloaded",
+          "401 Unauthorized",
+          "Timeout de conexión",
+          "400 Bad Request: parámetro desconocido"
+        ]
+      },
+      "answer": [
+        0,
+        1,
+        3
+      ],
+      "explanation": {
+        "en": "Rate limits, provider overload, 5xx, timeouts and connection errors are transient. 400 and 401 are caused by your request or credentials; retrying wastes time and hides bugs.",
+        "es": "Los rate limits, la sobrecarga del proveedor, los 5xx, los timeouts y los errores de conexión son transitorios. Los 400 y 401 los causa tu request o tus credenciales; reintentarlos pierde tiempo y oculta bugs."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "code",
+      "prompt": {
+        "en": "What does this Pydantic v2 snippet print?",
+        "es": "¿Qué imprime este fragmento de Pydantic v2?"
+      },
+      "code": "from typing import Literal\nfrom pydantic import BaseModel, ConfigDict, Field, ValidationError\n\nclass Triage(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n    category: Literal[\"billing\", \"shipping\", \"other\"]\n    confidence: float = Field(ge=0, le=1)\n\nraw = '{\"category\": \"billing\", \"confidence\": 0.92, \"notes\": \"vip\"}'\ntry:\n    t = Triage.model_validate_json(raw)\n    print(\"ok\", t.category)\nexcept ValidationError as e:\n    print(\"invalid\", e.error_count())",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "invalid 1",
+          "ok billing",
+          "invalid 2",
+          "ok billing (notes is silently dropped)"
+        ],
+        "es": [
+          "invalid 1",
+          "ok billing",
+          "invalid 2",
+          "ok billing (notes se descarta en silencio)"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "extra=\"forbid\" makes unknown fields an error. category and confidence are valid, so there is exactly one error: the extra \"notes\" field. Without extra=\"forbid\", Pydantic would ignore it by default.",
+        "es": "extra=\"forbid\" convierte los campos desconocidos en error. category y confidence son válidos, así que hay exactamente un error: el campo extra \"notes\". Sin extra=\"forbid\", Pydantic lo ignoraría por defecto."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of one tool calling round-trip with the Anthropic Messages API.",
+        "es": "Ordena los pasos de un ciclo de tool calling con la Messages API de Anthropic."
+      },
+      "items": {
+        "en": [
+          "Send messages together with tool definitions (name, description, input_schema)",
+          "Receive a response with stop_reason \"tool_use\" and tool_use blocks",
+          "Validate each tool input with Pydantic",
+          "Execute the tools",
+          "Append the full assistant turn, then one user turn with tool_result blocks referencing each tool_use_id",
+          "Call the model again and receive the final answer"
+        ],
+        "es": [
+          "Enviar los mensajes junto con las definiciones de tools (name, description, input_schema)",
+          "Recibir una respuesta con stop_reason \"tool_use\" y bloques tool_use",
+          "Validar cada input de tool con Pydantic",
+          "Ejecutar las tools",
+          "Agregar el turno completo del asistente y luego un turno de usuario con bloques tool_result que referencian cada tool_use_id",
+          "Llamar al modelo de nuevo y recibir la respuesta final"
+        ]
+      },
+      "explanation": {
+        "en": "The model only requests tools; your code validates and executes them, sends results back linked by id, and calls the model again. Validation comes before execution because your function is the trust boundary.",
+        "es": "El modelo solo solicita tools; tu código las valida y ejecuta, devuelve los resultados vinculados por id y llama al modelo de nuevo. La validación va antes de la ejecución porque tu función es la frontera de confianza."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "Claude returns three tool_use blocks in one assistant turn. How should you send the results back?",
+        "es": "Claude devuelve tres bloques tool_use en un mismo turno del asistente. ¿Cómo debes devolver los resultados?"
+      },
+      "options": {
+        "en": [
+          "All three tool_result blocks in a single user message, each with its tool_use_id",
+          "Three separate user messages, one per result, in the same order",
+          "Only the first result; the model will request the others again",
+          "A single text message summarizing the three results"
+        ],
+        "es": [
+          "Los tres bloques tool_result en un único mensaje de usuario, cada uno con su tool_use_id",
+          "Tres mensajes de usuario separados, uno por resultado, en el mismo orden",
+          "Solo el primer resultado; el modelo volverá a solicitar los demás",
+          "Un único mensaje de texto que resuma los tres resultados"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "Parallel tool results go back together in one user turn, matched by tool_use_id. Splitting them across messages breaks the expected shape and discourages parallel calls.",
+        "es": "Los resultados de tools paralelas vuelven juntos en un turno de usuario, emparejados por tool_use_id. Dividirlos en varios mensajes rompe la forma esperada y desincentiva las llamadas paralelas."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "code",
+      "prompt": {
+        "en": "What does this asyncio program print?",
+        "es": "¿Qué imprime este programa de asyncio?"
+      },
+      "code": "import asyncio\n\nactive = 0\npeak = 0\nsem = asyncio.Semaphore(3)\n\nasync def call(i: int) -> None:\n    global active, peak\n    async with sem:\n        active += 1\n        peak = max(peak, active)\n        await asyncio.sleep(0.01)\n        active -= 1\n\nasync def main() -> None:\n    await asyncio.gather(*(call(i) for i in range(10)))\n    print(peak)\n\nasyncio.run(main())",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "3",
+          "10",
+          "1",
+          "It raises because the semaphore is created outside the event loop"
+        ],
+        "es": [
+          "3",
+          "10",
+          "1",
+          "Lanza un error porque el semáforo se crea fuera del event loop"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "gather starts all 10 coroutines, but the semaphore lets only 3 inside the block at once, so peak concurrency is 3. Since Python 3.10, asyncio primitives bind to the running loop on first use, so creating it at module level is fine.",
+        "es": "gather inicia las 10 corrutinas, pero el semáforo solo deja entrar a 3 al bloque a la vez, así que la concurrencia máxima es 3. Desde Python 3.10, las primitivas de asyncio se vinculan al loop en ejecución en su primer uso, así que crearlo a nivel de módulo está bien."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "order",
+      "prompt": {
+        "en": "Order the events of a simple single-block Anthropic streaming response.",
+        "es": "Ordena los eventos de una respuesta en streaming simple de Anthropic con un solo bloque."
+      },
+      "items": {
+        "en": [
+          "message_start",
+          "content_block_start",
+          "content_block_delta (repeated)",
+          "content_block_stop",
+          "message_delta (stop_reason, output usage)",
+          "message_stop"
+        ],
+        "es": [
+          "message_start",
+          "content_block_start",
+          "content_block_delta (repetido)",
+          "content_block_stop",
+          "message_delta (stop_reason, usage de salida)",
+          "message_stop"
+        ]
+      },
+      "explanation": {
+        "en": "message_start carries the message id and input usage; blocks open, stream deltas and close; message_delta carries the stop reason and cumulative output tokens; message_stop ends the stream. Ping events can appear anywhere.",
+        "es": "message_start trae el id del mensaje y el usage de entrada; los bloques se abren, transmiten deltas y se cierran; message_delta trae el stop reason y los tokens de salida acumulados; message_stop termina el stream. Los eventos ping pueden aparecer en cualquier momento."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "multi",
+      "prompt": {
+        "en": "Which are good practices when streaming LLM responses to users? Select all that apply.",
+        "es": "¿Cuáles son buenas prácticas al hacer streaming de respuestas LLM a los usuarios? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Enforce an idle timeout between chunks, not just a total request timeout",
+          "Retry transparently only if nothing has been forwarded to the user yet",
+          "Parse a tool input only after its content block has stopped",
+          "Use an unbounded queue between the provider stream and a slow client",
+          "Catch CancelledError and keep reading so the full answer is logged"
+        ],
+        "es": [
+          "Aplicar un timeout de inactividad entre chunks, no solo un timeout total del request",
+          "Reintentar de forma transparente solo si aún no se ha enviado nada al usuario",
+          "Parsear el input de una tool solo después de que su bloque de contenido se detuvo",
+          "Usar una cola sin límite entre el stream del proveedor y un cliente lento",
+          "Atrapar CancelledError y seguir leyendo para que la respuesta completa quede registrada"
+        ]
+      },
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation": {
+        "en": "Idle timeouts catch stalled streams, retries after partial output duplicate text, and partial_json fragments are not valid JSON. Unbounded queues leak memory with slow clients, and swallowing CancelledError keeps generating and billing after the client left.",
+        "es": "Los timeouts de inactividad detectan streams detenidos, reintentar después de una salida parcial duplica texto y los fragmentos partial_json no son JSON válido. Las colas sin límite fugan memoria con clientes lentos, y tragarse CancelledError sigue generando y facturando después de que el cliente se fue."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "single",
+      "prompt": {
+        "en": "Prompt ticket-triage is at 1.4.0. You add a new category \"warranty_claim\" to the output schema and the prompt. What is the next version?",
+        "es": "El prompt ticket-triage está en 1.4.0. Agregas una nueva categoría \"warranty_claim\" al schema de salida y al prompt. ¿Cuál es la siguiente versión?"
+      },
+      "options": {
+        "en": [
+          "2.0.0",
+          "1.5.0",
+          "1.4.1",
+          "1.4.0, since the prompt id did not change"
+        ],
+        "es": [
+          "2.0.0",
+          "1.5.0",
+          "1.4.1",
+          "1.4.0, ya que el id del prompt no cambió"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "A new enum value changes the output contract: consumers with exhaustive handling of categories can break. That is a MAJOR bump. MINOR is for behavior changes with the same contract; PATCH for no intended behavior change.",
+        "es": "Un nuevo valor de enum cambia el contrato de salida: los consumidores que manejan las categorías de forma exhaustiva pueden romperse. Eso es un incremento MAJOR. MINOR es para cambios de comportamiento con el mismo contrato; PATCH para cambios sin efecto intencional en el comportamiento."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "code",
+      "prompt": {
+        "en": "What values can this backoff function print?",
+        "es": "¿Qué valores puede imprimir esta función de backoff?"
+      },
+      "code": "import random\n\ndef backoff(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:\n    return random.uniform(0, min(cap, base * 2 ** attempt))\n\nprint(backoff(3), backoff(6))",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "First between 0 and 8, second between 0 and 30",
+          "Exactly 8 and exactly 64",
+          "First between 0 and 8, second between 0 and 64",
+          "Exactly 3 and exactly 6"
+        ],
+        "es": [
+          "El primero entre 0 y 8, el segundo entre 0 y 30",
+          "Exactamente 8 y exactamente 64",
+          "El primero entre 0 y 8, el segundo entre 0 y 64",
+          "Exactamente 3 y exactamente 6"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "Full jitter samples uniformly between 0 and the exponential value, capped. 2**3 = 8, and 2**6 = 64 is capped at 30. Randomness spreads retries so clients do not retry in synchronized waves.",
+        "es": "El full jitter muestrea uniformemente entre 0 y el valor exponencial, con tope. 2**3 = 8, y 2**6 = 64 se limita a 30. La aleatoriedad dispersa los reintentos para que los clientes no reintenten en olas sincronizadas."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "single",
+      "prompt": {
+        "en": "A nightly job sends few requests, each with a very large prompt. It gets 429s although it is well under the requests-per-minute limit. What is the most likely cause?",
+        "es": "Un job nocturno envía pocos requests, cada uno con un prompt muy grande. Recibe 429 aunque está muy por debajo del límite de requests por minuto. ¿Cuál es la causa más probable?"
+      },
+      "options": {
+        "en": [
+          "It exceeds the input tokens per minute limit",
+          "The API key is invalid",
+          "The model id has a typo",
+          "The job uses async Python instead of threads"
+        ],
+        "es": [
+          "Excede el límite de tokens de entrada por minuto",
+          "La API key es inválida",
+          "El id del modelo tiene un error de tipeo",
+          "El job usa Python async en lugar de threads"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "Providers limit requests, input tokens and output tokens per minute independently. Large prompts exhaust the input-token budget first. Shape traffic with a token bucket on estimated input tokens. An invalid key or model id gives 401 or 404, not 429.",
+        "es": "Los proveedores limitan requests, tokens de entrada y tokens de salida por minuto de forma independiente. Los prompts grandes agotan primero el presupuesto de tokens de entrada. Da forma al tráfico con un token bucket sobre los tokens de entrada estimados. Una key o id de modelo inválido da 401 o 404, no 429."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "multi",
+      "prompt": {
+        "en": "Which fields belong in a per-call LLM cost record? Select all that apply.",
+        "es": "¿Qué campos pertenecen a un registro de costo por llamada LLM? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "Feature name",
+          "Prompt id and version",
+          "Attempt number (first try, retry, repair)",
+          "The concrete model id that served the call",
+          "The full raw customer message, for later analysis"
+        ],
+        "es": [
+          "Nombre de la feature",
+          "Id y versión del prompt",
+          "Número de intento (primer intento, reintento, reparación)",
+          "El id concreto del modelo que atendió la llamada",
+          "El mensaje crudo completo del cliente, para análisis posterior"
+        ]
+      },
+      "answer": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "explanation": {
+        "en": "Attribution needs feature, prompt version, attempt and the actual model (fallbacks change it). Raw customer messages are PII and do not belong in cost logs; keep them in systems with proper access controls if needed at all.",
+        "es": "La atribución necesita feature, versión de prompt, intento y el modelo real (los fallbacks lo cambian). Los mensajes crudos del cliente son PII y no pertenecen a los logs de costo; guárdalos en sistemas con controles de acceso adecuados, si es que hacen falta."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "code",
+      "prompt": {
+        "en": "What does this cost calculation print?",
+        "es": "¿Qué imprime este cálculo de costo?"
+      },
+      "code": "from decimal import Decimal\n\nMTOK = Decimal(1_000_000)\nprice_in, price_out = Decimal(\"2.00\"), Decimal(\"10.00\")  # USD per MTok\ninput_tokens, output_tokens = 12_000, 1_500\n\ncost = (input_tokens * price_in + output_tokens * price_out) / MTOK\nprint(cost)",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "0.039",
+          "39.0",
+          "0.0039",
+          "0.39"
+        ],
+        "es": [
+          "0.039",
+          "39.0",
+          "0.0039",
+          "0.39"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "12,000 x 2.00 = 24,000 and 1,500 x 10.00 = 15,000. The sum is 39,000; divided by 1,000,000 gives 0.039 USD. Note that output tokens drive a large share of the cost even though there are 8x fewer of them.",
+        "es": "12,000 x 2.00 = 24,000 y 1,500 x 10.00 = 15,000. La suma es 39,000; dividida entre 1,000,000 da 0.039 USD. Observa que los tokens de salida generan gran parte del costo aunque haya 8 veces menos."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "single",
+      "prompt": {
+        "en": "Inside an asyncio.TaskGroup, one of three tasks raises an exception. What happens?",
+        "es": "Dentro de un asyncio.TaskGroup, una de tres tareas lanza una excepción. ¿Qué pasa?"
+      },
+      "options": {
+        "en": [
+          "The remaining tasks are cancelled and the TaskGroup raises an ExceptionGroup when the block exits",
+          "The other tasks keep running and the exception is returned as a value",
+          "The exception is logged and silently ignored",
+          "The event loop stops and the program exits immediately"
+        ],
+        "es": [
+          "Las tareas restantes se cancelan y el TaskGroup lanza un ExceptionGroup al salir del bloque",
+          "Las otras tareas siguen corriendo y la excepción se devuelve como valor",
+          "La excepción se registra y se ignora en silencio",
+          "El event loop se detiene y el programa termina de inmediato"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "TaskGroup implements structured concurrency: a failure cancels siblings and surfaces as an ExceptionGroup. Use it when tasks are parts of one operation. For independent batch items, gather(return_exceptions=True) returns exceptions as values instead.",
+        "es": "TaskGroup implementa concurrencia estructurada: una falla cancela a las hermanas y aparece como un ExceptionGroup. Úsalo cuando las tareas son partes de una misma operación. Para ítems independientes de un batch, gather(return_exceptions=True) devuelve las excepciones como valores."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of a bounded validation-and-repair loop for structured extraction.",
+        "es": "Ordena los pasos de un bucle acotado de validación y reparación para extracción estructurada."
+      },
+      "items": {
+        "en": [
+          "Call the model with the JSON Schema generated from the Pydantic model",
+          "Check stop_reason and reject max_tokens or refusal",
+          "Validate the output with model_validate_json",
+          "On ValidationError, append the previous output and the structured errors as a new user turn",
+          "Call again, up to the maximum number of repairs",
+          "If still invalid, escalate to a fallback (stronger model or human queue)"
+        ],
+        "es": [
+          "Llamar al modelo con el JSON Schema generado desde el modelo Pydantic",
+          "Revisar stop_reason y rechazar max_tokens o refusal",
+          "Validar la salida con model_validate_json",
+          "Ante un ValidationError, agregar la salida anterior y los errores estructurados como un nuevo turno de usuario",
+          "Llamar de nuevo, hasta el máximo de reparaciones",
+          "Si sigue inválido, escalar a un fallback (modelo más fuerte o cola humana)"
+        ]
+      },
+      "explanation": {
+        "en": "Check truncation and refusals first, since repairing a truncated answer is pointless. A repair sends a different request that includes the errors. The loop is bounded and ends in an explicit fallback, never in silently returning invalid data.",
+        "es": "Revisa primero el truncamiento y los rechazos, porque reparar una respuesta truncada no sirve. Una reparación envía un request distinto que incluye los errores. El bucle está acotado y termina en un fallback explícito, nunca devolviendo datos inválidos en silencio."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "single",
+      "prompt": {
+        "en": "Your multi-provider client implements its own retries. Why construct the Anthropic SDK client with max_retries=0?",
+        "es": "Tu cliente multi-proveedor implementa sus propios reintentos. ¿Por qué construir el cliente del SDK de Anthropic con max_retries=0?"
+      },
+      "options": {
+        "en": [
+          "To avoid stacked retries multiplying calls and latency, and to keep one layer that can also fail over to another provider",
+          "Because the SDK cannot retry streaming requests at all",
+          "Because max_retries=0 makes requests cheaper per token",
+          "Because SDK retries ignore 429 responses"
+        ],
+        "es": [
+          "Para evitar reintentos apilados que multiplican llamadas y latencia, y mantener una sola capa que además pueda hacer failover a otro proveedor",
+          "Porque el SDK no puede reintentar requests de streaming en absoluto",
+          "Porque max_retries=0 abarata los requests por token",
+          "Porque los reintentos del SDK ignoran las respuestas 429"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "The SDK retries 429, 5xx and connection errors by default. With your own layer on top, one logical call can become many HTTP calls. Owning retries in your layer also lets you respect deadlines and fail over across providers.",
+        "es": "El SDK reintenta 429, 5xx y errores de conexión por defecto. Con tu propia capa encima, una llamada lógica puede convertirse en muchas llamadas HTTP. Encargarte de los reintentos en tu capa también te permite respetar fechas límite y hacer failover entre proveedores."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "multi",
+      "prompt": {
+        "en": "The provider enforces your JSON Schema with constrained decoding. Why do you still validate with Pydantic? Select all that apply.",
+        "es": "El proveedor impone tu JSON Schema con decodificación restringida. ¿Por qué igual validas con Pydantic? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "To enforce business rules the schema cannot express, such as an order id format",
+          "To check cross-field consistency, such as urgent priority only for some categories",
+          "To keep validation identical when switching to a model without constrained decoding",
+          "Because constrained decoding guarantees the label is correct, so Pydantic only formats it",
+          "Because Pydantic validation makes generation faster"
+        ],
+        "es": [
+          "Para aplicar reglas de negocio que el schema no puede expresar, como el formato de un id de pedido",
+          "Para verificar la consistencia entre campos, como prioridad urgent solo para algunas categorías",
+          "Para mantener la validación idéntica al cambiar a un modelo sin decodificación restringida",
+          "Porque la decodificación restringida garantiza que la etiqueta es correcta, así que Pydantic solo la formatea",
+          "Porque la validación con Pydantic hace más rápida la generación"
+        ]
+      },
+      "answer": [
+        0,
+        1,
+        2
+      ],
+      "explanation": {
+        "en": "Constrained decoding guarantees structure, not correctness or business rules. Pydantic validators encode rules and cross-field checks in one place and make behavior consistent across providers. Label accuracy is measured with evals.",
+        "es": "La decodificación restringida garantiza estructura, no corrección ni reglas de negocio. Los validadores de Pydantic codifican reglas y verificaciones entre campos en un solo lugar y hacen consistente el comportamiento entre proveedores. La precisión de las etiquetas se mide con evals."
+      }
+    },
+    {
+      "id": "q19",
+      "type": "code",
+      "prompt": {
+        "en": "This tool loop fails on the second API call when Claude requests two tools in parallel. What is the main problem?",
+        "es": "Este bucle de tools falla en la segunda llamada a la API cuando Claude solicita dos tools en paralelo. ¿Cuál es el problema principal?"
+      },
+      "code": "resp = await client.messages.create(\n    model=\"claude-sonnet-5-5\", max_tokens=1024,\n    tools=TOOLS, messages=messages,\n)\nmessages.append({\"role\": \"assistant\",\n                 \"content\": [b for b in resp.content if b.type == \"text\"]})\nfor block in resp.content:\n    if block.type == \"tool_use\":\n        out = await dispatch(block.name, block.input)\n        messages.append({\"role\": \"user\", \"content\": [\n            {\"type\": \"tool_result\", \"tool_use_id\": block.id, \"content\": out}\n        ]})\nresp2 = await client.messages.create(\n    model=\"claude-sonnet-5-5\", max_tokens=1024,\n    tools=TOOLS, messages=messages,\n)",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "The assistant turn drops the tool_use blocks, so the tool_result ids reference nothing, and parallel results are split across separate user messages",
+          "tool_result content must always be an integer",
+          "max_tokens=1024 is too small for tool calling",
+          "The second call must omit the tools parameter"
+        ],
+        "es": [
+          "El turno del asistente descarta los bloques tool_use, así que los ids de tool_result no referencian nada, y los resultados paralelos se dividen en mensajes de usuario separados",
+          "El contenido de tool_result siempre debe ser un entero",
+          "max_tokens=1024 es muy poco para tool calling",
+          "La segunda llamada debe omitir el parámetro tools"
+        ]
+      },
+      "answer": [
+        0
+      ],
+      "explanation": {
+        "en": "Append the full resp.content (text and tool_use blocks) as the assistant turn; each tool_result must match a tool_use id in that turn. All results from one turn go back in a single user message.",
+        "es": "Agrega el resp.content completo (bloques de texto y tool_use) como turno del asistente; cada tool_result debe coincidir con un id de tool_use de ese turno. Todos los resultados de un turno vuelven en un único mensaje de usuario."
+      }
+    }
+  ]
+}

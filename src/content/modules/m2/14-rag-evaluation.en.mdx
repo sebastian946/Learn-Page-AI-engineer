@@ -37,7 +37,7 @@ Reading the metrics together is where the value is:
 | High faithfulness, low answer relevance | Model is grounded but answering a different question (often bad query rewriting) |
 | Low context precision, high recall | Right chunks are there but buried; add or tune a re-ranker |
 
-If you have labeled chunk IDs, also compute deterministic retrieval metrics: **recall@k** and **MRR**. They are free, fast and not noisy. Use LLM-judged metrics for what deterministic ones cannot capture.
+If your items are labelled with the expected document and section, also compute deterministic retrieval metrics: **hit@k** (or recall@k) and **MRR**. They are free, fast and not noisy. Use LLM-judged metrics for what deterministic ones cannot capture.
 
 ## Running the metrics with Ragas
 
@@ -130,12 +130,14 @@ Run with `deepeval test run tests/test_rag_golden.py`. By default DeepEval uses 
 
 ## Golden datasets
 
-The dataset matters more than the library. A golden item looks like this:
+The dataset matters more than the library. You have been growing one since `02-chunking/` (questions labelled with `expected_doc_id` and `expected_section`, then `category` and `filters` in `04-hybrid/`). For generation metrics, each item also needs a written `reference` answer:
 
 ```json
-{"id": "dti-007", "question": "Can a borrower exceed 45% DTI on a conventional loan?",
- "reference": "Yes, up to 50% with compensating factors such as 6 months of reserves.",
- "relevant_chunk_ids": ["uw-guide-4.2-a1f3"], "tags": ["dti", "conventional"], "answerable": true}
+{"id": "gift-004", "question": "Under the current FHA policy, can a gift come from the borrower's employer?",
+ "expected_doc_id": "fha-gift-funds_v3", "expected_section": "3.2 Acceptable Donors",
+ "category": "paraphrase", "filters": {"jurisdictions": ["US"]},
+ "reference": "Yes. The 2026 policy (v3) accepts gifts from an employer, documented with a signed gift letter.",
+ "difficulty": "lookup", "answerable": true}
 ```
 
 Build it like a test plan:
@@ -174,7 +176,7 @@ Faithfulness checks whether every claim in the answer is supported by the retrie
 
 <InterviewQuestion question="How would you build the first evaluation dataset for a new RAG product?" level="senior">
 
-I start with 30–50 items written with a domain expert, covering the main topics, several difficulty types (lookup, multi-hop, numeric) and 10–20% unanswerable questions. Each item has a reference answer and the relevant chunk IDs so I can compute deterministic recall@k next to LLM-judged metrics. I may bootstrap with synthetic generation but every item is reviewed. The dataset lives in git with versioning, every production bug becomes a new item, and once there is traffic I sample real questions. I pin the judge model and metric library versions so scores are comparable over time.
+I start with 30–50 items written with a domain expert, covering the main topics, several difficulty types (lookup, multi-hop, numeric) and 10–20% unanswerable questions. Each item has a reference answer and the expected document and section so I can compute deterministic recall@k next to LLM-judged metrics. I may bootstrap with synthetic generation but every item is reviewed. The dataset lives in git with versioning, every production bug becomes a new item, and once there is traffic I sample real questions. I pin the judge model and metric library versions so scores are comparable over time.
 
 </InterviewQuestion>
 

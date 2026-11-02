@@ -1,6 +1,6 @@
 ## Objetivo
 
-Convierte "se ve bien" en números. Vas a construir un golden dataset de 30 preguntas sobre el corpus hipotecario, ejecutar tu pipeline de `05-reranking` sobre él y puntuarlo con Ragas (faithfulness, answer relevance, context precision, context recall) más recall@5 determinista. Luego compararás dos configuraciones del pipeline y escribirás un reporte breve de evaluación.
+Convierte "se ve bien" en números. Vas a completar el golden dataset que empezaste en `02-chunking/` (30+ preguntas sobre el corpus hipotecario, ahora con respuestas de referencia), ejecutar tu pipeline de `05-reranking` sobre él y puntuarlo con Ragas (faithfulness, answer relevance, context precision, context recall) más hit@5 determinista. Luego compararás dos configuraciones del pipeline y escribirás un reporte breve de evaluación.
 
 Esta carpeta se convierte en la semilla de la suite de evals del proyecto final y del Módulo 3. Constrúyela como si otras personas fueran a ejecutarla: un solo comando, reproducible y versionada.
 
@@ -10,28 +10,30 @@ Carpeta: `rag-lab/06-evals/`.
 
 ## Requisitos del dataset
 
-Escribe `data/golden.jsonl` con 30 ítems. Cada ítem:
+No empieces de cero. Tu golden set viene creciendo desde `02-chunking/data/golden.jsonl` (25+ preguntas etiquetadas con `expected_doc_id` y `expected_section`), se extendió en `04-hybrid/data/golden_hybrid.jsonl` con `category` (exact_term, filtered, paraphrase) y `filters`, y en `05-reranking/` con filas `follow_up`. Copia `05-reranking/data/golden_rerank.jsonl` a `06-evals/data/golden.jsonl` y agrega lo que necesitan las métricas de generación. Un ítem terminado:
 
 ```json
-{"id": "gift-003", "question": "Are gift funds allowed for a down payment on an investment property?",
- "reference": "No. Gift funds are allowed only for primary residences and second homes.",
- "relevant_chunk_ids": ["uw-guide-5.1-9c2e"], "tags": ["gift-funds", "investment"],
+{"id": "gift-007", "question": "In a loan with a 2025 application date, could the gift come from the borrower's employer?",
+ "expected_doc_id": "fha-gift-funds_v2", "expected_section": "3.2 Acceptable Donors",
+ "category": "filtered", "filters": {"jurisdictions": ["US"], "as_of": "2025-06-30"},
+ "reference": "No. Under the 2024 policy (v2), in force until the 2026 update, employers were not acceptable donors.",
  "difficulty": "lookup", "answerable": true}
 ```
 
-Mezcla:
+Requisitos:
 
-- Al menos 6 temas (DTI, LTV, fondos de regalo, reservas, eventos de crédito, tipos de propiedad, rate locks, costos de cierre).
-- Al menos 18 `lookup`, 6 `multi_hop` (la respuesta necesita dos chunks) y 3 `numeric` (un cálculo o umbral).
-- Al menos 4 ítems con `answerable: false`, cuya referencia sea "The policies do not cover this."
-- `relevant_chunk_ids` debe apuntar a IDs de chunks reales de tu tabla pgvector. Escribe un pequeño script que lo verifique.
+- Al menos 30 ítems en total, cada uno con una `reference` escrita a partir del documento fuente y una `difficulty`.
+- Al menos 5 ítems `multi_hop` (la respuesta necesita dos secciones) y 3 `numeric` (un cálculo o umbral).
+- Al menos 2 ítems que prueben las versiones de la política de fondos de regalo de FHA: uno respondido por la v3 vigente (2026) y otro con un filtro `as_of` que seleccione la v2 (2024).
+- Al menos 4 ítems con `answerable: false`, `expected_doc_id: null` y la referencia "The policies do not cover this."
+- Cada par `expected_doc_id` + `expected_section` debe existir en tus tablas `documents` y `chunks`. Escribe un pequeño script que lo verifique.
 
 <AcceptanceCriteria>
 
-- [ ] `data/golden.jsonl` tiene 30 ítems que cumplen el esquema, validados por un modelo Pydantic en `golden.py`.
-- [ ] `scripts/check_golden.py` falla si algún `relevant_chunk_id` no existe en la base de datos.
-- [ ] `run_eval.py --config baseline|rerank` ejecuta el pipeline sobre cada ítem y guarda los resultados crudos (respuesta, IDs y textos de chunks recuperados, latencia) en `runs/<timestamp>-<config>.jsonl`.
-- [ ] Ragas puntúa faithfulness, response relevancy, context precision y context recall con un modelo juez fijado; recall@5 y MRR@10 deterministas se calculan a partir de los IDs de chunks.
+- [ ] `data/golden.jsonl` tiene 30+ ítems (reutilizados de `05-reranking/` y extendidos) que cumplen el esquema, validados por un modelo Pydantic en `golden.py`.
+- [ ] `scripts/check_golden.py` falla si algún par `expected_doc_id` + `expected_section` no existe en la base de datos.
+- [ ] `run_eval.py --config baseline|rerank` ejecuta el pipeline sobre cada ítem y guarda los resultados crudos (respuesta, pares doc_id/section y textos recuperados, latencia) en `runs/<timestamp>-<config>.jsonl`.
+- [ ] Ragas puntúa faithfulness, response relevancy, context precision y context recall con un modelo juez fijado; hit@5 y MRR@10 deterministas se calculan a partir de `doc_id` + `section`, en total y por `category`.
 - [ ] Los ítems sin respuesta se puntúan por separado: tasa de abstención (el sistema dijo que no encontró respuesta).
 - [ ] El reporte `reports/<date>.md` incluye una tabla agregada para ambas configuraciones, los 5 peores ítems con un diagnóstico de una línea cada uno (retrieval vs generación) y una recomendación.
 - [ ] Las versiones de las librerías y el id del modelo juez quedan registrados en el encabezado del reporte.
@@ -56,8 +58,12 @@ class GoldenItem(BaseModel):
     id: str
     question: str
     reference: str
-    relevant_chunk_ids: list[str] = Field(default_factory=list)
-    tags: list[str]
+    expected_doc_id: str | None = None      # None for unanswerable items
+    expected_section: str | None = None
+    category: Literal["exact_term", "filtered", "paraphrase", "follow_up", "general"] = "general"
+    filters: dict = Field(default_factory=dict)
+    history: list[dict] = Field(default_factory=list)
+    reference: str
     difficulty: Literal["lookup", "multi_hop", "numeric"]
     answerable: bool = True
 
@@ -73,7 +79,7 @@ class RunRecord(BaseModel):
     item_id: str
     answer: str
     answer_found: bool
-    retrieved_ids: list[str]
+    retrieved_sources: list[tuple[str, str]]   # (doc_id, section), best-first
     retrieved_texts: list[str]
     latency_ms: float
 
@@ -126,7 +132,7 @@ def abstention_rate(items: list[GoldenItem], runs: dict[str, RunRecord]) -> floa
   <Hint>Escribe primero el dataset, a partir de los documentos, no de las respuestas de tu sistema. Si copias lo que dice tu pipeline en `reference`, estás haciendo snapshot testing de tus bugs. Abre el PDF, encuentra el párrafo, escribe la referencia con tus palabras y anota el ID del chunk.</Hint>
   <Hint>Separa la generación de la puntuación. Ejecuta el pipeline una vez y guarda las salidas crudas en `runs/`. La puntuación luego lee ese archivo. Vas a ajustar la puntuación y el análisis muchas veces; no quieres pagar 30 generaciones cada vez.</Hint>
   <Hint>Ragas llama al juez muchas veces por muestra (extracción de afirmaciones, verificación). Si chocas con rate limits, usa un `RunConfig(max_workers=4, timeout=120)` y pásalo a `evaluate`. Pon la temperatura del juez en 0.</Hint>
-  <Hint>Para el análisis de los 5 peores, ordena el dataframe por muestra según faithfulness y según context recall. Context recall bajo más un chunk correcto ausente de `retrieved_ids` significa retrieval. Context recall alto más faithfulness baja significa generación. Escribe ese diagnóstico en una línea por ítem.</Hint>
+  <Hint>Para el análisis de los 5 peores, ordena el dataframe por muestra según faithfulness y según context recall. Context recall bajo más el `(doc_id, section)` esperado ausente de `retrieved_sources` significa retrieval. Context recall alto más faithfulness baja significa generación. Escribe ese diagnóstico en una línea por ítem.</Hint>
 </Hints>
 
 <CommitBox repo="rag-lab">
@@ -167,4 +173,4 @@ rag-lab/
 
 </CommitBox>
 
-<Checklist id="m2-15-review" title="Autoevaluación" items={["Las referencias se escribieron a partir de los documentos fuente, no copiadas de la salida del sistema", "Cada relevant_chunk_id existe en la base de datos", "Incluí al menos 4 ítems sin respuesta y se puntúan como abstención", "Generación y puntuación son pasos separados; puedo volver a puntuar una ejecución guardada", "El id del modelo juez y las versiones de librerías están fijados y registrados", "Revisé los scores por ítem, no solo los promedios", "Cada uno de los 5 peores ítems tiene un diagnóstico retrieval vs generación", "El reporte compara dos configuraciones y hace una recomendación", "El dataset está en git para que los cambios sean revisables"]} />
+<Checklist id="m2-15-review" title="Autoevaluación" items={["Las referencias se escribieron a partir de los documentos fuente, no copiadas de la salida del sistema", "Cada doc_id y sección esperados existen en la base de datos", "Incluí al menos 4 ítems sin respuesta y se puntúan como abstención", "Generación y puntuación son pasos separados; puedo volver a puntuar una ejecución guardada", "El id del modelo juez y las versiones de librerías están fijados y registrados", "Revisé los scores por ítem, no solo los promedios", "Cada uno de los 5 peores ítems tiene un diagnóstico retrieval vs generación", "El reporte compara dos configuraciones y hace una recomendación", "El dataset está en git para que los cambios sean revisables"]} />

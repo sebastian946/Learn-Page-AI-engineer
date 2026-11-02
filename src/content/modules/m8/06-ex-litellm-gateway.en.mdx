@@ -1,0 +1,172 @@
+## Goal
+
+Stand up a small AI gateway on your laptop and prove three policies with automated tests:
+
+1. **Fallback:** when the primary provider fails, requests still succeed through the backup.
+2. **Access control:** a team can only use the model aliases it was granted.
+3. **Budgets:** a team that spends its budget gets rejected until the period resets.
+
+You will run LiteLLM proxy, Postgres and Redis in docker-compose. To make failures reproducible and free, the "providers" are two copies of a tiny mock server that speaks the OpenAI chat completions format and can be told to fail. An optional third model points at the real Anthropic API if you set `ANTHROPIC_API_KEY`.
+
+Think of it as contract testing for infrastructure: the gateway config is the system under test, and pytest is the client.
+
+<AcceptanceCriteria>
+
+- [ ] `docker compose up` starts `litellm`, `postgres`, `redis`, `mock-primary` and `mock-backup`, and the proxy health endpoint returns healthy
+- [ ] `config.yaml` defines aliases `chat-default` (mock-primary), `chat-backup` (mock-backup) and a fallback from `chat-default` to `chat-backup`; provider and master keys come from environment variables only
+- [ ] A setup script creates two teams through the admin API: `team-a` (allowed: `chat-default`, `chat-backup`; small budget) and `team-b` (allowed: `chat-backup` only), and one key per team
+- [ ] Test: with mock-primary healthy, a `team-a` request is served by mock-primary (verified with the mocks' `/stats` counters)
+- [ ] Test: after switching mock-primary to failure mode, the same request succeeds and mock-backup's counter increases
+- [ ] Test: a `team-b` request to `chat-default` is rejected with a 4xx status
+- [ ] Test: `team-a` requests are rejected once its budget is spent (mock pricing is set high enough to hit it in about 20 requests)
+- [ ] The README shows the team spend report from the gateway's API after the test run
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# mock/server.py — OpenAI-compatible mock provider (pip install fastapi uvicorn)
+import os
+import time
+import uuid
+
+from fastapi import FastAPI, HTTPException
+
+app = FastAPI()
+NAME = os.getenv("MOCK_NAME", "mock")
+state = {"fail": False, "requests": 0}
+
+@app.post("/v1/chat/completions")
+async def chat(body: dict) -> dict:
+    state["requests"] += 1
+    if state["fail"]:
+        raise HTTPException(status_code=503, detail=f"{NAME} unavailable")
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": body.get("model", NAME),
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": f"answer from {NAME}"}}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+    }
+
+@app.post("/admin/fail")
+async def set_fail(on: bool) -> dict:
+    state["fail"] = on
+    return state
+
+@app.get("/stats")
+async def stats() -> dict:
+    return state
+```
+
+```yaml
+# docker-compose.yml — complete the litellm service
+services:
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: litellm, POSTGRES_PASSWORD: litellm, POSTGRES_DB: litellm }
+  redis:
+    image: redis:7
+  mock-primary:
+    build: ./mock
+    environment: { MOCK_NAME: primary }
+    ports: ["9001:8000"]
+  mock-backup:
+    build: ./mock
+    environment: { MOCK_NAME: backup }
+    ports: ["9002:8000"]
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable   # pin a tested version for real use
+    # TODO: mount ./config.yaml, pass --config and --port 4000,
+    # set LITELLM_MASTER_KEY, DATABASE_URL, REDIS_HOST from .env,
+    # depends_on postgres and redis, expose 4000
+```
+
+```python
+# tests/test_gateway.py — skeleton
+import httpx
+import pytest
+
+GATEWAY = "http://localhost:4000"
+
+def chat(key: str, model: str) -> httpx.Response:
+    return httpx.post(f"{GATEWAY}/v1/chat/completions", timeout=30,
+                      headers={"Authorization": f"Bearer {key}"},
+                      json={"model": model, "messages": [{"role": "user", "content": "hi"}]})
+
+def requests_seen(port: int) -> int:
+    return httpx.get(f"http://localhost:{port}/stats").json()["requests"]
+
+def test_fallback_to_backup(team_a_key: str) -> None:
+    httpx.post("http://localhost:9001/admin/fail", params={"on": True})
+    before = requests_seen(9002)
+    resp = chat(team_a_key, "chat-default")
+    assert resp.status_code == 200
+    assert requests_seen(9002) > before
+    # TODO: reset mock-primary in a fixture finalizer
+
+# TODO: test_primary_serves_when_healthy, test_team_b_cannot_use_chat_default,
+#       test_budget_exceeded (set budget and mock pricing so ~20 requests exhaust it)
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Point each alias at a mock with `model: openai/mock-primary` and `api_base: http://mock-primary:8000/v1` plus a dummy `api_key`. The `openai/` prefix tells LiteLLM to use the OpenAI wire format against your base URL. Add `input_cost_per_token` and `output_cost_per_token` to `litellm_params` so spend is non-zero for a fake model.</Hint>
+  <Hint>Do the math for the budget test. With 1,000 prompt and 500 completion tokens per mock response, `input_cost_per_token: 0.00001` and `output_cost_per_token: 0.00002` cost 0.02 per request. A team `max_budget` of 0.4 is exhausted after about 20 requests.</Hint>
+  <Hint>Spend is written to the database asynchronously and budget checks may lag a little. In the budget test, loop until you get a rejection (with an upper bound such as 60 requests) instead of asserting that request number 21 fails exactly. Retries also count: set `num_retries: 0` on the fallback test's alias or account for it when you read the counters.</Hint>
+  <Hint>Put team and key creation in a session-scoped pytest fixture that calls `/team/new` and `/key/generate` with the master key and returns the generated keys. For the report, `GET /team/info?team_id=...` returns the team's current spend; save its JSON to `results/spend.json` and quote it in the README.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  02-litellm-gateway/
+    docker-compose.yml
+    config.yaml
+    .env.example            # LITELLM_MASTER_KEY, DATABASE_URL, REDIS_HOST, optional ANTHROPIC_API_KEY
+    mock/
+      server.py
+      Dockerfile
+    scripts/
+      bootstrap_teams.py    # creates teams and keys, prints them once
+    tests/
+      conftest.py
+      test_gateway.py
+    results/
+      spend.json
+      pytest-output.txt
+    README.md
+```
+
+README outline:
+
+1. Architecture diagram (Mermaid): client → LiteLLM → mock-primary / mock-backup, with Postgres and Redis.
+2. The policies in plain English: aliases, fallback chain, teams, allowed models, budgets.
+3. How to run: `docker compose up -d`, `python scripts/bootstrap_teams.py`, `pytest -v`.
+4. Results: test output and the spend report.
+5. Production notes: replicas plus shared Redis, master key from a secrets manager, config changes through review and canary, fallback chains that respect data classification.
+
+Suggested commits:
+
+- `feat(gateway): mock OpenAI-compatible providers with failure switch`
+- `infra(gateway): docker-compose with LiteLLM, Postgres and Redis`
+- `feat(gateway): aliases, fallback chain and pricing for mock models`
+- `test(gateway): fallback, access control and budget enforcement`
+- `docs(gateway): results and production notes`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m8-06-review" title="Self-review" items={["No key appears in config.yaml or docker-compose.yml; everything comes from .env, which is git-ignored", "The fallback test proves which backend served the request, not only that it returned 200", "Mock-primary is reset after the failure test so test order does not matter", "The budget test has an upper bound and does not depend on exact timing", "team-b is rejected from chat-default with a 4xx, and I wrote down the exact status and error", "pytest passes twice in a row against a fresh docker compose up", "The README explains why shared Redis is needed when the proxy has several replicas", "I noted which fallback I would never configure for a PII workload"]} />

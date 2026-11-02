@@ -1,5 +1,3 @@
-# Data pipelines for ingestion and eval datasets
-
 RAG quality is mostly data quality. A retriever cannot find a policy that was never ingested, was ingested twice, or was ingested with a customer's SSN embedded in it. Eval quality is data quality too: a golden set with duplicates or leaked PII is a liability, not an asset.
 
 As an SDET you already think about **test data management**: fixtures, seeding, cleanup, reproducibility. Data pipelines for AI are the same discipline at production scale. This lesson covers five properties every ingestion and eval-dataset pipeline needs:

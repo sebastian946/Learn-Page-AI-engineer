@@ -30,9 +30,9 @@ Reducir el tiempo mediano para obtener una respuesta correcta sobre políticas d
 ## Requisitos funcionales
 
 1. **Ingesta** de la Guía de Underwriting, los boletines, las matrices de productos (PDF) y las páginas de FAQ (HTML). Extraer texto y tablas, conservando números de sección, números de página y títulos.
-2. **Versionado de documentos:** cada documento y chunk tiene `effective_from` y, cuando aplica, `superseded_by`. El retrieval solo devuelve chunks vigentes en la fecha de la consulta (por defecto: hoy).
-3. **Filtros por metadata:** programa de préstamo (convencional, FHA, VA), estado, tipo de documento. El usuario puede definirlos y el asistente puede inferirlos de la pregunta.
-4. **Retrieval híbrido:** similitud con pgvector más búsqueda de texto completo de Postgres, fusionados con RRF.
+2. **Versionado de documentos:** cada fila de documento lleva `doc_type`, `jurisdiction`, `effective_date`, `is_current` y `content_hash`, el mismo contrato de metadata que en `rag-lab`. Por defecto el retrieval solo devuelve versiones vigentes; una fecha `as_of` selecciona la versión que estaba vigente en esa fecha. Las versiones reemplazadas se quedan en la base de datos para auditoría.
+3. **Filtros por metadata:** jurisdicción (`US` más el estado del oficial, como `US-TX`), programa de préstamo (convencional, FHA, VA) y tipo de documento, aplicados dentro de cada rama del retrieval antes de la fusión. Vienen primero del contexto de la solicitud; el asistente puede refinarlos a partir de la pregunta tras validarlos.
+4. **Retrieval híbrido:** similitud coseno con pgvector más búsqueda de texto completo de Postgres, 40 candidatos por rama, fusionados con RRF (k = 60).
 5. **Re-ranking** de los candidatos fusionados con un cross-encoder (local por defecto; un re-ranker hospedado puede ser una opción configurable).
 6. **Reescritura de consultas:** condensación de conversación para preguntas de seguimiento; multi-query opcional detrás de un flag.
 7. **Respuestas con citas:** cada oración factual cita al menos un chunk, mostrando documento, sección y página. Las citas se validan antes de mostrar la respuesta.
@@ -50,7 +50,7 @@ Reducir el tiempo mediano para obtener una respuesta correcta sobre políticas d
 | Costo | Por debajo de una meta que tú defines por cada 1,000 solicitudes, calculada con el uso de tokens registrado y los precios actuales del proveedor; documenta el supuesto |
 | Faithfulness | ≥ 0.90 en promedio sobre el golden set (Ragas o DeepEval), ningún ítem con respuesta por debajo de 0.5 sin explicación |
 | Context recall | ≥ 0.85 en promedio sobre ítems con respuesta |
-| Retrieval | recall@5 ≥ 0.85 en ítems con IDs de chunks etiquetados |
+| Retrieval | hit@5 ≥ 0.85 en ítems etiquetados con `expected_doc_id` y `expected_section` |
 | Abstención | ≥ 90% de los ítems sin respuesta respondidos correctamente con "no encontrado" |
 | Validez de citas | 100% de las citas mostradas apuntan a chunks recuperados con citas textuales que coinciden |
 | Seguridad | Sin PII de solicitantes en el corpus ni en los logs; secretos por variables de entorno; ningún dato enviado a proveedores sin un acuerdo aprobado (documenta qué proveedores usas) |
@@ -66,8 +66,8 @@ Reducir el tiempo mediano para obtener una respuesta correcta sobre políticas d
 
 ## Entregables
 
-1. Repositorio `mortgage-knowledge-assistant` con el código fuente, `docker-compose.yml` (Postgres con pgvector, la API, Redis opcional) y un setup de un solo comando.
-2. Un **corpus sintético** creado por ti: una guía de underwriting (al menos 30 páginas), al menos 8 boletines con fechas de vigencia (al menos 2 que reemplacen reglas anteriores), 3 matrices de productos y 15 páginas de FAQ. No uses documentos de ningún prestamista real.
+1. Repositorio `mortgage-knowledge-assistant` con el código fuente, `docker-compose.yml` (Postgres desde la imagen `pgvector/pgvector:pg17`, la API, Redis opcional) y un setup de un solo comando.
+2. Un **corpus sintético** creado por ti, que extienda el corpus de `rag-lab` y su convención de nombres (`policies/TX/slug_vN_YYYY-MM-DD.pdf`): una guía de underwriting (al menos 30 páginas), al menos 8 boletines con fechas de vigencia (al menos 2 que reemplacen reglas anteriores, incluido el par de fondos de regalo de FHA v2 2024 y v3 2026), 3 matrices de productos y 15 páginas de FAQ en HTML. No uses documentos de ningún prestamista real.
 3. El golden dataset (`evals/golden.jsonl`) y el runner de evaluación con un reporte guardado.
 4. El dashboard (un notebook, una página de Streamlit o un tablero de Grafana que lea tus logs de solicitudes).
 5. Un README con arquitectura, decisiones de diseño, resultados de evals, análisis de costos y un GIF de demo.
@@ -88,7 +88,7 @@ Reducir el tiempo mediano para obtener una respuesta correcta sobre políticas d
   subgraph Offline["Ingesta offline"]
     D["PDFs, boletines, FAQ HTML"] --> P["Parseo y limpieza (tablas, secciones)"]
     P --> C["Chunking consciente de la estructura"]
-    C --> M["Metadata: programa, estado, effective_from, superseded_by"]
+    C --> M["Metadata: doc_type, jurisdiction, effective_date, is_current"]
     M --> E["Embeddings (caché por hash)"]
     E --> PG[("Postgres: pgvector + tsvector")]
   end
@@ -116,7 +116,7 @@ Notas:
 
 | Criterio | Peso | Excelente | Aceptable | Necesita trabajo |
 |---|---|---|---|---|
-| Calidad de retrieval | 20% | Híbrido + filtros + versionado + re-rank; recall@5 y context recall cumplen las metas con evidencia | El híbrido funciona, una meta incumplida con diagnóstico | Solo vectorial o sin filtro por fecha de vigencia |
+| Calidad de retrieval | 20% | Híbrido + filtros + versionado + re-rank; hit@5 y context recall cumplen las metas con evidencia | El híbrido funciona, una meta incumplida con diagnóstico | Solo vectorial o sin filtro por fecha de vigencia |
 | Grounding y citas | 20% | Citas por afirmación validadas; la abstención cumple la meta | Se muestran citas y en su mayoría son válidas | Citas sin validar o respuestas con conocimiento general |
 | Suite de evaluación | 20% | 50+ pares revisados, ítems sin respuesta y de varios turnos, análisis por ítem, juez fijado | 50 pares con scores agregados | Menos pares, referencias copiadas de la salida del sistema |
 | Observabilidad, latencia y costo | 15% | Traces por etapa, dashboard con p50/p95 y costo por 1k, supuestos documentados | Dashboard solo con totales | Sin datos de costo ni de latencia |
@@ -127,7 +127,7 @@ Notas:
 
 **Día 1 — Corpus e ingesta.** Escribe el corpus sintético, incluyendo boletines que reemplazan reglas y tablas. Construye el parseo, el chunking consciente de la estructura y la extracción de metadata. Carga en pgvector con índices HNSW y de texto completo. Empieza a redactar preguntas golden mientras escribes los documentos; es cuando mejor conoces las respuestas.
 
-**Día 2 — Retrieval.** Búsqueda híbrida con RRF, filtros de metadata y de fecha de vigencia, re-ranking con cross-encoder y condensación de conversación. Construye el benchmark de retrieval (recall@5, MRR) sobre IDs de chunks etiquetados y ajusta el tamaño de búsqueda y el top-k.
+**Día 2 — Retrieval.** Búsqueda híbrida con RRF, filtros de metadata y de fecha de vigencia, re-ranking con cross-encoder y condensación de conversación. Construye el benchmark de retrieval (hit@5, MRR por categoría) sobre los ítems golden etiquetados con documento y sección, reutilizando el golden set de `rag-lab` como punto de partida, y ajusta el tamaño de búsqueda y el top-k.
 
 **Día 3 — Generación y API.** Prompt de citas, salida estructurada, validación de citas, abstención. FastAPI `POST /ask` con trace IDs y registro de solicitudes. Cachés de respuestas y de embeddings. UI mínima.
 
@@ -137,7 +137,7 @@ Notas:
 
 ## Definition of Done
 
-<Checklist id="m2-20-dod" title="Definition of Done" items={["Corpus sintético en el repo, incluyendo boletines que reemplazan reglas y tablas de matrices de productos", "La ingesta conserva sección, página, programa, estado y fechas de vigencia en cada chunk", "Retrieval híbrido con RRF, filtros de metadata y filtrado por fecha de vigencia", "Re-ranking con cross-encoder y una comparación medida de antes y después", "Las preguntas de seguimiento se condensan antes del retrieval", "Cada cita mostrada se valida contra los chunks recuperados", "Las preguntas sin respuesta devuelven 'no encontrado' con enlaces a las secciones más cercanas", "El golden dataset tiene 50+ pares revisados, 8+ sin respuesta y 5+ de varios turnos", "Reporte de evals con juez fijado, análisis por ítem y metas cumplidas o explicadas", "El dashboard muestra latencia p50/p95 por etapa y costo por cada 1,000 solicitudes", "Cada solicitud tiene un trace reconstruible", "El setup con docker compose funciona en una máquina limpia", "README con diagrama de arquitectura, decisiones, resultados de evals, análisis de costos y GIF de demo", "Al menos tres ADRs en el repo"]} />
+<Checklist id="m2-20-dod" title="Definition of Done" items={["Corpus sintético en el repo, incluyendo boletines que reemplazan reglas y tablas de matrices de productos", "La ingesta conserva sección, página, doc_type, jurisdiction, effective_date, is_current y content_hash", "Retrieval híbrido con RRF, filtros de metadata y filtrado por fecha de vigencia", "Re-ranking con cross-encoder y una comparación medida de antes y después", "Las preguntas de seguimiento se condensan antes del retrieval", "Cada cita mostrada se valida contra los chunks recuperados", "Las preguntas sin respuesta devuelven 'no encontrado' con enlaces a las secciones más cercanas", "El golden dataset tiene 50+ pares revisados, 8+ sin respuesta y 5+ de varios turnos", "Reporte de evals con juez fijado, análisis por ítem y metas cumplidas o explicadas", "El dashboard muestra latencia p50/p95 por etapa y costo por cada 1,000 solicitudes", "Cada solicitud tiene un trace reconstruible", "El setup con docker compose funciona en una máquina limpia", "README con diagrama de arquitectura, decisiones, resultados de evals, análisis de costos y GIF de demo", "Al menos tres ADRs en el repo"]} />
 
 ## Cómo presentarlo en una entrevista
 

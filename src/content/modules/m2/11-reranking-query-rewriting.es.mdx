@@ -104,7 +104,7 @@ Pon el re-ranker detrás de una interfaz pequeña (`rerank(query, candidates, to
 
 ### ¿Cuántos candidatos re-rankear?
 
-La latencia crece linealmente con los candidatos. Un punto de partida razonable: recupera 30–50, re-rankea y quédate con 4–8. Luego mide. Si el recall@50 es alto pero el recall@5 después del re-ranking no se mueve, tu re-ranker no está ayudando y debes revisar truncamiento o desajuste de dominio. Si el recall@50 en sí es bajo, el re-ranking no te va a salvar; arregla primero el chunking o el retrieval.
+La latencia crece linealmente con los candidatos. Un punto de partida razonable: re-rankea el conjunto de candidatos fusionados de tu retriever híbrido (en `04-hybrid/` son 40 candidatos por rama, filtrados dentro de cada rama y fusionados con RRF) y quédate con 4–8. Luego mide. Si el recall@50 es alto pero el recall@5 después del re-ranking no se mueve, tu re-ranker no está ayudando y debes revisar truncamiento o desajuste de dominio. Si el recall@50 en sí es bajo, el re-ranking no te va a salvar; arregla primero el chunking o el retrieval.
 
 ## Reescritura de consultas
 

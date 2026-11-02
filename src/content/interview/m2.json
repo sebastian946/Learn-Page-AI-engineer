@@ -2,7 +2,10 @@
   {
     "id": "m2-iv-01",
     "level": "mid",
-    "tags": ["rag", "architecture"],
+    "tags": [
+      "rag",
+      "architecture"
+    ],
     "question": {
       "en": "Walk me through the components of a production RAG system.",
       "es": "Explícame los componentes de un sistema RAG en producción."
@@ -15,7 +18,9 @@
   {
     "id": "m2-iv-02",
     "level": "mid",
-    "tags": ["chunking"],
+    "tags": [
+      "chunking"
+    ],
     "question": {
       "en": "How do you choose a chunking strategy and chunk size?",
       "es": "¿Cómo eliges una estrategia de chunking y un tamaño de chunk?"
@@ -28,7 +33,10 @@
   {
     "id": "m2-iv-03",
     "level": "mid",
-    "tags": ["embeddings", "cost"],
+    "tags": [
+      "embeddings",
+      "cost"
+    ],
     "question": {
       "en": "What do you consider when choosing an embedding model?",
       "es": "¿Qué consideras al elegir un modelo de embeddings?"
@@ -41,7 +49,10 @@
   {
     "id": "m2-iv-04",
     "level": "senior",
-    "tags": ["pgvector", "vector-store"],
+    "tags": [
+      "pgvector",
+      "vector-store"
+    ],
     "question": {
       "en": "Why would you choose pgvector over a dedicated vector database, and when would you not?",
       "es": "¿Por qué elegirías pgvector en lugar de una base de datos vectorial dedicada, y cuándo no?"
@@ -54,7 +65,11 @@
   {
     "id": "m2-iv-05",
     "level": "mid",
-    "tags": ["hybrid-search", "bm25", "rrf"],
+    "tags": [
+      "hybrid-search",
+      "bm25",
+      "rrf"
+    ],
     "question": {
       "en": "What is hybrid search and how does reciprocal rank fusion work?",
       "es": "¿Qué es la búsqueda híbrida y cómo funciona reciprocal rank fusion?"
@@ -67,20 +82,26 @@
   {
     "id": "m2-iv-06",
     "level": "senior",
-    "tags": ["metadata-filtering", "versioning"],
+    "tags": [
+      "metadata-filtering",
+      "versioning"
+    ],
     "question": {
       "en": "How do you prevent a RAG system from answering with outdated policies?",
       "es": "¿Cómo evitas que un sistema RAG responda con políticas desactualizadas?"
     },
     "answer": {
-      "en": "I treat it as a data problem first. Every document and chunk carries `effective_from` and, when replaced, `superseded_by`. Ingestion sets these from document headers or a registry maintained by the policy owners. Retrieval filters to chunks in force on the query date, which also allows historical questions (\"what was the rule in January?\").\n\nOn top: the corpus version is part of cache keys so old answers stop being served after re-ingestion, the answer shows the effective date of each cited source, and the golden dataset contains items that specifically test superseded rules, so a regression fails CI. I would also alert when two in-force chunks conflict.",
-      "es": "Lo trato primero como un problema de datos. Cada documento y chunk lleva `effective_from` y, cuando se reemplaza, `superseded_by`. La ingesta los fija a partir de los encabezados del documento o de un registro mantenido por los dueños de las políticas. El retrieval filtra a los chunks vigentes en la fecha de la consulta, lo que también permite preguntas históricas (\"¿cuál era la regla en enero?\").\n\nAdemás: la versión del corpus forma parte de las claves de caché para que las respuestas viejas dejen de servirse tras re-ingestar, la respuesta muestra la fecha de vigencia de cada fuente citada, y el golden dataset contiene ítems que prueban específicamente reglas reemplazadas, así una regresión hace fallar el CI. También generaría una alerta cuando dos chunks vigentes se contradicen."
+      "en": "I treat it as a data problem first. Every document carries `effective_date`, `is_current`, `jurisdiction` and `content_hash` as typed columns. Ingestion sets them from the file naming convention or document headers and flips `is_current` when a newer version arrives. Retrieval filters to current versions inside every leg, before fusion; an `as_of` date selects the version in force at that time, which also allows historical questions (\"what was the rule in January?\"). Superseded versions stay for audit.\n\nOn top: the corpus version is part of cache keys so old answers stop being served after re-ingestion, the answer shows the effective date of each cited source, and the golden dataset contains items that specifically test superseded rules, so a regression fails CI. I would also alert when two in-force chunks conflict.",
+      "es": "Lo trato primero como un problema de datos. Cada documento lleva `effective_date`, `is_current`, `jurisdiction` y `content_hash` como columnas tipadas. La ingesta los fija a partir de la convención de nombres de archivo o de los encabezados del documento, y cambia `is_current` cuando llega una versión más nueva. El retrieval filtra a las versiones vigentes dentro de cada rama, antes de la fusión; una fecha `as_of` selecciona la versión vigente en ese momento, lo que también permite preguntas históricas (\"¿cuál era la regla en enero?\"). Las versiones reemplazadas se conservan para auditoría.\n\nAdemás: la versión del corpus forma parte de las claves de caché para que las respuestas viejas dejen de servirse tras re-ingestar, la respuesta muestra la fecha de vigencia de cada fuente citada, y el golden dataset contiene ítems que prueban específicamente reglas reemplazadas, así una regresión hace fallar el CI. También generaría una alerta cuando dos chunks vigentes se contradicen."
     }
   },
   {
     "id": "m2-iv-07",
     "level": "mid",
-    "tags": ["reranking", "cross-encoder"],
+    "tags": [
+      "reranking",
+      "cross-encoder"
+    ],
     "question": {
       "en": "When does adding a re-ranker help, and how do you know?",
       "es": "¿Cuándo ayuda agregar un re-ranker y cómo lo sabes?"
@@ -93,7 +114,11 @@
   {
     "id": "m2-iv-08",
     "level": "senior",
-    "tags": ["query-rewriting", "hyde", "conversation"],
+    "tags": [
+      "query-rewriting",
+      "hyde",
+      "conversation"
+    ],
     "question": {
       "en": "Compare multi-query, HyDE, step-back prompting and conversation condensation. Which would you implement first?",
       "es": "Compara multi-query, HyDE, step-back prompting y condensación de conversación. ¿Cuál implementarías primero?"
@@ -106,7 +131,10 @@
   {
     "id": "m2-iv-09",
     "level": "mid",
-    "tags": ["citations", "grounding"],
+    "tags": [
+      "citations",
+      "grounding"
+    ],
     "question": {
       "en": "How do you implement trustworthy citations in a RAG answer?",
       "es": "¿Cómo implementas citas confiables en una respuesta RAG?"
@@ -119,7 +147,11 @@
   {
     "id": "m2-iv-10",
     "level": "senior",
-    "tags": ["failure-modes", "debugging", "observability"],
+    "tags": [
+      "failure-modes",
+      "debugging",
+      "observability"
+    ],
     "question": {
       "en": "What are the main failure modes of RAG, and how do you detect each in production?",
       "es": "¿Cuáles son los principales modos de falla de RAG y cómo detectas cada uno en producción?"
@@ -132,7 +164,11 @@
   {
     "id": "m2-iv-11",
     "level": "mid",
-    "tags": ["evaluation", "ragas", "deepeval"],
+    "tags": [
+      "evaluation",
+      "ragas",
+      "deepeval"
+    ],
     "question": {
       "en": "Explain faithfulness, answer relevance, context precision and context recall. Which need a reference answer?",
       "es": "Explica faithfulness, answer relevance, context precision y context recall. ¿Cuáles necesitan una respuesta de referencia?"
@@ -145,7 +181,11 @@
   {
     "id": "m2-iv-12",
     "level": "senior",
-    "tags": ["golden-dataset", "evaluation", "ci"],
+    "tags": [
+      "golden-dataset",
+      "evaluation",
+      "ci"
+    ],
     "question": {
       "en": "How do you build and maintain a golden dataset for RAG, and how do you use it in CI?",
       "es": "¿Cómo construyes y mantienes un golden dataset para RAG, y cómo lo usas en CI?"
@@ -158,7 +198,11 @@
   {
     "id": "m2-iv-13",
     "level": "senior",
-    "tags": ["caching", "cost", "latency"],
+    "tags": [
+      "caching",
+      "cost",
+      "latency"
+    ],
     "question": {
       "en": "Design the caching strategy for a RAG assistant used by 200 loan officers.",
       "es": "Diseña la estrategia de caché para un asistente RAG usado por 200 oficiales de crédito."
@@ -171,7 +215,11 @@
   {
     "id": "m2-iv-14",
     "level": "senior",
-    "tags": ["frameworks", "langchain", "architecture"],
+    "tags": [
+      "frameworks",
+      "langchain",
+      "architecture"
+    ],
     "question": {
       "en": "Would you build a production RAG system with LangChain or without a framework?",
       "es": "¿Construirías un sistema RAG en producción con LangChain o sin framework?"

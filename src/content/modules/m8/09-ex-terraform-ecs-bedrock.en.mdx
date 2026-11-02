@@ -1,0 +1,177 @@
+## Goal
+
+Write a reusable Terraform module, `llm-ecs-service`, that deploys an LLM API on ECS Fargate the way lesson 7 described, and **prove its security properties with tests that run without an AWS account**.
+
+The module must create:
+
+- an ECS task definition and service in private subnets with no public IP;
+- an ALB and target group with streaming-friendly timeouts;
+- an interface VPC endpoint for `bedrock-runtime` with an endpoint policy;
+- execution and task IAM roles with least privilege;
+- a reference to a provider API key in Secrets Manager (the value never in code or state).
+
+You will test it with `terraform test` and a **mocked AWS provider** (Terraform 1.7 or newer). Mocked providers return fake values for computed attributes, so `command = plan` runs offline and your assertions check the configuration logic. If you have a sandbox AWS account, a real `terraform plan` is a bonus, not a requirement.
+
+The SDET framing: this is unit testing for infrastructure. Each assertion encodes a requirement a security reviewer would otherwise check by hand.
+
+<AcceptanceCriteria>
+
+- [ ] `terraform fmt -check` and `terraform validate` pass for the module and the example root
+- [ ] The module exposes typed variables with descriptions, including `allowed_model_arns`, `idle_timeout_seconds` (validated at 120 or more) and `drain_seconds`
+- [ ] `terraform test` passes with `mock_provider "aws"` and at least 6 `run` blocks
+- [ ] A test asserts the ALB idle timeout is at least 120 seconds and the target group deregistration delay equals `drain_seconds`
+- [ ] A test uses `expect_failures` to prove that `idle_timeout_seconds = 60` is rejected
+- [ ] A test asserts the bedrock-runtime endpoint uses the correct regional service name, has private DNS enabled, and its policy lists exactly `allowed_model_arns`
+- [ ] A test asserts no IAM statement in the task role uses `bedrock:*` or a `*` resource
+- [ ] A test asserts the container definition gets the API key through `secrets` (a Secrets Manager ARN) and that no `environment` entry name contains `KEY` or `SECRET`
+- [ ] Checkov (or Trivy config scan) runs on the module; findings are fixed or skipped with a written reason
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```hcl
+# modules/llm-ecs-service/variables.tf (excerpt)
+variable "name" {
+  type        = string
+  description = "Service name, used as a prefix for every resource."
+}
+
+variable "region" { type = string }
+variable "account_id" { type = string }
+variable "vpc_id" { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "public_subnet_ids" { type = list(string) }
+variable "cluster_arn" { type = string }
+variable "image" { type = string }
+
+variable "allowed_model_arns" {
+  type        = list(string)
+  description = "Foundation-model and inference-profile ARNs this service may invoke."
+  validation {
+    condition     = length(var.allowed_model_arns) > 0 && !contains(var.allowed_model_arns, "*")
+    error_message = "List explicit model ARNs; wildcards are not allowed."
+  }
+}
+
+variable "api_key_secret_arn" {
+  type        = string
+  description = "Secrets Manager ARN of the provider API key (value managed outside Terraform)."
+}
+
+variable "idle_timeout_seconds" {
+  type    = number
+  default = 300
+  # TODO: validation >= 120 with a clear error message
+}
+
+variable "drain_seconds" {
+  type    = number
+  default = 120
+}
+```
+
+```hcl
+# modules/llm-ecs-service/tests/security.tftest.hcl
+mock_provider "aws" {}
+
+variables {
+  name               = "claims-assistant"
+  region             = "us-east-1"
+  account_id         = "123456789012"
+  vpc_id             = "vpc-0abc"
+  private_subnet_ids = ["subnet-a", "subnet-b"]
+  public_subnet_ids  = ["subnet-c", "subnet-d"]
+  cluster_arn        = "arn:aws:ecs:us-east-1:123456789012:cluster/llm"
+  image              = "123456789012.dkr.ecr.us-east-1.amazonaws.com/claims:1.4.0"
+  api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:claims/anthropic-AbC123"
+  allowed_model_arns = ["arn:aws:bedrock:us-east-1::foundation-model/example-model-id"]
+}
+
+run "alb_is_streaming_friendly" {
+  command = plan
+  assert {
+    condition     = aws_lb.this.idle_timeout >= 120
+    error_message = "ALB idle timeout must allow long streams."
+  }
+}
+
+run "short_timeout_is_rejected" {
+  command = plan
+  variables { idle_timeout_seconds = 60 }
+  expect_failures = [var.idle_timeout_seconds]
+}
+
+run "bedrock_endpoint_is_private_and_scoped" {
+  command = plan
+  assert {
+    condition     = aws_vpc_endpoint.bedrock_runtime.service_name == "com.amazonaws.us-east-1.bedrock-runtime"
+    error_message = "Wrong service name for the Bedrock runtime endpoint."
+  }
+  # TODO: private_dns_enabled, and jsondecode(policy).Statement[0].Resource == var.allowed_model_arns
+}
+
+# TODO: run blocks for IAM wildcards, secrets vs environment, no public IP
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Keep the IAM policy as an `aws_iam_policy_document` data source whose `statement` blocks are built from variables. Arguments you set are known at plan time even with a mocked provider, so a test can inspect `data.aws_iam_policy_document.invoke_models.statement` directly. Only computed attributes like `.json` get fake values.</Hint>
+  <Hint>If a resource validates JSON that comes from a mocked data source (for example a role policy built from `.json`), the mock's random string can cause trouble. Use an `override_data` block in the test file to give that data source a realistic `json` value, or build the policy with `jsonencode` in a `local` that you can also assert on.</Hint>
+  <Hint>For the IAM wildcard test, flatten every statement's actions and resources and check them with `alltrue`, for example `alltrue([for s in data.aws_iam_policy_document.invoke_models.statement : !contains(s.actions, "bedrock:*")])`, and the same idea for `"*"` in `resources`. For the container test, `jsondecode(aws_ecs_task_definition.api.container_definitions)[0]` gives you the `secrets` and `environment` lists.</Hint>
+  <Hint>Checkov will flag things like the ALB not having access logs or the target group using HTTP. Fix what is cheap (access logs to a bucket variable, `drop_invalid_header_fields`), and for the rest add inline skips with a reason, such as TLS terminating at the ALB inside a private network. A reviewer cares that each skip is a decision, not that the list is empty.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  03-terraform-ecs-bedrock/
+    modules/
+      llm-ecs-service/
+        main.tf             # task definition, service, security groups
+        alb.tf
+        endpoints.tf        # bedrock-runtime interface endpoint + policy
+        iam.tf              # execution role, task role
+        variables.tf
+        outputs.tf
+        versions.tf         # required_version >= 1.7, aws provider pin
+        tests/
+          security.tftest.hcl
+          networking.tftest.hcl
+    examples/
+      staging/
+        main.tf             # calls the module with example values
+    .checkov.yaml
+    README.md
+```
+
+README outline:
+
+1. What the module creates (resource list and a Mermaid diagram: ALB → ECS tasks in private subnets → VPC endpoint → Bedrock).
+2. Inputs and outputs table.
+3. Security properties, each mapped to the test that proves it.
+4. How to run: `terraform init`, `terraform test`, `checkov -d .`.
+5. Known gaps: other endpoints needed for a no-NAT VPC (ECR, logs, Secrets Manager, S3 gateway), and the CI workflow you would add.
+
+Suggested commits:
+
+- `feat(tf): llm-ecs-service module skeleton with typed variables`
+- `feat(tf): ALB and target group sized for streaming`
+- `feat(tf): bedrock-runtime VPC endpoint with scoped policy`
+- `feat(tf): least-privilege execution and task roles`
+- `test(tf): plan-only tests with mocked AWS provider`
+- `chore(tf): checkov scan with documented skips`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m8-09-review" title="Self-review" items={["terraform test passes offline with mock_provider and no AWS credentials", "Every security property in the README points to a specific run block", "The short-timeout test fails if I remove the validation (I tried it)", "No secret value appears anywhere in .tf files, tfvars or test files", "The task role and the endpoint policy allow the same model ARNs", "Tasks run with assign_public_ip = false in private subnets", "desired_count is ignored in lifecycle so autoscaling is not reset", "Each Checkov skip has a one-line reason"]} />

@@ -104,7 +104,7 @@ Put the re-ranker behind a small interface (`rerank(query, candidates, top_k)`) 
 
 ### How many candidates to re-rank?
 
-Latency grows linearly with candidates. A reasonable starting point: retrieve 30–50, re-rank, keep 4–8. Then measure. If recall@50 is high but recall@5 after re-ranking does not move, your re-ranker is not helping and you should check truncation or domain mismatch. If recall@50 itself is low, re-ranking cannot save you; fix chunking or retrieval first.
+Latency grows linearly with candidates. A reasonable starting point: re-rank the fused candidate set from your hybrid retriever (in `04-hybrid/` that is 40 candidates per leg, filtered inside each leg and fused with RRF), then keep 4–8. Then measure. If recall@50 is high but recall@5 after re-ranking does not move, your re-ranker is not helping and you should check truncation or domain mismatch. If recall@50 itself is low, re-ranking cannot save you; fix chunking or retrieval first.
 
 ## Query rewriting
 

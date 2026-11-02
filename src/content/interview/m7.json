@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m7-iv-01",
+    "level": "senior",
+    "tags": ["multi-tenancy", "isolation", "rag"],
+    "question": {
+      "en": "How do you guarantee tenant isolation in a multi-tenant RAG system?",
+      "es": "¿Cómo garantizas el aislamiento entre tenants en un sistema RAG multi-tenant?"
+    },
+    "answer": {
+      "en": "I start from the threat: nearest-neighbor search ignores ownership, so isolation must be enforced, not assumed.\n\n- **Pick the model per tier:** pool with `tenant_id` on every row for small tenants, namespace or collection per tenant for mid-size, a dedicated cell for regulated or residency-bound tenants.\n- **Enforce in the data layer:** PostgreSQL RLS with `FORCE ROW LEVEL SECURITY`, the app connecting as a non-owner role, and the tenant set per transaction with `set_config(..., true)`.\n- **Cover every path:** BM25 and vector queries, cache keys, agent tools (tenant from runtime context, never a model argument), traces and eval datasets.\n- **Test it:** canary strings per tenant, a raw-count test without filters, prompt-injection attempts to cross tenants, and a trace audit, all in CI as blocking tests.\n\nI also monitor per-tenant recall, because post-filtering in HNSW quietly hurts small tenants.",
+      "es": "Empiezo por la amenaza: la búsqueda de vecinos más cercanos ignora la propiedad de los datos, así que el aislamiento debe aplicarse, no suponerse.\n\n- **Elegir el modelo por plan:** pool con `tenant_id` en cada fila para tenants pequeños, namespace o colección por tenant para medianos, una celda dedicada para tenants regulados o con requisitos de residencia.\n- **Aplicarlo en la capa de datos:** RLS de PostgreSQL con `FORCE ROW LEVEL SECURITY`, la app conectándose con un rol que no es dueño y el tenant fijado por transacción con `set_config(..., true)`.\n- **Cubrir cada camino:** consultas BM25 y vectoriales, claves de caché, herramientas del agente (tenant desde el contexto del runtime, nunca como argumento del modelo), traces y datasets de evals.\n- **Probarlo:** cadenas canario por tenant, un test de conteo crudo sin filtros, intentos de prompt injection para cruzar tenants y una auditoría de traces, todo en CI como tests bloqueantes.\n\nTambién monitoreo el recall por tenant, porque el post-filtrado en HNSW perjudica en silencio a los tenants pequeños."
+    }
+  },
+  {
+    "id": "m7-iv-02",
+    "level": "senior",
+    "tags": ["system-design", "rag", "capacity"],
+    "question": {
+      "en": "Design a RAG system for 10,000 employees. Walk me through your capacity estimates and what they imply.",
+      "es": "Diseña un sistema RAG para 10.000 empleados. Explícame tus estimaciones de capacidad y qué implican."
+    },
+    "answer": {
+      "en": "Assume 40% daily active and 10 queries each: 40,000 queries a day. Over 8 working hours that is about 1.4 QPS, about 6 at a 4x peak. At 6 seconds per streamed answer, around 35 concurrent streams.\n\nTokens: about 4k input and 400 output per request, so roughly 3.5 billion input tokens a month. Corpus: 200k documents at 5k tokens is 1 billion tokens, 2 million chunks of 500 tokens, about 8 GB of 1024-dim vectors, around 16 GB with HNSW.\n\nImplications: the API layer is easy; the index fits on one pgvector instance; the LLM is both the bottleneck (tokens-per-minute quotas) and the main cost. So I spend design time on permission-aware retrieval, evals, provider failover and cost levers like routing, prompt caching and per-permission-set caching, not on a distributed vector database.",
+      "es": "Supongo 40% de activos diarios y 10 consultas cada uno: 40.000 consultas al día. En 8 horas laborales son unos 1.4 QPS, unos 6 con un pico de 4x. Con 6 segundos por respuesta en streaming, unos 35 streams concurrentes.\n\nTokens: unos 4k de entrada y 400 de salida por petición, así que aproximadamente 3.500 millones de tokens de entrada al mes. Corpus: 200k documentos de 5k tokens son 1.000 millones de tokens, 2 millones de chunks de 500 tokens, unos 8 GB de vectores de 1024 dimensiones, unos 16 GB con HNSW.\n\nImplicaciones: la capa de API es fácil; el índice cabe en una instancia de pgvector; el LLM es a la vez el cuello de botella (cuotas de tokens por minuto) y el costo principal. Así que dedico el tiempo de diseño al retrieval consciente de permisos, los evals, el failover de proveedores y las palancas de costo como enrutamiento, prompt caching y caché por conjunto de permisos, no a una vector database distribuida."
+    }
+  },
+  {
+    "id": "m7-iv-03",
+    "level": "mid",
+    "tags": ["permissions", "rag", "security"],
+    "question": {
+      "en": "How do you handle document-level permissions in enterprise RAG?",
+      "es": "¿Cómo manejas los permisos a nivel de documento en RAG empresarial?"
+    },
+    "answer": {
+      "en": "I sync ACLs from each source system and denormalize the allowed groups onto every chunk, for example an `acl_groups text[]` column with a GIN index. At query time I resolve the user's groups from SSO and filter inside the retrieval query, before ranking, so the top-k only contains allowed chunks. Filtering after retrieval both leaks risk and destroys quality, because most of the top-k gets thrown away.\n\nPermission changes update the ACL array without re-embedding. Cache keys include a hash of the user's group set. If ACL data is older than a threshold, the system fails closed. In the eval suite I include users from different groups with zero tolerance for citations they should not see.",
+      "es": "Sincronizo las ACLs desde cada sistema de origen y desnormalizo los grupos permitidos en cada chunk, por ejemplo con una columna `acl_groups text[]` con índice GIN. En tiempo de consulta resuelvo los grupos del usuario desde SSO y filtro dentro de la consulta de retrieval, antes del ranking, para que el top-k solo contenga chunks permitidos. Filtrar después del retrieval genera riesgo de fuga y además destruye la calidad, porque se descarta la mayor parte del top-k.\n\nLos cambios de permisos actualizan el arreglo de ACL sin regenerar embeddings. Las claves de caché incluyen un hash del conjunto de grupos del usuario. Si los datos de ACL superan un umbral de antigüedad, el sistema falla cerrado. En la suite de evals incluyo usuarios de distintos grupos con tolerancia cero a citas que no deberían ver."
+    }
+  },
+  {
+    "id": "m7-iv-04",
+    "level": "senior",
+    "tags": ["cost", "multi-tenancy", "finops"],
+    "question": {
+      "en": "How would you attribute LLM and infrastructure costs to tenants in a B2B AI product?",
+      "es": "¿Cómo atribuirías los costos de LLM y de infraestructura a los tenants en un producto de IA B2B?"
+    },
+    "answer": {
+      "en": "Every variable cost event gets tagged at the source: each LLM call records tenant, feature, model, prompt version, input, output and cached tokens, and computed cost from a versioned price table in config. Embedding calls at ingestion and query time, re-ranker calls and ingestion compute get the same treatment. Events go to a `usage_events` table asynchronously so they never slow the hot path.\n\nShared fixed costs, such as the database instance or cluster, are allocated by a declared rule, for example storage share for the database and request share for compute, written down in an ADR so finance can challenge it.\n\nA daily rollup gives cost per tenant, cost per 1k requests and gross margin per plan. Alerts fire at 80% of a tenant's budget. That data drives pricing, routing policies and decisions like moving a heavy tenant to its own cell.",
+      "es": "Cada evento de costo variable se etiqueta en el origen: cada llamada al LLM registra tenant, funcionalidad, modelo, versión de prompt, tokens de entrada, salida y cacheados, y el costo calculado a partir de una tabla de precios versionada en configuración. Las llamadas de embeddings en ingesta y en consulta, las del re-ranker y el cómputo de ingesta reciben el mismo tratamiento. Los eventos van a una tabla `usage_events` de forma asíncrona para no ralentizar el hot path.\n\nLos costos fijos compartidos, como la instancia de base de datos o el clúster, se asignan con una regla declarada, por ejemplo porcentaje de almacenamiento para la base de datos y de peticiones para el cómputo, escrita en un ADR para que finanzas pueda cuestionarla.\n\nUn rollup diario da costo por tenant, costo por 1k peticiones y margen bruto por plan. Se disparan alertas al 80% del presupuesto de un tenant. Esos datos guían los precios, las políticas de enrutamiento y decisiones como mover un tenant pesado a su propia celda."
+    }
+  },
+  {
+    "id": "m7-iv-05",
+    "level": "mid",
+    "tags": ["trade-offs", "latency", "quality", "cost"],
+    "question": {
+      "en": "How do you think about the latency, quality and cost trade-off in an LLM feature?",
+      "es": "¿Cómo piensas el trade-off entre latencia, calidad y costo en una funcionalidad con LLM?"
+    },
+    "answer": {
+      "en": "I treat them as three axes and each design lever moves at least two. A bigger model raises quality, latency and cost. A re-ranker raises quality and adds latency. A cache cuts latency and cost but risks stale answers. Streaming lowers perceived latency for free.\n\nThe key is to measure instead of argue. I keep a golden set and run each option through it, recording quality, p95 and cost per 1k requests. Then I pick the combination that meets the targets, not the one with the best single metric. I also make the trade-off configurable, for example a router policy that sends easy questions to a fast tier, so it can change per tenant or per budget state without a redeploy.",
+      "es": "Los trato como tres ejes, y cada palanca de diseño mueve al menos dos. Un modelo más grande sube la calidad, la latencia y el costo. Un re-ranker sube la calidad y agrega latencia. Una caché baja la latencia y el costo pero arriesga respuestas viejas. El streaming baja la latencia percibida gratis.\n\nLa clave es medir en lugar de discutir. Mantengo un golden set y paso cada opción por él, registrando calidad, p95 y costo por 1k peticiones. Luego elijo la combinación que cumple los objetivos, no la que tiene la mejor métrica individual. También hago configurable el trade-off, por ejemplo con una política de router que envía preguntas fáciles a un nivel rápido, para que pueda cambiar por tenant o por estado del presupuesto sin redeploy."
+    }
+  },
+  {
+    "id": "m7-iv-06",
+    "level": "mid",
+    "tags": ["build-vs-buy", "vector-db"],
+    "question": {
+      "en": "Managed vector database or pgvector? How do you decide?",
+      "es": "¿Vector database administrada o pgvector? ¿Cómo decides?"
+    },
+    "answer": {
+      "en": "I ask, in order: is it core to our differentiation, what are the data constraints, what is the total cost of ownership, what is the exit cost, and how fast do we need value.\n\nIf the team already runs PostgreSQL, data must stay in our VPC, and the corpus is in the low tens of millions of chunks or less, pgvector usually wins: one fewer system, transactional consistency with metadata, and RLS for tenant isolation. A managed service makes sense when scale or latency targets exceed what we can run well, or when the team lacks database operations capacity.\n\nEither way I put retrieval behind an interface and write the decision in an ADR with a clear trigger to revisit, like a chunk count or p99 latency threshold.",
+      "es": "Me pregunto, en orden: ¿es central para nuestra diferenciación?, ¿cuáles son las restricciones de datos?, ¿cuál es el costo total de propiedad?, ¿cuál es el costo de salida? y ¿qué tan rápido necesitamos valor?\n\nSi el equipo ya opera PostgreSQL, los datos deben quedarse en nuestra VPC y el corpus está en unas decenas de millones de chunks o menos, pgvector suele ganar: un sistema menos, consistencia transaccional con la metadata y RLS para el aislamiento por tenant. Un servicio administrado tiene sentido cuando la escala o los objetivos de latencia superan lo que podemos operar bien, o cuando al equipo le falta capacidad de operación de bases de datos.\n\nEn cualquier caso pongo el retrieval detrás de una interfaz y escribo la decisión en un ADR con un disparador claro para revisarla, como un umbral de cantidad de chunks o de latencia p99."
+    }
+  },
+  {
+    "id": "m7-iv-07",
+    "level": "mid",
+    "tags": ["behavioral", "career-change", "sdet"],
+    "question": {
+      "en": "You come from QA. Why should we hire you as an AI engineer?",
+      "es": "Vienes de QA. ¿Por qué deberíamos contratarte como AI engineer?"
+    },
+    "answer": {
+      "en": "Because the hard part of AI products is not the demo; it is proving the system is correct and keeping it correct as prompts, models and data change. That is evaluation, regression testing and observability, which I've done professionally for years.\n\nOn top of that I've built the AI engineering side end to end: RAG with hybrid retrieval, re-ranking and citations; LangGraph agents with human approval and MCP tools; FastAPI services deployed to AWS through CI/CD. My final project is a multi-tenant RAG and agent platform where the eval suite gates every PR, every request is traced with tenant and model, and cost is tracked per tenant. I can show you the repo, the eval report and a trace right now.",
+      "es": "Porque la parte difícil de los productos de IA no es la demo; es demostrar que el sistema es correcto y mantenerlo correcto mientras cambian prompts, modelos y datos. Eso es evaluación, pruebas de regresión y observabilidad, que he hecho profesionalmente durante años.\n\nEncima de eso he construido el lado de ingeniería de IA de punta a punta: RAG con retrieval híbrido, re-ranking y citas; agentes de LangGraph con aprobación humana y herramientas MCP; servicios FastAPI desplegados en AWS mediante CI/CD. Mi proyecto final es una plataforma multi-tenant de RAG y agentes donde la suite de evals bloquea cada PR, cada petición se traza con tenant y modelo, y el costo se mide por tenant. Puedo mostrarte ahora mismo el repo, el reporte de evals y un trace."
+    }
+  },
+  {
+    "id": "m7-iv-08",
+    "level": "senior",
+    "tags": ["agents", "system-design", "hitl"],
+    "question": {
+      "en": "Design an agent platform for customer support that can issue refunds. What are the key safety mechanisms?",
+      "es": "Diseña una plataforma de agentes para soporte al cliente que pueda emitir reembolsos. ¿Cuáles son los mecanismos de seguridad clave?"
+    },
+    "answer": {
+      "en": "- **Tool contracts:** `issue_refund` takes an idempotency key, validates order state, and enforces the per-tenant limit inside the tool, returning typed errors like `LIMIT_EXCEEDED` or `ALREADY_REFUNDED`. Limits never live only in the prompt.\n- **Tenant context from the runtime**, never from model arguments.\n- **Human-in-the-loop:** amounts above the limit go to an approval node using LangGraph interrupts with a persistent checkpointer, so approval can arrive later.\n- **Guards:** max steps and tokens per ticket, a per-tenant kill switch, and a circuit breaker on tool error rates.\n- **Audit:** every tool call logged with inputs, outputs and approver.\n- **Evals:** trajectory tests that assert tool order and arguments, plus red-team prompts that try to trigger unauthorized refunds. Both gate releases.\n\nEscalation to humans uses confidence and sentiment thresholds and hands over a summary.",
+      "es": "- **Contratos de herramientas:** `issue_refund` recibe una idempotency key, valida el estado del pedido y aplica el límite por tenant dentro de la herramienta, devolviendo errores tipados como `LIMIT_EXCEEDED` o `ALREADY_REFUNDED`. Los límites nunca viven solo en el prompt.\n- **Contexto de tenant desde el runtime**, nunca desde argumentos del modelo.\n- **Human-in-the-loop:** los montos por encima del límite van a un nodo de aprobación con interrupts de LangGraph y un checkpointer persistente, para que la aprobación pueda llegar después.\n- **Protecciones:** máximo de pasos y tokens por ticket, un interruptor de apagado por tenant y un circuit breaker según la tasa de errores de las herramientas.\n- **Auditoría:** cada llamada a herramienta registrada con entradas, salidas y aprobador.\n- **Evals:** tests de trayectoria que verifican el orden y los argumentos de las herramientas, más prompts de red team que intentan disparar reembolsos no autorizados. Ambos bloquean los releases.\n\nEl escalamiento a humanos usa umbrales de confianza y sentimiento y entrega un resumen."
+    }
+  },
+  {
+    "id": "m7-iv-09",
+    "level": "mid",
+    "tags": ["documentation", "readme", "adr"],
+    "question": {
+      "en": "What goes into a good README and architecture doc for an AI project?",
+      "es": "¿Qué debe tener un buen README y un buen documento de arquitectura para un proyecto de IA?"
+    },
+    "answer": {
+      "en": "The README leads with proof: a one-line pitch, a short demo GIF, and a results table with targets, dataset version and run date. Ideally that table is generated from the eval report so it cannot go stale. Then an architecture diagram with the request path, a run-in-5-minutes section that works with a fake LLM provider, evaluation details, a cost analysis showing the formula and measured tokens, observability screenshots, links to ADRs and an honest limitations section.\n\nThe architecture doc uses C4 levels 1 and 2 plus a sequence diagram of one request, with notes on protocols, sync versus async, secrets and failure behavior. ADRs record each significant decision with context, alternatives and consequences. In interviews, an ADR turns \"why did you do that?\" into a structured answer.",
+      "es": "El README empieza con pruebas: un pitch de una línea, un GIF de demo corto y una tabla de resultados con objetivos, versión del dataset y fecha de corrida. Idealmente esa tabla se genera desde el reporte de evals para que no quede desactualizada. Luego un diagrama de arquitectura con el camino de la petición, una sección para correrlo en 5 minutos que funcione con un proveedor de LLM fake, detalles de evaluación, un análisis de costos con la fórmula y los tokens medidos, capturas de observabilidad, enlaces a ADRs y una sección honesta de limitaciones.\n\nEl documento de arquitectura usa los niveles 1 y 2 de C4 más un diagrama de secuencia de una petición, con notas sobre protocolos, síncrono vs asíncrono, secretos y comportamiento ante fallas. Los ADRs registran cada decisión importante con contexto, alternativas y consecuencias. En entrevistas, un ADR convierte \"¿por qué hiciste eso?\" en una respuesta estructurada."
+    }
+  },
+  {
+    "id": "m7-iv-10",
+    "level": "senior",
+    "tags": ["residency", "gdpr", "architecture"],
+    "question": {
+      "en": "A tenant requires EU data residency and later requests full deletion of its data. How does your architecture handle both?",
+      "es": "Un tenant exige residencia de datos en la UE y luego pide el borrado total de sus datos. ¿Cómo maneja tu arquitectura ambas cosas?"
+    },
+    "answer": {
+      "en": "Residency: I use a cell architecture. A thin global control plane holds auth, billing and the tenant directory; each region has a full stack with its own database, vector index, queue, LLM endpoint and observability. The tenant's region field routes every request to its home cell. Traces either go to a regional backend or are redacted before export, and backups and eval runs stay in-region.\n\nDeletion: I keep a data inventory per tenant so erasure is a checklist, not a hunt. Documents, chunks and embeddings are deleted by tenant id; caches are purged by tenant prefix; traces are deleted or were redacted; tenant-specific eval datasets are removed; backups expire on a documented schedule. A deletion job produces an audit record, and a test seeds a tenant, deletes it and asserts nothing remains in any store.",
+      "es": "Residencia: uso una arquitectura de celdas. Un control plane global delgado guarda auth, facturación y el directorio de tenants; cada región tiene un stack completo con su propia base de datos, índice vectorial, cola, endpoint de LLM y observabilidad. El campo de región del tenant enruta cada petición a su celda de origen. Los traces van a un backend regional o se redactan antes de exportarse, y los backups y corridas de evals se quedan en la región.\n\nBorrado: mantengo un inventario de datos por tenant para que la supresión sea una checklist, no una búsqueda. Documentos, chunks y embeddings se borran por tenant id; las cachés se purgan por prefijo de tenant; los traces se borran o ya estaban redactados; los datasets de evals propios del tenant se eliminan; los backups expiran según un calendario documentado. Un job de borrado produce un registro de auditoría, y un test siembra un tenant, lo borra y verifica que no quede nada en ningún almacén."
+    }
+  },
+  {
+    "id": "m7-iv-11",
+    "level": "mid",
+    "tags": ["behavioral", "project", "storytelling"],
+    "question": {
+      "en": "Tell me about a project you're proud of.",
+      "es": "Cuéntame de un proyecto del que estés orgulloso."
+    },
+    "answer": {
+      "en": "Use a 4-minute structure and then stop:\n\n- **Context (30 s):** the client and problem, for example a legal-tech SaaS serving 14 firms that needed a research assistant with strict isolation.\n- **Role and constraints (20 s):** solo, 5 days, latency, cost and isolation targets.\n- **Architecture (60 s):** the request path in one breath.\n- **Hardest problem (60 s):** one deep issue, such as small tenants getting poor recall from HNSW post-filtering, and how you diagnosed and fixed it.\n- **Results (30 s):** your measured eval scores against targets, isolation test results, p95 and cost per 1k requests.\n- **What you'd change (20 s).**\n\nOnly use numbers you can back with an artifact, say \"I\" for your own work, and offer to show the repo or a trace.",
+      "es": "Usa una estructura de 4 minutos y luego detente:\n\n- **Contexto (30 s):** el cliente y el problema, por ejemplo un SaaS de legal-tech que atiende a 14 bufetes y necesitaba un asistente de investigación con aislamiento estricto.\n- **Rol y restricciones (20 s):** solo, 5 días, objetivos de latencia, costo y aislamiento.\n- **Arquitectura (60 s):** el camino de la petición de un tirón.\n- **Problema más difícil (60 s):** un problema profundo, como tenants pequeños con mal recall por el post-filtrado de HNSW, y cómo lo diagnosticaste y resolviste.\n- **Resultados (30 s):** tus puntajes de evals medidos contra los objetivos, resultados de los tests de aislamiento, p95 y costo por 1k peticiones.\n- **Qué cambiarías (20 s).**\n\nUsa solo números que puedas respaldar con un artefacto, di \"yo\" para tu propio trabajo y ofrece mostrar el repo o un trace."
+    }
+  },
+  {
+    "id": "m7-iv-12",
+    "level": "senior",
+    "tags": ["scaling", "multi-tenancy", "operations"],
+    "question": {
+      "en": "Your multi-tenant AI platform grows from 14 to 100 tenants and 10x the documents. What breaks first, and what do you do?",
+      "es": "Tu plataforma de IA multi-tenant crece de 14 a 100 tenants y 10 veces más documentos. ¿Qué se rompe primero y qué haces?"
+    },
+    "answer": {
+      "en": "Likely first: LLM provider quotas and cost, then retrieval quality for small tenants in the pooled index, then ingestion throughput.\n\n- **LLM:** request quota increases, spread load across regions or providers behind the provider abstraction, tighten routing to smaller models, add prompt caching and per-tenant caches. Watch margin per plan.\n- **Retrieval:** per-tenant recall monitoring will show small-tenant degradation. Partition the table by tenant or tenant group, tune HNSW search parameters, and move the largest tenants to dedicated namespaces or cells.\n- **Ingestion:** scale workers on queue depth with per-tenant concurrency caps, and keep ingestion separate from chat traffic.\n- **Operations:** automated tenant onboarding, per-tenant SLO dashboards and noisy-neighbor alerts.\n\nI would load test at the new scale with k6 and rerun the eval and isolation suites before each migration step.",
+      "es": "Probablemente primero: las cuotas y el costo del proveedor de LLM, luego la calidad de retrieval de los tenants pequeños en el índice compartido, luego el throughput de ingesta.\n\n- **LLM:** pedir aumentos de cuota, repartir la carga entre regiones o proveedores detrás de la abstracción de proveedor, ajustar el enrutamiento hacia modelos más pequeños, agregar prompt caching y cachés por tenant. Vigilar el margen por plan.\n- **Retrieval:** el monitoreo de recall por tenant mostrará la degradación de los tenants pequeños. Particionar la tabla por tenant o grupo de tenants, ajustar los parámetros de búsqueda de HNSW y mover a los tenants más grandes a namespaces o celdas dedicadas.\n- **Ingesta:** escalar workers según la profundidad de la cola con topes de concurrencia por tenant, y mantener la ingesta separada del tráfico de chat.\n- **Operación:** onboarding automatizado de tenants, dashboards de SLO por tenant y alertas de vecinos ruidosos.\n\nHaría pruebas de carga a la nueva escala con k6 y volvería a correr las suites de evals y de aislamiento antes de cada paso de migración."
+    }
+  }
+]

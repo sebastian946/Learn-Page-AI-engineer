@@ -1,0 +1,236 @@
+## Why IaC matters more for LLM apps
+
+In Module 5 you deployed to ECS with a task definition in the repo and maybe a little Terraform. That works for one service. It breaks down when a regulated client asks: "Show me every path by which customer data can reach a model provider, and prove the staging and production networks are configured the same way."
+
+Clicked-together infrastructure cannot answer that. Terraform can, because the answer is in code review history. For LLM apps, IaC captures several settings that are easy to get wrong by hand and hard to spot later:
+
+- ALB and target group timeouts sized for streaming.
+- Private network paths to Bedrock and Secrets Manager (no internet egress for model calls).
+- IAM that allows invoking **specific** models, not `bedrock:*` on `*`.
+- Secrets that are referenced, never stored in the image or in Terraform state.
+
+This lesson assumes you know Terraform basics (providers, resources, modules, state). It focuses on the LLM-specific resources and decisions.
+
+## Module layout
+
+Split reusable modules from environment roots. Each environment has its own state.
+
+```text
+infra/
+  modules/
+    llm-ecs-service/        # ECS service, task def, ALB target group, IAM, autoscaling
+      main.tf  iam.tf  alb.tf  variables.tf  outputs.tf
+    network-endpoints/      # VPC endpoints for bedrock-runtime, secretsmanager, ecr, logs, s3
+  envs/
+    staging/  main.tf  backend.tf  terraform.tfvars
+    prod/     main.tf  backend.tf  terraform.tfvars
+```
+
+Use a remote backend with locking, for example S3 with `use_lockfile = true` (recent Terraform versions) or a DynamoDB lock table on older setups. Separate AWS accounts for staging and prod are the norm in regulated environments.
+
+## The ALB, sized for streams
+
+The two most important numbers from Module 5 now live in code, where reviewers can see them.
+
+```hcl
+resource "aws_lb" "this" {
+  name               = "${var.name}-alb"
+  load_balancer_type = "application"
+  internal           = var.internal
+  subnets            = var.public_subnet_ids
+  security_groups    = [aws_security_group.alb.id]
+  idle_timeout       = var.idle_timeout_seconds   # e.g. 300 for long streams
+  drop_invalid_header_fields = true
+}
+
+resource "aws_lb_target_group" "api" {
+  name                 = "${var.name}-tg"
+  port                 = var.container_port
+  protocol             = "HTTP"
+  target_type          = "ip"                     # Fargate awsvpc
+  vpc_id               = var.vpc_id
+  deregistration_delay = var.drain_seconds        # >= p99 stream duration
+
+  health_check {
+    path                = "/healthz"              # liveness, not provider health
+    matcher             = "200"
+    interval            = 15
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+```
+
+Add a validation so nobody "optimizes" the timeout back to the default without thinking:
+
+```hcl
+variable "idle_timeout_seconds" {
+  type    = number
+  default = 300
+  validation {
+    condition     = var.idle_timeout_seconds >= 120
+    error_message = "Streaming LLM responses need an ALB idle timeout of at least 120 seconds."
+  }
+}
+```
+
+## Private paths to Bedrock: VPC endpoints
+
+Without endpoints, a task in a private subnet reaches Bedrock through a NAT gateway and the public internet (TLS-encrypted, but still leaving your VPC). An **interface VPC endpoint** for `bedrock-runtime` keeps the traffic on the AWS network and lets you attach an endpoint policy.
+
+```hcl
+resource "aws_security_group" "endpoints" {
+  name   = "${var.name}-vpce"
+  vpc_id = var.vpc_id
+  ingress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = var.client_security_group_ids   # only the app tasks
+  }
+}
+
+resource "aws_vpc_endpoint" "bedrock_runtime" {
+  vpc_id              = var.vpc_id
+  service_name        = "com.amazonaws.${var.region}.bedrock-runtime"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = var.private_subnet_ids
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true   # SDK calls to the regional hostname resolve privately
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+      Resource  = var.allowed_model_arns
+    }]
+  })
+}
+```
+
+Create the same kind of endpoint for `secretsmanager`, `ecr.api`, `ecr.dkr` and `logs`, plus an S3 **gateway** endpoint (ECR stores image layers in S3). With all of them in place, the service can run in subnets with no NAT at all. That is a strong statement in a security review: "the model service has no route to the internet".
+
+Two details trip people up. `private_dns_enabled` requires the VPC to have DNS support and DNS hostnames enabled. And the endpoint policy is an **extra** filter: the task role must still allow the same actions.
+
+## IAM least privilege for model calls
+
+The task role is what your code runs as. Give it exactly the models it needs.
+
+```hcl
+data "aws_iam_policy_document" "invoke_models" {
+  statement {
+    sid     = "InvokeApprovedModels"
+    actions = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+    resources = concat(
+      [for id in var.foundation_model_ids :
+        "arn:aws:bedrock:*::foundation-model/${id}"],          # all regions a profile may route to
+      [for id in var.inference_profile_ids :
+        "arn:aws:bedrock:${var.region}:${var.account_id}:inference-profile/${id}"]
+    )
+  }
+  statement {
+    sid       = "ApplyGuardrail"
+    actions   = ["bedrock:ApplyGuardrail"]
+    resources = [var.guardrail_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "task_invoke" {
+  name   = "${var.name}-invoke-models"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.invoke_models.json
+}
+```
+
+Why the wildcard region on foundation-model ARNs? A **cross-region inference profile** (lesson 8) may route a request to the model in another region, and IAM evaluates both the profile ARN and the destination model ARN. If you want to restrict regions tightly, list them explicitly instead of `*`.
+
+Keep two roles separate, as in Module 5:
+
+- **Execution role:** pulls the image, writes logs, reads the secrets referenced in the task definition (`secretsmanager:GetSecretValue` on those ARNs only).
+- **Task role:** what the app does at runtime: invoke models, read its S3 bucket, write its traces.
+
+## Secrets without leaking them into state
+
+Anything Terraform writes ends up in state. An `aws_secretsmanager_secret_version` with a literal `secret_string` puts your provider key in the state file. Options, from best to acceptable:
+
+1. Terraform creates the **secret container** only. A human or a separate pipeline sets the value (`aws secretsmanager put-secret-value`). Terraform references the ARN.
+2. Use **write-only arguments** where your Terraform and provider versions support them (for example `secret_string_wo`), which are never persisted to state.
+3. If a value must be in state, encrypt the state bucket with KMS, restrict access tightly and treat the state file as a secret.
+
+The task definition then references the ARN in `secrets`, exactly as in Module 5.
+
+## ECS service and autoscaling in code
+
+The service resource ties it together. Two settings deserve attention: the deployment circuit breaker (automatic rollback when new tasks fail to become healthy) and `stop_timeout` in the container definition for stream draining.
+
+```hcl
+resource "aws_ecs_service" "api" {
+  name            = var.name
+  cluster         = var.cluster_arn
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = var.min_tasks
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [aws_security_group.task.id]
+    assign_public_ip = false
+  }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = var.container_port
+  }
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+  lifecycle { ignore_changes = [desired_count] }   # autoscaling owns it
+}
+```
+
+`ignore_changes` on `desired_count` stops every `terraform apply` from resetting the count that Application Auto Scaling chose.
+
+## Guardrails on the IaC itself
+
+Treat Terraform like application code. You know this pattern from CI:
+
+- `terraform fmt -check` and `terraform validate` on every PR.
+- A static scanner (Checkov, tfsec/Trivy) to catch public buckets, open security groups and wildcard IAM.
+- `terraform test` with mocked providers for module logic (the exercise uses this).
+- `terraform plan` posted to the PR from GitHub Actions using OIDC (Module 5), and `apply` only from `main` with an approval for prod.
+
+## Common mistakes
+
+- **`bedrock:*` on `*`** in the task role. It also allows management actions like creating provisioned throughput, which costs real money.
+- **Forgetting the S3 gateway endpoint** in a no-NAT VPC. Image pulls fail with confusing timeouts.
+- **Endpoint policy that allows models the task role does not**, or the reverse. Both must agree.
+- **Provider keys in Terraform state** via literal secret values.
+- **`desired_count` without `ignore_changes`**, so every apply fights the autoscaler.
+- **Default ALB idle timeout** shipped to prod. Streams die at 60 seconds of silence.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you make sure an ECS-hosted LLM service can only call approved Bedrock models and never reaches the internet?" level="senior">
+
+Network first: run tasks in private subnets with no NAT route, and add interface VPC endpoints for bedrock-runtime, Secrets Manager, ECR and CloudWatch Logs, plus an S3 gateway endpoint for image layers. With private DNS on the endpoints, SDK calls resolve to private IPs.
+
+Then two IAM layers. The task role allows only `InvokeModel` and `InvokeModelWithResponseStream` on the specific foundation-model and inference-profile ARNs we approved. The endpoint policy repeats that allow-list, so even a misconfigured role cannot use other models through this path. Everything is in Terraform, scanned in CI and reviewed, which gives auditors a history of every change.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Mention state hygiene">
+
+When Terraform comes up, say how you keep secrets out of state. Many candidates never think about it, and interviewers at regulated companies notice.
+
+</Callout>
+
+## Further reading
+
+- Terraform AWS provider docs: https://registry.terraform.io/providers/hashicorp/aws/latest/docs
+- Terraform tests: https://developer.hashicorp.com/terraform/language/tests
+- Use interface VPC endpoints with Amazon Bedrock: https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html
+- Identity-based policies for Amazon Bedrock: https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html
+- Application Load Balancer attributes (idle timeout): https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html

@@ -58,7 +58,7 @@ Más una capa que vive en el proveedor: el **prompt caching**.
 
 ### Capa 1: el caché de embeddings no es negociable
 
-Re-indexar el corpus después de un cambio de chunking no debería volver a generar embeddings de texto que no cambió. Haz hash del texto normalizado del chunk más el nombre del modelo de embeddings y guarda los vectores con ese hash como clave. Probablemente hiciste una versión de esto en `03-pgvector/`; hazlo explícito. Incluir el modelo en la clave importa: los vectores de dos modelos distintos viven en espacios diferentes y nunca deben mezclarse.
+Re-indexar el corpus después de un cambio de chunking no debería volver a generar embeddings de texto que no cambió. Haz hash del texto normalizado del chunk más el nombre del modelo de embeddings y guarda los vectores con ese hash como clave. Tu tabla `chunks` de `03-pgvector/` ya guarda `embedding_model`, y los documentos llevan un `content_hash`; haz explícito el caché con una búsqueda que use ambos como clave. Incluir el modelo en la clave importa: los vectores de dos modelos distintos viven en espacios diferentes y nunca deben mezclarse.
 
 ### Capas 3–4: versiona todo en la clave
 

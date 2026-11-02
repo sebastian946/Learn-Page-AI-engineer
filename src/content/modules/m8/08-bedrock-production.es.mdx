@@ -1,0 +1,164 @@
+## Por qué Bedrock aparece en tantas ofertas de trabajo
+
+Muchas empresas ya tienen contratos con AWS, revisiones de seguridad y acuerdos de procesamiento de datos. Amazon Bedrock les permite usar foundation models (los modelos Claude de Anthropic, los modelos propios de Amazon, Llama de Meta, Mistral y otros) dentro de ese perímetro existente: IAM para el acceso, VPC endpoints para la red, CloudTrail para la auditoría, facturación consolidada. Para un cliente regulado eso suele ser el factor decisivo, más que cualquier benchmark.
+
+El Módulo 1 usó Bedrock como un proveedor más detrás de tu abstracción. Esta lección cubre qué cambia cuando es **la** plataforma de producción.
+
+## La superficie de la API
+
+Importan dos APIs de runtime:
+
+- **`InvokeModel` / `InvokeModelWithResponseStream`**: envías el cuerpo de request nativo del proveedor. Máximo control, payloads específicos de cada proveedor.
+- **`Converse` / `ConverseStream`**: un único formato de mensajes entre modelos, con tool use, system prompts, guardrails y metadatos de uso integrados. Prefiérela para código nuevo; convierte los cambios de modelo en un cambio de configuración.
+
+```python
+import os
+from collections.abc import Iterator
+
+import boto3
+from botocore.config import Config
+
+cfg = Config(retries={"max_attempts": 6, "mode": "adaptive"},
+             connect_timeout=5, read_timeout=120)
+brt = boto3.client("bedrock-runtime", region_name=os.environ["AWS_REGION"], config=cfg)
+
+MODEL_ID = os.environ["BEDROCK_MODEL_ID"]          # often an inference profile id
+GUARDRAIL = {"guardrailIdentifier": os.environ["GUARDRAIL_ID"],
+             "guardrailVersion": os.environ["GUARDRAIL_VERSION"],   # pin a number, not DRAFT
+             "trace": "enabled", "streamProcessingMode": "sync"}
+
+def stream_answer(question: str, context: str) -> Iterator[str]:
+    resp = brt.converse_stream(
+        modelId=MODEL_ID,
+        system=[{"text": "Answer only from the provided policy context. Cite section ids."}],
+        messages=[{"role": "user", "content": [{"text": f"{context}\n\nQuestion: {question}"}]}],
+        inferenceConfig={"maxTokens": 800, "temperature": 0.2},
+        guardrailConfig=GUARDRAIL,
+    )
+    for event in resp["stream"]:
+        if "contentBlockDelta" in event:
+            yield event["contentBlockDelta"]["delta"].get("text", "")
+        elif "messageStop" in event and event["messageStop"]["stopReason"] == "guardrail_intervened":
+            log_guardrail_block(question)            # count it; it is a product signal
+        elif "metadata" in event:
+            record_usage(event["metadata"]["usage"])  # inputTokens, outputTokens
+```
+
+boto3 es síncrono. En un servicio FastAPI, córrelo en un thread pool o usa un wrapper asíncrono como `aioboto3`; si no, el event loop queda bloqueado durante todo el stream. El modo de reintentos `adaptive` agrega rate limiting del lado del cliente cuando Bedrock devuelve `ThrottlingException`.
+
+## Acceso a modelos y gobernanza
+
+El acceso se controla por cuenta y por región:
+
+- **IAM** decide qué principals pueden invocar qué ARNs de modelos (lección 7).
+- Algunos proveedores requieren un **acuerdo único** o un formulario de caso de uso, y algunos modelos de terceros se contratan vía AWS Marketplace. Las cuentas más antiguas lo gestionaban en una página de consola llamada "Model access"; el proceso cambió con el tiempo, así que revisa la documentación actual para tu cuenta.
+- A nivel de organización, las **Service Control Policies** pueden denegar `bedrock:InvokeModel` sobre cualquier modelo que no esté en la lista aprobada. Así un equipo de plataforma impone "solo modelos aprobados" en cientos de cuentas.
+
+Trata "un equipo quiere un modelo nuevo" como un pedido de cambio: revisión de seguridad, resultados de evaluación sobre el dataset del equipo y luego una actualización de IAM/SCP mediante Terraform.
+
+## Cuotas y opciones de throughput
+
+Bedrock aplica cuotas por modelo, por región y por cuenta, normalmente como requests por minuto y tokens por minuto. Los valores por defecto varían según el modelo y la cuenta. Planificar producción significa:
+
+1. Estimar el pico de tokens por minuto a partir de tu modelo de costos del Módulo 5 (input más output).
+2. Compararlo con la cuota en la consola de Service Quotas. Pide aumentos temprano; no son instantáneos.
+3. Crear alarmas sobre la métrica de CloudWatch `InvocationThrottles`.
+
+Luego eliges un modo de consumo:
+
+| Modo | Cómo funciona | Úsalo cuando |
+|---|---|---|
+| **On-demand** | Pagas por token, capacidad compartida, sujeto a cuotas | Por defecto; tráfico con picos o moderado |
+| **Inferencia cross-region** | Un inference profile rutea requests entre varias regiones de una geografía | Necesitas más throughput o resiliencia sin cambiar código |
+| **Provisioned Throughput** | Compras model units por un plazo; throughput dedicado | Volumen alto y estable, latencia estricta, o modelos custom/fine-tuned que lo requieren |
+| **Batch inference** | Envías un archivo de requests y los resultados llegan a S3 | Jobs offline (backfills, corridas de evaluación, resúmenes masivos); normalmente con descuento frente a on-demand en los modelos soportados |
+
+Provisioned Throughput es un compromiso de capacidad. Haz la cuenta con datos reales de tráfico antes de comprar: una model unit que pagas mientras está ociosa es el problema de la GPU ociosa de la lección 3, con un contrato encima. Revisa precios y plazos actuales en la página de precios de AWS; cambian.
+
+## Inferencia cross-region
+
+Un **inference profile** es un id que pasas como `modelId`. Un perfil geográfico (por ejemplo uno con prefijo `us.` o `eu.`) puede rutear cada request a cualquier región de esa geografía, usando capacidad libre. Un perfil global puede rutear de forma más amplia.
+
+Qué significa para ti:
+
+- **Sube el throughput y la resiliencia**, a menudo sin más cambio de código que el id del modelo.
+- **Residencia de datos:** un perfil geográfico mantiene el procesamiento dentro de esa geografía. Un perfil global puede no cumplir un requisito estricto de residencia. Decídelo con el equipo de cumplimiento del cliente y déjalo por escrito.
+- **IAM:** permite el ARN del perfil y los ARNs de foundation models en las regiones de destino (lección 7).
+- **Logs:** los logs de invocación y los eventos de CloudTrail se registran en la región de origen a la que llamaste.
+
+## Bedrock Guardrails
+
+Los Guardrails son políticas configurables que Bedrock evalúa sobre inputs y outputs:
+
+- **Filtros de contenido** (odio, insultos, sexual, violencia, conducta indebida, ataques de prompt) con intensidad ajustable.
+- **Temas denegados** descritos en lenguaje natural ("consejos de inversión", "diagnóstico de condiciones médicas").
+- **Filtros de palabras** y listas de groserías.
+- **Filtros de información sensible**: detectan tipos de PII (nombres, SSNs, emails...) o regex propias, y las **bloquean** o las **enmascaran**.
+- **Chequeos de grounding contextual**: puntúan si una respuesta está fundamentada en la fuente provista y es relevante para la consulta, una red de seguridad específica de RAG.
+
+Reglas operativas:
+
+- Los guardrails tienen **versiones**. Fija un número de versión en producción; `DRAFT` cambia bajo tus pies.
+- Puedes llamar a **`ApplyGuardrail`** sobre cualquier texto, independientemente de la invocación del modelo. Eso te permite aplicar la misma política a la salida de un modelo autoalojado o a un documento antes de indexarlo.
+- Una intervención del guardrail es un evento de producto. Regístrala y cuéntala. Un pico después de un cambio de prompt es una señal de release (lección 1).
+- Los guardrails agregan latencia y costo por unidad de texto. En modo streaming, `sync` revisa los chunks antes de liberarlos (más seguro, más lento); `async` transmite primero y revisa en paralelo (más rápido, puede mostrar texto que luego se marca).
+
+Los guardrails complementan, no reemplazan, las defensas del Módulo 3: validación de inputs, manejo de prompt injection, contratos de salida y evaluaciones.
+
+## Registrar las invocaciones
+
+Dos logs distintos, ambos necesarios:
+
+- **CloudTrail** registra la actividad de la API: quién invocó qué modelo, cuándo y desde dónde. Es tu rastro de auditoría de accesos.
+- **Model invocation logging** registra el **contenido**: prompts, respuestas, cantidad de tokens, enviados a CloudWatch Logs y/o S3. Viene desactivado por defecto y se configura por región.
+
+```hcl
+resource "aws_bedrock_model_invocation_logging_configuration" "this" {
+  logging_config {
+    text_data_delivery_enabled      = true
+    image_data_delivery_enabled     = false
+    embedding_data_delivery_enabled = false
+    s3_config {
+      bucket_name = aws_s3_bucket.bedrock_logs.id    # KMS-encrypted, Object Lock, lifecycle rules
+      key_prefix  = "invocations"
+    }
+  }
+}
+```
+
+Los logs de invocación contienen lo que los usuarios escribieron, incluida PII y PHI. Cifra el bucket con una KMS key gestionada por el cliente, restringe la lectura a un grupo pequeño, define un período de retención acorde a la política y decide de forma consciente si necesitas logs de contenido en cada entorno (lección 11). Tus propios traces de aplicación (Langfuse, OpenTelemetry) tienen el mismo problema.
+
+Para métricas, el namespace de CloudWatch `AWS/Bedrock` ofrece por modelo `Invocations`, `InvocationLatency`, `InvocationThrottles`, `InvocationClientErrors`, `InvocationServerErrors`, `InputTokenCount` y `OutputTokenCount`. Construye tu dashboard y tus alarmas de throttling sobre ellas.
+
+## Errores comunes
+
+- **Fijar los guardrails en `DRAFT`.** Alguien edita la consola y el comportamiento de producción cambia sin deploy.
+- **Llamar a boto3 de forma síncrona dentro de handlers async.** Un stream bloquea el event loop para todos los demás usuarios.
+- **Ignorar las cuotas hasta el día del lanzamiento.** Los pedidos de aumento tardan; el throttling parece una caída.
+- **Usar un inference profile global para datos con requisitos de residencia** sin aprobación de cumplimiento.
+- **Activar el invocation logging sin retención ni controles de acceso.** Acabas de construir un archivo de PHI sin protección.
+- **Comprar Provisioned Throughput con una estimación.** Mide primero el uso on-demand.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Una aseguradora de salud quiere usar Claude en Bedrock para respuestas a sus afiliados. ¿Qué preocupaciones de producción planteas?" level="senior">
+
+Acceso y gobernanza: IAM y SCPs que permitan solo los ARNs aprobados de modelo e inference profile, a través de un VPC endpoint con una política equivalente. Residencia: si un perfil cross-region geográfico es aceptable o debemos quedarnos en una región. Capacidad: pico de tokens por minuto contra las cuotas, con alarmas de throttling, y on-demand primero, Provisioned Throughput solo cuando los datos de tráfico lo justifiquen.
+
+Seguridad: una versión fija de Bedrock Guardrail con enmascarado de PII, temas denegados como consejos de diagnóstico y chequeos de grounding, encima de nuestras propias evaluaciones y contratos de salida. Auditoría: CloudTrail para los accesos, invocation logging solo donde se justifique, con cifrado KMS, acceso restringido y una política de retención. Además, el BAA y los términos de uso de datos del proveedor revisados por su equipo de cumplimiento.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuál es la diferencia entre Converse e InvokeModel?" level="mid">
+
+`InvokeModel` recibe el formato de request nativo del proveedor del modelo, así que el código es específico de cada modelo. `Converse` ofrece un único schema de mensajes entre los modelos soportados, con system prompts, tool use, configuración de guardrails y uso de tokens integrados. Uso Converse por defecto para que cambiar de modelo sea un cambio de configuración, y uso InvokeModel solo para funcionalidades que Converse no expone.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Guía de usuario de Amazon Bedrock: https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html
+- API Converse: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
+- Inferencia cross-region: https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html
+- Bedrock Guardrails: https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html
+- Model invocation logging: https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html

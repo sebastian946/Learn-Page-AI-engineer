@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m6-iv-01",
+    "level": "mid",
+    "tags": ["sql", "observability", "window-functions"],
+    "question": {
+      "en": "You have a table of LLM requests with latency, model, prompt version and feedback. How do you find whether the latest prompt version degraded quality or latency?",
+      "es": "Tienes una tabla de requests a un LLM con latencia, modelo, versión de prompt y feedback. ¿Cómo averiguas si la última versión del prompt empeoró la calidad o la latencia?"
+    },
+    "answer": {
+      "en": "I'd compute metrics per `prompt_version` and segment, not globally.\n\n- Latency: p50/p95 with `percentile_cont` (or `percentile_approx` on large tables), excluding errors and timeouts, which I report separately.\n- Quality: thumbs-down rate, no-citation rate and error rate per version.\n- Compare within the same route or tenant, because traffic mix may have shifted when the version shipped. A CTE computes rates per `(route, version)` and a pivot gives the delta.\n- `LAG` over deploy dates shows trends across several versions.\n\nIf a segment regressed, I confirm offline: run both prompt versions on the same frozen eval dataset so the difference can't be explained by traffic changes.",
+      "es": "Calcularía las métricas por `prompt_version` y por segmento, no de forma global.\n\n- Latencia: p50/p95 con `percentile_cont` (o `percentile_approx` en tablas grandes), excluyendo errores y timeouts, que reporto aparte.\n- Calidad: tasa de thumbs-down, tasa de respuestas sin citas y tasa de error por versión.\n- Comparo dentro de la misma ruta o tenant, porque la mezcla de tráfico pudo cambiar cuando salió la versión. Un CTE calcula las tasas por `(route, version)` y un pivot da el delta.\n- `LAG` sobre las fechas de deploy muestra la tendencia a través de varias versiones.\n\nSi un segmento empeoró, lo confirmo offline: ejecuto ambas versiones del prompt sobre el mismo dataset de evaluación congelado para que la diferencia no se explique por cambios de tráfico."
+    }
+  },
+  {
+    "id": "m6-iv-02",
+    "level": "mid",
+    "tags": ["data-pipelines", "idempotency", "rag"],
+    "question": {
+      "en": "How do you design a document ingestion pipeline for RAG so it can be safely re-run?",
+      "es": "¿Cómo diseñas un pipeline de ingesta de documentos para RAG que se pueda volver a ejecutar de forma segura?"
+    },
+    "answer": {
+      "en": "Three properties: incremental, idempotent and stale-aware.\n\n- **Incremental**: a watermark or file checkpoint (Auto Loader on Databricks) so only new or changed files are processed. The checkpoint is saved after the write commits.\n- **Idempotent**: deterministic `chunk_id` from source URI, position and content hash, and upserts (`MERGE` or `ON CONFLICT`). Re-processing a file yields the same rows.\n- **Stale-aware**: when a document changes, delete its chunks from older versions in the same transaction.\n\nI add lineage columns (`source_version`, `parser_version`, `run_id`) and a test that runs ingestion twice and asserts the row count doesn't change. Then a crash is fixed by simply re-running the job.",
+      "es": "Tres propiedades: incremental, idempotente y consciente de lo obsoleto.\n\n- **Incremental**: un watermark o checkpoint de archivos (Auto Loader en Databricks) para procesar solo archivos nuevos o modificados. El checkpoint se guarda después del commit de la escritura.\n- **Idempotente**: `chunk_id` determinista a partir del URI fuente, la posición y el hash del contenido, y upserts (`MERGE` u `ON CONFLICT`). Reprocesar un archivo produce las mismas filas.\n- **Consciente de lo obsoleto**: cuando un documento cambia, borro sus chunks de versiones anteriores en la misma transacción.\n\nAgrego columnas de lineage (`source_version`, `parser_version`, `run_id`) y un test que ejecuta la ingesta dos veces y verifica que el número de filas no cambie. Así una caída se resuelve simplemente volviendo a ejecutar el job."
+    }
+  },
+  {
+    "id": "m6-iv-03",
+    "level": "senior",
+    "tags": ["pii", "privacy", "governance"],
+    "question": {
+      "en": "A healthcare client wants RAG over documents containing patient data. How do you handle PII end to end?",
+      "es": "Un cliente de salud quiere RAG sobre documentos que contienen datos de pacientes. ¿Cómo manejas la PII de punta a punta?"
+    },
+    "answer": {
+      "en": "Scrub early and keep originals in one governed place.\n\n- Detect PII right after parsing, before chunking, embedding, logging or eval export: regex for structured ids, NER (for example Presidio) for names and addresses, allow-lists for false positives.\n- Choose redaction or consistent pseudonyms depending on whether questions need entity structure. A reversible mapping, if needed, lives in a separate table with strict grants.\n- Use only approved model endpoints (on Databricks, external or foundation model endpoints governed by AI Gateway, with guardrails), and make sure inference logs don't reintroduce raw PII.\n- Measure scrubber recall per entity type on a labeled set and fail the pipeline if it drops.\n- Use Unity Catalog grants and audit logs to show who can access originals.",
+      "es": "Eliminar temprano y mantener los originales en un solo lugar gobernado.\n\n- Detecto la PII justo después del parsing, antes del chunking, los embeddings, los logs o la exportación de evals: regex para ids estructurados, NER (por ejemplo Presidio) para nombres y direcciones, listas de permitidos para falsos positivos.\n- Elijo entre redacción o seudónimos consistentes según si las preguntas necesitan la estructura de entidades. Un mapeo reversible, si hace falta, vive en una tabla separada con grants estrictos.\n- Uso solo endpoints de modelos aprobados (en Databricks, endpoints externos o de foundation models gobernados por AI Gateway, con guardrails), y me aseguro de que los logs de inferencia no reintroduzcan PII cruda.\n- Mido el recall del scrubber por tipo de entidad sobre un set etiquetado y hago fallar el pipeline si baja.\n- Uso grants y logs de auditoría de Unity Catalog para mostrar quién puede acceder a los originales."
+    }
+  },
+  {
+    "id": "m6-iv-04",
+    "level": "mid",
+    "tags": ["databricks", "unity-catalog", "governance"],
+    "question": {
+      "en": "Why would a company build its GenAI applications on Databricks with Unity Catalog instead of a standalone stack?",
+      "es": "¿Por qué una empresa construiría sus aplicaciones de GenAI en Databricks con Unity Catalog en lugar de un stack independiente?"
+    },
+    "answer": {
+      "en": "Mainly governance and proximity to data.\n\n- Tables, Volumes with raw files, vector indexes, functions used as tools and registered models all live in one `catalog.schema.object` namespace with one permission model.\n- Lineage is captured automatically, so you can show which documents feed which index and which model uses it — important for regulated industries.\n- Data stays in Delta; compute (Vector Search, Model Serving, `ai_query`) comes to it instead of copying data to external systems.\n- MLflow, evaluation, inference tables and the Agent Framework are integrated.\n\nThe trade-offs are platform lock-in, cost visibility on a shared workspace, and APIs that change quickly. For a company already on Databricks those trade-offs usually favor staying.",
+      "es": "Principalmente gobernanza y cercanía a los datos.\n\n- Las tablas, los Volumes con archivos crudos, los índices vectoriales, las funciones usadas como herramientas y los modelos registrados viven en un solo namespace `catalog.schema.object` con un solo modelo de permisos.\n- El lineage se captura automáticamente, así puedes mostrar qué documentos alimentan qué índice y qué modelo lo usa, algo importante en industrias reguladas.\n- Los datos se quedan en Delta; el cómputo (Vector Search, Model Serving, `ai_query`) va hacia ellos en lugar de copiar datos a sistemas externos.\n- MLflow, la evaluación, las inference tables y el Agent Framework están integrados.\n\nLos trade-offs son el lock-in de plataforma, la visibilidad de costos en un workspace compartido y APIs que cambian rápido. Para una empresa que ya está en Databricks, esos trade-offs suelen favorecer quedarse."
+    }
+  },
+  {
+    "id": "m6-iv-05",
+    "level": "mid",
+    "tags": ["vector-search", "databricks"],
+    "question": {
+      "en": "Explain the difference between a Delta Sync index and a Direct Vector Access index in Mosaic AI Vector Search, and when to use each.",
+      "es": "Explica la diferencia entre un índice Delta Sync y un índice Direct Vector Access en Mosaic AI Vector Search, y cuándo usar cada uno."
+    },
+    "answer": {
+      "en": "A **Delta Sync index** is derived from a Delta table. Databricks syncs it using Change Data Feed, either on demand (TRIGGERED) or continuously. Embeddings can be managed — Databricks computes them from a text column with an embedding endpoint — or self-managed from a vector column. Requirements: CDF enabled and a primary key. It's the default for RAG over lakehouse documents.\n\nA **Direct Vector Access index** has no source table: the application upserts and deletes vectors through the API and owns consistency. Use it when the source of truth is outside Delta or writes are real-time from an app.\n\nI also choose the sync mode by the freshness requirement: TRIGGERED for batch updates, CONTINUOUS only when minutes matter, since it costs more.",
+      "es": "Un **índice Delta Sync** se deriva de una tabla Delta. Databricks lo sincroniza usando Change Data Feed, bajo demanda (TRIGGERED) o de forma continua. Los embeddings pueden ser administrados — Databricks los calcula desde una columna de texto con un endpoint de embeddings — o propios desde una columna de vectores. Requisitos: CDF activado y una primary key. Es la opción por defecto para RAG sobre documentos del lakehouse.\n\nUn **índice Direct Vector Access** no tiene tabla fuente: la aplicación hace upsert y delete de vectores a través de la API y se encarga de la consistencia. Úsalo cuando la fuente de verdad está fuera de Delta o las escrituras son en tiempo real desde una app.\n\nTambién elijo el modo de sincronización según el requisito de frescura: TRIGGERED para actualizaciones por lotes, CONTINUOUS solo cuando importan los minutos, porque cuesta más."
+    }
+  },
+  {
+    "id": "m6-iv-06",
+    "level": "senior",
+    "tags": ["model-serving", "cost", "architecture"],
+    "question": {
+      "en": "How do you decide between pay-per-token, provisioned throughput and external model endpoints on Databricks?",
+      "es": "¿Cómo decides entre endpoints pay-per-token, provisioned throughput y modelos externos en Databricks?"
+    },
+    "answer": {
+      "en": "By model requirement, traffic shape and SLA.\n\n- **External models** when we need a proprietary frontier model. The endpoint centralizes credentials, rate limits, usage tracking and logging via AI Gateway.\n- **Pay-per-token** Foundation Model APIs for prototypes, spiky or low traffic, and embeddings, accepting shared rate limits.\n- **Provisioned throughput** for fine-tuned models or production workloads that need guaranteed capacity and predictable latency.\n- **`ai_query`** batch for offline enrichment over tables.\n\nFor cost I model monthly tokens times current per-token prices against reserved capacity per hour at realistic utilization, and find the crossover. I usually start on pay-per-token in dev, measure real traffic, then move high-volume paths to provisioned throughput. I'd also keep a fallback route configured.",
+      "es": "Según el requisito de modelo, la forma del tráfico y el SLA.\n\n- **Modelos externos** cuando necesitamos un modelo frontera propietario. El endpoint centraliza credenciales, rate limits, seguimiento de uso y logs vía AI Gateway.\n- **Pay-per-token** de Foundation Model APIs para prototipos, tráfico variable o bajo, y embeddings, aceptando rate limits compartidos.\n- **Provisioned throughput** para modelos con fine-tuning o cargas de producción que necesitan capacidad garantizada y latencia predecible.\n- **`ai_query`** en batch para enriquecimiento offline sobre tablas.\n\nPara el costo modelo los tokens mensuales por los precios actuales por token contra la capacidad reservada por hora con una utilización realista, y encuentro el punto de cruce. Normalmente empiezo con pay-per-token en dev, mido el tráfico real y luego muevo las rutas de alto volumen a provisioned throughput. También mantendría configurada una ruta de fallback."
+    }
+  },
+  {
+    "id": "m6-iv-07",
+    "level": "mid",
+    "tags": ["mlflow", "evaluation", "llm-judge"],
+    "question": {
+      "en": "How do you evaluate a RAG application with MLflow?",
+      "es": "¿Cómo evalúas una aplicación RAG con MLflow?"
+    },
+    "answer": {
+      "en": "First, tracing: autolog for the LLM SDK or framework and `@mlflow.trace` on my functions, with the retriever span typed as `RETRIEVER` so judges can see retrieved context.\n\nThen `mlflow.genai.evaluate` with a versioned dataset of `inputs` and `expectations` (expected facts or responses), my app as `predict_fn`, and scorers:\n\n- built-in judges: Correctness, RetrievalGroundedness, RetrievalRelevance, RelevanceToQuery, Safety\n- a `Guidelines` scorer for domain rules\n- code scorers for citations, format and latency\n\nEach run stores metrics plus per-row traces and rationales. I compare runs for prompt or model changes with the same dataset and judge model recorded as params, and read rationales on regressions. On older Databricks code you'll see `mlflow.evaluate(model_type=\"databricks-agent\")`, which is the same idea.",
+      "es": "Primero, tracing: autolog para el SDK o framework del LLM y `@mlflow.trace` en mis funciones, con el span del retriever tipado como `RETRIEVER` para que los jueces vean el contexto recuperado.\n\nLuego `mlflow.genai.evaluate` con un dataset versionado de `inputs` y `expectations` (hechos o respuestas esperadas), mi app como `predict_fn` y scorers:\n\n- jueces integrados: Correctness, RetrievalGroundedness, RetrievalRelevance, RelevanceToQuery, Safety\n- un scorer `Guidelines` para reglas del dominio\n- scorers de código para citas, formato y latencia\n\nCada run guarda métricas más traces por fila y justificaciones. Comparo runs ante cambios de prompt o modelo con el mismo dataset y modelo juez registrados como params, y leo las justificaciones en las regresiones. En código antiguo de Databricks verás `mlflow.evaluate(model_type=\"databricks-agent\")`, que es la misma idea."
+    }
+  },
+  {
+    "id": "m6-iv-08",
+    "level": "senior",
+    "tags": ["llm-judge", "evaluation", "calibration"],
+    "question": {
+      "en": "Your LLM judge says the new version is 4 points better on correctness. Do you ship?",
+      "es": "Tu juez LLM dice que la nueva versión es 4 puntos mejor en correctness. ¿La lanzas?"
+    },
+    "answer": {
+      "en": "Not on that number alone.\n\n- Is the judge calibrated? I check agreement with human labels on a sample (30–50 rows). If agreement is weak, 4 points is noise.\n- Same dataset version and same judge model and prompt for both runs? Otherwise the comparison is invalid.\n- Is the delta larger than run-to-run variance? I rerun the baseline to see the noise floor, or bootstrap a confidence interval.\n- Where does the gain come from? I look at rows that changed and read rationales; a gain on easy questions can hide a regression on a critical segment.\n- Guardrail metrics: groundedness, safety, latency and cost must not regress.\n\nIf all hold, ship behind a flag and confirm with online metrics.",
+      "es": "No solo con ese número.\n\n- ¿El juez está calibrado? Reviso el acuerdo con etiquetas humanas en una muestra (30–50 filas). Si el acuerdo es débil, 4 puntos son ruido.\n- ¿Misma versión de dataset y mismo modelo y prompt de juez en ambos runs? Si no, la comparación no es válida.\n- ¿El delta es mayor que la varianza entre corridas? Vuelvo a ejecutar la línea base para ver el piso de ruido, o hago bootstrap de un intervalo de confianza.\n- ¿De dónde viene la mejora? Miro las filas que cambiaron y leo las justificaciones; una mejora en preguntas fáciles puede esconder una regresión en un segmento crítico.\n- Métricas de guardia: groundedness, seguridad, latencia y costo no deben empeorar.\n\nSi todo se cumple, lo lanzo detrás de un feature flag y confirmo con métricas online."
+    }
+  },
+  {
+    "id": "m6-iv-09",
+    "level": "mid",
+    "tags": ["agent-framework", "databricks", "deployment"],
+    "question": {
+      "en": "What does `agents.deploy` do, and what do you need to have done before calling it?",
+      "es": "¿Qué hace `agents.deploy` y qué necesitas haber hecho antes de llamarlo?"
+    },
+    "answer": {
+      "en": "Before: the agent is authored in code implementing an MLflow agent interface (ResponsesAgent with MLflow 3), logged with `mlflow.pyfunc.log_model` using models from code, an input example, pinned requirements and declared `resources` (LLM endpoints, vector indexes, UC functions), evaluated, and registered as a version in Unity Catalog.\n\n`agents.deploy(uc_model_name, version)` then creates or updates a Model Serving endpoint for that version, sets up automatic auth for the declared resources, enables tracing and payload logging so production requests are recorded, and creates a Review App for stakeholder feedback. Deploying a new version updates the same endpoint, so client URLs stay stable.",
+      "es": "Antes: el agente está escrito en código implementando una interfaz de agente de MLflow (ResponsesAgent con MLflow 3), registrado con `mlflow.pyfunc.log_model` usando models from code, un input example, dependencias fijadas y `resources` declarados (endpoints de LLM, índices vectoriales, funciones de UC), evaluado y registrado como versión en Unity Catalog.\n\n`agents.deploy(uc_model_name, version)` luego crea o actualiza un endpoint de Model Serving para esa versión, configura la autenticación automática para los resources declarados, activa el tracing y el registro de payloads para que los requests de producción queden guardados, y crea una Review App para el feedback de los stakeholders. Desplegar una nueva versión actualiza el mismo endpoint, así las URLs de los clientes se mantienen estables."
+    }
+  },
+  {
+    "id": "m6-iv-10",
+    "level": "senior",
+    "tags": ["fine-tuning", "lora", "decision-making"],
+    "question": {
+      "en": "When is fine-tuning the right choice for an LLM application, and what does it cost beyond training?",
+      "es": "¿Cuándo es el fine-tuning la decisión correcta para una aplicación con LLM, y cuánto cuesta más allá del entrenamiento?"
+    },
+    "answer": {
+      "en": "I climb a ladder: prompting first, RAG for knowledge, fine-tuning last. Fine-tuning fits narrow, stable tasks — classification into internal codes, extraction from one form family, a strict style — when I have hundreds to thousands of reviewed examples and a measured gap after prompt and retrieval work, or when a small fine-tuned model can replace a large one to cut cost or latency, or must run on our own infrastructure.\n\nLoRA or QLoRA keep training cheap: frozen base, small adapters, 4-bit base for QLoRA.\n\nThe real cost is ownership: a training-data pipeline, reproducible runs, evaluation on every retrain, dedicated serving (provisioned throughput or GPUs), and re-basing when a better base model ships. I document that maintenance cost before recommending it.",
+      "es": "Subo una escalera: primero prompting, RAG para el conocimiento, fine-tuning al final. El fine-tuning encaja en tareas estrechas y estables — clasificación en códigos internos, extracción de una familia de formularios, un estilo estricto — cuando tengo de cientos a miles de ejemplos revisados y una brecha medida después del trabajo de prompts y retrieval, o cuando un modelo pequeño con fine-tuning puede reemplazar a uno grande para bajar costo o latencia, o debe correr en nuestra propia infraestructura.\n\nLoRA o QLoRA mantienen barato el entrenamiento: base congelada, adapters pequeños, base en 4 bits para QLoRA.\n\nEl costo real es mantenerlo: un pipeline de datos de entrenamiento, corridas reproducibles, evaluación en cada re-entrenamiento, serving dedicado (provisioned throughput o GPUs) y re-basing cuando sale un modelo base mejor. Documento ese costo de mantenimiento antes de recomendarlo."
+    }
+  },
+  {
+    "id": "m6-iv-11",
+    "level": "senior",
+    "tags": ["vllm", "self-hosting", "inference"],
+    "question": {
+      "en": "When would you self-host an open model with vLLM instead of using a managed API, and how would you size it?",
+      "es": "¿Cuándo autoalojarías un modelo abierto con vLLM en lugar de usar una API administrada, y cómo lo dimensionarías?"
+    },
+    "answer": {
+      "en": "Self-host when data residency rules out third-party APIs, when traffic is high and steady enough to keep GPUs busy, or when a small open or fine-tuned model is good enough for a narrow task. APIs win for low or spiky volume, frontier quality, or teams without GPU operations experience.\n\nSizing: weights plus KV cache. For example, Llama 3.1 8B in 16-bit is about 16 GB of weights, and its KV cache is about 128 KiB per token, so 8k-token sequences need about 1 GiB each. Available memory after weights divided by per-sequence KV gives concurrency. vLLM's PagedAttention and continuous batching raise effective throughput. Then I load test with realistic prompt and output lengths, measure tokens per second and p95, and compare total cost with API pricing.",
+      "es": "Autoalojo cuando la residencia de datos descarta APIs externas, cuando el tráfico es lo bastante alto y estable para mantener ocupadas las GPUs, o cuando un modelo abierto pequeño o con fine-tuning es suficiente para una tarea estrecha. Las APIs ganan con volumen bajo o variable, calidad frontera o equipos sin experiencia operando GPUs.\n\nDimensionamiento: pesos más KV cache. Por ejemplo, Llama 3.1 8B en 16 bits son unos 16 GB de pesos, y su KV cache ocupa unos 128 KiB por token, así que secuencias de 8k tokens necesitan alrededor de 1 GiB cada una. La memoria disponible después de los pesos dividida por el KV por secuencia da la concurrencia. PagedAttention y continuous batching de vLLM suben el throughput efectivo. Luego hago pruebas de carga con longitudes realistas de prompt y salida, mido tokens por segundo y p95, y comparo el costo total con los precios de la API."
+    }
+  },
+  {
+    "id": "m6-iv-12",
+    "level": "mid",
+    "tags": ["delta-lake", "reproducibility", "evaluation"],
+    "question": {
+      "en": "How do you make LLM evaluation results reproducible over time?",
+      "es": "¿Cómo haces que los resultados de evaluación de un LLM sean reproducibles en el tiempo?"
+    },
+    "answer": {
+      "en": "Version every input to the evaluation and record it with the results.\n\n- **Dataset**: immutable files (`eval_v3.jsonl`) or a Delta table queried with `VERSION AS OF`; I record the version in the MLflow run and set VACUUM retention so old versions stay available.\n- **App**: prompt version, model or endpoint name, retrieval config (embedding model, chunk size, k), code commit.\n- **Judge**: judge model and scorer definitions pinned and logged; a judge change means a new baseline.\n- **Randomness**: temperature 0 where possible, fixed seeds for sampling.\n\nI keep a frozen regression set for CI and a rolling set refreshed from production, and never compare metrics across different dataset or judge versions.",
+      "es": "Versiono cada entrada de la evaluación y la registro junto con los resultados.\n\n- **Dataset**: archivos inmutables (`eval_v3.jsonl`) o una tabla Delta consultada con `VERSION AS OF`; registro la versión en el run de MLflow y configuro la retención de VACUUM para que las versiones antiguas sigan disponibles.\n- **App**: versión del prompt, nombre del modelo o endpoint, configuración de retrieval (modelo de embeddings, tamaño de chunk, k), commit del código.\n- **Juez**: modelo juez y definiciones de scorers fijados y registrados; un cambio de juez significa una nueva línea base.\n- **Aleatoriedad**: temperatura 0 cuando sea posible, semillas fijas para el muestreo.\n\nMantengo un set de regresión congelado para CI y un set móvil refrescado desde producción, y nunca comparo métricas entre distintas versiones de dataset o de juez."
+    }
+  }
+]

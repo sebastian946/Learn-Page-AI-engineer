@@ -1,0 +1,177 @@
+## Objetivo
+
+Escribe un módulo de Terraform reutilizable, `llm-ecs-service`, que despliegue una API LLM en ECS Fargate como describió la lección 7, y **demuestra sus propiedades de seguridad con tests que corren sin cuenta de AWS**.
+
+El módulo debe crear:
+
+- una task definition y un servicio de ECS en subredes privadas sin IP pública;
+- un ALB y un target group con timeouts adecuados para streaming;
+- un interface VPC endpoint para `bedrock-runtime` con una política de endpoint;
+- roles IAM de ejecución y de task con mínimo privilegio;
+- una referencia a la API key del proveedor en Secrets Manager (el valor nunca en el código ni en el state).
+
+Lo vas a probar con `terraform test` y un **provider de AWS mockeado** (Terraform 1.7 o más nuevo). Los providers mockeados devuelven valores falsos para los atributos calculados, así que `command = plan` corre offline y tus aserciones verifican la lógica de la configuración. Si tienes una cuenta sandbox de AWS, un `terraform plan` real es un extra, no un requisito.
+
+El enfoque de SDET: esto es unit testing de infraestructura. Cada aserción codifica un requisito que, si no, un revisor de seguridad verificaría a mano.
+
+<AcceptanceCriteria>
+
+- [ ] `terraform fmt -check` y `terraform validate` pasan para el módulo y para la raíz de ejemplo
+- [ ] El módulo expone variables tipadas con descripciones, incluidas `allowed_model_arns`, `idle_timeout_seconds` (validada en 120 o más) y `drain_seconds`
+- [ ] `terraform test` pasa con `mock_provider "aws"` y al menos 6 bloques `run`
+- [ ] Un test afirma que el idle timeout del ALB es de al menos 120 segundos y que el deregistration delay del target group es igual a `drain_seconds`
+- [ ] Un test usa `expect_failures` para demostrar que `idle_timeout_seconds = 60` es rechazado
+- [ ] Un test afirma que el endpoint de bedrock-runtime usa el nombre de servicio regional correcto, tiene DNS privado habilitado y que su política lista exactamente `allowed_model_arns`
+- [ ] Un test afirma que ninguna sentencia IAM del task role usa `bedrock:*` ni un resource `*`
+- [ ] Un test afirma que la definición del contenedor recibe la API key mediante `secrets` (un ARN de Secrets Manager) y que ningún nombre de entrada en `environment` contiene `KEY` o `SECRET`
+- [ ] Checkov (o el escaneo de configuración de Trivy) corre sobre el módulo; los hallazgos se corrigen o se omiten con una razón escrita
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```hcl
+# modules/llm-ecs-service/variables.tf (excerpt)
+variable "name" {
+  type        = string
+  description = "Service name, used as a prefix for every resource."
+}
+
+variable "region" { type = string }
+variable "account_id" { type = string }
+variable "vpc_id" { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "public_subnet_ids" { type = list(string) }
+variable "cluster_arn" { type = string }
+variable "image" { type = string }
+
+variable "allowed_model_arns" {
+  type        = list(string)
+  description = "Foundation-model and inference-profile ARNs this service may invoke."
+  validation {
+    condition     = length(var.allowed_model_arns) > 0 && !contains(var.allowed_model_arns, "*")
+    error_message = "List explicit model ARNs; wildcards are not allowed."
+  }
+}
+
+variable "api_key_secret_arn" {
+  type        = string
+  description = "Secrets Manager ARN of the provider API key (value managed outside Terraform)."
+}
+
+variable "idle_timeout_seconds" {
+  type    = number
+  default = 300
+  # TODO: validation >= 120 with a clear error message
+}
+
+variable "drain_seconds" {
+  type    = number
+  default = 120
+}
+```
+
+```hcl
+# modules/llm-ecs-service/tests/security.tftest.hcl
+mock_provider "aws" {}
+
+variables {
+  name               = "claims-assistant"
+  region             = "us-east-1"
+  account_id         = "123456789012"
+  vpc_id             = "vpc-0abc"
+  private_subnet_ids = ["subnet-a", "subnet-b"]
+  public_subnet_ids  = ["subnet-c", "subnet-d"]
+  cluster_arn        = "arn:aws:ecs:us-east-1:123456789012:cluster/llm"
+  image              = "123456789012.dkr.ecr.us-east-1.amazonaws.com/claims:1.4.0"
+  api_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:claims/anthropic-AbC123"
+  allowed_model_arns = ["arn:aws:bedrock:us-east-1::foundation-model/example-model-id"]
+}
+
+run "alb_is_streaming_friendly" {
+  command = plan
+  assert {
+    condition     = aws_lb.this.idle_timeout >= 120
+    error_message = "ALB idle timeout must allow long streams."
+  }
+}
+
+run "short_timeout_is_rejected" {
+  command = plan
+  variables { idle_timeout_seconds = 60 }
+  expect_failures = [var.idle_timeout_seconds]
+}
+
+run "bedrock_endpoint_is_private_and_scoped" {
+  command = plan
+  assert {
+    condition     = aws_vpc_endpoint.bedrock_runtime.service_name == "com.amazonaws.us-east-1.bedrock-runtime"
+    error_message = "Wrong service name for the Bedrock runtime endpoint."
+  }
+  # TODO: private_dns_enabled, and jsondecode(policy).Statement[0].Resource == var.allowed_model_arns
+}
+
+# TODO: run blocks for IAM wildcards, secrets vs environment, no public IP
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Mantén la política IAM como un data source `aws_iam_policy_document` cuyos bloques `statement` se construyen a partir de variables. Los argumentos que defines se conocen en tiempo de plan incluso con un provider mockeado, así que un test puede inspeccionar `data.aws_iam_policy_document.invoke_models.statement` directamente. Solo los atributos calculados como `.json` reciben valores falsos.</Hint>
+  <Hint>Si un recurso valida JSON que viene de un data source mockeado (por ejemplo una role policy construida desde `.json`), el string aleatorio del mock puede dar problemas. Usa un bloque `override_data` en el archivo de test para darle a ese data source un valor `json` realista, o construye la política con `jsonencode` en un `local` sobre el que también puedas hacer aserciones.</Hint>
+  <Hint>Para el test de comodines de IAM, aplana las acciones y los resources de cada sentencia y verifícalos con `alltrue`, por ejemplo `alltrue([for s in data.aws_iam_policy_document.invoke_models.statement : !contains(s.actions, "bedrock:*")])`, y la misma idea para `"*"` en `resources`. Para el test del contenedor, `jsondecode(aws_ecs_task_definition.api.container_definitions)[0]` te da las listas `secrets` y `environment`.</Hint>
+  <Hint>Checkov marcará cosas como que el ALB no tiene access logs o que el target group usa HTTP. Corrige lo barato (access logs hacia un bucket recibido como variable, `drop_invalid_header_fields`), y para el resto agrega skips inline con una razón, como que TLS termina en el ALB dentro de una red privada. A un revisor le importa que cada skip sea una decisión, no que la lista esté vacía.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  03-terraform-ecs-bedrock/
+    modules/
+      llm-ecs-service/
+        main.tf             # task definition, service, security groups
+        alb.tf
+        endpoints.tf        # bedrock-runtime interface endpoint + policy
+        iam.tf              # execution role, task role
+        variables.tf
+        outputs.tf
+        versions.tf         # required_version >= 1.7, aws provider pin
+        tests/
+          security.tftest.hcl
+          networking.tftest.hcl
+    examples/
+      staging/
+        main.tf             # calls the module with example values
+    .checkov.yaml
+    README.md
+```
+
+Esquema del README:
+
+1. Qué crea el módulo (lista de recursos y un diagrama Mermaid: ALB → tasks de ECS en subredes privadas → VPC endpoint → Bedrock).
+2. Tabla de inputs y outputs.
+3. Propiedades de seguridad, cada una asociada al test que la demuestra.
+4. Cómo correrlo: `terraform init`, `terraform test`, `checkov -d .`.
+5. Brechas conocidas: otros endpoints necesarios para una VPC sin NAT (ECR, logs, Secrets Manager, gateway de S3), y el workflow de CI que agregarías.
+
+Commits sugeridos:
+
+- `feat(tf): llm-ecs-service module skeleton with typed variables`
+- `feat(tf): ALB and target group sized for streaming`
+- `feat(tf): bedrock-runtime VPC endpoint with scoped policy`
+- `feat(tf): least-privilege execution and task roles`
+- `test(tf): plan-only tests with mocked AWS provider`
+- `chore(tf): checkov scan with documented skips`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m8-09-review" title="Autoevaluación" items={["terraform test pasa offline con mock_provider y sin credenciales de AWS", "Cada propiedad de seguridad del README apunta a un bloque run específico", "El test de timeout corto falla si quito la validación (lo probé)", "Ningún valor secreto aparece en archivos .tf, tfvars ni de test", "El task role y la política del endpoint permiten los mismos ARNs de modelos", "Las tasks corren con assign_public_ip = false en subredes privadas", "desired_count se ignora en lifecycle para que el autoscaling no se reinicie", "Cada skip de Checkov tiene una razón de una línea"]} />

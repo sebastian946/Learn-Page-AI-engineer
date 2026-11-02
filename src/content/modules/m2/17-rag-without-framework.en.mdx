@@ -69,48 +69,40 @@ async def embed(texts: list[str]) -> np.ndarray:
     return vecs / np.linalg.norm(vecs, axis=1, keepdims=True)  # normalize once, cosine == dot
 ```
 
-Normalizing at write time means cosine similarity becomes a dot product. That matters when you do in-memory search with numpy, and it lets you use pgvector's inner-product operator.
+Normalizing at write time means cosine similarity becomes a plain dot product, which keeps in-memory numpy search and tests simple. pgvector's cosine operator ranks normalized and raw vectors the same way, so nothing breaks in the database.
 
 ### 2. Store and 3. Retrieve: SQL you can read
 
-With psycopg 3 and the `pgvector` adapter, the store is a table and the retriever is a query. You see the distance operator, the filters and the index that will be used.
+With psycopg 3 and the `pgvector` adapter, the store is the `documents` and `chunks` schema you built in `03-pgvector/` (Postgres from the `pgvector/pgvector:pg17` image), and the retriever is a query. You see the distance operator, the filters and the index that will be used.
 
 ```python
-import numpy as np
 import psycopg
 from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 
-DDL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE TABLE IF NOT EXISTS chunks (
-  chunk_id   text PRIMARY KEY,
-  doc_id     text NOT NULL,
-  section    text,
-  page       int,
-  product    text,            -- metadata used for filtering, e.g. 'fha', 'conventional'
-  text       text NOT NULL,
-  embedding  vector(1536) NOT NULL,  -- must match your embedding model's dimension
-  tsv        tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED
-);
-CREATE INDEX IF NOT EXISTS chunks_hnsw ON chunks USING hnsw (embedding vector_ip_ops);
-CREATE INDEX IF NOT EXISTS chunks_tsv ON chunks USING gin (tsv);
-"""
+# Schema from 03-pgvector: documents(doc_id, doc_type, jurisdiction, effective_date, is_current, content_hash)
+# and chunks(chunk_id, doc_id, parent_id, section, page, content, embedding_model, embedding vector(1024), tsv),
+# with an HNSW index on (embedding vector_cosine_ops) and a GIN index on tsv.
 
 VECTOR_SQL = """
-SELECT chunk_id, doc_id, section, page, text, -(embedding <#> %(q)s) AS score
-FROM chunks
-WHERE (%(product)s::text IS NULL OR product = %(product)s)
-ORDER BY embedding <#> %(q)s
-LIMIT %(k)s
+SELECT c.chunk_id, c.parent_id, c.doc_id, c.section, c.page, c.content,
+       1 - (c.embedding <=> %(q)s) AS score
+FROM chunks c JOIN documents d USING (doc_id)
+WHERE d.is_current AND d.jurisdiction = ANY(%(jur)s)
+  AND (%(doc_type)s::text IS NULL OR d.doc_type = %(doc_type)s)
+  AND c.embedding_model = %(model)s
+ORDER BY c.embedding <=> %(q)s
+LIMIT %(n)s
 """
 
 KEYWORD_SQL = """
-SELECT chunk_id, doc_id, section, page, text, ts_rank_cd(tsv, query) AS score
-FROM chunks, websearch_to_tsquery('english', %(text)s) AS query
-WHERE tsv @@ query AND (%(product)s::text IS NULL OR product = %(product)s)
+SELECT c.chunk_id, c.parent_id, c.doc_id, c.section, c.page, c.content,
+       ts_rank_cd(c.tsv, query) AS score
+FROM chunks c JOIN documents d USING (doc_id), websearch_to_tsquery('english', %(text)s) AS query
+WHERE c.tsv @@ query AND d.is_current AND d.jurisdiction = ANY(%(jur)s)
+  AND (%(doc_type)s::text IS NULL OR d.doc_type = %(doc_type)s)
 ORDER BY score DESC
-LIMIT %(k)s
+LIMIT %(n)s
 """
 
 
@@ -136,7 +128,48 @@ def rrf(*ranked_lists: list[dict], k: int = 60) -> list[dict]:
     return [rows[cid] for cid in sorted(scores, key=scores.get, reverse=True)]
 ```
 
-`<#>` is pgvector's *negative* inner product, so ascending order means most similar first, and we negate it for a readable score. With normalized vectors this ranks exactly like cosine. The HNSW index uses the matching operator class (`vector_ip_ops`); if the operator in the query does not match the index's operator class, Postgres silently falls back to a sequential scan. A framework would not tell you that.
+`<=>` is pgvector's cosine *distance* (0 means identical), so ascending order puts the most similar chunk first, and `1 - distance` gives a readable similarity. The HNSW index from `03-pgvector/` was built with `vector_cosine_ops`, so the query must use `<=>`. Switch to `<#>` (inner product) or `<->` (L2) and Postgres silently falls back to a sequential scan. A framework would not tell you that.
+
+Two more decisions are now explicit. The metadata filters (`is_current`, `jurisdiction`, `doc_type`) sit inside each leg, before fusion, exactly as in `04-hybrid/`; filtering after fusion would let out-of-scope chunks push valid ones out of the 40 candidates. And `embedding_model = %(model)s` guarantees you never compare a query vector with vectors from a different model during a migration.
+
+### Parent-child retrieval by hand
+
+Lesson 04 introduced parent-child retrieval: match on small child chunks, send their full parent section to the LLM. LangChain's `ParentDocumentRetriever` hides a docstore, an id key in metadata and a dedup step. By hand, it is one table, one column and one function.
+
+```sql
+-- Parents are full sections; children are the small chunks you already embed.
+CREATE TABLE IF NOT EXISTS parents (
+  parent_id  text PRIMARY KEY,
+  doc_id     text NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+  section    text NOT NULL,
+  content    text NOT NULL            -- cap at roughly 1,500 tokens at ingestion
+);
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS parent_id text REFERENCES parents(parent_id);
+```
+
+```python
+PARENTS_SQL = "SELECT parent_id, doc_id, section, content FROM parents WHERE parent_id = ANY(%(ids)s)"
+
+
+def expand_to_parents(conn, children: list[dict], max_parents: int = 4) -> list[dict]:
+    """children arrive best-first (after RRF and re-ranking). Keep that order, dedupe parents."""
+    order: list[str] = []
+    for c in children:
+        pid = c["parent_id"] or c["chunk_id"]       # chunks without a parent stand alone
+        if pid not in order:
+            order.append(pid)
+        if len(order) == max_parents:
+            break
+    parents = {r["parent_id"]: r for r in search(conn, PARENTS_SQL, {"ids": order})}
+    out: list[dict] = []
+    for pid in order:
+        matched = [c for c in children if (c["parent_id"] or c["chunk_id"]) == pid]
+        base = parents.get(pid) or matched[0]       # fall back to the child itself
+        out.append({**base, "chunk_id": pid, "matched_children": [c["chunk_id"] for c in matched]})
+    return out
+```
+
+What you now control, and what the framework chose for you: the order of parents follows the best child (not the parent's own score), duplicates collapse when several children share a section, parents are capped so context does not explode, and `matched_children` survives so the UI can highlight the exact sentence that matched while the citation points to the whole section. Measure it on the golden set: parent expansion usually helps answers that need the surrounding conditions of a rule, and costs more input tokens per request.
 
 ### 4. Generate: the SDK, a prompt you own, and validation
 
@@ -150,7 +183,7 @@ like [uw-4.2-a1f3]. If the chunks do not contain the answer, reply exactly: NOT_
 
 
 async def generate(question: str, chunks: list[dict]) -> dict:
-    context = "\n\n".join(f'<chunk id="{c["chunk_id"]}">\n{c["text"]}\n</chunk>' for c in chunks)
+    context = "\n\n".join(f'<chunk id="{c["chunk_id"]}">\n{c["content"]}\n</chunk>' for c in chunks)
     msg = await client.messages.create(
         model="claude-sonnet-5-5",
         max_tokens=700,
@@ -161,7 +194,7 @@ async def generate(question: str, chunks: list[dict]) -> dict:
     return {"answer": text, "found": text != "NOT_FOUND", "usage": msg.usage.model_dump()}
 ```
 
-Wiring it together is a plain async function: embed the query, run both SQL searches, fuse with `rrf`, optionally re-rank, take the top 5, generate, validate citations (lesson 13), log a trace. No hidden state.
+Wiring it together is a plain async function: embed the query, run both SQL searches with 40 candidates each, fuse with `rrf`, optionally re-rank, expand to parents, generate, validate citations (lesson 13), log a trace. No hidden state.
 
 ## What you gain and what you lose
 
@@ -184,7 +217,7 @@ A pragmatic stance many teams take: write the core retrieval and generation path
 
 - **Forgetting to sort embedding results by index.** Most APIs return them in order, but the contract is the `index` field. Relying on order is a latent bug.
 - **Dimension mismatches.** The `vector(N)` column must match the model's output dimension. Switching models means a new column or table, plus re-embedding.
-- **Operator and index mismatch.** Using `<=>` (cosine distance) in the query with an index built for `vector_ip_ops` skips the index. Check with `EXPLAIN ANALYZE`.
+- **Operator and index mismatch.** Using `<#>` (inner product) in the query with an index built for `vector_cosine_ops` skips the index. Check with `EXPLAIN ANALYZE`.
 - **No retries or backoff.** Ingestion of 10,000 chunks will hit a 429. Without backoff, you get partial indexes.
 - **Rebuilding a framework.** If your "no framework" code grows plugin registries and abstract base classes, stop. Keep it boring.
 - **String-building SQL.** Always use parameters (`%(q)s`), never f-strings, even for internal tools.

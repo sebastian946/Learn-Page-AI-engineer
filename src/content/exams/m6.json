@@ -1,0 +1,508 @@
+{
+  "moduleId": "m6",
+  "title": { "en": "Module 6 exam", "es": "Examen del módulo 6" },
+  "timeLimitMinutes": 35,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "A team stores parsed policy documents as chunks in a Delta table that is refreshed once per night. They want a retrieval layer with minimal custom code that stays in sync with the table. Which approach fits best?",
+        "es": "Un equipo guarda documentos de pólizas parseados como chunks en una tabla Delta que se refresca una vez por noche. Quieren una capa de retrieval con el mínimo de código propio que se mantenga sincronizada con la tabla. ¿Qué enfoque encaja mejor?"
+      },
+      "options": {
+        "en": [
+          "A Delta Sync index with managed embeddings in TRIGGERED mode, synced after the nightly job",
+          "A Direct Vector Access index updated by a custom job that computes and upserts embeddings",
+          "A Delta Sync index in CONTINUOUS mode to guarantee second-level freshness",
+          "Export the chunks nightly to an external vector database and query it from the app"
+        ],
+        "es": [
+          "Un índice Delta Sync con embeddings administrados en modo TRIGGERED, sincronizado después del job nocturno",
+          "Un índice Direct Vector Access actualizado por un job propio que calcula y hace upsert de embeddings",
+          "Un índice Delta Sync en modo CONTINUOUS para garantizar frescura de segundos",
+          "Exportar los chunks cada noche a una base vectorial externa y consultarla desde la app"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Delta Sync with managed embeddings removes the embedding job and keeps the index tied to the governed table. Nightly updates do not justify CONTINUOUS cost. Direct Access adds sync code, and exporting loses Unity Catalog governance.",
+        "es": "Delta Sync con embeddings administrados elimina el job de embeddings y mantiene el índice ligado a la tabla gobernada. Las actualizaciones nocturnas no justifican el costo de CONTINUOUS. Direct Access agrega código de sincronización y exportar pierde la gobernanza de Unity Catalog."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "Creating a Delta Sync Vector Search index on `main.claims.chunks` fails. The table has a `chunk_id` primary key. What is the most likely missing configuration?",
+        "es": "Crear un índice Delta Sync de Vector Search sobre `main.claims.chunks` falla. La tabla tiene una primary key `chunk_id`. ¿Cuál es la configuración faltante más probable?"
+      },
+      "options": {
+        "en": [
+          "Change Data Feed is not enabled on the source table",
+          "The table has not been OPTIMIZEd in the last 24 hours",
+          "The table is not partitioned by `doc_type`",
+          "VACUUM retention is set below 7 days"
+        ],
+        "es": [
+          "Change Data Feed no está activado en la tabla fuente",
+          "La tabla no se ha optimizado con OPTIMIZE en las últimas 24 horas",
+          "La tabla no está particionada por `doc_type`",
+          "La retención de VACUUM está configurada en menos de 7 días"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Delta Sync indexes read row-level changes through Change Data Feed (`delta.enableChangeDataFeed = true`). Partitioning, OPTIMIZE and VACUUM settings are not prerequisites.",
+        "es": "Los índices Delta Sync leen los cambios por fila a través de Change Data Feed (`delta.enableChangeDataFeed = true`). El particionado, OPTIMIZE y la configuración de VACUUM no son prerrequisitos."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "A company wants several teams to use a proprietary frontier model from a third-party provider. Security forbids teams from holding provider API keys and wants per-team usage tracking. What should the GenAI engineer set up?",
+        "es": "Una empresa quiere que varios equipos usen un modelo frontera propietario de un proveedor externo. Seguridad prohíbe que los equipos tengan API keys del proveedor y quiere seguimiento de uso por equipo. ¿Qué debe configurar el GenAI engineer?"
+      },
+      "options": {
+        "en": [
+          "An external model serving endpoint with the key in Databricks secrets, endpoint permissions per team and AI Gateway usage tracking",
+          "A provisioned throughput endpoint for the proprietary model",
+          "Store the API key in a shared notebook that all teams import",
+          "A pay-per-token Foundation Model API endpoint with an open model instead"
+        ],
+        "es": [
+          "Un endpoint de serving de modelo externo con la clave en secrets de Databricks, permisos del endpoint por equipo y seguimiento de uso de AI Gateway",
+          "Un endpoint de provisioned throughput para el modelo propietario",
+          "Guardar la API key en un notebook compartido que todos los equipos importen",
+          "Un endpoint pay-per-token de Foundation Model API con un modelo abierto en su lugar"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "External model endpoints proxy third-party providers, keep credentials in secrets, and support permissions, rate limits and usage tracking through AI Gateway. Provisioned throughput serves Databricks-hosted models, not third-party proprietary ones.",
+        "es": "Los endpoints de modelos externos hacen de proxy hacia proveedores externos, guardan las credenciales en secrets y soportan permisos, rate limits y seguimiento de uso a través de AI Gateway. Provisioned throughput sirve modelos alojados en Databricks, no modelos propietarios de terceros."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "A fine-tuned open model must serve a customer-facing application with a strict latency SLA and steady high traffic. Which serving option is most appropriate?",
+        "es": "Un modelo abierto con fine-tuning debe servir una aplicación de cara al cliente con un SLA de latencia estricto y tráfico alto y estable. ¿Qué opción de serving es la más adecuada?"
+      },
+      "options": {
+        "en": [
+          "Foundation Model APIs with provisioned throughput",
+          "Foundation Model APIs pay-per-token shared endpoint",
+          "Calling the model row by row with `ai_query` from a scheduled SQL job",
+          "A custom endpoint with scale-to-zero enabled to save cost"
+        ],
+        "es": [
+          "Foundation Model APIs con provisioned throughput",
+          "Endpoint compartido pay-per-token de Foundation Model APIs",
+          "Llamar al modelo fila por fila con `ai_query` desde un job SQL programado",
+          "Un endpoint personalizado con escalado a cero activado para ahorrar costos"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Provisioned throughput gives dedicated, predictable capacity and is the documented path for fine-tuned foundation models. Pay-per-token has shared limits, `ai_query` is for batch, and scale-to-zero adds cold starts that break latency SLAs.",
+        "es": "Provisioned throughput da capacidad dedicada y predecible, y es el camino documentado para modelos foundation con fine-tuning. Pay-per-token tiene límites compartidos, `ai_query` es para batch y el escalado a cero agrega cold starts que rompen los SLAs de latencia."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "multi",
+      "prompt": {
+        "en": "Which of the following are Unity Catalog securables a GenAI engineer typically governs with GRANT statements? (Select all that apply.)",
+        "es": "¿Cuáles de los siguientes son securables de Unity Catalog que un GenAI engineer suele gobernar con sentencias GRANT? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Volumes holding raw PDFs",
+          "Registered MLflow models (agents and chains)",
+          "Functions used as agent tools",
+          "Python virtual environments on a driver node",
+          "Individual prompt strings inside a notebook"
+        ],
+        "es": [
+          "Volumes que guardan PDFs crudos",
+          "Modelos de MLflow registrados (agentes y cadenas)",
+          "Funciones usadas como herramientas de agentes",
+          "Entornos virtuales de Python en un nodo driver",
+          "Strings de prompt individuales dentro de un notebook"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Volumes, registered models and functions are UC objects in the catalog.schema.object namespace, governed with privileges like READ VOLUME, EXECUTE and model permissions. Virtual environments and prompt strings are not catalog objects.",
+        "es": "Los Volumes, los modelos registrados y las funciones son objetos de UC en el namespace catalog.schema.object, gobernados con privilegios como READ VOLUME, EXECUTE y permisos de modelos. Los entornos virtuales y los strings de prompt no son objetos del catálogo."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "multi",
+      "prompt": {
+        "en": "A team builds an eval dataset from production LLM logs. Which practices reduce bias and risk? (Select all that apply.)",
+        "es": "Un equipo construye un dataset de evaluación a partir de logs de producción de un LLM. ¿Qué prácticas reducen el sesgo y el riesgo? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Stratify the sample by route or intent",
+          "Deduplicate on a normalized question hash",
+          "Scrub PII before exporting the dataset",
+          "Use the production answers as expected responses without review",
+          "Sample uniformly at random from all traffic and skip failures"
+        ],
+        "es": [
+          "Estratificar la muestra por ruta o intención",
+          "Deduplicar sobre un hash de la pregunta normalizada",
+          "Eliminar la PII antes de exportar el dataset",
+          "Usar las respuestas de producción como respuestas esperadas sin revisarlas",
+          "Muestrear de forma uniforme y aleatoria todo el tráfico y omitir las fallas"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Stratification represents small segments, dedup prevents popular questions from dominating, and scrubbing keeps PII out of eval files. Copying production answers encodes today's bugs as ground truth, and uniform sampling without failures misses edge cases.",
+        "es": "La estratificación representa los segmentos pequeños, la deduplicación evita que las preguntas populares dominen y el scrub mantiene la PII fuera de los archivos de evaluación. Copiar respuestas de producción convierte los bugs de hoy en verdad de referencia, y el muestreo uniforme sin fallas pierde los casos borde."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "single",
+      "prompt": {
+        "en": "A deployed agent returns 403 errors when it queries a Vector Search index, although the developer could query it from a notebook. What is the recommended fix?",
+        "es": "Un agente desplegado devuelve errores 403 cuando consulta un índice de Vector Search, aunque el desarrollador podía consultarlo desde un notebook. ¿Cuál es la solución recomendada?"
+      },
+      "options": {
+        "en": [
+          "Declare the index as a resource (DatabricksVectorSearchIndex) when logging the model, then redeploy",
+          "Hard-code the developer's personal access token in agent.py",
+          "Copy the index data into the model artifact",
+          "Switch the index to CONTINUOUS sync mode"
+        ],
+        "es": [
+          "Declarar el índice como resource (DatabricksVectorSearchIndex) al registrar el modelo y volver a desplegar",
+          "Escribir el token de acceso personal del desarrollador en agent.py",
+          "Copiar los datos del índice dentro del artefacto del modelo",
+          "Cambiar el índice al modo de sincronización CONTINUOUS"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Declared resources let Databricks provision automatic authentication passthrough with scoped, short-lived credentials for the serving endpoint. Personal tokens are a security anti-pattern, and the sync mode has nothing to do with permissions.",
+        "es": "Los resources declarados permiten a Databricks configurar el passthrough automático de autenticación con credenciales limitadas y de corta duración para el endpoint de serving. Los tokens personales son un antipatrón de seguridad, y el modo de sincronización no tiene relación con los permisos."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "single",
+      "prompt": {
+        "en": "Claims adjusters with no Databricks experience need to chat with a new agent and leave structured feedback on its answers before launch. What should the team use?",
+        "es": "Ajustadores de reclamos sin experiencia en Databricks necesitan conversar con un nuevo agente y dejar feedback estructurado sobre sus respuestas antes del lanzamiento. ¿Qué debe usar el equipo?"
+      },
+      "options": {
+        "en": [
+          "The Review App created by agents.deploy, including labeling sessions",
+          "Give the adjusters notebook access and ask them to run cells",
+          "A shared spreadsheet where adjusters paste questions and answers",
+          "The MLflow tracking UI with edit permissions on the experiment"
+        ],
+        "es": [
+          "La Review App creada por agents.deploy, incluidas las sesiones de etiquetado",
+          "Dar a los ajustadores acceso a notebooks y pedirles que ejecuten celdas",
+          "Una hoja de cálculo compartida donde los ajustadores peguen preguntas y respuestas",
+          "La UI de tracking de MLflow con permisos de edición sobre el experimento"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The Review App is built for SMEs: a chat UI with feedback capture and labeling sessions, stored with traces so feedback can become evaluation data.",
+        "es": "La Review App está hecha para SMEs: una interfaz de chat con captura de feedback y sesiones de etiquetado, guardadas con los traces para que el feedback pueda convertirse en datos de evaluación."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps to take an agent from code to a governed production endpoint on Databricks.",
+        "es": "Ordena los pasos para llevar un agente desde el código hasta un endpoint de producción gobernado en Databricks."
+      },
+      "items": {
+        "en": [
+          "Author agent.py implementing the MLflow agent interface and call set_model",
+          "Log the agent with models from code and declared resources",
+          "Evaluate the logged agent with mlflow.genai.evaluate against thresholds",
+          "Register the model version in Unity Catalog",
+          "Deploy with agents.deploy to get the endpoint and Review App"
+        ],
+        "es": [
+          "Escribir agent.py implementando la interfaz de agente de MLflow y llamar a set_model",
+          "Registrar el agente en MLflow con models from code y resources declarados",
+          "Evaluar el agente registrado con mlflow.genai.evaluate contra umbrales",
+          "Registrar la versión del modelo en Unity Catalog",
+          "Desplegar con agents.deploy para obtener el endpoint y la Review App"
+        ]
+      },
+      "explanation": {
+        "en": "Author, log, evaluate, register, deploy. Evaluating before registering acts as the quality gate; deployment works from a UC model version.",
+        "es": "Crear, registrar en MLflow, evaluar, registrar en UC, desplegar. Evaluar antes de registrar en UC funciona como gate de calidad; el deploy parte de una versión de modelo en UC."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "order",
+      "prompt": {
+        "en": "Order the layers of a medallion pipeline for unstructured claim documents feeding Vector Search.",
+        "es": "Ordena las capas de un pipeline medallion para documentos de reclamos no estructurados que alimenta Vector Search."
+      },
+      "items": {
+        "en": [
+          "PDFs land in a Unity Catalog Volume",
+          "Auto Loader writes raw binary files to a bronze Delta table",
+          "Text is parsed per page, cleaned and PII-scrubbed into a silver table",
+          "Chunks with lineage columns are written to a gold table with CDF enabled",
+          "A Delta Sync index syncs from the gold table"
+        ],
+        "es": [
+          "Los PDFs llegan a un Volume de Unity Catalog",
+          "Auto Loader escribe los archivos binarios crudos en una tabla Delta bronze",
+          "El texto se parsea por página, se limpia y se le quita la PII en una tabla silver",
+          "Los chunks con columnas de lineage se escriben en una tabla gold con CDF activado",
+          "Un índice Delta Sync se sincroniza desde la tabla gold"
+        ]
+      },
+      "explanation": {
+        "en": "Files land in a Volume, bronze keeps raw data, silver holds clean parsed text, gold holds embedding-ready chunks with CDF, and the index syncs from gold.",
+        "es": "Los archivos llegan a un Volume, bronze guarda los datos crudos, silver tiene el texto parseado y limpio, gold tiene los chunks listos para embeddings con CDF, y el índice se sincroniza desde gold."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "code",
+      "prompt": {
+        "en": "What does this query return?",
+        "es": "¿Qué devuelve esta consulta?"
+      },
+      "code": "SELECT model,\n       percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95\nFROM llm_requests\nWHERE status = 'ok'\n  AND ts >= now() - interval '7 days'\nGROUP BY model;",
+      "codeLang": "sql",
+      "options": {
+        "en": [
+          "One row per model with the 95th percentile latency of successful requests in the last 7 days",
+          "One row per request with its latency rank within the model",
+          "The average latency per model, excluding the slowest 5% of requests",
+          "One row per model with the latency of its 95th request"
+        ],
+        "es": [
+          "Una fila por modelo con la latencia del percentil 95 de los requests exitosos de los últimos 7 días",
+          "Una fila por request con su posición de latencia dentro del modelo",
+          "La latencia promedio por modelo, excluyendo el 5% de requests más lentos",
+          "Una fila por modelo con la latencia de su request número 95"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "`percentile_cont` is an ordered-set aggregate: with GROUP BY it returns one value per group, interpolating the 95th percentile. Failed requests are excluded by the status filter.",
+        "es": "`percentile_cont` es un agregado de conjunto ordenado: con GROUP BY devuelve un valor por grupo, interpolando el percentil 95. Los requests fallidos se excluyen con el filtro de status."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "code",
+      "prompt": {
+        "en": "A team runs this evaluation. RetrievalGroundedness returns no useful results for every row. What is the most likely cause?",
+        "es": "Un equipo ejecuta esta evaluación. RetrievalGroundedness no devuelve resultados útiles en ninguna fila. ¿Cuál es la causa más probable?"
+      },
+      "code": "@mlflow.trace\ndef retrieve(question: str) -> list[dict]:\n    return search(question, k=5)\n\n@mlflow.trace\ndef answer(question: str) -> str:\n    docs = retrieve(question)\n    return call_llm(question, docs)\n\nmlflow.genai.evaluate(\n    data=eval_data,\n    predict_fn=answer,\n    scorers=[RetrievalGroundedness(), Correctness()],\n)",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "The retrieve span is not typed as SpanType.RETRIEVER, so the judge cannot find retrieved context in the trace",
+          "Correctness and RetrievalGroundedness cannot be used in the same evaluation",
+          "predict_fn must be a class, not a function",
+          "mlflow.genai.evaluate requires a Spark DataFrame as data"
+        ],
+        "es": [
+          "El span de retrieve no está tipado como SpanType.RETRIEVER, así el juez no encuentra el contexto recuperado en el trace",
+          "Correctness y RetrievalGroundedness no pueden usarse en la misma evaluación",
+          "predict_fn debe ser una clase, no una función",
+          "mlflow.genai.evaluate requiere un Spark DataFrame como data"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Retrieval-aware judges locate context through RETRIEVER spans. Use `@mlflow.trace(span_type=SpanType.RETRIEVER)` on the retrieval function. The other statements are false.",
+        "es": "Los jueces que entienden retrieval localizan el contexto mediante spans RETRIEVER. Usa `@mlflow.trace(span_type=SpanType.RETRIEVER)` en la función de retrieval. Las demás afirmaciones son falsas."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "code",
+      "prompt": {
+        "en": "This ingestion code runs twice on the same file after a crash. What happens to the chunks table?",
+        "es": "Este código de ingesta se ejecuta dos veces sobre el mismo archivo después de una caída. ¿Qué pasa con la tabla de chunks?"
+      },
+      "code": "import uuid\n\ndef ingest(doc_uri: str, chunks: list[str], conn) -> None:\n    for pos, text in enumerate(chunks):\n        conn.execute(\n            \"INSERT INTO chunks (chunk_id, source_uri, position, text) \"\n            \"VALUES (%s, %s, %s, %s) ON CONFLICT (chunk_id) DO NOTHING\",\n            (str(uuid.uuid4()), doc_uri, pos, text),\n        )",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "Every chunk is inserted twice, because random UUIDs never conflict",
+          "The second run inserts nothing, because ON CONFLICT prevents duplicates",
+          "The second run fails with a primary key violation",
+          "The second run replaces the first run's rows with new ids"
+        ],
+        "es": [
+          "Cada chunk se inserta dos veces, porque los UUID aleatorios nunca entran en conflicto",
+          "La segunda corrida no inserta nada, porque ON CONFLICT evita duplicados",
+          "La segunda corrida falla con una violación de primary key",
+          "La segunda corrida reemplaza las filas de la primera con ids nuevos"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "ON CONFLICT only helps if the key is deterministic. A random uuid4 is different every run, so nothing conflicts and duplicates accumulate. Derive chunk_id from source URI, position and content hash.",
+        "es": "ON CONFLICT solo sirve si la clave es determinista. Un uuid4 aleatorio es distinto en cada corrida, así que nada entra en conflicto y los duplicados se acumulan. Deriva el chunk_id del URI fuente, la posición y el hash del contenido."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "single",
+      "prompt": {
+        "en": "A stakeholder asks to fine-tune a model on the company's 2,000 policy documents so it can answer coverage questions. Policies are revised quarterly and answers must cite sources. What should the GenAI engineer recommend first?",
+        "es": "Un stakeholder pide hacer fine-tuning de un modelo con los 2,000 documentos de pólizas de la empresa para que responda preguntas de cobertura. Las pólizas se revisan cada trimestre y las respuestas deben citar fuentes. ¿Qué debe recomendar primero el GenAI engineer?"
+      },
+      "options": {
+        "en": [
+          "A RAG application over the policies with citations, evaluated on a golden set",
+          "Full fine-tuning of the largest available open model",
+          "QLoRA fine-tuning repeated every quarter",
+          "Pre-training a domain model from scratch"
+        ],
+        "es": [
+          "Una aplicación RAG sobre las pólizas con citas, evaluada con un golden set",
+          "Fine-tuning completo del modelo abierto más grande disponible",
+          "Fine-tuning con QLoRA repetido cada trimestre",
+          "Pre-entrenar un modelo de dominio desde cero"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "This is a knowledge problem with changing facts and a citation requirement — RAG's strengths. Fine-tuning freezes knowledge at training time, cannot cite, and adds retraining and serving costs.",
+        "es": "Es un problema de conocimiento con hechos que cambian y un requisito de citas, justo las fortalezas de RAG. El fine-tuning congela el conocimiento al momento del entrenamiento, no puede citar y agrega costos de re-entrenamiento y serving."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "multi",
+      "prompt": {
+        "en": "Which statements about vLLM are correct? (Select all that apply.)",
+        "es": "¿Qué afirmaciones sobre vLLM son correctas? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "PagedAttention allocates the KV cache in fixed-size blocks on demand, reducing fragmentation",
+          "Continuous batching adds and removes sequences at each decoding step",
+          "It exposes an OpenAI-compatible HTTP API",
+          "It removes the need for GPUs by running models in 1-bit precision",
+          "It fine-tunes models automatically from production traffic"
+        ],
+        "es": [
+          "PagedAttention asigna el KV cache en bloques de tamaño fijo bajo demanda, reduciendo la fragmentación",
+          "Continuous batching agrega y retira secuencias en cada paso de decodificación",
+          "Expone una API HTTP compatible con OpenAI",
+          "Elimina la necesidad de GPUs ejecutando modelos con precisión de 1 bit",
+          "Hace fine-tuning de modelos automáticamente a partir del tráfico de producción"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "PagedAttention, continuous batching and an OpenAI-compatible server are vLLM's core features. It is an inference server: it does not remove GPU requirements or train models.",
+        "es": "PagedAttention, continuous batching y un servidor compatible con OpenAI son las funciones centrales de vLLM. Es un servidor de inferencia: no elimina el requisito de GPUs ni entrena modelos."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "single",
+      "prompt": {
+        "en": "A team needs to classify 3 million historical claim descriptions stored in a Delta table, once. Which approach is most appropriate on Databricks?",
+        "es": "Un equipo necesita clasificar una sola vez 3 millones de descripciones de reclamos históricos guardadas en una tabla Delta. ¿Qué enfoque es el más adecuado en Databricks?"
+      },
+      "options": {
+        "en": [
+          "Batch inference in SQL with ai_query over the table, writing results to a new Delta table",
+          "A Python loop calling the real-time endpoint once per row from a notebook",
+          "Deploy an agent with agents.deploy and send it the rows through the Review App",
+          "Create a Vector Search index and use similarity search as the classifier"
+        ],
+        "es": [
+          "Inferencia batch en SQL con ai_query sobre la tabla, escribiendo los resultados en una nueva tabla Delta",
+          "Un loop de Python que llama al endpoint en tiempo real una vez por fila desde un notebook",
+          "Desplegar un agente con agents.deploy y enviarle las filas a través de la Review App",
+          "Crear un índice de Vector Search y usar la búsqueda por similitud como clasificador"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Offline enrichment over a table is a batch job; ai_query runs model inference from SQL in parallel and writes results back to Delta. A per-row Python loop is slow and fragile; the other options do not fit the task.",
+        "es": "El enriquecimiento offline sobre una tabla es un job batch; ai_query ejecuta inferencia desde SQL en paralelo y escribe los resultados de vuelta en Delta. Un loop de Python por fila es lento y frágil; las otras opciones no encajan con la tarea."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "single",
+      "prompt": {
+        "en": "An eval run from three weeks ago must be reproduced exactly, but the golden dataset Delta table has been updated since. What is the simplest correct approach?",
+        "es": "Hay que reproducir exactamente una corrida de evaluación de hace tres semanas, pero la tabla Delta del golden dataset se actualizó desde entonces. ¿Cuál es el enfoque correcto más simple?"
+      },
+      "options": {
+        "en": [
+          "Query the table with VERSION AS OF using the version recorded in the MLflow run",
+          "Ask the team to remember which rows were added and delete them",
+          "Run VACUUM to restore the previous files",
+          "Re-run the original sampling query, which always returns the same rows"
+        ],
+        "es": [
+          "Consultar la tabla con VERSION AS OF usando la versión registrada en el run de MLflow",
+          "Pedir al equipo que recuerde qué filas se agregaron y borrarlas",
+          "Ejecutar VACUUM para restaurar los archivos anteriores",
+          "Volver a ejecutar la consulta de muestreo original, que siempre devuelve las mismas filas"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Delta time travel returns the exact table state at a version or timestamp, as long as VACUUM has not removed those files. Recording the dataset version in the run makes this possible. VACUUM deletes old files; it does not restore them.",
+        "es": "El time travel de Delta devuelve el estado exacto de la tabla en una versión o timestamp, siempre que VACUUM no haya borrado esos archivos. Registrar la versión del dataset en el run lo hace posible. VACUUM borra archivos antiguos; no los restaura."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "single",
+      "prompt": {
+        "en": "Retrieval quality is poor for long policy sections. Investigation shows chunks are about 3x longer than the embedding model's maximum input length. What is happening and what should change?",
+        "es": "La calidad del retrieval es mala para secciones largas de pólizas. La investigación muestra que los chunks son unas 3 veces más largos que la longitud máxima de entrada del modelo de embeddings. ¿Qué está pasando y qué debe cambiar?"
+      },
+      "options": {
+        "en": [
+          "Text beyond the limit is truncated before embedding, so most of each chunk is not represented; reduce chunk size below the model limit",
+          "The index is in TRIGGERED mode; switch to CONTINUOUS",
+          "Long chunks always improve recall; increase num_results instead",
+          "The embedding endpoint is rate limited; move it to provisioned throughput"
+        ],
+        "es": [
+          "El texto que supera el límite se trunca antes de generar el embedding, así la mayor parte de cada chunk no queda representada; reduce el tamaño de chunk por debajo del límite del modelo",
+          "El índice está en modo TRIGGERED; cámbialo a CONTINUOUS",
+          "Los chunks largos siempre mejoran el recall; aumenta num_results en su lugar",
+          "El endpoint de embeddings tiene rate limit; muévelo a provisioned throughput"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Embedding models silently truncate input beyond their context limit, so the tail of oversized chunks never influences retrieval. Chunk size must respect the embedding model's limit; validate with recall@k.",
+        "es": "Los modelos de embeddings truncan en silencio la entrada que supera su límite de contexto, así el final de los chunks demasiado grandes nunca influye en el retrieval. El tamaño de chunk debe respetar el límite del modelo de embeddings; valídalo con recall@k."
+      }
+    }
+  ]
+}

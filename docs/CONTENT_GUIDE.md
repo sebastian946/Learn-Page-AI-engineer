@@ -106,6 +106,7 @@ Folder structure, README outline, commit message suggestions (markdown).
 ### Rules that keep MDX compiling
 
 - `{`, `}` and `<` in prose are JSX syntax. Put them in `inline code` or code blocks, or rephrase ("under 200 ms", not "<200ms").
+- Don't start with a `# Title`. The page already renders the title from `module.json`; start sections at `##`.
 - No HTML comments (`<!-- -->`). Use `{/* comment */}`.
 - Leave a blank line after an opening component tag and before its closing tag when the content is markdown.
 - Array props are JS: `items={["a", "b"]}`. Escape inner double quotes or use single quotes for the string.

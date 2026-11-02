@@ -1,0 +1,171 @@
+## Where good test cases come from
+
+Module 3 covered golden-dataset basics, including when synthetic data is acceptable, and red-teaming basics. This lesson goes further on three questions an eval owner faces every week:
+
+1. How do I generate many test cases with an LLM **without fooling myself**?
+2. How do I make sure I cover the edge cases, not just the happy path?
+3. How do I test behavior when I **do not have a correct answer** for every input?
+
+The third question is the classic test-oracle problem. Testers solved it decades ago with **metamorphic testing**, and it maps perfectly onto LLM systems.
+
+## Synthetic data without self-deception
+
+LLM-generated test cases are cheap and fast. They are also biased in predictable ways:
+
+- **Too easy and too clean.** Generated tickets read like well-written prompts. Real users write "hi so my thing dont work since tuesday??".
+- **Same-family bias.** If the generator and the system under test come from the same model family, the cases match the system's own style and phrasing. Scores look great and mean little.
+- **Label leakage.** If the generator also writes the expected answer, you are testing whether model B agrees with model A, not whether it is right.
+- **Mode collapse.** Ask for 500 cases and you get 40 ideas with 12 rewordings each.
+
+Countermeasures that work:
+
+1. **Seed from reality.** Start from real (anonymized) inputs and ask the generator for variations, not inventions.
+2. **Generate from a taxonomy.** Define axes (intent × persona × difficulty × edge-case type) and generate per cell. Then you can measure coverage per cell instead of hoping.
+3. **Use a different model family** for generation than for the system under test and the judge.
+4. **Deduplicate.** Exact duplicates, near-duplicates within the synthetic set, and near-duplicates against your existing golden set and any few-shot examples in the prompt. A test case that is a paraphrase of a few-shot example is contaminated.
+5. **Treat generated labels as hypotheses.** A human reviews a random sample. Estimate the label error rate with a Wilson interval (lesson 02). If 6 of 60 reviewed labels are wrong, the 95% interval is roughly 5% to 20%. That is too high for a release gate, so you review everything or fix the generator.
+6. **Tag provenance and report separately.** Every item carries `source: real | synthetic | perturbed`. Report metrics per source. If synthetic scores are much higher than real ones, your synthetic data is too easy.
+
+```python
+import itertools
+import json
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+TAXONOMY = {
+    "intent": ["billing_refund", "shipping", "account", "legal_threat"],
+    "persona": ["terse mobile user", "angry repeat customer", "non-native English speaker"],
+    "edge": ["none", "two intents in one message", "typos and no punctuation", "negation"],
+}
+
+def generation_jobs() -> list[dict]:
+    keys = list(TAXONOMY)
+    return [dict(zip(keys, combo)) for combo in itertools.product(*TAXONOMY.values())]
+
+def near_duplicates(new: list[str], existing: list[str], threshold: float = 0.85) -> set[int]:
+    """Indexes in `new` that are near-duplicates of each other or of `existing` (golden set, few-shots)."""
+    vec = TfidfVectorizer(ngram_range=(1, 2)).fit(new + existing)
+    a = vec.transform(new)
+    drop: set[int] = set()
+    if existing:
+        sims = cosine_similarity(a, vec.transform(existing)).max(axis=1)
+        drop |= {i for i, s in enumerate(sims) if s >= threshold}
+    within = cosine_similarity(a)
+    for i in range(len(new)):
+        if i in drop:
+            continue
+        for j in range(i + 1, len(new)):
+            if within[i, j] >= threshold:
+                drop.add(j)
+    return drop
+
+jobs = generation_jobs()   # 4 x 3 x 4 = 48 cells; generate 3-5 cases per cell with a different model family
+print(len(jobs), json.dumps(jobs[0]))
+```
+
+TF-IDF catches lexical near-duplicates cheaply. Add an embedding-based pass for paraphrases if your set is large.
+
+## Edge-case taxonomies
+
+A taxonomy turns "think of edge cases" into a checklist you can measure coverage against. A practical starting point for LLM features:
+
+| Category | Examples |
+|---|---|
+| Input form | Empty, one word, very long, pasted email thread, HTML, OCR noise, emoji, mixed languages |
+| Language quality | Typos, no punctuation, slang, non-native grammar, all caps |
+| Semantics | Negation ("I do NOT want a refund"), multiple intents, ambiguity, sarcasm, hypotheticals |
+| Numbers and entities | Dates in different formats, currencies, units, rare names, IDs that look like numbers |
+| Scope | Out-of-domain questions, partially answerable questions, questions the docs cannot answer |
+| Context (RAG) | No relevant document, conflicting documents, outdated document, very long document |
+| Conversation | Topic switch, user corrects themselves, refers back three turns, repeats the question |
+| Adversarial | Prompt injection, role-play jailbreaks, data exfiltration attempts (see Module 3) |
+
+For each category, record how many items you have and the pass rate. Empty cells are your coverage gaps. This is equivalence partitioning and boundary analysis, applied to language.
+
+## Metamorphic testing
+
+You often cannot say what the *correct* output is for a new input. But you can say how the output **should relate** to the output for a modified input. That relation is a **metamorphic relation (MR)**. If the relation is violated, at least one of the two outputs is wrong, and you found a bug without an oracle.
+
+The CheckList paper (Ribeiro et al., 2020) brought this to NLP with three test types: minimum functionality tests, invariance tests and directional expectation tests. For LLM apps, useful relations are:
+
+- **Invariance:** the output label or extracted value must not change. Paraphrase the question; add typos; swap a customer name ("Maria" to "John"); reorder retrieved passages; add irrelevant politeness; translate the input.
+- **Directional:** the output must move in a known direction. Add "my lawyer will contact you" and priority must not decrease. Remove the only relevant passage and the RAG answer must become a refusal. Increase the loan amount and the monthly payment must increase.
+- **Equivalence across formats:** the same contract as PDF text and as DOCX text must yield the same extracted fields.
+- **Consistency:** asking "is the notice period 30 days?" must agree with the extracted `notice_days`.
+
+```python
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class MR:
+    name: str
+    transform: Callable[[str], str]
+    relation: Callable[[str, str], bool]   # (source_output, followup_output) -> holds?
+
+PRIORITY = {"low": 0, "normal": 1, "high": 2, "urgent": 3}
+
+RELATIONS = [
+    MR("name_swap_invariance", lambda t: t.replace("Maria", "John"), lambda a, b: a == b),
+    MR("polite_suffix_invariance", lambda t: t + " Thanks so much, have a great day!", lambda a, b: a == b),
+    MR(
+        "legal_threat_raises_priority",
+        lambda t: t + " If this is not fixed my lawyer will contact you.",
+        lambda a, b: PRIORITY[b] >= PRIORITY[a],
+    ),
+]
+
+def run_mrs(system: Callable[[str], str], sources: list[str]) -> dict[str, float]:
+    """Returns violation rate per relation. Each violation is a bug candidate to triage."""
+    out: dict[str, float] = {}
+    for mr in RELATIONS:
+        pairs = [(system(s), system(mr.transform(s))) for s in sources if mr.transform(s) != s]
+        violations = [p for p in pairs if not mr.relation(*p)]
+        out[mr.name] = len(violations) / len(pairs) if pairs else float("nan")
+    return out
+```
+
+Two cautions. First, non-determinism can violate an invariance relation by itself. Run the source input twice and measure the self-inconsistency rate; that is the floor for every invariance MR. Second, a transform can accidentally change the meaning (a "harmless" paraphrase that drops a negation). Generate transforms with code where possible, and spot-check LLM-generated paraphrases.
+
+## Perturbation and robustness tests
+
+Robustness testing is invariance testing at scale. Apply a family of perturbations (typos at 5% of characters, casing, whitespace, synonym swaps, OCR-style character confusions such as `0` for `O`) and report the **flip rate**: the fraction of items whose output changes. Report it per perturbation type and per segment. A model that flips 2% of labels under typos is fine. One that flips 15% under typos will fail on real mobile traffic.
+
+Robustness numbers are especially useful in model migrations: a cheaper model often matches the expensive one on clean inputs and degrades faster on noisy ones. That is a risk your clean golden set will never show.
+
+<Callout type="tip" title="SDET lens">
+
+Metamorphic testing is property-based testing for language. You already know the pattern from Hypothesis or fast-check: you do not assert a specific output, you assert a property that must hold across generated inputs. Each violated relation is a reproducible bug report: source input, transformed input, both outputs.
+
+</Callout>
+
+## Common mistakes
+
+- **Generating cases and labels with the same model that you evaluate.** You measure agreement with yourself.
+- **No deduplication against few-shot examples or the existing golden set.** Contamination inflates scores.
+- **Mixing synthetic and real items in one number.** Report per source.
+- **Invariance tests without a self-consistency baseline.** You blame the transform for plain non-determinism.
+- **Paraphrase transforms that change meaning.** Spot-check them, or the "violations" are false alarms.
+- **Edge cases with no coverage accounting.** Without a taxonomy you cannot say what is missing.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How do you test an LLM feature when you do not have the correct answer for most inputs?" level="senior">
+
+I use metamorphic testing. I define relations between the outputs for an input and a transformed version of it. Invariance relations: paraphrases, typos, name swaps or passage reordering must not change the label or extracted value. Directional relations: adding a legal threat must not lower priority; removing the only relevant passage must turn the answer into a refusal. Each violation is a bug candidate with a reproducible pair. I measure the system's self-inconsistency rate first, because non-determinism alone can violate invariance. I report violation rates per relation and per segment, and convert confirmed violations into regression cases.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What are the risks of LLM-generated eval data, and how do you mitigate them?" level="mid">
+
+Generated data tends to be too clean, too repetitive and stylistically close to the generator. If the same family generates cases and labels and also runs the system, scores are inflated. I seed generation from real anonymized inputs, generate per cell of an edge-case taxonomy, use a different model family for generation, deduplicate against itself, the golden set and the prompt's few-shot examples, and have humans review a random sample of labels with an error-rate interval. Every item is tagged with its source and I report metrics separately for real and synthetic.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Ribeiro et al., "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList": https://arxiv.org/abs/2005.04118
+- Chen et al., "Metamorphic Testing: A Review of Challenges and Opportunities" (ACM Computing Surveys, 2018): https://dl.acm.org/doi/10.1145/3143561
+- promptfoo test case configuration: https://www.promptfoo.dev/docs/configuration/test-cases/
+- Hypothesis (property-based testing for Python): https://hypothesis.readthedocs.io

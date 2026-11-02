@@ -1,0 +1,160 @@
+<ClientBrief company="Cartwheel Outfitters" industry="E-commerce / Venta de equipo outdoor" duration="4 días" />
+
+## Contexto de la empresa
+
+Cartwheel Outfitters es un retailer online ficticio de tamaño medio que vende equipo outdoor (carpas, botas, chaquetas, equipo de escalada) con envíos a Estados Unidos y Canadá. Procesa unos 9,000 pedidos al día y recibe cerca de **40,000 tickets de soporte al mes** por email y chat, en inglés y español. El volumen se duplica en noviembre y diciembre.
+
+Hoy, un equipo de 6 "agentes de triage" lee cada ticket y lo mueve a una de siete colas en su helpdesk. La mediana del tiempo hasta la cola es de 3.5 horas, y supera las 20 horas los lunes y en temporada alta. Los tickets mal enrutados rebotan entre equipos. Los clientes con problemas de seguridad (una estufa con fuga de gas, un arnés con una correa deshilachada) a veces esperan un día entero antes de que un especialista los vea.
+
+La empresa ya usa Claude a través de la API de Anthropic para herramientas internas, y tiene una cuenta de OpenAI a través de un proveedor de marketing. Su equipo de plataforma no quiere nada que los ate a un solo proveedor.
+
+## Stakeholders
+
+| Nombre | Rol | Qué le importa |
+|---|---|---|
+| Dana Whitfield | VP de Experiencia del Cliente (sponsor) | Tiempo hasta la cola menor a 1 minuto, menos tickets rebotados, tickets de seguridad nunca demorados |
+| Marcus Oyelaran | Líder de Operaciones de Soporte | Que los agentes confíen en el enrutamiento; corrección fácil; una cola clara de revisión humana |
+| Priya Raman | Head of Platform Engineering | Diseño agnóstico al proveedor, observabilidad, sin facturas sorpresa |
+| Luis Carrasco | Finance Business Partner | Un pronóstico mensual de costos y el costo por 1,000 tickets |
+| Helena Brandt | Gerente de Trust & Safety | Tickets de fraude y seguridad detectados con un recall muy alto |
+
+## Objetivo de negocio
+
+Clasificar y enrutar automáticamente los tickets entrantes en **menos de un minuto**, con una precisión al menos igual a la del equipo humano de triage, para que los 6 agentes de triage pasen a resolver tickets. Los tickets inciertos o de alto riesgo deben ir a una cola de revisión humana en lugar de adivinarse. El liderazgo quiere pruebas, con números, de que el sistema es preciso, barato y seguro antes de activarlo.
+
+## Requisitos funcionales
+
+1. **Clasificación con salida estructurada.** Para cada ticket, produce un objeto validado:
+   - `category`: uno de `order_status`, `shipping_delay`, `return_refund`, `damaged_item`, `billing`, `account_access`, `fraud_report`, `product_question`, `other`
+   - `priority`: `low`, `medium`, `high`, `urgent`
+   - `safety_flag`: booleano (lesión, fuego, gas, falla estructural de equipo de seguridad)
+   - `language`: `en`, `es` u `other`
+   - `order_id`: string con formato `A-12345`, o null
+   - `confidence`: número entre 0 y 1
+   - `rationale`: una frase corta (para agentes, no para clientes), sin PII
+2. **Enrutamiento.** Mapea categoría a cola: logistics (`order_status`, `shipping_delay`), returns (`return_refund`, `damaged_item`), payments (`billing`), accounts (`account_access`), trust_safety (`fraud_report`, y cualquier ticket con `safety_flag`), presales (`product_question`), general (`other`).
+3. **Estrategia de fallback (cascada de modelos).**
+   - Nivel 1: clasifica con el modelo barato (`claude-haiku-5-5`, nombre lógico `fast`).
+   - Escala al Nivel 2 (`claude-sonnet-5-5`, nombre lógico `smart`) cuando: la confianza está por debajo de un umbral **calibrado**, la validación necesitó una reparación, o la categoría predicha es de alto riesgo (`fraud_report`, `billing`) o `safety_flag` es true.
+   - Envía a la **cola de revisión humana** cuando la confianza del Nivel 2 sigue por debajo de su umbral, ambos niveles discrepan en una categoría de alto riesgo, o ambos niveles fallan.
+   - Si todos los proveedores están caídos, enruta a `general` con una etiqueta `needs_review`. Nunca pierdas un ticket.
+4. **Failover de proveedor.** Si Anthropic no está disponible (después de los reintentos), el Nivel 1 hace failover a un modelo de OpenAI configurado en `models.toml`, que debe haber pasado el mismo eval.
+5. **Modo batch y modo individual.** `route_ticket(ticket)` para un ticket, y un CLI que procesa un archivo JSONL de forma concurrente con progreso y capacidad de reanudación.
+6. **Reporte de costos.** Un comando que lee el log de costos y produce `reports/cost_report.md`: gasto total, costo por 1k tickets, separado por nivel y proveedor, tasa de escalamiento, tasa de cola humana, overhead de reintentos y reparaciones, y un pronóstico mensual con 40k y 80k tickets.
+7. **Reporte de evaluación.** Un comando que ejecuta el set de prueba etiquetado y produce `reports/eval_report.md` con precision/recall/F1 por categoría, macro-F1, precisión del enrutamiento, recall de seguridad/fraude, matriz de confusión y tabla de calibración.
+
+## Requisitos no funcionales
+
+| Área | Meta |
+|---|---|
+| Latencia | p95 menor a 4 s para tickets que solo usan el Nivel 1, menor a 10 s para tickets escalados, medido de extremo a extremo por ticket |
+| Throughput | Sostener 2,000 tickets por hora en modo batch dentro de tus rate limits |
+| Costo | Menos de **$1.50 por 1,000 tickets** en total (ambos niveles, reintentos, reparaciones), calculado desde tu configuración de precios fechada. Recalcula y declara tus supuestos si los precios difieren |
+| Precisión | Macro-F1 de categoría de al menos 0.85 en el set de prueba; precisión de enrutamiento de al menos 0.92 en tickets enrutados automáticamente |
+| Seguridad | Recall de al menos 0.95 para `safety_flag` y para `fraud_report` |
+| Carga humana | Cola de revisión humana como máximo 12% de los tickets |
+| Confiabilidad | Ningún ticket perdido; cada ticket termina en una cola con un código de razón (auto, escalated, human, degraded) |
+| Observabilidad | Log JSON por ticket con id del request, niveles usados, modelos, versión de prompt, latencia, tokens y costo |
+| Privacidad | Sin emails, teléfonos ni fragmentos de tarjetas en `rationale` ni en los logs |
+
+## Datos
+
+Cartwheel no puede compartir tickets reales. Crea un **dataset etiquetado sintético pero realista** de al menos 300 tickets:
+
+- Cubre las 9 categorías, con un desbalance realista (estado del pedido y retraso de envío son cerca de la mitad del tráfico real).
+- Al menos 15% en español, más algunos tickets en idiomas mezclados.
+- Incluye casos difíciles: sarcasmo, dos problemas en un ticket, ids de pedido ausentes, una disputa de reembolso que en realidad es fraude, un "se rompió el cierre" que es `damaged_item` y un "la estufa tuvo una fuga de gas" que es `safety_flag`.
+- Etiqueta cada ticket con categoría, prioridad, flag de seguridad y cola. Haz una segunda pasada en la que vuelvas a etiquetar 30 tickets a ciegas y calcula tu propio acuerdo: esa es tu línea base humana.
+- Divide en **calibración (100)** y **prueba (200)**. Los umbrales se ajustan solo con calibración. El set de prueba se usa una vez por versión de prompt.
+
+## Fuera de alcance
+
+- Generar respuestas para los clientes (un módulo posterior cubre la redacción de respuestas).
+- Integrar con la API de un helpdesk real. Simula las colas como campos de salida o una tabla SQLite local.
+- Una interfaz web. Un CLI y salidas JSON son suficientes. Un endpoint FastAPI es opcional (el módulo 5 cubre el serving).
+- Hacer fine-tuning de cualquier modelo.
+- Adjuntos e imágenes.
+
+## Entregables
+
+1. Repo público en GitHub `support-ticket-router` que depende de tu paquete `llm-provider-client` (dependencia por path o git).
+2. Archivos de prompt versionados con changelog, y el schema Pydantic como única fuente de verdad.
+3. Router con cascada, umbrales calibrados, cola humana y modo degradado.
+4. Dataset etiquetado (`data/tickets.jsonl`) con un data card que describa cómo se construyó.
+5. `reports/eval_report.md` y `reports/cost_report.md`, generados por comandos, no escritos a mano.
+6. Tests que corren sin conexión con el proveedor falso, cubriendo cada camino de enrutamiento.
+7. README con diagrama de arquitectura, resultados, análisis de costos, trade-offs y un GIF de demo o grabación de terminal.
+
+## Criterios de aceptación
+
+- Ejecutar `make eval` regenera el reporte de evaluación y cumple las metas de precisión y seguridad en el set de prueba.
+- Ejecutar `make cost-report` reproduce los números de costo de la corrida registrada, y el costo por 1k tickets está por debajo de la meta.
+- Cada camino de enrutamiento (auto, escalated, human, degraded, failover de proveedor) está cubierto por un test sin conexión.
+- Los umbrales viven en configuración con una nota que muestra cómo se derivaron del set de calibración.
+- Ningún tipo de SDK de vendor aparece fuera de los adaptadores de `llm-provider-client`.
+- Los logs contienen versión de prompt y niveles para cada ticket; no aparece PII en logs ni rationales (testeado).
+
+## Arquitectura sugerida
+
+<Diagram caption="Router de tickets de soporte con cascada de modelos y fallback humano" chart={`flowchart TD
+  T["Incoming ticket (email or chat)"] --> P["Pre-process: language, PII masking, truncate"]
+  P --> F["Tier 1: fast model, structured output"]
+  F --> V1{"Valid and confident and not high-risk?"}
+  V1 -->|yes| R["Route to queue"]
+  V1 -->|no| S["Tier 2: smart model, structured output"]
+  S --> V2{"Valid and confident and tiers agree on risk?"}
+  V2 -->|yes| R
+  V2 -->|no| H["Human review queue"]
+  F -.->|"provider down after retries"| FO["Failover model (OpenAI)"]
+  FO --> V1
+  S -.->|"all providers down"| D["Degraded: general queue + needs_review"]
+  R --> L[("Per-ticket log: tiers, models, tokens, cost")]
+  H --> L
+  D --> L
+  L --> CR["Cost report"]
+  L --> ER["Eval report"]`} />
+
+Notas de implementación:
+
+- **La confianza no viene calibrada por defecto.** Que un modelo diga 0.9 no significa que acierte el 90% de las veces. Agrupa las predicciones del set de calibración por confianza declarada (por ejemplo 0–0.5, 0.5–0.7, 0.7–0.85, 0.85–1.0), calcula la precisión real por grupo y elige el umbral del Nivel 1 como el borde más bajo donde la precisión alcanza tu meta. Muestra la tabla en el reporte de evaluación.
+- **Elige umbrales con la curva costo/precisión.** Barre el umbral del Nivel 1 y grafica tasa de escalamiento, costo por 1k y macro-F1. Elige el codo y justifícalo en el README.
+- **Las reglas de alto riesgo son código, no prompt.** El escalamiento por fraude, facturación y seguridad se decide en Python a partir de la salida estructurada, para que un cambio de prompt no pueda debilitarlo.
+- **El effort es una palanca.** Prueba el Nivel 1 con effort bajo y el Nivel 2 con effort medio. Mide, no supongas.
+- **Pre-procesamiento.** Enmascara emails y teléfonos antes de enviarlos al modelo cuando la tarea no los necesita, y trunca los hilos de email muy largos al último mensaje más un historial corto.
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Excelente (5) | Adecuado (3) | Débil (1) |
+|---|---|---|---|---|
+| Precisión y seguridad | 25% | Todas las metas cumplidas en un set de prueba limpio; errores analizados por categoría | La mayoría de las metas cumplidas; algo de análisis | Metas no cumplidas o medidas con datos de calibración |
+| Diseño de cascada y fallback | 20% | Umbrales calibrados, reglas de riesgo en código, todos los caminos testeados, modo degradado funcional | La cascada funciona con umbrales elegidos a mano | Un solo modelo o fallbacks sin testear |
+| Ingeniería de costos | 20% | Reporte generado, costo por 1k bajo la meta, costo por enrutamiento correcto, pronóstico con supuestos | Costo registrado y resumido | Sin datos de costo o números calculados a mano |
+| Calidad de código y tests | 15% | Tipado, agnóstico al proveedor, tests sin conexión para cada camino, CI los ejecuta | Estructura razonable, tests parciales | Código del vendor por todas partes, sin tests |
+| Contrato de prompt y schema | 10% | Prompt versionado con changelog, schema como única fuente, tests de contrato | Prompt versionado, schema presente | Prompts como strings inline |
+| Documentación y demo | 10% | El README cuenta la historia: problema, arquitectura, resultados, trade-offs, demo | El README cubre instalación y resultados | Solo instalación |
+
+## Cronograma sugerido (4 días)
+
+**Día 1 – Datos y contrato.** Escribe el dataset (300 tickets) y el data card. Define el schema Pydantic y las definiciones de categorías. Escribe el prompt v1.0.0. Arma el esqueleto del router sobre `llm-provider-client` con el proveedor falso y la tabla de enrutamiento. Tests sin conexión para los caminos de enrutamiento.
+
+**Día 2 – Nivel 1 y evaluación.** Ejecuta el Nivel 1 sobre el set de calibración. Construye el comando de evaluación (métricas por categoría, matriz de confusión, grupos de calibración). Itera el prompt a v1.1.0 según los errores, registrando los cambios en el changelog.
+
+**Día 3 – Cascada y costos.** Agrega el Nivel 2, las reglas de riesgo, la cola humana y el modo degradado. Barre umbrales en el set de calibración y elígelos. Agrega el failover de proveedor y pruébalo. Construye el comando del reporte de costos.
+
+**Día 4 – Corrida final de prueba e historia.** Ejecuta una vez sobre el set de prueba. Genera ambos reportes. Escribe el README con arquitectura, resultados, análisis de costos y trade-offs. Graba la demo. Limpia y etiqueta `v1.0.0`.
+
+## Definition of Done
+
+<Checklist id="m1-14-dod" title="Definition of Done" items={["Dataset etiquetado de 300+ tickets con data card y división calibración/prueba", "El schema Pydantic es la única fuente de verdad; el JSON Schema se genera a partir de él", "Los archivos de prompt están versionados con changelog y se registran en cada llamada", "El escalamiento de Nivel 1 a Nivel 2 usa umbrales calibrados y reglas de riesgo en código", "La cola de revisión humana y el modo degradado están implementados y testeados", "El failover de proveedor funciona y el modelo de failover pasó el mismo eval", "El reporte de evaluación cumple las metas de macro-F1, precisión de enrutamiento y recall de seguridad en el set de prueba", "El reporte de costos muestra el costo por 1k tickets bajo la meta, por nivel y proveedor, con pronóstico mensual", "Los tests sin conexión cubren cada camino de enrutamiento y corren en CI", "Sin PII en logs ni rationales, verificado por un test", "El README incluye diagrama de arquitectura, tablas de resultados, trade-offs y una grabación de demo"]} />
+
+## Cómo presentarlo en una entrevista
+
+Usa una historia de 3 minutos y luego deja que el entrevistador profundice.
+
+1. **El problema en términos de negocio.** "40k tickets al mes, 3.5 horas de mediana hasta la cola, tickets de seguridad esperando un día. Objetivo: menos de un minuto, tan preciso como los humanos, seguro por diseño."
+2. **La arquitectura en una frase.** "Un modelo barato clasifica con salida estructurada; la baja confianza, las reparaciones o las categorías de alto riesgo escalan a un modelo más fuerte; lo que sigue siendo incierto va a humanos; todo corre a través de mi cliente agnóstico al proveedor con reintentos, rate limits y registro de costos."
+3. **Los números.** Macro-F1, recall de seguridad, precisión de enrutamiento, tasa de cola humana, costo por 1k tickets, latencia p95. Di qué metas no cumpliste, si alguna, y por qué.
+4. **La decisión interesante.** La calibración. "La confianza declarada por el modelo era excesiva en la franja 0.7–0.85, así que fijé el umbral en 0.85 usando el set de calibración. Eso subió los escalamientos de 9% a 14%, pero llevó la precisión de enrutamiento por encima de la meta, y el costo se mantuvo dentro del presupuesto."
+5. **Qué harías después.** Monitoreo online de la tasa de corrección humana por versión de prompt, un gate de evals en CI (módulo 3) y servirlo detrás de una API con una cola (módulo 5).
+
+Espera preguntas de seguimiento como: "¿Por qué no usar el modelo fuerte para todo?" (muestra la curva costo/precisión), "¿Cómo sabes que tus datos sintéticos son representativos?" (data card, casos difíciles, plan para validar con muestras reales), "¿Qué pasa cuando el proveedor se cae?" (failover y modo degradado, con tests) y "¿Cómo detectarías drift?" (cambios semanales en la distribución de categorías y en la confianza, tasa de corrección humana). Ten abiertos los reportes de evaluación y de costos; los números que puedes mostrar le ganan a los números que recuerdas.

@@ -14,7 +14,7 @@ The package exposes one CLI with two commands:
 
 ```bash
 uv run python -m ragcore ingest data/chunks.jsonl     # embeds and upserts chunks
-uv run python -m ragcore ask "Can gift funds be used for an investment property?" --product conventional
+uv run python -m ragcore ask "Can gift funds be used for an investment property?" --jurisdiction US-TX
 ```
 
 The `ask` output prints the answer, the citations (chunk ID, document, section, page) and a one-line trace summary: retrieval latency, generation latency, input and output tokens, estimated cost.
@@ -25,7 +25,8 @@ The `ask` output prints the answer, the citations (chunk ID, document, section, 
 - [ ] `ragcore/` totals under 300 lines (a test or script counts non-blank, non-comment lines).
 - [ ] Embeddings: batched, sorted by `index`, normalized, with exponential backoff on 429 and 5xx; an embedding cache keyed by `sha256(model + text)` skips unchanged chunks on re-ingest.
 - [ ] Ingestion is idempotent: running `ingest` twice yields the same row count (upsert on `chunk_id`).
-- [ ] Retrieval runs vector and full-text queries in SQL, fuses with RRF (k = 60), supports a `product` filter, and returns at most 5 chunks (after optional re-ranking).
+- [ ] Retrieval runs vector and full-text queries in SQL, fuses with RRF (k = 60), takes 40 candidates per leg, applies `jurisdiction`, `doc_type` and `is_current` filters inside each leg, and returns at most 5 chunks (after optional re-ranking).
+- [ ] Parent-child retrieval is implemented by hand: children are matched, then deduplicated parent sections (capped in length) are sent to the LLM, keeping `matched_children` for highlighting. The README compares it with child-only context on the golden set.
 - [ ] `EXPLAIN ANALYZE` output in the README shows the HNSW index being used for the vector query.
 - [ ] Generation uses a system prompt you own, requires chunk-ID citations, validates them, and returns `NOT_FOUND` handling when the context is insufficient.
 - [ ] `eval_compare.py` runs both this pipeline and the LangChain one on `06-evals/data/golden.jsonl` and prints faithfulness, context recall, recall@5, p95 latency and mean cost per request for each.
@@ -58,13 +59,13 @@ class Trace:
     citation_problems: list[str] = field(default_factory=list)
 
 
-async def ask(conn, question: str, product: str | None = None, reranker=None, top_k: int = 5) -> tuple[dict, Trace]:
+async def ask(conn, question: str, jurisdictions: list[str], reranker=None, top_k: int = 5) -> tuple[dict, Trace]:
     trace = Trace(question=question)
     t0 = time.perf_counter()
 
     qvec = (await embed([question]))[0]
-    # TODO: run VECTOR_SQL and KEYWORD_SQL with k=40 and the product filter
-    # TODO: fuse with rrf(...), optionally rerank, keep top_k
+    # TODO: run VECTOR_SQL and KEYWORD_SQL with n=40 and the filters (jurisdictions always include "US")
+    # TODO: fuse with rrf(...), optionally rerank, keep top_k, then expand_to_parents(...)
     chunks: list[dict] = []
     trace.retrieved_ids = [c["chunk_id"] for c in chunks]
     trace.retrieval_ms = (time.perf_counter() - t0) * 1000
@@ -110,8 +111,8 @@ def test_under_300_lines() -> None:
 
 <Hints>
   <Hint>Split `ragcore/` into small modules: `embed.py`, `store.py`, `generate.py`, `validate.py`, `pipeline.py`, `cli.py`. Each one should be readable in a single screen. If one file grows past 80 lines, you are probably building a framework.</Hint>
-  <Hint>For idempotent ingestion use `INSERT ... ON CONFLICT (chunk_id) DO UPDATE SET text = EXCLUDED.text, embedding = EXCLUDED.embedding`. For the embedding cache, a small table `embedding_cache(hash text primary key, embedding vector(N))` works and keeps everything in Postgres.</Hint>
-  <Hint>When passing the query vector to psycopg, the `pgvector` adapter accepts a numpy array once you call `register_vector(conn)`. If the planner ignores your HNSW index, check that the query uses the operator matching the index class (`<#>` for `vector_ip_ops`) and run `ANALYZE chunks;` after a bulk load.</Hint>
+  <Hint>For idempotent ingestion use `INSERT ... ON CONFLICT (chunk_id) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding`. For the embedding cache, a small table `embedding_cache(hash text primary key, embedding_model text, embedding vector(1024))` works and keeps everything in Postgres.</Hint>
+  <Hint>When passing the query vector to psycopg, the `pgvector` adapter accepts a numpy array once you call `register_vector(conn)`. If the planner ignores your HNSW index, check that the query uses the operator matching the index class (`<=>` for `vector_cosine_ops`) and run `ANALYZE chunks;` after a bulk load.</Hint>
   <Hint>For `eval_compare.py`, write a tiny adapter so both pipelines return the same `RunRecord` shape from `06-evals/golden.py`. Then reuse your scoring code unchanged. Same judge model, same dataset, same top-k, or the comparison is meaningless.</Hint>
 </Hints>
 
@@ -128,6 +129,7 @@ rag-lab/
       cli.py
       embed.py
       store.py
+      parents.py
       generate.py
       validate.py
       pipeline.py

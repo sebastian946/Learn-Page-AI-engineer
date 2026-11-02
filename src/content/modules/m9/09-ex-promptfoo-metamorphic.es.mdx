@@ -1,0 +1,182 @@
+## Objetivo
+
+Construye una suite de promptfoo para un prompt de triage de tickets que devuelve JSON con `category` y `priority`. La suite tiene dos capas:
+
+1. **Pruebas basadas en ejemplos** con etiquetas gold, como las que conoces del módulo 3.
+2. **Pruebas metamórficas** generadas por código a partir de casos fuente: relaciones de invariancia (cambio de nombre, errores de tipeo, relleno cortés, oraciones reordenadas, traducción) y relaciones direccionales (agregar una amenaza legal o una palabra de caída del servicio no debe bajar la prioridad; agregar "no quiero un reembolso" no debe producir `billing_refund`).
+
+Luego corres la suite contra dos modelos y comparas no solo la accuracy sino las **tasas de violación por relación**. Ese es el tipo de evidencia que necesita el proyecto final: un modelo más barato que iguala con entradas limpias pero rompe la invariancia con entradas ruidosas es un riesgo de migración.
+
+Esta es la carpeta `03-metamorphic/` de `llm-eval-lab`. Si prefieres Inspect AI, puedes implementar el mismo diseño con un scorer personalizado; los criterios de aceptación son los mismos.
+
+## Contexto
+
+Tu prompt de triage devuelve exactamente este JSON:
+
+```json
+{"category": "billing_refund", "priority": "high"}
+```
+
+Categorías: `billing_refund`, `shipping`, `account`, `product_question`, `legal_threat`. Prioridades: `low`, `normal`, `high`, `urgent`.
+
+Empieza con 40 **casos fuente** etiquetados a mano en `sources.jsonl` (reutiliza tickets del ejercicio 03 y agrega prioridades). Luego genera casos derivados con código. Algunas relaciones se pueden verificar dentro de promptfoo porque el valor esperado se desprende de la etiqueta gold de la fuente (por ejemplo, un cambio de nombre debe conservar la categoría gold). Otras comparan **las dos salidas** sin ninguna etiqueta gold (por ejemplo, la prioridad tras agregar una amenaza legal debe ser mayor o igual que antes). promptfoo evalúa una prueba a la vez, así que esas las verificas con un script pequeño sobre el archivo de resultados.
+
+<AcceptanceCriteria>
+
+- [ ] `prompts/triage.txt` y `promptfooconfig.yaml` corren contra dos modelos (dos proveedores, o dos niveles de un proveedor) con temperature 0
+- [ ] Al menos 40 casos fuente con categoría y prioridad gold; al menos 8 relaciones implementadas en `generate_mr_tests.py` (al menos 5 de invariancia y 3 direccionales)
+- [ ] Las transformaciones son código determinista (con semilla); cualquier paráfrasis o traducción generada por LLM está en caché y revisaste al menos 20, con los resultados anotados en el README
+- [ ] Las pruebas generadas llevan `metadata` con `source_id`, `relation` y `kind` (`source`, `invariance`, `directional`)
+- [ ] Cada prueba afirma JSON válido con valores permitidos; las relaciones ancladas al gold afirman la categoría esperada con una aserción `javascript`
+- [ ] `check_relations.py` lee el archivo de salida de promptfoo, empareja cada resultado derivado con el resultado de su fuente por proveedor y calcula la tasa de violación por relación con un CI de Wilson
+- [ ] Se reporta un baseline de auto-consistencia: cada caso fuente corrido dos veces (`--repeat 2`) y la tasa con la que cambia la salida sin ninguna transformación
+- [ ] `REPORT.md` tiene una tabla de accuracy y tasa de violación por relación y por modelo, resalta las relaciones donde los modelos difieren más allá de sus CIs y lista 5 ejemplos concretos de violaciones
+- [ ] La suite corre en CI ante cambios en `prompts/` con un subconjunto de costo acotado (por ejemplo 10 fuentes × todas las relaciones)
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```yaml
+# 03-metamorphic/promptfooconfig.yaml
+description: Ticket triage - example-based and metamorphic tests
+prompts:
+  - file://prompts/triage.txt
+providers:
+  - id: anthropic:messages:claude-sonnet-5-5
+    label: baseline
+    config: { temperature: 0, max_tokens: 60 }
+  - id: anthropic:messages:claude-haiku-5-5
+    label: candidate
+    config: { temperature: 0, max_tokens: 60 }
+defaultTest:
+  assert:
+    - type: is-json
+    - type: javascript
+      value: |
+        const o = JSON.parse(output);
+        const cats = ['billing_refund', 'shipping', 'account', 'product_question', 'legal_threat'];
+        const pris = ['low', 'normal', 'high', 'urgent'];
+        return cats.includes(o.category) && pris.includes(o.priority);
+tests:
+  - file://tests/generated.yaml
+```
+
+```python
+# 03-metamorphic/generate_mr_tests.py
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Literal
+
+import yaml
+
+rng = random.Random(42)
+
+
+@dataclass
+class Relation:
+    name: str
+    kind: Literal["invariance", "directional"]
+    transform: Callable[[str], str]
+    expected_category: Callable[[str], str | None]  # from gold; None = checked offline only
+
+
+def typos(text: str, rate: float = 0.05) -> str:
+    chars = list(text)
+    for i in range(len(chars) - 1):
+        if chars[i].isalpha() and rng.random() < rate:
+            chars[i], chars[i + 1] = chars[i + 1], chars[i]
+    return "".join(chars)
+
+
+RELATIONS: list[Relation] = [
+    Relation("typos_5pct", "invariance", typos, lambda gold: gold),
+    Relation("polite_filler", "invariance", lambda t: "Hello team, hope you are well. " + t, lambda gold: gold),
+    Relation("legal_threat_priority", "directional",
+             lambda t: t + " If this is not solved by Friday my lawyer will contact you.", lambda gold: None),
+    # TODO(you): name swap, sentence reorder, translation (cached LLM call), outage keyword,
+    #            explicit negation of refund, ALL CAPS
+]
+
+
+def test_case(vars_text: str, meta: dict, expected_category: str | None) -> dict:
+    asserts = []
+    if expected_category:
+        asserts.append({"type": "javascript",
+                        "value": f"JSON.parse(output).category === '{expected_category}'"})
+    return {"vars": {"ticket": vars_text}, "metadata": meta, "assert": asserts}
+
+
+def main() -> None:
+    sources = [json.loads(l) for l in Path("sources.jsonl").read_text("utf-8").splitlines()]
+    tests = []
+    for s in sources:
+        tests.append(test_case(s["text"], {"source_id": s["id"], "relation": "none", "kind": "source"},
+                               s["category"]))
+        for r in RELATIONS:
+            new_text = r.transform(s["text"])
+            if new_text == s["text"]:
+                continue
+            meta = {"source_id": s["id"], "relation": r.name, "kind": r.kind}
+            tests.append(test_case(new_text, meta, r.expected_category(s["category"])))
+    Path("tests/generated.yaml").write_text(yaml.safe_dump(tests, sort_keys=False), "utf-8")
+    print(f"wrote {len(tests)} tests")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>No todas las relaciones aplican a todas las fuentes. Un cambio de nombre no hace nada en un ticket sin nombre, y "agregar una amenaza legal" no tiene sentido en un ticket que ya lo es. Sáltate los textos sin cambios (el starter ya lo hace) y agrega un predicado `applies(source)` a `Relation` para el resto. Reporta cuántos pares produjo cada relación; una relación con 4 pares tiene un CI enorme.</Hint>
+  <Hint>Escribe la salida de promptfoo con `-o results/run.json` y abre el archivo antes de escribir el parser: encuentra dónde guarda cada fila la etiqueta del proveedor, la metadata de la prueba y la salida cruda. Arma un dict con llave `(provider, source_id, relation)` y empareja cada caso derivado con su fila `(provider, source_id, "none")`.</Hint>
+  <Hint>Mide la auto-consistencia con `--repeat 2` solo sobre los casos fuente (una configuración pequeña aparte o un filtro). Si el 4% de las salidas fuente cambia entre dos llamadas idénticas, una tasa de violación de invariancia del 5% apenas supera el ruido. Pon la tasa de auto-consistencia como primera fila de tu tabla.</Hint>
+  <Hint>Para el job de CI, genera un subconjunto fijo con semilla (por ejemplo 10 fuentes) para que el costo por corrida sea predecible, usa la caché integrada de promptfoo y haz fallar el job solo con las aserciones ancladas al gold. Reporta las tasas de violación direccional como comentario en el PR en lugar de un gate estricto hasta que conozcas su nivel de ruido.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  03-metamorphic/
+    README.md
+    prompts/
+      triage.txt
+    sources.jsonl          # 40 hand-labeled source cases
+    generate_mr_tests.py
+    relations.py           # transforms + applies() predicates, unit-tested
+    tests/
+      generated.yaml       # generated, committed for review
+      test_relations.py    # transforms are deterministic and meaning-preserving on fixtures
+    promptfooconfig.yaml
+    promptfooconfig.ci.yaml
+    check_relations.py
+    results/               # gitignored except the summary
+    REPORT.md
+  .github/workflows/metamorphic.yml
+```
+
+Esquema de `03-metamorphic/README.md`:
+
+- Por qué metamorphic testing: el problema del oráculo en un párrafo
+- Catálogo de relaciones: nombre, tipo, transformación, relación esperada, número de pares aplicables
+- Cómo correr: `python generate_mr_tests.py`, `npx promptfoo@latest eval -o results/run.json`, `python check_relations.py results/run.json`
+- Notas de la revisión por muestreo de las transformaciones generadas por LLM
+- Tabla de resultados por modelo y hallazgos principales
+- Subconjunto de CI y costo por corrida
+
+Commits sugeridos:
+
+- `feat(metamorphic): source cases and triage prompt`
+- `feat(metamorphic): relation catalog with deterministic transforms`
+- `feat(metamorphic): promptfoo config for two models`
+- `feat(metamorphic): offline relation checker with Wilson CIs`
+- `ci(metamorphic): cost-bounded suite on prompt changes`
+
+</CommitBox>
+
+<Checklist id="m9-09-review" title="Autorrevisión" items={["Las transformaciones son código, con semilla y con pruebas unitarias; las paráfrasis de LLM están en caché y revisadas por muestreo", "Cada relación reporta su número de pares aplicables", "Las relaciones ancladas al gold se afirman en promptfoo; las relaciones salida-vs-salida se verifican offline", "La auto-consistencia está medida y se muestra como piso de ruido", "Las tasas de violación tienen CIs de Wilson, y las diferencias entre modelos se juzgan contra ellos", "El reporte muestra ejemplos concretos de violaciones que un desarrollador puede reproducir", "El subconjunto de CI tiene un costo predecible y solo falla de forma estricta en verificaciones ancladas al gold"]} />

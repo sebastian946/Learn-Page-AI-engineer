@@ -1,5 +1,3 @@
-# Exercise: evaluate a RAG chain with MLflow
-
 **Scenario (certification style).** The claims team wants to ship prompt `v2` of their policy Q&A chain. Before approving, the tech lead asks for evidence: "Show me v2 is at least as correct and grounded as v1, that it cites sources, and that it stays inside the latency budget. Use MLflow so we can compare runs later."
 
 You will trace a small RAG chain, evaluate two prompt versions with `mlflow.genai.evaluate` using built-in LLM judges, one `Guidelines` scorer and two custom code scorers, compare the runs and write a recommendation.

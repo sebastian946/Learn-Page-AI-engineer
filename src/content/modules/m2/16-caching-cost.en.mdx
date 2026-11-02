@@ -58,7 +58,7 @@ Plus one layer that lives at the provider: **prompt caching**.
 
 ### Layer 1: the embedding cache is non-negotiable
 
-Re-indexing the corpus after a chunking change should not re-embed unchanged text. Hash the normalized chunk text plus the embedding model name and store vectors keyed by that hash. You likely did a version of this in `03-pgvector/`; make it explicit. Including the model in the key matters: vectors from two different models live in different spaces and must never mix.
+Re-indexing the corpus after a chunking change should not re-embed unchanged text. Hash the normalized chunk text plus the embedding model name and store vectors keyed by that hash. Your `chunks` table from `03-pgvector/` already stores `embedding_model`, and documents carry a `content_hash`; make the cache explicit with a lookup keyed by both. Including the model in the key matters: vectors from two different models live in different spaces and must never mix.
 
 ### Layers 3–4: version everything in the key
 

@@ -51,6 +51,7 @@ const en = {
   'lesson.notFound': 'Lesson not found.',
   'lesson.loading': 'Loading lesson…',
   'lesson.fallback': 'This lesson is not translated yet. Showing the English version.',
+  'lesson.error': 'This lesson failed to render.',
   'lock.title': 'This module is locked',
   'lock.body':
     'Pass the previous module exam with at least 70% to unlock it. You can also unlock it now if you already know the material.',
@@ -167,6 +168,7 @@ const es: Record<MessageKey, string> = {
   'lesson.notFound': 'Lección no encontrada.',
   'lesson.loading': 'Cargando lección…',
   'lesson.fallback': 'Esta lección aún no está traducida. Se muestra la versión en inglés.',
+  'lesson.error': 'Esta lección no se pudo mostrar.',
   'lock.title': 'Este módulo está bloqueado',
   'lock.body':
     'Aprueba el examen del módulo anterior con al menos 70% para desbloquearlo. También puedes desbloquearlo ahora si ya dominas el material.',

@@ -1,0 +1,151 @@
+## Single-turn evals miss conversation bugs
+
+Most of your eval sets so far are one input, one output. Real support bots and agents fail in ways that only appear across turns:
+
+- They forget a constraint the user gave three turns ago.
+- They ask for information the user already provided.
+- They follow policy on turn 1 and drop it on turn 6 ("verify identity before changing the address").
+- They never recover after misunderstanding the user.
+- They call the refund tool twice because the user repeated themselves.
+
+In Module 4 you scored agent trajectories: the sequence of tool calls compared with an expected path. This lesson goes deeper: how to generate realistic conversations at scale with **simulated users**, how to score at the **conversation level**, how to judge **tool use** precisely, and how to treat **cost and steps** as first-class eval dimensions.
+
+## Two ways to drive a conversation
+
+**Scenario scripts.** A fixed list of user turns, like a Playwright script. Deterministic, cheap, perfect for regression: "user asks for refund, gives wrong order id, then correct one". The weakness is that real conversations branch. If the bot asks an unexpected question, the script's next line no longer makes sense.
+
+**Simulated users.** An LLM plays the user. It receives a persona, a goal, private facts it only reveals when asked, and a stop condition. It responds to whatever the bot says. This is how benchmarks like τ-bench evaluate customer service agents: a simulated user talks to the agent, and success is checked against the **final state of the database**, not against a transcript.
+
+Use both. Scripts for the known critical paths, gated in CI. Simulators for breadth and for finding new failure modes, run nightly or before releases.
+
+### Making simulated users trustworthy
+
+A simulator is another model in your test setup, and it can be wrong too:
+
+- **Too cooperative.** It volunteers everything at once. Instruct it to answer only what is asked and to reveal private facts only when requested.
+- **Leaks the goal or plays the agent.** It starts suggesting solutions. Keep its instructions short and role-locked, and check transcripts for it.
+- **Never stops, or stops too early.** Give an explicit stop token (`###DONE###`) and a hard turn cap.
+- **Same model family as the bot.** The two can "understand" each other too well. Use a different family for the simulator.
+- **Unrealistic style.** Compare against real transcripts: message length distribution, typo rate, how often users change their mind. Have a human rate 20 simulated conversations for realism before trusting the setup.
+
+## Conversation-level metrics
+
+Score the whole conversation, with the conversation as the unit of analysis (lesson 02):
+
+| Dimension | How to measure |
+|---|---|
+| Task success | End-state check: the order is refunded, the address changed, the ticket escalated. Objective, no judge needed |
+| Policy adherence | Rule checks over the trace ("no `issue_refund` before `verify_identity`") plus a judge for soft policies |
+| Efficiency | Turns to resolution, redundant questions, repeated information requests |
+| Consistency | No contradiction with earlier turns (judge with the full transcript) |
+| Escalation correctness | Escalated when it should, did not escalate when it could solve it |
+| User experience | Judge-rated frustration or tone trajectory; for real traffic, explicit ratings and abandonment |
+
+### Reliability: pass^k
+
+A bot that solves a task 80% of the time is not 80% reliable for users; each user gets one attempt, and a big customer gets thousands. τ-bench introduced **pass^k**: the probability that **all k** independent attempts at the same task succeed. If per-attempt success is 0.8 and attempts are independent, pass^4 is about 0.41. For a support bot, pass^k is a better reliability metric than average success because it punishes flaky behavior. It is the eval version of a flaky test that passes 80% of the time: nobody calls that test "80% good".
+
+Given `n` trials per task with `c` successes, an unbiased estimate of pass^k is `C(c, k) / C(n, k)`, averaged over tasks.
+
+## Tool-use correctness
+
+Look at each tool call, not just the final answer:
+
+- **Selection:** the right tool for the situation; no tool call when none is needed.
+- **Arguments:** schema-valid (your Pydantic models catch this) and semantically correct (refund amount equals the order total, not a number the user invented).
+- **Ordering constraints:** preconditions respected (verify identity, then change address).
+- **Forbidden calls:** never call `delete_account` in a refund scenario.
+- **Side-effect safety:** no duplicate refunds when the user repeats a request. Idempotency is an eval dimension.
+- **Error handling:** when a tool returns an error, the agent retries sensibly or tells the user, and never claims success.
+
+Most of these are deterministic checks over the trace. Reserve judges for what code cannot check.
+
+## Cost and step budgets as eval dimensions
+
+An agent that succeeds in 40 steps for 1.20 dollars may be worse than one that succeeds 3 points less often in 6 steps for 0.08 dollars. Record per conversation: input and output tokens, cost, tool calls, turns, wall time. Then report:
+
+- **Cost per successful task** (total cost divided by successes), not just cost per conversation.
+- **Budget violations:** conversations that hit the step cap or the cost cap. These are failures even if the user eventually got an answer.
+- **Pareto view:** success rate vs cost per task for each configuration. A migration candidate must sit on or near the frontier.
+
+## Code: simulated user loop, end-state check and pass^k
+
+```python
+from math import comb
+
+import anthropic
+
+client = anthropic.AsyncAnthropic()
+SIM_MODEL = "claude-haiku-5-5"   # pick a different family from the bot if you can
+STOP = "###DONE###"
+
+def user_system(s: dict) -> str:
+    return (
+        f"You are a customer. Persona: {s['persona']}. Goal: {s['goal']}.\n"
+        f"Private facts, reveal ONLY when asked: {s['private_facts']}.\n"
+        "Write short, realistic messages. Never suggest solutions. "
+        f"When your goal is met or clearly impossible, reply with {STOP} only."
+    )
+
+async def simulate(bot, scenario: dict, max_turns: int = 12) -> dict:
+    """bot: async callable(history) -> (reply_text, tool_calls, cost_usd). Returns a transcript record."""
+    history: list[dict] = []
+    sim_view = [{"role": "user", "content": "Start the conversation with the support bot."}]
+    cost, tool_calls, hit_cap = 0.0, [], False
+    for _ in range(max_turns):
+        sim = await client.messages.create(model=SIM_MODEL, max_tokens=200,
+                                           system=user_system(scenario), messages=sim_view)
+        user_msg = sim.content[0].text.strip()
+        if STOP in user_msg:
+            break
+        history.append({"role": "user", "content": user_msg})
+        reply, calls, c = await bot(history)
+        history.append({"role": "assistant", "content": reply})
+        tool_calls += calls
+        cost += c
+        sim_view += [{"role": "assistant", "content": user_msg}, {"role": "user", "content": reply}]
+    else:
+        hit_cap = True   # loop ended without the simulator saying it was done
+    return {"scenario_id": scenario["id"], "history": history, "tool_calls": tool_calls,
+            "turns": len(history) // 2, "cost_usd": cost, "hit_turn_cap": hit_cap}
+
+def end_state_ok(db_after: dict, expected: dict) -> bool:
+    return all(db_after.get(k) == v for k, v in expected.items())
+
+def pass_hat_k(results: dict[str, list[bool]], k: int) -> float:
+    """results: task_id -> list of success flags over n trials (n >= k)."""
+    per_task = [comb(sum(r), k) / comb(len(r), k) for r in results.values()]
+    return sum(per_task) / len(per_task)
+```
+
+Notice the role flip: from the simulator's point of view, the bot's replies are "user" messages and its own messages are "assistant" messages. Getting this wrong is the most common simulator bug.
+
+## Common mistakes
+
+- **Judging a transcript when you could check the end state.** Database state is objective; a judge reading the transcript can be fooled by a bot that *says* it refunded.
+- **Average success instead of pass^k.** Flaky agents look fine on averages.
+- **Simulator from the same family, with no realism check.**
+- **Counting turns as samples.** The conversation is the unit.
+- **Ignoring cost and step caps.** A success that took 40 tool calls is a production incident waiting to happen.
+- **Only LLM simulators, no scripts.** You lose deterministic regression coverage of critical paths.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you evaluate a multi-turn customer support agent before release?" level="senior">
+
+I combine scripted scenarios for critical paths, gated in CI, with LLM-simulated users for breadth. Simulators get a persona, a goal, private facts revealed only on request and a stop token; they use a different model family than the bot, and I validate their realism on a sample with human raters. Success is checked against the end state of a sandbox database, not the transcript. I check tool-use rules deterministically over the trace: preconditions, forbidden calls, argument correctness and no duplicate side effects. I report task success with CIs over conversations, pass^k for reliability, policy violations, turns to resolution, cost per successful task and budget-cap hits.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="What is pass^k and why does it matter for agents?" level="mid">
+
+pass^k is the probability that all k independent attempts at the same task succeed. It measures reliability rather than average capability. An agent with 80% per-attempt success has a pass^4 of about 41% if attempts are independent, which reveals flakiness that an average hides. For a support product where each customer gets one attempt and large customers hit the same flows thousands of times, reliability is what matters. I estimate it per task from n trials as C(c, k) / C(n, k) and average across tasks.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Yao et al., "τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains": https://arxiv.org/abs/2406.12045
+- Inspect AI agents and tools: https://inspect.aisi.org.uk/
+- DeepEval conversational metrics: https://docs.confident-ai.com
+- LangSmith evaluation concepts: https://docs.smith.langchain.com

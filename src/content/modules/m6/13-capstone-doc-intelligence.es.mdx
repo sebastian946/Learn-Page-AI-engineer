@@ -1,0 +1,212 @@
+<ClientBrief company="Harborline Mutual" industry="Seguros / Reclamos de propiedad y accidentes" duration="5 días" />
+
+Eres un AI engineer contratado. Harborline Mutual quiere un pipeline que lea los documentos de reclamos, extraiga los campos que hoy los ajustadores escriben a mano y responda las preguntas de los ajustadores sobre un reclamo con citas. Su plataforma de datos es Databricks, gobernada por Unity Catalog. Si no tienes un workspace, construye el mismo sistema con el stack local descrito abajo: el brief, los requisitos y la rúbrica no cambian.
+
+<Callout type="warning" title="Las APIs de Databricks evolucionan">
+
+Vector Search, Model Serving, MLflow 3 y el Agent Framework cambian con frecuencia. Diseña con los conceptos de este módulo y revisa docs.databricks.com y mlflow.org/docs para conocer los nombres de funciones y parámetros actuales mientras construyes. Anota en tu README qué versiones usaste.
+
+</Callout>
+
+## Contexto de la empresa
+
+Harborline Mutual es una aseguradora regional de propiedad y accidentes (ficticia) con unos 1,200 empleados y 400,000 pólizas activas de hogar y auto. Maneja aproximadamente 6,000 reclamos nuevos por mes. Cada reclamo llega como un paquete de PDFs: un **formulario de primer aviso de siniestro (FNOL)**, **reportes de campo del ajustador**, **presupuestos de reparación**, fotos con descripciones y el **documento de la póliza** correspondiente con sus endosos.
+
+Hoy, el personal de recepción abre cada PDF y escribe 15–20 campos en el sistema de reclamos. Toma 12–20 minutos por reclamo y los errores son comunes (número de póliza incorrecto, fecha del siniestro omitida). Cuando los ajustadores necesitan saber "¿esto está cubierto?", buscan a mano en PDFs de pólizas de 40 páginas.
+
+Harborline ya deposita los documentos en almacenamiento en la nube y opera su data warehouse en Databricks. Seguridad exige que los datos de reclamos permanezcan dentro de la plataforma gobernada, que el acceso sea auditable y que ningún dato personal se envíe a sistemas fuera de los endpoints aprobados.
+
+## Stakeholders
+
+| Persona | Rol | Qué le importa |
+|---|---|---|
+| Dana Okafor | VP de Operaciones de Reclamos (sponsor) | Tiempo de recepción por reclamo, productividad de los ajustadores |
+| Luis Herrera | Ajustador Senior de Reclamos (SME) | Respuestas correctas con citas de página; ninguna afirmación de cobertura inventada |
+| Priya Raman | Líder de Plataforma de Datos | Gobernanza con Unity Catalog, lineage, costo en el workspace compartido |
+| Martin Cole | Seguridad de la Información / Privacidad | Manejo de PII, control de acceso, logs de auditoría |
+| Ana Petrov | Gerente de QA de Reclamos | Precisión medible, protección contra regresiones cuando cambian los prompts |
+
+## Objetivo de negocio
+
+Reducir el tiempo manual de recepción al menos un 60% prellenando los campos estructurados del reclamo a partir de los documentos, y dar a los ajustadores un asistente de preguntas y respuestas con citas sobre los documentos y la póliza de cada reclamo. El éxito en un piloto de 4 semanas significa que el personal de recepción solo revisa y corrige los campos extraídos, y que los ajustadores usan el asistente para consultas de cobertura sin que la revisión de QA encuentre afirmaciones de cobertura sin respaldo.
+
+## Requisitos funcionales
+
+1. **Ingesta.** Los PDFs de reclamos llegan a un Volume de Unity Catalog (`/Volumes/<catalog>/claims/raw_docs/`). Un job incremental (Auto Loader con `binaryFile`, trigger `availableNow`) carga los archivos nuevos en una tabla Delta bronze con ruta, tamaño, fecha de modificación y el `claim_id` tomado del nombre de la carpeta.
+2. **Parsing y chunking.** Parsea cada PDF a texto por página (un parser de Python o `ai_parse_document` si está disponible), clasifica el tipo de documento (`fnol`, `adjuster_report`, `estimate`, `policy`, `endorsement`) y escribe una tabla silver. Haz chunking a una tabla gold con `chunk_id` determinista, `claim_id`, `doc_id`, `doc_type`, `page`, `content` y columnas de lineage (`parser_version`, `chunker_config`, `run_id`). Change Data Feed activado, primary key definida.
+3. **Manejo de PII.** Detecta y seudonimiza nombres, teléfonos, emails y SSNs en el texto que va al índice de Q&A y a los logs. Conserva los valores originales solo en la tabla gobernada de extracción que necesita recepción, restringida con grants de UC.
+4. **Vector Search.** Índice Delta Sync sobre los chunks gold con embeddings administrados, sincronización `TRIGGERED` después de cada corrida de ingesta, filtrable por `claim_id` y `doc_type`.
+5. **Cadena de extracción.** Para cada reclamo, extrae a un modelo Pydantic y escribe en `claims.extracted_fields`:
+   - `claim_number`, `policy_number`, `date_of_loss`, `date_reported`, `loss_type` (enum: water, fire, wind, theft, collision, liability, other), `loss_location`, `claimed_amount`, `estimate_total`, `insured_name`, `adjuster_name`, `police_report_number` (nullable)
+   - un `source` por campo (`doc_id`, `page`) y una `confidence` (`high` | `low`)
+   - validación: las fechas se parsean, `date_of_loss` no es posterior a `date_reported`, el número de póliza coincide con `POL-` más 8 dígitos, los montos no son negativos. Los campos que fallan quedan en `null` con `confidence = low`, nunca se adivinan.
+6. **Cadena de Q&A.** Dado un `claim_id` y una pregunta, recupera solo los chunks de ese reclamo más su póliza, responde con citas `[doc_id p.N]` y di "no hay suficiente información" cuando los documentos no lo respondan. Nunca debe afirmar que un reclamo está aprobado o que será pagado.
+7. **Evaluación.** Traces de MLflow para ambas cadenas. `mlflow.genai.evaluate` con:
+   - extracción: scorers de código personalizados para coincidencia exacta por campo (normalizada) sobre un golden set de al menos 40 reclamos
+   - Q&A: `Correctness`, `RetrievalGroundedness`, `RelevanceToQuery`, `Safety`, un scorer `Guidelines` para la regla de "no prometer aprobaciones" y un scorer de código para citas, sobre al menos 40 preguntas golden
+8. **Serving.** Registra el agente de Q&A con models from code y resources declarados, regístralo en Unity Catalog y despliégalo con `agents.deploy` (o un endpoint de Model Serving). Inference tables o registro de traces activados. La extracción corre como job batch (o `ai_query` sobre la tabla silver).
+9. **Monitoreo.** Un dashboard SQL o notebook sobre las tablas de inferencia y extracción: requests por día, latencia p95, tasa de campos con baja confianza, tasa de thumbs-down.
+
+## Requisitos no funcionales
+
+| Área | Objetivo |
+|---|---|
+| Latencia de Q&A | p95 menor a 6 s de punta a punta para una pregunta |
+| Throughput de extracción | Un paquete de reclamo de 10 páginas extraído en menos de 60 s en batch |
+| Precisión de extracción | ≥ 95% de coincidencia exacta por campo en los campos clave (número de reclamo, número de póliza, fecha del siniestro, tipo de pérdida, monto reclamado); ≥ 85% en todos los campos |
+| Calidad de Q&A | Groundedness ≥ 0.90, correctness ≥ 0.80, cero violaciones de "promesa de aprobación" en el golden set |
+| Costo | Mide y reporta el costo por cada 1k documentos procesados y por cada 1k preguntas respondidas, a partir del uso de tokens y los precios actuales del proveedor y la plataforma. Define un objetivo después de la primera medición y explícalo |
+| Frescura | Documentos nuevos consultables dentro de 30 minutos después de llegar (job programado) |
+| Gobernanza | Todas las tablas, el Volume, el índice y el modelo en un mismo schema de UC; las apps usan un service principal; sin tokens personales en el código |
+| Privacidad | Recall del scrubber de PII ≥ 0.95 sobre una muestra etiquetada de 50 fragmentos |
+
+## Fuera de alcance
+
+- Detección de fraude o decisiones de aprobación de reclamos.
+- Entrenamiento de modelos OCR. Usa un parser existente; las imágenes escaneadas se pueden omitir y registrar.
+- Integración con el sistema real de gestión de reclamos: escribe solo en tablas Delta.
+- Un front end web personalizado. La Review App (o un demo simple en notebook/Streamlit) es suficiente.
+- Fine-tuning. Documenta por qué no lo necesitaste.
+
+## Alternativa local
+
+| Databricks | Equivalente local |
+|---|---|
+| Volume de UC | Carpeta `data/raw_docs/<claim_id>/` |
+| Auto Loader + Delta bronze | Job de Python con un manifiesto de archivos procesados, escribiendo Parquet (DuckDB) o Postgres |
+| Delta silver/gold con CDF | Tablas de Postgres con `run_id` y upserts, o DuckDB sobre Parquet |
+| Vector Search (Delta Sync) | pgvector o Chroma con un job de upsert idempotente |
+| Model Serving / modelos externos | SDK de Anthropic u OpenAI directo, modelos desde la configuración |
+| Endpoint de `agents.deploy` | Servicio FastAPI en Docker (Módulo 5) |
+| MLflow en Databricks | `mlflow server` local con backend SQLite |
+| Inference tables | Tabla de log de requests en Postgres (schema de la lección 1) |
+| Grants de UC | Roles de Postgres; documenta la equivalencia |
+
+## Entregables
+
+1. Repo `doc-intelligence-pipeline` con código, notebooks (o jobs) y tests.
+2. Golden datasets: más de 40 reclamos anotados para extracción, más de 40 pares de Q&A, 50 fragmentos de PII.
+3. Experimento de MLflow con al menos dos corridas de evaluación (línea base y mejorada).
+4. Endpoint desplegado (o servicio FastAPI local) y un GIF/video demo de 3 minutos.
+5. README con arquitectura, decisiones de diseño, resultados de evaluación, reporte de costos y runbook.
+6. Un resumen de una página para Dana (resultado de negocio, precisión, costo, riesgos).
+
+## Criterios de aceptación
+
+- Volver a ejecutar la ingesta sobre los mismos archivos no produce filas duplicadas (demostrado con un test o una consulta en el README).
+- Actualizar un documento y volver a ejecutar el pipeline actualiza sus chunks y elimina los obsoletos del índice.
+- La extracción cumple los objetivos de precisión en el golden set, reportados por campo desde un run de MLflow.
+- Q&A cumple los objetivos de groundedness, correctness y seguridad; las violaciones se listan y explican.
+- El retrieval de Q&A está limitado por `claim_id`: un test muestra que una pregunta sobre el reclamo A nunca devuelve chunks del reclamo B.
+- La latencia p95 y el costo por 1k se miden y reportan, con el método explicado.
+- El endpoint o servicio es accesible y tiene tracing; el registro de inferencias se verifica con una consulta.
+- Sin secretos en el repo; acceso mediante service principal o configuración de entorno.
+
+## Arquitectura sugerida
+
+<Diagram caption="Pipeline de inteligencia documental de Harborline" chart={`flowchart LR
+  subgraph Ingesta
+    A["PDFs de reclamos"] --> B["Volume de UC raw_docs"]
+    B --> C["Auto Loader a bronze_docs"]
+  end
+  subgraph prep["Preparación"]
+    C --> D["Parsing + clasificación a silver_pages"]
+    D --> E["Seudonimizar PII"]
+    E --> F["Chunking a gold_chunks (CDF, PK)"]
+  end
+  subgraph Serving
+    F --> G["Índice Delta Sync de Vector Search"]
+    D --> H["Job de extracción (Pydantic + LLM)"]
+    H --> I["Delta extracted_fields"]
+    G --> J["Agente de Q&A (modelo MLflow)"]
+    K["Model Serving: endpoint del LLM"] --> H
+    K --> J
+    J --> L["Endpoint del agente + Review App"]
+  end
+  subgraph evalg["Evaluación"]
+    L --> M["Inference tables / traces"]
+    M --> N["MLflow GenAI evaluate"]
+    O["Golden sets en UC"] --> N
+    N --> P["Dashboard + gate de regresión"]
+  end`} />
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Excelente | Aceptable | Necesita trabajo |
+|---|---|---|---|---|
+| Pipeline de datos | 20% | Incremental, idempotente, manejo de chunks obsoletos, lineage por fila, tests | Incremental e idempotente | Recargas completas, posibles duplicados |
+| Calidad de extracción | 20% | Cumple todos los objetivos de precisión, validación y fuentes por campo | Cumple el objetivo de campos clave | Bajo el objetivo o sin métricas por campo |
+| Calidad y seguridad de Q&A | 20% | Cumple objetivos, retrieval limitado, rechazos correctos, justificaciones analizadas | Cumple la mayoría de objetivos | Sin eval de groundedness o con fuga entre reclamos |
+| Rigor de evaluación | 15% | Golden sets versionados, juez calibrado contra etiquetas humanas, corridas base vs mejorada | Una corrida de evaluación con scorers mixtos | Revisiones manuales ad hoc |
+| Gobernanza y privacidad | 15% | Grants de UC, service principal, recall de PII medido, historia de auditoría | Uso de objetos de UC, scrub básico | Tokens personales, PII en índice o logs |
+| Comunicación | 10% | README claro, reporte de costos, runbook, resumen para stakeholders | README con resultados | Faltan resultados o decisiones |
+
+## Cronograma sugerido
+
+| Día | Enfoque |
+|---|---|
+| 1 | Schema de UC, Volume, ingesta bronze, parsing a silver, clasificación de tipo de documento. Empieza a anotar el golden set de extracción |
+| 2 | Scrub de PII con recall medido, chunking a gold con lineage, índice de Vector Search, test de retrieval limitado |
+| 3 | Cadena de extracción con validación Pydantic, job batch, scorers por campo, primera corrida de evaluación en MLflow |
+| 4 | Agente de Q&A con citas y reglas de rechazo, tracing, jueces + guidelines + scorers de código, mejorar y volver a correr |
+| 5 | Registrar en MLflow y UC y desplegar; registro de inferencias; consultas de monitoreo; medición de costo y latencia; README, demo y resumen para stakeholders |
+
+<CommitBox repo="doc-intelligence-pipeline">
+
+```text
+doc-intelligence-pipeline/
+  README.md
+  docs/
+    architecture.md
+    cost-report.md
+    runbook.md
+    stakeholder-summary.md
+  config/
+    settings.yaml               # catalog, schema, endpoints, model names, chunking
+  pipeline/
+    ingest.py                   # Auto Loader job / local manifest loader
+    parse.py
+    pii.py
+    chunk.py
+    index.py                    # Vector Search or pgvector/Chroma
+  chains/
+    schemas.py                  # Pydantic ClaimFields
+    extract.py
+    qa_agent.py                 # ResponsesAgent, models from code
+  evaluation/
+    golden/                     # extraction, qa, pii datasets (versioned)
+    scorers.py
+    run_eval.py
+  deploy/
+    log_and_register.py
+    deploy_agent.py
+  sql/
+    monitoring.sql
+  tests/
+```
+
+Esquema del README: problema y resultado, diagrama de arquitectura, camino Databricks vs local, modelo de datos (bronze/silver/gold), enfoque de PII y recall medido, diseño de extracción, diseño de Q&A, tabla de resultados de evaluación (base vs final), latencia y costo por 1k, gobernanza, cómo ejecutarlo, limitaciones y próximos pasos.
+
+Commits sugeridos: `feat(ingest): incremental bronze ingestion from UC Volume`, `feat(prepare): parsing, PII pseudonymization and chunking with lineage`, `feat(index): delta sync vector index with claim-scoped retrieval`, `feat(extract): validated claim field extraction job`, `feat(qa): cited Q&A agent with refusal rules`, `feat(eval): golden sets and MLflow evaluation`, `feat(deploy): register in UC and deploy agent`, `docs: cost report, runbook and results`.
+
+</CommitBox>
+
+## Definition of Done
+
+<Checklist id="m6-13-dod" title="Definition of Done" items={["La ingesta es incremental e idempotente, demostrado con una nueva corrida", "Los chunks obsoletos se eliminan cuando cambia un documento", "La tabla gold de chunks tiene CDF, primary key y columnas de lineage", "Recall del scrubber de PII medido sobre 50 fragmentos etiquetados y de al menos 0.95", "La extracción cumple los objetivos de precisión por campo en un run de MLflow", "Q&A cumple los objetivos de groundedness, correctness y seguridad con cero promesas de aprobación", "El retrieval está limitado por claim_id, con un test que demuestra que no hay fuga entre reclamos", "Agente registrado con resources declarados, registrado en Unity Catalog y desplegado (o equivalente local con FastAPI)", "Registro de inferencias verificado y consultas de monitoreo escritas", "Latencia p95 y costo por 1k documentos y por 1k preguntas medidos y documentados", "README, runbook, reporte de costos, resumen para stakeholders y GIF demo en el repo"]} />
+
+## Cómo presentarlo en una entrevista
+
+Empieza con el problema de negocio en una frase: "Una aseguradora gastaba 15 minutos por reclamo escribiendo campos desde PDFs; construí un pipeline gobernado que los extrae con más de 95% de precisión por campo y responde las preguntas de los ajustadores con citas."
+
+Luego recorre el diagrama de izquierda a derecha, deteniéndote en las decisiones:
+
+- **Por qué Delta Sync en modo TRIGGERED**: los documentos llegan por lotes; una frescura de 30 minutos no justifica el costo de la sincronización continua.
+- **Por qué la extracción es un job batch y Q&A es un endpoint**: necesidades de latencia y perfiles de costo distintos.
+- **Cómo evitas la fuga entre reclamos**: filtro por `claim_id` derivado del contexto del request, más un test.
+- **Cómo mediste la calidad**: scorers de código por campo para la extracción, jueces más una muestra calibrada para Q&A, dos runs de MLflow que muestran la mejora.
+- **Dónde vive la PII**: los originales solo en la tabla de extracción restringida; seudónimos en todo lo demás; recall medido.
+- **Cuánto cuesta**: tu costo medido por 1k documentos y preguntas, y la palanca más grande que encontraste.
+- **Por qué no hubo fine-tuning**: prompting más validación cumplieron los objetivos; el fine-tuning agregaría costos de re-entrenamiento y serving.
+
+Espera preguntas de seguimiento como "¿qué se rompe con 10x de volumen?" (throughput de parsing, provisioned throughput para el LLM, tamaño del índice y dimensionamiento del endpoint) y "¿cómo detectarías una regresión después de un cambio de prompt?" (golden sets como gate de CI más scorers programados sobre traces de producción). Si usaste el stack local, dilo directamente y muestra la tabla de equivalencias: el razonamiento de diseño es el mismo, y los entrevistadores valoran esa honestidad.
