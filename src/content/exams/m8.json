@@ -1,0 +1,503 @@
+{
+  "moduleId": "m8",
+  "title": { "en": "Module 8 exam", "es": "Examen del módulo 8" },
+  "timeLimitMinutes": 35,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "An API-calling LLM chat service on Kubernetes autoscales on CPU at 70%. Users report slow first tokens at peak while CPU sits around 20%. What is the most likely reason?",
+        "es": "Un servicio de chat LLM en Kubernetes que llama a una API escala por CPU al 70%. Los usuarios reportan primeros tokens lentos en el pico mientras la CPU está cerca del 20%. ¿Cuál es la razón más probable?"
+      },
+      "options": {
+        "en": [
+          "The service is I/O-bound: workers wait on provider streams, so CPU never reflects saturation",
+          "The HPA needs a higher maxReplicas to read CPU correctly",
+          "CPU metrics are only collected every 10 minutes",
+          "Streaming responses always use more CPU than the HPA can measure"
+        ],
+        "es": [
+          "El servicio está limitado por I/O: los workers esperan los streams del proveedor, así que la CPU nunca refleja la saturación",
+          "El HPA necesita un maxReplicas más alto para leer bien la CPU",
+          "Las métricas de CPU solo se recolectan cada 10 minutos",
+          "Las respuestas en streaming siempre usan más CPU de la que el HPA puede medir"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "LLM API calls spend most of their time waiting on the network. Pods saturate their concurrency long before CPU rises. Scale on in-flight requests or queue depth instead.",
+        "es": "Las llamadas a APIs de LLM pasan la mayor parte del tiempo esperando la red. Los pods saturan su concurrencia mucho antes de que suba la CPU. Escala por requests en vuelo o profundidad de cola."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "A model has 40 layers, 8 KV heads and head dimension 128, served with an FP16 KV cache. Roughly how much KV cache does one token need?",
+        "es": "Un modelo tiene 40 capas, 8 KV heads y head dimension 128, servido con KV cache en FP16. ¿Aproximadamente cuánto KV cache necesita un token?"
+      },
+      "options": {
+        "en": ["160 KiB", "80 KiB", "320 KiB", "1.25 MiB"],
+        "es": ["160 KiB", "80 KiB", "320 KiB", "1.25 MiB"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "2 (K and V) × 40 layers × 8 heads × 128 dims × 2 bytes = 163,840 bytes = 160 KiB per token.",
+        "es": "2 (K y V) × 40 capas × 8 heads × 128 dimensiones × 2 bytes = 163.840 bytes = 160 KiB por token."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "You want to shadow production traffic to a new version of an agent that can send emails and update orders. What is the most important precaution?",
+        "es": "Quieres hacer shadow del tráfico de producción hacia una versión nueva de un agente que puede enviar emails y actualizar pedidos. ¿Cuál es la precaución más importante?"
+      },
+      "options": {
+        "en": [
+          "Disable or stub side-effecting tools in the shadow path",
+          "Mirror 100% of traffic so the comparison is complete",
+          "Return the shadow response to users when it scores higher",
+          "Run the shadow version with a higher temperature"
+        ],
+        "es": [
+          "Desactivar o reemplazar con stubs las tools con efectos secundarios en el camino shadow",
+          "Espejar el 100% del tráfico para que la comparación sea completa",
+          "Devolver a los usuarios la respuesta shadow cuando puntúe más alto",
+          "Correr la versión shadow con una temperature más alta"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Shadow traffic must be side-effect free. Otherwise the shadow agent sends duplicate emails or changes real orders. Its responses are discarded, never shown to users.",
+        "es": "El shadow traffic debe estar libre de efectos secundarios. Si no, el agente shadow envía emails duplicados o cambia pedidos reales. Sus respuestas se descartan y nunca se muestran a los usuarios."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "Which signal is the best basis for autoscaling a vLLM deployment serving interactive chat?",
+        "es": "¿Qué señal es la mejor base para el autoscaling de un deployment de vLLM que atiende chat interactivo?"
+      },
+      "options": {
+        "en": [
+          "Sustained vllm:num_requests_waiting above zero (or p95 TTFT)",
+          "GPU utilization above 80%",
+          "Node memory usage",
+          "Number of HTTP connections on the ingress"
+        ],
+        "es": [
+          "vllm:num_requests_waiting por encima de cero de forma sostenida (o el p95 del TTFT)",
+          "Utilización de GPU por encima del 80%",
+          "Uso de memoria del nodo",
+          "Cantidad de conexiones HTTP en el ingress"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "GPU utilization reads near 100% under almost any load. Waiting requests, KV cache usage and TTFT show when the server is out of batch capacity.",
+        "es": "La utilización de GPU marca cerca del 100% con casi cualquier carga. Los requests en espera, el uso del KV cache y el TTFT muestran cuándo el servidor se quedó sin capacidad de batch."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "single",
+      "prompt": {
+        "en": "Production code calls Bedrock with guardrailVersion set to DRAFT. What is the main risk?",
+        "es": "El código de producción llama a Bedrock con guardrailVersion en DRAFT. ¿Cuál es el riesgo principal?"
+      },
+      "options": {
+        "en": [
+          "Anyone editing the guardrail changes production behavior with no deploy or review",
+          "DRAFT guardrails are ignored by the Converse API",
+          "DRAFT guardrails double the token cost",
+          "DRAFT guardrails only work in us-east-1"
+        ],
+        "es": [
+          "Cualquiera que edite el guardrail cambia el comportamiento de producción sin deploy ni revisión",
+          "La API Converse ignora los guardrails en DRAFT",
+          "Los guardrails en DRAFT duplican el costo en tokens",
+          "Los guardrails en DRAFT solo funcionan en us-east-1"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Guardrails are versioned. Pin a numbered version in production so changes go through the release process like any prompt or model change.",
+        "es": "Los guardrails tienen versiones. Fija una versión numerada en producción para que los cambios pasen por el proceso de release como cualquier cambio de prompt o modelo."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "A PII-sensitive workload runs on a self-hosted model. Its GPU nodes become unavailable. What should the gateway do?",
+        "es": "Una carga sensible a PII corre en un modelo autoalojado. Sus nodos GPU dejan de estar disponibles. ¿Qué debería hacer el gateway?"
+      },
+      "options": {
+        "en": [
+          "Route to another approved replica or queue requests durably, accepting degraded service",
+          "Fall back to the public API provider so users are not affected",
+          "Strip names from the prompt with a regex and send it to the public API",
+          "Return cached answers from other tenants"
+        ],
+        "es": [
+          "Rutear a otra réplica aprobada o encolar los requests de forma durable, aceptando un servicio degradado",
+          "Caer al proveedor de API pública para no afectar a los usuarios",
+          "Quitar los nombres del prompt con una regex y enviarlo a la API pública",
+          "Devolver respuestas en caché de otros tenants"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Fallback chains must respect data classification. For regulated data, short unavailability is usually acceptable; processing by an unapproved provider is not.",
+        "es": "Las cadenas de fallback deben respetar la clasificación de datos. Para datos regulados, una indisponibilidad corta suele ser aceptable; el procesamiento por un proveedor no aprobado no lo es."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "multi",
+      "prompt": {
+        "en": "Which signals are useful automated gates for a canary of a prompt change? Select all that apply.",
+        "es": "¿Qué señales son gates automáticos útiles para el canary de un cambio de prompt? Selecciona todas las que correspondan."
+      },
+      "options": {
+        "en": [
+          "JSON schema validity rate of the outputs, per version",
+          "Sampled LLM-judge score, per version",
+          "Refusal-pattern rate, per version",
+          "Number of commits in the release",
+          "CPU usage of the Kubernetes control plane"
+        ],
+        "es": [
+          "Tasa de validez del JSON schema de las salidas, por versión",
+          "Puntaje muestreado de un juez LLM, por versión",
+          "Tasa de patrones de rechazo, por versión",
+          "Cantidad de commits del release",
+          "Uso de CPU del control plane de Kubernetes"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "LLM regressions are usually 200 OK. Contract signals and sampled quality signals, labeled by version, detect them. Commit counts and control-plane CPU say nothing about output quality.",
+        "es": "Las regresiones de LLM suelen ser 200 OK. Las señales de contrato y de calidad muestreada, etiquetadas por versión, las detectan. La cantidad de commits y la CPU del control plane no dicen nada sobre la calidad de las salidas."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "multi",
+      "prompt": {
+        "en": "An ECS Fargate service runs in private subnets with no NAT gateway. It pulls images from ECR and calls Bedrock. Which of these does it need? Select all that apply.",
+        "es": "Un servicio ECS Fargate corre en subredes privadas sin NAT gateway. Descarga imágenes de ECR y llama a Bedrock. ¿Cuáles de estos necesita? Selecciona todos los que correspondan."
+      },
+      "options": {
+        "en": [
+          "An interface VPC endpoint for bedrock-runtime",
+          "Interface VPC endpoints for ecr.api and ecr.dkr",
+          "An S3 gateway endpoint",
+          "An internet gateway attached to the task subnets",
+          "A public IP on each task"
+        ],
+        "es": [
+          "Un interface VPC endpoint para bedrock-runtime",
+          "Interface VPC endpoints para ecr.api y ecr.dkr",
+          "Un gateway endpoint de S3",
+          "Un internet gateway asociado a las subredes de las tasks",
+          "Una IP pública en cada task"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Bedrock runtime and ECR need interface endpoints, and ECR image layers come from S3, so an S3 gateway endpoint is required. (Logs and Secrets Manager endpoints are usually needed too.) Internet routes and public IPs defeat the purpose.",
+        "es": "Bedrock runtime y ECR necesitan interface endpoints, y las capas de imagen de ECR vienen de S3, así que hace falta un gateway endpoint de S3. (Normalmente también se necesitan endpoints de logs y Secrets Manager.) Las rutas a internet y las IPs públicas anulan el objetivo."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "multi",
+      "prompt": {
+        "en": "A user exercises a right-to-deletion request. Which stores of an LLM platform may hold their content and must be covered? Select all that apply.",
+        "es": "Un usuario ejerce un pedido de derecho al borrado. ¿Qué almacenes de una plataforma LLM pueden guardar su contenido y deben cubrirse? Selecciona todos los que correspondan."
+      },
+      "options": {
+        "en": [
+          "Tracing backend (Langfuse or OpenTelemetry traces)",
+          "Semantic and response caches",
+          "Vector store chunks built from their documents",
+          "Eval datasets sampled from production traffic",
+          "Terraform state for the ALB"
+        ],
+        "es": [
+          "Backend de tracing (traces de Langfuse u OpenTelemetry)",
+          "Cachés semánticas y de respuestas",
+          "Chunks del vector store construidos a partir de sus documentos",
+          "Datasets de evaluación muestreados del tráfico de producción",
+          "State de Terraform del ALB"
+        ]
+      },
+      "answer": [0, 1, 2, 3],
+      "explanation": {
+        "en": "LLM systems copy user content into traces, caches, vector stores and eval datasets. Infrastructure state does not contain user content.",
+        "es": "Los sistemas LLM copian contenido del usuario en traces, cachés, vector stores y datasets de evaluación. El state de infraestructura no contiene contenido de usuarios."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "multi",
+      "prompt": {
+        "en": "Which items belong pinned in an LLM release manifest so a production answer can be traced and reproduced? Select all that apply.",
+        "es": "¿Qué elementos deben quedar fijados en un manifiesto de release LLM para poder trazar y reproducir una respuesta de producción? Selecciona todos los que correspondan."
+      },
+      "options": {
+        "en": [
+          "Prompt name and immutable version number",
+          "Model snapshot id or weights digest",
+          "Guardrail version",
+          "Eval dataset version and report location",
+          "The provider's floating latest alias"
+        ],
+        "es": [
+          "Nombre del prompt y número de versión inmutable",
+          "Id del snapshot del modelo o digest de los pesos",
+          "Versión del guardrail",
+          "Versión del dataset de evaluación y ubicación del reporte",
+          "El alias flotante latest del proveedor"
+        ]
+      },
+      "answer": [0, 1, 2, 3],
+      "explanation": {
+        "en": "A release is the whole bundle that shapes behavior. A floating alias like latest can move silently, which breaks reproducibility.",
+        "es": "Un release es todo el paquete que define el comportamiento. Un alias flotante como latest puede moverse en silencio, lo que rompe la reproducibilidad."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of a graceful pod termination for a streaming LLM service.",
+        "es": "Ordena los pasos de una terminación elegante de un pod en un servicio LLM con streaming."
+      },
+      "items": {
+        "en": [
+          "Pod is marked Terminating; endpoint removal begins and the preStop sleep runs",
+          "SIGTERM is delivered to the container after preStop completes",
+          "The app fails readiness, refuses new requests and drains in-flight streams",
+          "Streams that would exceed the deadline end with a retry event",
+          "The process exits before terminationGracePeriodSeconds, avoiding SIGKILL"
+        ],
+        "es": [
+          "El pod se marca como Terminating; empieza la remoción del endpoint y corre el sleep del preStop",
+          "SIGTERM llega al contenedor cuando termina el preStop",
+          "La app hace fallar la readiness, rechaza requests nuevos y drena los streams en vuelo",
+          "Los streams que superarían el plazo terminan con un evento de reintento",
+          "El proceso termina antes de terminationGracePeriodSeconds, evitando SIGKILL"
+        ]
+      },
+      "explanation": {
+        "en": "The preStop delay lets endpoint removal propagate while the pod still serves. Then SIGTERM triggers draining, and the grace period must cover preStop plus the longest stream.",
+        "es": "El retraso del preStop deja que la remoción del endpoint se propague mientras el pod todavía sirve. Luego SIGTERM dispara el drenado, y el período de gracia debe cubrir el preStop más el stream más largo."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps for safely swapping the model behind a user-facing feature.",
+        "es": "Ordena los pasos para cambiar de forma segura el modelo detrás de una funcionalidad de cara al usuario."
+      },
+      "items": {
+        "en": [
+          "Run the offline eval suite on the golden dataset",
+          "Shadow a share of live traffic with side effects disabled and compare outputs",
+          "Canary a small share of users with automated gates",
+          "Increase canary weight step by step to 100%",
+          "Remove the old model from gateway config and IAM allow-lists"
+        ],
+        "es": [
+          "Correr la suite de evaluación offline sobre el golden dataset",
+          "Hacer shadow de una parte del tráfico real con los efectos secundarios desactivados y comparar salidas",
+          "Hacer canary con una pequeña parte de los usuarios con gates automáticos",
+          "Subir el peso del canary paso a paso hasta el 100%",
+          "Quitar el modelo viejo de la configuración del gateway y de las listas permitidas de IAM"
+        ]
+      },
+      "explanation": {
+        "en": "Offline evals first, then zero-risk shadow, then a gated canary, then full rollout. Cleaning up the old model last prevents accidental use.",
+        "es": "Primero evaluaciones offline, luego shadow sin riesgo, luego un canary con gates y después el rollout completo. Limpiar el modelo viejo al final evita su uso accidental."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "order",
+      "prompt": {
+        "en": "Your provider announced the retirement of a model. Order the migration steps.",
+        "es": "Tu proveedor anunció el retiro de un modelo. Ordena los pasos de la migración."
+      },
+      "items": {
+        "en": [
+          "Inventory which teams, keys and aliases use the model from gateway logs",
+          "Choose a successor and an alternative candidate",
+          "Evaluate candidates on each team's golden dataset and adjust prompts",
+          "Release through shadow and canary per consumer",
+          "Switch aliases and remove the retired model before the deadline"
+        ],
+        "es": [
+          "Inventariar qué equipos, keys y alias usan el modelo a partir de los logs del gateway",
+          "Elegir un sucesor y un candidato alternativo",
+          "Evaluar los candidatos con el golden dataset de cada equipo y ajustar prompts",
+          "Publicar con shadow y canary por consumidor",
+          "Cambiar los alias y quitar el modelo retirado antes de la fecha límite"
+        ]
+      },
+      "explanation": {
+        "en": "You cannot plan a migration without knowing who uses the model. Evaluation comes before any traffic moves, and removal comes last.",
+        "es": "No puedes planificar una migración sin saber quién usa el modelo. La evaluación va antes de mover tráfico, y la remoción va al final."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "code",
+      "prompt": {
+        "en": "This Rollout has 5 replicas and no trafficRouting. The analysis run in step 2 fails. What happens?",
+        "es": "Este Rollout tiene 5 réplicas y no tiene trafficRouting. El análisis del paso 2 falla. ¿Qué pasa?"
+      },
+      "code": "apiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: triage\nspec:\n  replicas: 5\n  strategy:\n    canary:\n      steps:\n        - setWeight: 20\n        - analysis:\n            templates:\n              - templateName: llm-canary-health\n        - setWeight: 60\n        - pause: { duration: 10m }",
+      "codeLang": "yaml",
+      "options": {
+        "en": [
+          "The rollout aborts: the canary (about 1 of 5 pods) is scaled down, all traffic returns to stable, and the Rollout is Degraded",
+          "The rollout pauses at 20% until someone runs promote",
+          "The rollout skips to setWeight 60 because analysis failures are warnings",
+          "All 5 pods are restarted with the canary image"
+        ],
+        "es": [
+          "El rollout aborta: el canary (cerca de 1 de 5 pods) se escala a cero, todo el tráfico vuelve a estable y el Rollout queda Degraded",
+          "El rollout se pausa en 20% hasta que alguien ejecute promote",
+          "El rollout salta a setWeight 60 porque las fallas de análisis son advertencias",
+          "Los 5 pods se reinician con la imagen canary"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A failed analysis step aborts the rollout automatically. Without a traffic router, 20% weight is approximated by replica count, so one of five pods runs the canary.",
+        "es": "Un paso de análisis fallido aborta el rollout automáticamente. Sin traffic router, el 20% se aproxima con la cantidad de réplicas, así que uno de cinco pods corre el canary."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "code",
+      "prompt": {
+        "en": "chat-private serves claims containing PHI and must never leave the cluster. What is wrong with this LiteLLM config?",
+        "es": "chat-private atiende reclamos con PHI y nunca debe salir del cluster. ¿Qué está mal en esta configuración de LiteLLM?"
+      },
+      "code": "model_list:\n  - model_name: chat-private\n    litellm_params:\n      model: hosted_vllm/llama-8b\n      api_base: http://vllm.models.svc:8000/v1\n  - model_name: chat-default\n    litellm_params:\n      model: anthropic/claude-sonnet-5-5\n      api_key: os.environ/ANTHROPIC_API_KEY\n\nrouter_settings:\n  num_retries: 2\n  fallbacks: [{ \"chat-private\": [\"chat-default\"] }]",
+      "codeLang": "yaml",
+      "options": {
+        "en": [
+          "When the self-hosted model fails, PHI requests fall back to a public API provider",
+          "hosted_vllm is not a valid provider prefix, so chat-private never works",
+          "num_retries must be 0 when fallbacks are defined",
+          "api_key cannot be read from the environment"
+        ],
+        "es": [
+          "Cuando falla el modelo autoalojado, los requests con PHI caen a un proveedor de API pública",
+          "hosted_vllm no es un prefijo de proveedor válido, así que chat-private nunca funciona",
+          "num_retries debe ser 0 cuando hay fallbacks definidos",
+          "api_key no puede leerse desde el entorno"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The fallback chain crosses the compliance boundary. PHI workloads should fall back to another approved replica or a queue, never to a public API.",
+        "es": "La cadena de fallback cruza la frontera de cumplimiento. Las cargas con PHI deben caer a otra réplica aprobada o a una cola, nunca a una API pública."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "code",
+      "prompt": {
+        "en": "Tasks in private subnets still reach Bedrock through the NAT gateway after this endpoint is applied. Why?",
+        "es": "Las tasks en subredes privadas siguen llegando a Bedrock a través del NAT gateway después de aplicar este endpoint. ¿Por qué?"
+      },
+      "code": "resource \"aws_vpc_endpoint\" \"bedrock_runtime\" {\n  vpc_id              = var.vpc_id\n  service_name        = \"com.amazonaws.${var.region}.bedrock-runtime\"\n  vpc_endpoint_type   = \"Interface\"\n  subnet_ids          = var.private_subnet_ids\n  security_group_ids  = [aws_security_group.endpoints.id]\n  private_dns_enabled = false\n}",
+      "codeLang": "hcl",
+      "options": {
+        "en": [
+          "private_dns_enabled is false, so the SDK's regional hostname still resolves to public IPs",
+          "Interface endpoints do not support bedrock-runtime; it needs a gateway endpoint",
+          "The endpoint needs an Elastic IP to receive traffic",
+          "subnet_ids must list public subnets"
+        ],
+        "es": [
+          "private_dns_enabled es false, así que el hostname regional del SDK sigue resolviendo a IPs públicas",
+          "Los interface endpoints no soportan bedrock-runtime; necesita un gateway endpoint",
+          "El endpoint necesita una Elastic IP para recibir tráfico",
+          "subnet_ids debe listar subredes públicas"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "With private DNS enabled, the standard regional hostname resolves to the endpoint's private IPs inside the VPC. Without it, clients must use the endpoint-specific DNS name or they keep going through NAT.",
+        "es": "Con DNS privado habilitado, el hostname regional estándar resuelve a las IPs privadas del endpoint dentro de la VPC. Sin él, los clientes deben usar el nombre DNS específico del endpoint o siguen saliendo por el NAT."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "code",
+      "prompt": {
+        "en": "The chat-api Deployment has replicas: 3. A cluster upgrade drains the nodes. What happens with this PodDisruptionBudget?",
+        "es": "El Deployment chat-api tiene replicas: 3. Un upgrade del cluster drena los nodos. ¿Qué pasa con este PodDisruptionBudget?"
+      },
+      "code": "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: chat-api\nspec:\n  minAvailable: 3\n  selector:\n    matchLabels:\n      app: chat-api",
+      "codeLang": "yaml",
+      "options": {
+        "en": [
+          "No pod can ever be evicted voluntarily, so the drain blocks and the upgrade stalls",
+          "Pods are evicted one at a time while a replacement starts",
+          "The PDB is ignored because minAvailable equals replicas",
+          "Kubernetes temporarily scales the Deployment to 4"
+        ],
+        "es": [
+          "Ningún pod puede desalojarse de forma voluntaria, así que el drain se bloquea y el upgrade se detiene",
+          "Los pods se desalojan de a uno mientras arranca un reemplazo",
+          "El PDB se ignora porque minAvailable es igual a las réplicas",
+          "Kubernetes escala temporalmente el Deployment a 4"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "minAvailable equal to the replica count allows zero voluntary disruptions. Use maxUnavailable: 1 (or minAvailable below the replica count) so drains proceed one pod at a time.",
+        "es": "Un minAvailable igual a la cantidad de réplicas no permite ninguna disrupción voluntaria. Usa maxUnavailable: 1 (o un minAvailable menor que las réplicas) para que los drains avancen de a un pod."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "single",
+      "prompt": {
+        "en": "A client requires that member data is processed only within the United States, but wants more Bedrock throughput. Which option fits best?",
+        "es": "Un cliente exige que los datos de afiliados se procesen solo dentro de Estados Unidos, pero quiere más throughput en Bedrock. ¿Qué opción encaja mejor?"
+      },
+      "options": {
+        "en": [
+          "A US geographic cross-region inference profile, with IAM allowing the profile and destination model ARNs",
+          "A global cross-region inference profile",
+          "Calling the model in every AWS region round-robin from the app",
+          "Disabling quotas in Service Quotas"
+        ],
+        "es": [
+          "Un inference profile cross-region geográfico de EE. UU., con IAM que permita el perfil y los ARNs de los modelos de destino",
+          "Un inference profile cross-region global",
+          "Llamar al modelo en todas las regiones de AWS en round-robin desde la app",
+          "Desactivar las cuotas en Service Quotas"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Geographic profiles route within a geography, adding throughput while respecting residency. A global profile may route outside it. Quotas cannot be disabled, only increased by request.",
+        "es": "Los perfiles geográficos rutean dentro de una geografía, sumando throughput mientras respetan la residencia. Un perfil global puede rutear fuera de ella. Las cuotas no se pueden desactivar, solo aumentar mediante un pedido."
+      }
+    }
+  ]
+}

@@ -1,0 +1,147 @@
+<ClientBrief company="Harborview Health Plan" industry="Salud / Seguros de salud" duration="5 días" />
+
+## Contexto de la empresa
+
+Harborview Health Plan es una aseguradora de salud regional ficticia con unos 600.000 afiliados y 2.400 empleados. Durante el último año, cuatro equipos internos lanzaron funcionalidades LLM por su cuenta:
+
+- **Claims Operations** resume expedientes de reclamos y documentos de respaldo para los ajustadores. Los expedientes contienen información de salud protegida (PHI): nombres, ids de afiliado, códigos de diagnóstico, notas de prestadores.
+- **Member Services** opera un asistente que redacta respuestas a emails de afiliados. Los emails suelen contener PHI.
+- **Marketing** genera variantes de textos para campañas. Sin datos de afiliados.
+- **Engineering Productivity** usa LLMs para resúmenes internos de code review y búsqueda en documentación. Solo datos internos.
+
+Cada equipo tiene sus propias keys de proveedor. El gasto solo se ve en la factura mensual. El trimestre pasado, una caída de un proveedor dejó fuera de servicio el asistente de respuestas a afiliados durante tres horas, y una auditoría interna detectó que un prototipo había enviado emails de afiliados a una API pública fuera de la lista de proveedores aprobados. El Chief Information Security Officer congeló los nuevos lanzamientos de IA hasta que exista una plataforma.
+
+Tú eres el ingeniero de plataforma de IA contratado para construirla.
+
+## Stakeholders
+
+| Persona | Rol | Qué le importa |
+|---|---|---|
+| Dana Whitfield | CISO | Nada de PHI hacia procesadores no aprobados, rastro de auditoría, mínimo privilegio |
+| Marcus Oyelaran | VP de Ingeniería, tu sponsor | Equipos desbloqueados rápido, una sola plataforma, guardias sin heroísmos |
+| Priya Raman | Directora de Claims Operations | Que los resúmenes sigan tan buenos como hoy, que los ajustadores nunca esperen más de unos segundos |
+| Leo Carvalho | Líder de FinOps | Gasto por equipo, presupuestos, sin facturas sorpresa |
+| Hannah Brooks | Oficial de cumplimiento y privacidad | Diseño pensado para HIPAA, retención, DR documentado, evidencia para auditores |
+
+## Objetivo de negocio
+
+Levantar el congelamiento de lanzamientos de IA entregando una **plataforma LLM compartida** que todos los equipos usen a través de un solo gateway, donde las cargas con PHI corran solo en un modelo autoalojado dentro de la red de Harborview, cada cambio de modelo o prompt se despliegue de forma progresiva con rollback automático, y cada equipo tenga un presupuesto.
+
+El éxito en una frase: "Cualquier equipo puede lanzar una funcionalidad LLM en una semana, y el CISO puede demostrar a dónde fue cada request."
+
+## Requisitos funcionales
+
+1. **AI gateway** (proxy LiteLLM o equivalente) como único punto de entrada para los cuatro equipos, con una API compatible con OpenAI.
+2. **Alias de modelos según la clasificación de datos:**
+   - `phi-chat`: modelo de pesos abiertos autoalojado en vLLM dentro del cluster. Único alias permitido para PHI.
+   - `general-chat` y `general-fast`: modelos de un proveedor de API (por ejemplo `claude-sonnet-5-5` y `claude-haiku-5-5`, directo o vía Bedrock), con fallback entre dos proveedores o regiones.
+3. **Equipos y keys:** un equipo del gateway por cada equipo interno, con lista de alias permitidos, presupuesto mensual, límites RPM/TPM y al menos una key por servicio. Claims y Member Services pueden usar `phi-chat` solo para tráfico con PHI; Marketing y Engineering Productivity no pueden usar `phi-chat`.
+4. **Ruteo consciente del cumplimiento:** ninguna cadena de fallback desde `phi-chat` sale del cluster. Cuando el modelo autoalojado no está disponible, los requests con PHI se encolan o fallan de forma clara.
+5. **Salvaguarda de PII en los alias generales:** un guardrail pre-call que detecta y enmascara patrones de PHI en los alias `general-*`, con una alerta cuando se dispara (indica una carga mal ruteada).
+6. **Releases canary** para la configuración del gateway, el deployment del modelo en vLLM y al menos un prompt de un equipo: Argo Rollouts (o canary en ECS) controlado por tasa de errores, validez del contrato y p95 del TTFT, con rollback automático.
+7. **Manifiestos de release** para el resumidor de reclamos: versión del prompt, digest del modelo, parámetros, versión del guardrail, versión del dataset de evaluación y reporte.
+8. **Infraestructura como código:** Terraform para las piezas en la nube (endpoints de red, IAM, contenedores de secretos, almacenamiento para logs), probado con tests de solo plan.
+9. **Dashboards:** gasto por equipo, requests y errores por alias, p95 del TTFT por alias, disparos de guardrails, profundidad de cola y uso del KV cache de vLLM, estado de los canaries.
+10. **Plan de DR y runbook de rollback**, con al menos un failover ensayado y un rollback ensayado.
+
+## Requisitos no funcionales
+
+| Área | Objetivo |
+|---|---|
+| Latencia | p95 del tiempo al primer token menor a 2,5 s para `phi-chat` con 30 streams concurrentes; overhead del gateway menor a 50 ms en p95, medido aparte de la latencia del proveedor |
+| Disponibilidad | Los alias `general-*` sobreviven a la pérdida de un proveedor sin errores visibles para el usuario más allá de reintentos; `phi-chat` sobrevive a la pérdida de un nodo GPU con throughput degradado |
+| Costo | Reportar el costo por cada 1.000 requests por alias. El costo autoalojado sale del precio por hora de la GPU (cifra de ejemplo, explicita tu supuesto) dividido por el throughput medido |
+| Calidad | Evaluación del resumen de reclamos: faithfulness mayor o igual a 0,90 y validez del contrato JSON mayor o igual al 99% sobre el golden set, para el modelo autoalojado y cualquier variante cuantizada |
+| Seguridad | Ninguna key de proveedor fuera del gateway; nada de PHI en logs de aplicación; registro de auditoría por cada request |
+| Recuperación | RTO y RPO documentados por componente; RTO medido para una falla ensayada |
+
+## Fuera de alcance
+
+- Construir las aplicaciones de los cuatro equipos. Usa pequeños clientes stub o scripts simples por equipo.
+- Fine-tuning. Usa un modelo de instrucciones existente.
+- PHI real. Genera expedientes de reclamos y emails sintéticos.
+- Una evaluación completa de SOC 2 o HIPAA. Produces evidencia de arquitectura, no una opinión legal.
+- Capacidad de GPU de nivel producción. Para `phi-chat` se acepta una sola GPU pequeña, un build de vLLM para CPU o un servidor mock compatible con OpenAI, si lo documentas.
+
+## Entregables
+
+1. Repositorio `llm-gateway-platform` con código, manifiestos, Terraform y documentación.
+2. Configuración del gateway, script de alta de equipos y tests de políticas (fallback, control de acceso, presupuestos, ruteo de PHI).
+3. Manifiestos de Kubernetes (kind o un cluster real) para el gateway, vLLM, Prometheus y Argo Rollouts.
+4. Módulos de Terraform con suites de `terraform test`.
+5. Manifiesto de release y reporte de evaluación del resumidor de reclamos.
+6. Dashboard (JSON de Grafana o capturas) que cubra el requisito 9.
+7. `docs/architecture.md`, `docs/dr-plan.md`, `docs/runbook-rollback.md`, `docs/data-flows.md` (qué datos van a dónde, retención por almacén).
+8. Una grabación o GIF de demo de 5 minutos: un canary de prompt malo que se revierte solo, y una caída de proveedor resuelta con fallback.
+
+## Criterios de aceptación
+
+- [ ] Una key de Marketing que llama a `phi-chat` es rechazada; una key de Claims que llama a `phi-chat` funciona
+- [ ] Con el proveedor general principal bloqueado, los requests a `general-chat` igual funcionan a través del fallback, demostrado con contadores por backend
+- [ ] Con el deployment de vLLM escalado a cero, los requests a `phi-chat` nunca llegan a un proveedor externo (el test afirma que el contador del mock externo no se mueve)
+- [ ] Un equipo que supera su presupuesto es rechazado, y el reporte de gasto muestra totales por equipo
+- [ ] Un email sintético con un id de afiliado enviado a `general-chat` es enmascarado por el guardrail y dispara una alerta
+- [ ] Un release de prompt deliberadamente malo del resumidor de reclamos se revierte automáticamente por el análisis del canary
+- [ ] `terraform test` pasa offline; los hallazgos de Checkov se corrigen o se omiten con razones
+- [ ] El resumidor de reclamos cumple los objetivos de calidad sobre el golden set con el modelo autoalojado
+- [ ] El plan de DR lista RTO y RPO por componente, y el runbook tiene los comandos exactos de rollback, ambos ensayados una vez con tiempos registrados
+
+## Arquitectura sugerida
+
+<Diagram caption="Plataforma LLM de Harborview: un gateway, ruteo según la clasificación de datos" chart={`flowchart LR
+  subgraph Equipos
+    C["Claims Ops"]
+    M["Member Services"]
+    K["Marketing"]
+    E["Eng Productivity"]
+  end
+  C --> G["AI gateway (LiteLLM, 3 réplicas)"]
+  M --> G
+  K --> G
+  E --> G
+  G --> R[("Redis: límites, cooldowns")]
+  G --> P[("Postgres: keys, presupuestos, gasto")]
+  G -->|"phi-chat"| V["Modelo autoalojado en vLLM (en el cluster)"]
+  G -->|"general-* con guardrail de PII"| A1["API del proveedor A"]
+  G -->|"fallback de general-*"| A2["Bedrock vía VPC endpoint"]
+  V --> PM["Prometheus"]
+  G --> PM
+  PM --> AR["Análisis de Argo Rollouts"]
+  PM --> D["Dashboards de Grafana"]
+  G --> AU[("Almacén de auditoría, Object Lock")]`} />
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Excelente | Aceptable | A mejorar |
+|---|---|---|---|---|
+| Ruteo consciente del cumplimiento | 20% | Aislamiento de PHI demostrado con tests automatizados, incluidos los casos de falla | Ruteo correcto, probado solo en el camino feliz | La PHI puede llegar a un proveedor externo por algún camino |
+| Progressive delivery | 20% | Gates del canary con señales de contrato y latencia, rollback automático demostrado para configuración, modelo y prompt | Un componente con canary y rollback automático | Rollout manual o gates solo con errores HTTP |
+| Políticas del gateway y FinOps | 15% | Presupuestos, límites y listas permitidas probados; dashboard de gasto por equipo y costo por 1.000 requests por alias | Presupuestos configurados y visibles | Sin vista de gasto por equipo |
+| Infraestructura como código | 15% | Módulos con tests y escáner, sin secretos en el state, IAM de mínimo privilegio | Terraform aplica o planifica sin errores | Click-ops o IAM con comodines |
+| Serving autoalojado | 10% | Dimensionado con la cuenta de KV, validado con prueba de carga, escalado por profundidad de cola | Modelo servido y medido | Sin medir, escalado por utilización de GPU |
+| Confiabilidad y DR | 10% | RTO/RPO por componente, failover y rollback ensayados con tiempos | Plan de DR escrito, sin ensayar | Sin plan de DR |
+| Documentación y demo | 10% | Documentación clara de arquitectura, flujos de datos y retención, demo precisa | Documentación completa pero escueta | Falta documentación o demo |
+
+## Cronograma sugerido (5 días)
+
+- **Día 1 — Gateway y políticas.** Setup con docker-compose o kind con LiteLLM, Postgres, Redis y proveedores mock. Alias, equipos, keys, presupuestos. Tests de políticas para control de acceso, fallback y aislamiento de PHI.
+- **Día 2 — Modelo autoalojado.** vLLM (o un sustituto documentado) en el cluster detrás de `phi-chat`. Notas de dimensionamiento de KV, prueba de carga, autoscaling por profundidad de cola. Golden set y reporte de evaluación del resumidor de reclamos; manifiesto de release.
+- **Día 3 — Progressive delivery.** Prometheus, Argo Rollouts, AnalysisTemplates para el gateway, vLLM y el prompt de reclamos. Demuestra un rollback automático.
+- **Día 4 — IaC y guardrails.** Módulos de Terraform (VPC endpoints, IAM, contenedores de secretos, buckets de logs con Object Lock) con tests y Checkov. Guardrail de PII en `general-*` con alertas. Dashboards.
+- **Día 5 — Confiabilidad y relato.** Plan de DR, runbook de rollback, ensaya un failover y un rollback con tiempos. Documento de flujos de datos y retención. Graba la demo, pule el README.
+
+## Definition of Done
+
+<Checklist id="m8-14-dod" title="Definition of Done" items={["Los cuatro equipos llaman a la plataforma a través del gateway con sus propias keys", "Tests automatizados demuestran que la PHI nunca sale del cluster, incluso con vLLM caído", "Presupuestos, rate limits y listas de alias permitidos se aplican y están probados", "El fallback de proveedor para los alias generales está demostrado con evidencia por backend", "Un release de prompt malo se revirtió automáticamente por el análisis del canary", "terraform test y Checkov corren en CI y pasan", "El resumidor de reclamos cumple los objetivos de faithfulness y contrato con el modelo autoalojado", "Los dashboards muestran gasto por equipo, latencia por alias, disparos de guardrails y profundidad de cola de vLLM", "Existen el plan de DR y el runbook de rollback, cada uno ensayado una vez con tiempos", "El documento de flujos de datos y retención lista cada almacén que puede guardar PHI", "El README tiene diagrama de arquitectura, costo por 1.000 requests por alias y la demo"]} />
+
+## Cómo presentar esto en una entrevista
+
+Empieza por el problema, no por las herramientas: "Una aseguradora de salud congeló los lanzamientos de IA después de que PHI llegó a una API no aprobada y una caída dejó fuera de servicio un asistente para afiliados. Construí la plataforma que levantó ese congelamiento."
+
+Luego recorre tres decisiones y sus trade-offs:
+
+1. **Ruteo según la clasificación de datos.** La PHI va solo a un modelo autoalojado, y su fallback es una cola, no una API pública. Aceptaste menor disponibilidad para las cargas con PHI a cambio de una garantía que se puede probar. Muestra el test que afirma que el contador del proveedor externo nunca se mueve.
+2. **Progressive delivery con gates propios de LLM.** Validez del contrato y TTFT por versión, no solo errores HTTP. Muestra el rollback automático grabado y di cuánto tiempo sirvió tráfico la versión mala y a cuántos requests.
+3. **Evidencia por construcción.** El historial de Terraform, los manifiestos de release, los logs de auditoría del gateway y los tiempos de DR ensayados son los artefactos que pide un auditor. Nómbralos.
+
+Ten los números listos: overhead del gateway en p95, el codo de concurrencia del modelo autoalojado, costo por 1.000 requests por alias con tus supuestos explícitos, y RTO medido. Cierra con lo que harías después: warm standby multirregión para la base de datos del gateway, seguimiento automatizado de retiros de modelos y un análisis online de puntaje de juez en el canary de reclamos.

@@ -1,0 +1,147 @@
+<ClientBrief company="Harborview Health Plan" industry="Healthcare / Health insurance" duration="5 days" />
+
+## Company context
+
+Harborview Health Plan is a fictional regional health insurer with about 600,000 members and 2,400 employees. Over the last year, four internal teams shipped LLM features on their own:
+
+- **Claims Operations** summarizes claim files and supporting documents for adjusters. The files contain protected health information (PHI): names, member ids, diagnosis codes, provider notes.
+- **Member Services** runs an assistant that drafts replies to member emails. Emails often contain PHI.
+- **Marketing** generates campaign copy variants. No member data.
+- **Engineering Productivity** uses LLMs for internal code review summaries and documentation search. Internal data only.
+
+Each team holds its own provider keys. Spend is visible only on the monthly invoice. Last quarter, a provider outage took down the member reply assistant for three hours, and an internal audit found that one prototype had sent member emails to a public API outside the approved vendor list. The Chief Information Security Officer froze new AI launches until there is a platform.
+
+You are the AI platform engineer hired to build it.
+
+## Stakeholders
+
+| Person | Role | What they care about |
+|---|---|---|
+| Dana Whitfield | CISO | No PHI to unapproved processors, audit trail, least privilege |
+| Marcus Oyelaran | VP Engineering, your sponsor | Teams unblocked fast, one platform, no heroics on call |
+| Priya Raman | Director of Claims Operations | Summaries stay as good as today, adjusters never wait more than a few seconds |
+| Leo Carvalho | FinOps lead | Spend per team, budgets, no surprise invoices |
+| Hannah Brooks | Compliance and privacy officer | HIPAA-minded design, retention, documented DR, evidence for auditors |
+
+## Business goal
+
+Lift the AI launch freeze by delivering a **shared LLM platform** that every team uses through one gateway, where PHI workloads run only on a self-hosted model inside Harborview's network, every model or prompt change rolls out progressively with automatic rollback, and each team has a budget.
+
+Success in one sentence: "Any team can ship an LLM feature in a week, and the CISO can prove where every request went."
+
+## Functional requirements
+
+1. **AI gateway** (LiteLLM proxy or equivalent) as the single entry point for all four teams, with an OpenAI-compatible API.
+2. **Model aliases by data classification:**
+   - `phi-chat`: self-hosted open-weight model on vLLM inside the cluster. Only alias allowed for PHI.
+   - `general-chat` and `general-fast`: API provider models (for example `claude-sonnet-5-5` and `claude-haiku-5-5` directly or through Bedrock), with fallback across two providers or regions.
+3. **Teams and keys:** one gateway team per internal team with an allow-list of aliases, a monthly budget, RPM/TPM limits, and at least one key per service. Claims and Member Services may use `phi-chat` only for PHI traffic; Marketing and Engineering Productivity may not use `phi-chat`.
+4. **Compliance-aware routing:** no fallback chain from `phi-chat` leads outside the cluster. When the self-hosted model is unavailable, PHI requests queue or fail clearly.
+5. **PII safeguard on general aliases:** a pre-call guardrail that detects and masks PHI patterns on `general-*` aliases, with an alert when it triggers (it indicates a misrouted workload).
+6. **Canary releases** for the gateway config, the vLLM model deployment and at least one team's prompt: Argo Rollouts (or ECS canary) gated on error rate, contract validity and p95 TTFT, with automatic rollback.
+7. **Release manifests** for the claims summarizer: prompt version, model digest, parameters, guardrail version, eval dataset version and report.
+8. **Infrastructure as code:** Terraform for the cloud pieces (network endpoints, IAM, secrets containers, storage for logs), tested with plan-only tests.
+9. **Dashboards:** spend per team, requests and errors per alias, p95 TTFT per alias, guardrail triggers, vLLM queue depth and KV cache usage, canary status.
+10. **DR plan and rollback runbook**, with at least one rehearsed failover and one rehearsed rollback.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Latency | p95 time to first token under 2.5 s for `phi-chat` at 30 concurrent streams; gateway overhead under 50 ms at p95, measured separately from provider latency |
+| Availability | `general-*` aliases survive the loss of one provider with no user-visible errors beyond retries; `phi-chat` survives the loss of one GPU node with degraded throughput |
+| Cost | Report cost per 1k requests per alias. Self-hosted cost from GPU hourly price (example figure, state your assumption) divided by measured throughput |
+| Quality | Claims summary eval: faithfulness at or above 0.90 and JSON contract validity at or above 99% on the golden set, for the self-hosted model and any quantized variant |
+| Security | No provider key outside the gateway; no PHI in application logs; audit record for every request |
+| Recovery | Documented RTO and RPO per component; measured RTO for one rehearsed failure |
+
+## Out of scope
+
+- Building the four teams' applications. Use small stub clients or simple scripts per team.
+- Fine-tuning. Use an off-the-shelf instruction model.
+- Real PHI. Generate synthetic claim files and emails.
+- A full SOC 2 or HIPAA assessment. You produce architecture evidence, not a legal opinion.
+- Production-grade GPU capacity. A single small GPU, a CPU vLLM build or a mocked OpenAI-compatible server for `phi-chat` is acceptable if you document it.
+
+## Deliverables
+
+1. Repository `llm-gateway-platform` with code, manifests, Terraform and docs.
+2. Gateway configuration, team bootstrap script and policy tests (fallback, access control, budgets, PHI routing).
+3. Kubernetes manifests (kind or a real cluster) for the gateway, vLLM, Prometheus and Argo Rollouts.
+4. Terraform modules with `terraform test` suites.
+5. Release manifest and eval report for the claims summarizer.
+6. Dashboard (Grafana JSON or screenshots) covering requirement 9.
+7. `docs/architecture.md`, `docs/dr-plan.md`, `docs/runbook-rollback.md`, `docs/data-flows.md` (which data goes where, retention per store).
+8. A 5-minute demo recording or GIF: a bad prompt canary auto-rolling back, and a provider outage handled by fallback.
+
+## Acceptance criteria
+
+- [ ] A Marketing key calling `phi-chat` is rejected; a Claims key calling `phi-chat` succeeds
+- [ ] With the primary general provider blocked, `general-chat` requests still succeed through the fallback, shown by per-backend counters
+- [ ] With the vLLM deployment scaled to zero, `phi-chat` requests never reach an external provider (test asserts the external mock's counter does not move)
+- [ ] A team that exceeds its budget is rejected, and the spend report shows per-team totals
+- [ ] A synthetic email with a member id sent to `general-chat` is masked by the guardrail and raises an alert
+- [ ] A deliberately bad prompt release for the claims summarizer is rolled back automatically by the canary analysis
+- [ ] `terraform test` passes offline; Checkov findings are fixed or skipped with reasons
+- [ ] The claims summarizer meets the quality targets on the golden set with the self-hosted model
+- [ ] The DR plan lists RTO and RPO per component, and the runbook has the exact rollback commands, both rehearsed once with timings recorded
+
+## Suggested architecture
+
+<Diagram caption="Harborview LLM platform: one gateway, routing by data classification" chart={`flowchart LR
+  subgraph Teams
+    C["Claims Ops"]
+    M["Member Services"]
+    K["Marketing"]
+    E["Eng Productivity"]
+  end
+  C --> G["AI gateway (LiteLLM, 3 replicas)"]
+  M --> G
+  K --> G
+  E --> G
+  G --> R[("Redis: limits, cooldowns")]
+  G --> P[("Postgres: keys, budgets, spend")]
+  G -->|"phi-chat"| V["vLLM self-hosted model (in cluster)"]
+  G -->|"general-* with PII guardrail"| A1["Provider A API"]
+  G -->|"general-* fallback"| A2["Bedrock via VPC endpoint"]
+  V --> PM["Prometheus"]
+  G --> PM
+  PM --> AR["Argo Rollouts analysis"]
+  PM --> D["Grafana dashboards"]
+  G --> AU[("Audit log store, Object Lock")]`} />
+
+## Evaluation rubric
+
+| Criterion | Weight | Excellent | Acceptable | Needs work |
+|---|---|---|---|---|
+| Compliance-aware routing | 20% | PHI isolation proven by automated tests, including failure cases | Routing correct, tested only on the happy path | PHI can reach an external provider in some path |
+| Progressive delivery | 20% | Canary gates on contract and latency signals, automatic rollback demonstrated for config, model and prompt | One component canaried with automatic rollback | Manual rollout or gates on HTTP errors only |
+| Gateway policy and FinOps | 15% | Budgets, limits, allow-lists tested; spend dashboard per team and cost per 1k requests per alias | Budgets configured and visible | No per-team spend view |
+| Infrastructure as code | 15% | Modules with tests and scanner, no secrets in state, least-privilege IAM | Terraform applies or plans cleanly | Click-ops or wildcard IAM |
+| Self-hosted serving | 10% | Sized with KV math, validated by load test, scaling on queue depth | Model served and measured | Unmeasured, scaling on GPU utilization |
+| Reliability and DR | 10% | RTO/RPO per component, rehearsed failover and rollback with timings | DR plan written, not rehearsed | No DR plan |
+| Documentation and demo | 10% | Clear architecture, data-flow and retention docs, crisp demo | Docs complete but thin | Missing docs or demo |
+
+## Suggested timeline (5 days)
+
+- **Day 1 — Gateway and policies.** Docker-compose or kind setup with LiteLLM, Postgres, Redis and mock providers. Aliases, teams, keys, budgets. Policy tests for access control, fallback and PHI isolation.
+- **Day 2 — Self-hosted model.** vLLM (or a documented substitute) in the cluster behind `phi-chat`. KV sizing notes, load test, autoscaling on queue depth. Claims summarizer golden set and eval report; release manifest.
+- **Day 3 — Progressive delivery.** Prometheus, Argo Rollouts, AnalysisTemplates for gateway, vLLM and the claims prompt. Demonstrate an automatic rollback.
+- **Day 4 — IaC and guardrails.** Terraform modules (VPC endpoints, IAM, secrets containers, log buckets with Object Lock) with tests and Checkov. PII guardrail on `general-*` with alerting. Dashboards.
+- **Day 5 — Reliability and story.** DR plan, rollback runbook, rehearse one failover and one rollback with timings. Data-flow and retention doc. Record the demo, polish the README.
+
+## Definition of Done
+
+<Checklist id="m8-14-dod" title="Definition of Done" items={["All four teams call the platform through the gateway with their own keys", "Automated tests prove PHI never leaves the cluster, including when vLLM is down", "Budgets, rate limits and alias allow-lists are enforced and tested", "Provider fallback for general aliases is demonstrated with per-backend evidence", "A bad prompt release was rolled back automatically by canary analysis", "terraform test and Checkov run in CI and pass", "Claims summarizer meets faithfulness and contract targets on the self-hosted model", "Dashboards show spend per team, latency per alias, guardrail triggers and vLLM queue depth", "DR plan and rollback runbook exist, each rehearsed once with timings", "Data-flow and retention document lists every store that can hold PHI", "README has architecture diagram, cost per 1k requests per alias and the demo"]} />
+
+## How to present this in an interview
+
+Open with the problem, not the tools: "A health insurer froze AI launches after PHI went to an unapproved API and an outage took down a member-facing assistant. I built the platform that lifted the freeze."
+
+Then walk through three decisions and their trade-offs:
+
+1. **Routing by data classification.** PHI goes only to a self-hosted model, and its fallback is a queue, not a public API. You accepted lower availability for PHI workloads in exchange for a guarantee you can test. Show the test that asserts the external provider's counter never moves.
+2. **Progressive delivery with LLM-specific gates.** Contract validity and TTFT per version, not just HTTP errors. Show the recorded auto-rollback and say how long the bad version served traffic and to how many requests.
+3. **Evidence by construction.** Terraform history, release manifests, gateway audit logs and rehearsed DR timings are the artifacts an auditor asks for. Name them.
+
+Have numbers ready: gateway overhead at p95, the concurrency knee of the self-hosted model, cost per 1k requests per alias with your stated assumptions, and measured RTO. Close with what you would do next: multi-region warm standby for the gateway database, automated model-retirement tracking, and an online judge-score analysis on the claims canary.

@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m8-iv-01",
+    "level": "mid",
+    "tags": ["canary", "release"],
+    "question": {
+      "en": "Why do prompt and model changes need canary releases if they already pass offline evals in CI?",
+      "es": "¿Por qué los cambios de prompt y de modelo necesitan releases canary si ya pasan las evaluaciones offline en CI?"
+    },
+    "answer": {
+      "en": "Offline evals only prove the change is good on the golden dataset. Production traffic is wider and drifts, so a prompt can pass CI and still double output length, refuse a category the dataset never covered, or break the JSON contract on rare inputs. None of these show up as HTTP errors, so a rolling deploy would ship them to everyone.\n\nA canary sends a small share of traffic to the new version and gates each step on signals labeled by version: error rate, contract validity, latency, and a sampled judge score. If a gate fails, the rollout aborts automatically. Offline evals are the regression suite; the canary is a production smoke test with a kill switch.",
+      "es": "Las evaluaciones offline solo prueban que el cambio es bueno en el golden dataset. El tráfico de producción es más amplio y cambia, así que un prompt puede pasar CI y aun así duplicar la longitud de salida, rechazar una categoría que el dataset nunca cubrió o romper el contrato JSON en inputs raros. Nada de esto aparece como error HTTP, así que un rolling deploy se lo enviaría a todos.\n\nUn canary envía una pequeña parte del tráfico a la versión nueva y controla cada paso con señales etiquetadas por versión: tasa de errores, validez del contrato, latencia y un puntaje de juez muestreado. Si un gate falla, el rollout aborta automáticamente. Las evaluaciones offline son la suite de regresión; el canary es un smoke test en producción con kill switch."
+    }
+  },
+  {
+    "id": "m8-iv-02",
+    "level": "senior",
+    "tags": ["shadow-traffic", "canary", "self-hosting"],
+    "question": {
+      "en": "You are moving a workload from an API model to a self-hosted model. Walk through the rollout.",
+      "es": "Vas a mover una carga de un modelo vía API a un modelo autoalojado. Explica el rollout."
+    },
+    "answer": {
+      "en": "First, offline: run the golden dataset against the self-hosted model, including the quantized variant if we plan to use one, and compare quality, output length and contract validity. Size the GPUs from KV cache math and confirm with a load test to find the concurrency knee.\n\nThen shadow 5–10% of live traffic with side effects disabled, comparing judge scores, latency and refusals per category. Next, a canary with sticky routing by user, gated on error rate, contract validity and p95 TTFT, with a background judge-score analysis. During the canary, keep the API model as overflow in the gateway for non-sensitive data, since GPU scale-up is slow. Finally, move the alias, keep the old route warm for a rollback window, and document the new runbook.",
+      "es": "Primero, offline: corro el golden dataset contra el modelo autoalojado, incluida la variante cuantizada si pensamos usarla, y comparo calidad, longitud de salida y validez del contrato. Dimensiono las GPUs con la cuenta del KV cache y lo confirmo con una prueba de carga para encontrar el codo de concurrencia.\n\nLuego hago shadow del 5–10% del tráfico real con efectos secundarios desactivados, comparando puntajes del juez, latencia y rechazos por categoría. Después, un canary con ruteo sticky por usuario, controlado por tasa de errores, validez del contrato y p95 del TTFT, con un análisis de puntaje de juez en segundo plano. Durante el canary mantengo el modelo vía API como desborde en el gateway para datos no sensibles, porque escalar GPUs es lento. Por último muevo el alias, mantengo la ruta vieja lista durante una ventana de rollback y documento el nuevo runbook."
+    }
+  },
+  {
+    "id": "m8-iv-03",
+    "level": "mid",
+    "tags": ["kubernetes", "autoscaling"],
+    "question": {
+      "en": "How would you autoscale an LLM API service on Kubernetes?",
+      "es": "¿Cómo harías el autoscaling de un servicio API de LLM en Kubernetes?"
+    },
+    "answer": {
+      "en": "Not on CPU: the service is I/O-bound and saturates while CPU stays low. I expose an in-flight requests gauge, decremented when the stream finishes, not when the handler returns, and scale on its per-pod average through the Prometheus Adapter or KEDA.\n\nI pick the target from a load test: the concurrency where p95 time to first token starts to climb, times about 0.7. Scale-up is fast, scale-down slow with a long stabilization window so we do not kill streams on every dip. maxReplicas is capped by the provider's concurrency quota, because more pods past that point only create more 429s. For async workers I use KEDA on queue depth, including scale to zero.",
+      "es": "No por CPU: el servicio está limitado por I/O y se satura con la CPU baja. Expongo un gauge de requests en vuelo, que se decrementa cuando termina el stream y no cuando retorna el handler, y escalo por su promedio por pod con el Prometheus Adapter o KEDA.\n\nElijo el objetivo con una prueba de carga: la concurrencia donde el p95 del tiempo al primer token empieza a subir, por 0,7 aproximadamente. Escalo hacia arriba rápido y hacia abajo despacio, con una ventana de estabilización larga para no matar streams en cada bajada. maxReplicas tiene un tope dado por la cuota de concurrencia del proveedor, porque más pods después de ese punto solo generan más 429. Para workers asíncronos uso KEDA por profundidad de cola, incluso escalando a cero."
+    }
+  },
+  {
+    "id": "m8-iv-04",
+    "level": "senior",
+    "tags": ["gpu", "kv-cache", "capacity"],
+    "question": {
+      "en": "How do you size GPUs for a self-hosted model?",
+      "es": "¿Cómo dimensionas GPUs para un modelo autoalojado?"
+    },
+    "answer": {
+      "en": "GPU memory holds weights, KV cache and overhead. Weights are parameters times bytes per parameter: about 16 GB for an 8B model in FP16, about 5 GB in 4-bit. KV cache per token is 2 × layers × KV heads × head dim × bytes, about 128 KiB for a Llama-3-8B shape. What remains after weights and overhead, divided by that and by the average tokens per sequence, gives concurrent sequences.\n\nThat estimate tells me whether FP16 fits the target concurrency or whether I need quantization, FP8 KV cache, a bigger GPU or tensor parallelism. Then I validate with a load test: TTFT, inter-token latency and total tokens per second across concurrency levels. I also check per-user decode speed stays above reading speed, and I run the eval suite on any quantized model.",
+      "es": "La memoria de la GPU guarda pesos, KV cache y overhead. Los pesos son parámetros por bytes por parámetro: unos 16 GB para un modelo de 8B en FP16, unos 5 GB en 4 bits. El KV cache por token es 2 × capas × KV heads × head dim × bytes, unos 128 KiB para un modelo con forma de Llama-3-8B. Lo que queda después de pesos y overhead, dividido por eso y por los tokens promedio por secuencia, da las secuencias concurrentes.\n\nEsa estimación me dice si FP16 alcanza la concurrencia objetivo o si necesito cuantización, KV cache en FP8, una GPU más grande o tensor parallelism. Luego lo valido con una prueba de carga: TTFT, latencia entre tokens y tokens por segundo totales en distintos niveles de concurrencia. También verifico que la velocidad de decode por usuario quede por encima de la velocidad de lectura, y corro la suite de evaluación sobre cualquier modelo cuantizado."
+    }
+  },
+  {
+    "id": "m8-iv-05",
+    "level": "mid",
+    "tags": ["quantization"],
+    "question": {
+      "en": "What are the trade-offs of quantizing a model to 4-bit AWQ for serving?",
+      "es": "¿Cuáles son los trade-offs de cuantizar un modelo a AWQ de 4 bits para servirlo?"
+    },
+    "answer": {
+      "en": "The gain is memory: weights shrink to roughly a quarter of FP16. On a memory-bound GPU that frees space for KV cache, so concurrency and total throughput go up, and smaller weights load faster on cold starts. A model that did not fit may now fit on one GPU.\n\nThe cost is possible quality loss, usually on long-context reasoning, math and strict structured output. So I never assume it is free: I run the same eval suite on the quantized model, prefer published quantized checkpoints from trusted sources, and compare with FP8, which is often near-lossless on supported hardware.",
+      "es": "La ganancia es memoria: los pesos se reducen a cerca de un cuarto de FP16. En una GPU limitada por memoria eso libera espacio para KV cache, así que suben la concurrencia y el throughput total, y los pesos más chicos cargan más rápido en los cold starts. Un modelo que no entraba puede entrar en una GPU.\n\nEl costo es una posible pérdida de calidad, normalmente en razonamiento con contexto largo, matemática y structured output estricto. Por eso nunca asumo que es gratis: corro la misma suite de evaluación sobre el modelo cuantizado, prefiero checkpoints cuantizados publicados por fuentes confiables y lo comparo con FP8, que suele ser casi sin pérdida en hardware compatible."
+    }
+  },
+  {
+    "id": "m8-iv-06",
+    "level": "mid",
+    "tags": ["ai-gateway", "litellm"],
+    "question": {
+      "en": "What does an AI gateway like LiteLLM give a company with many teams using LLMs?",
+      "es": "¿Qué le da un AI gateway como LiteLLM a una empresa con muchos equipos que usan LLMs?"
+    },
+    "answer": {
+      "en": "One OpenAI-compatible API in front of every provider, so teams stop wiring SDKs and keys themselves. Provider keys live only in the gateway; teams get virtual keys that can be revoked. Model aliases decouple apps from vendor model ids, so models can be swapped centrally.\n\nIt also centralizes retries, fallbacks and load balancing across providers and regions, per-team budgets and rate limits, a shared cache, logging of cost and usage per team, and guardrails such as PII masking. Operationally it becomes critical infrastructure: several replicas, shared Redis and Postgres, config in git with review, and fallback chains that respect data classification.",
+      "es": "Una sola API compatible con OpenAI delante de cada proveedor, así los equipos dejan de conectar SDKs y keys por su cuenta. Las keys de proveedores viven solo en el gateway; los equipos reciben keys virtuales revocables. Los alias de modelos desacoplan las apps de los ids de modelo del proveedor, así se pueden cambiar modelos de forma centralizada.\n\nTambién centraliza reintentos, fallbacks y balanceo entre proveedores y regiones, presupuestos y rate limits por equipo, una caché compartida, logging de costo y uso por equipo, y guardrails como el enmascarado de PII. En lo operativo se vuelve infraestructura crítica: varias réplicas, Redis y Postgres compartidos, configuración en git con revisión, y cadenas de fallback que respetan la clasificación de datos."
+    }
+  },
+  {
+    "id": "m8-iv-07",
+    "level": "senior",
+    "tags": ["terraform", "bedrock", "security"],
+    "question": {
+      "en": "How do you restrict an ECS service so it can only call approved Bedrock models over a private network?",
+      "es": "¿Cómo restringes un servicio ECS para que solo pueda llamar a modelos aprobados de Bedrock por una red privada?"
+    },
+    "answer": {
+      "en": "Network: tasks in private subnets with no public IP and ideally no NAT, plus interface VPC endpoints for bedrock-runtime, ECR, CloudWatch Logs and Secrets Manager, and an S3 gateway endpoint for image layers. Private DNS on the endpoints makes SDK calls resolve privately.\n\nIAM: the task role allows only InvokeModel and InvokeModelWithResponseStream on the approved foundation-model and inference-profile ARNs, never bedrock:* on *. The endpoint policy repeats that allow-list. At org level an SCP can deny unapproved models across accounts. All of it lives in Terraform with plan-only tests and a static scanner in CI, so every change is reviewed and auditable.",
+      "es": "Red: tasks en subredes privadas sin IP pública e idealmente sin NAT, más interface VPC endpoints para bedrock-runtime, ECR, CloudWatch Logs y Secrets Manager, y un gateway endpoint de S3 para las capas de imagen. El DNS privado en los endpoints hace que las llamadas del SDK resuelvan de forma privada.\n\nIAM: el task role permite solo InvokeModel e InvokeModelWithResponseStream sobre los ARNs aprobados de foundation models e inference profiles, nunca bedrock:* sobre *. La política del endpoint repite esa lista. A nivel de organización, una SCP puede denegar modelos no aprobados en todas las cuentas. Todo vive en Terraform con tests de solo plan y un escáner estático en CI, así cada cambio queda revisado y auditable."
+    }
+  },
+  {
+    "id": "m8-iv-08",
+    "level": "mid",
+    "tags": ["bedrock", "throughput"],
+    "question": {
+      "en": "When would you choose Bedrock Provisioned Throughput over on-demand?",
+      "es": "¿Cuándo elegirías Provisioned Throughput de Bedrock en lugar de on-demand?"
+    },
+    "answer": {
+      "en": "On-demand is the default: pay per token, shared capacity, subject to per-model quotas. I would consider Provisioned Throughput when traffic is steady and high enough that dedicated model units stay busy, when strict latency or guaranteed capacity matters more than flexibility, or when a custom or fine-tuned model requires it.\n\nBefore buying, I measure on-demand usage for a few weeks and model cost both ways, because it is a term commitment: idle units are paid for anyway. First I also try cheaper levers: quota increases, a geographic cross-region inference profile for extra throughput, and batch inference for offline jobs.",
+      "es": "On-demand es la opción por defecto: pagas por token, capacidad compartida, sujeta a cuotas por modelo. Consideraría Provisioned Throughput cuando el tráfico es estable y lo bastante alto para mantener ocupadas las model units dedicadas, cuando la latencia estricta o la capacidad garantizada importan más que la flexibilidad, o cuando un modelo custom o con fine-tuning lo requiere.\n\nAntes de comprar mido el uso on-demand durante algunas semanas y modelo el costo de ambas formas, porque es un compromiso a plazo: las unidades ociosas se pagan igual. Primero pruebo palancas más baratas: aumentos de cuota, un inference profile cross-region geográfico para más throughput y batch inference para jobs offline."
+    }
+  },
+  {
+    "id": "m8-iv-09",
+    "level": "senior",
+    "tags": ["release-management", "registry", "reproducibility"],
+    "question": {
+      "en": "How do you make an LLM feature reproducible and auditable across releases?",
+      "es": "¿Cómo haces que una funcionalidad LLM sea reproducible y auditable entre releases?"
+    },
+    "answer": {
+      "en": "I define the release unit as a manifest in git that pins everything that shapes behavior: immutable prompt version, model snapshot or weights digest, generation parameters, retrieval config, guardrail version, and the eval dataset version with a link to the report. No floating 'latest' aliases.\n\nThe app loads the manifest at startup, resolves registry aliases to concrete versions, and stamps release id and hash on every trace. Promotion moves the same manifest from dev to staging to prod, and CI blocks it without a passing eval report. Reproducible then means: the exact configuration can be rebuilt, re-running evals gives statistically the same scores, and any production answer traces back to its release.",
+      "es": "Defino la unidad de release como un manifiesto en git que fija todo lo que define el comportamiento: versión inmutable del prompt, snapshot del modelo o digest de pesos, parámetros de generación, configuración de retrieval, versión del guardrail y la versión del dataset de evaluación con un enlace al reporte. Nada de alias flotantes 'latest'.\n\nLa app carga el manifiesto al arrancar, resuelve los alias del registro a versiones concretas y marca cada trace con el id y el hash del release. La promoción mueve el mismo manifiesto de dev a staging y a prod, y CI la bloquea sin un reporte de evaluación aprobado. Reproducible significa entonces: se puede reconstruir la configuración exacta, volver a correr las evaluaciones da puntajes estadísticamente iguales y cualquier respuesta de producción se traza hasta su release."
+    }
+  },
+  {
+    "id": "m8-iv-10",
+    "level": "senior",
+    "tags": ["deprecation", "migration"],
+    "question": {
+      "en": "A provider is retiring an embedding model your RAG products depend on. How do you plan the migration?",
+      "es": "Un proveedor va a retirar un modelo de embeddings del que dependen tus productos RAG. ¿Cómo planificas la migración?"
+    },
+    "answer": {
+      "en": "Embedding retirements are the expensive kind, because every vector must be recomputed. First, inventory the indexes, corpora sizes and consumers. Then choose a candidate model and evaluate retrieval quality on each product's golden set: context precision and recall, plus end-to-end faithfulness.\n\nI build a new index side by side with the new model, never re-embedding in place, and estimate compute time and cost for the backfill plus a dual-write path for new documents. Then shadow queries against both indexes, canary the switch of reads per product, and keep the old index until the rollback window closes. The deadline is set internally well before the retirement date.",
+      "es": "Los retiros de embeddings son los caros, porque hay que recalcular cada vector. Primero inventario índices, tamaños de corpus y consumidores. Luego elijo un modelo candidato y evalúo la calidad de retrieval con el golden set de cada producto: context precision y recall, más faithfulness de punta a punta.\n\nConstruyo un índice nuevo en paralelo con el modelo nuevo, nunca re-embebiendo en el lugar, y estimo tiempo y costo de cómputo del backfill más un camino de doble escritura para documentos nuevos. Luego hago shadow de consultas contra ambos índices, canary del cambio de lecturas por producto, y mantengo el índice viejo hasta que cierra la ventana de rollback. La fecha límite interna queda bastante antes de la fecha de retiro."
+    }
+  },
+  {
+    "id": "m8-iv-11",
+    "level": "senior",
+    "tags": ["dr", "reliability", "multi-region"],
+    "question": {
+      "en": "What does a disaster recovery plan for an LLM platform need beyond a normal web app?",
+      "es": "¿Qué necesita un plan de recuperación ante desastres de una plataforma LLM además de lo de una web app normal?"
+    },
+    "answer": {
+      "en": "Two redundancy axes. Model redundancy: the same capability from a second provider or region via gateway fallbacks, with circuit breakers for degraded providers and quota exhaustion handled by shedding or queuing. Platform redundancy: gateway, app, vector store and conversation store in a standby region with chosen RTO and RPO per component.\n\nLLM-specific items: the gateway database must exist in the standby or nobody authenticates; self-hosted weights must be pre-staged there; vector indexes are either replicated or rebuildable within the RTO. And failover rules differ per data classification: PII workloads never fail over to unapproved processors. Finally, game days with measured RTO, because an untested plan is a hypothesis.",
+      "es": "Dos ejes de redundancia. Redundancia de modelos: la misma capacidad desde un segundo proveedor o región mediante fallbacks del gateway, con circuit breakers para proveedores degradados y el agotamiento de cuota manejado descartando o encolando tráfico. Redundancia de plataforma: gateway, app, vector store y almacén de conversaciones en una región standby, con RTO y RPO elegidos por componente.\n\nCosas propias de LLM: la base de datos del gateway debe existir en el standby o nadie se autentica; los pesos autoalojados deben estar preubicados ahí; los índices vectoriales se replican o se pueden reconstruir dentro del RTO. Y las reglas de failover cambian según la clasificación de datos: las cargas con PII nunca hacen failover a procesadores no aprobados. Por último, game days con RTO medido, porque un plan sin probar es una hipótesis."
+    }
+  },
+  {
+    "id": "m8-iv-12",
+    "level": "mid",
+    "tags": ["pii", "compliance", "logging"],
+    "question": {
+      "en": "How do you handle PII in an LLM application's logs and traces?",
+      "es": "¿Cómo manejas la PII en los logs y traces de una aplicación LLM?"
+    },
+    "answer": {
+      "en": "Default to not logging raw content. Application logs carry ids, model, release, tokens, cost and guardrail outcomes, not prompts. Where content is needed for debugging or evals, traces are masked or pseudonymized, kept in a store with KMS encryption, restricted access and a short retention, and provider-side invocation logging is enabled only when justified.\n\nI also enumerate every store that can hold content, including caches, vector stores and eval datasets, so retention rules and deletion requests reach all of them. PII detection tools like Presidio help but are probabilistic, so I measure their recall on our real document types and treat them as one layer.",
+      "es": "Por defecto, no registrar contenido en crudo. Los logs de aplicación llevan ids, modelo, release, tokens, costo y resultados de guardrails, no prompts. Donde se necesita contenido para depurar o evaluar, los traces se enmascaran o seudonimizan, se guardan en un almacén con cifrado KMS, acceso restringido y retención corta, y el invocation logging del lado del proveedor se activa solo si se justifica.\n\nTambién enumero cada almacén que puede guardar contenido, incluidas cachés, vector stores y datasets de evaluación, para que las reglas de retención y los pedidos de borrado lleguen a todos. Las herramientas de detección de PII como Presidio ayudan pero son probabilísticas, así que mido su recall con nuestros tipos de documento reales y las trato como una capa más."
+    }
+  }
+]
