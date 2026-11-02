@@ -1,0 +1,475 @@
+{
+  "moduleId": "m9",
+  "title": { "en": "Module 9 exam", "es": "Examen del módulo 9" },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "A classifier scores 80% accuracy on 400 independent items. What is the approximate half-width of the 95% confidence interval?",
+        "es": "Un clasificador saca 80% de accuracy en 400 ítems independientes. ¿Cuál es aproximadamente la mitad del ancho del intervalo de confianza al 95%?"
+      },
+      "options": {
+        "en": ["About 1 point", "About 4 points", "About 8 points", "About 0.4 points"],
+        "es": ["Alrededor de 1 punto", "Alrededor de 4 puntos", "Alrededor de 8 puntos", "Alrededor de 0.4 puntos"]
+      },
+      "answer": [1],
+      "explanation": {
+        "en": "The standard error is sqrt(0.8 × 0.2 / 400) = 0.02. Multiplying by 1.96 gives about 0.039, so roughly ±4 points. With 100 items it would be about ±8 points; to halve the interval you need four times the data.",
+        "es": "El error estándar es sqrt(0.8 × 0.2 / 400) = 0.02. Multiplicado por 1.96 da unos 0.039, es decir, aproximadamente ±4 puntos. Con 100 ítems serían unos ±8 puntos; para reducir el intervalo a la mitad necesitas cuatro veces más datos."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "Why does a paired comparison of two prompts on the same items usually give a much narrower confidence interval than comparing two independent accuracies?",
+        "es": "¿Por qué una comparación pareada de dos prompts sobre los mismos ítems suele dar un intervalo de confianza mucho más estrecho que comparar dos accuracies independientes?"
+      },
+      "options": {
+        "en": [
+          "Item difficulty is shared by both prompts, so it cancels out in the per-item differences",
+          "Paired tests assume the outputs are deterministic",
+          "Paired tests use a smaller alpha by default",
+          "Paired tests ignore items where the prompts disagree"
+        ],
+        "es": [
+          "La dificultad de los ítems la comparten ambos prompts, así que se cancela en las diferencias por ítem",
+          "Las pruebas pareadas suponen que las salidas son deterministas",
+          "Las pruebas pareadas usan un alpha más pequeño por defecto",
+          "Las pruebas pareadas ignoran los ítems donde los prompts discrepan"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Most variance in eval scores comes from item difficulty. Hard items are hard for both systems. Analyzing per-item differences removes that shared component, leaving only the disagreement. Note that McNemar keeps exactly the items where the systems disagree; it ignores the concordant ones.",
+        "es": "La mayor parte de la varianza en los puntajes viene de la dificultad de los ítems. Los ítems difíciles son difíciles para ambos sistemas. Analizar las diferencias por ítem elimina ese componente compartido y deja solo el desacuerdo. Ojo: McNemar conserva justamente los ítems donde los sistemas discrepan e ignora los concordantes."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "A candidate model migration has a preregistered non-inferiority margin of 2 points on field F1. The 95% paired CI of (candidate minus baseline) is -1.2 to +0.9 points. What is the correct conclusion?",
+        "es": "Una migración de modelo tiene un margen de no inferioridad pre-registrado de 2 puntos en F1 por campo. El CI pareado al 95% de (candidato menos baseline) va de -1.2 a +0.9 puntos. ¿Cuál es la conclusión correcta?"
+      },
+      "options": {
+        "en": [
+          "The candidate is non-inferior, because the lower bound is above -2 points",
+          "The result is inconclusive, because the interval includes 0",
+          "The candidate is worse, because the point estimate is negative",
+          "The candidate is better, because the upper bound is positive"
+        ],
+        "es": [
+          "El candidato es no inferior, porque el límite inferior está por encima de -2 puntos",
+          "El resultado no es concluyente, porque el intervalo incluye el 0",
+          "El candidato es peor, porque la estimación puntual es negativa",
+          "El candidato es mejor, porque el límite superior es positivo"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Non-inferiority asks whether the candidate is not worse by more than the margin. The whole interval sits above -2, so the candidate is non-inferior. It is even within (-2, +2), so practically equivalent. Including 0 only means we cannot claim a difference, which is not the question here.",
+        "es": "La no inferioridad pregunta si el candidato no es peor por más del margen. Todo el intervalo está por encima de -2, así que el candidato es no inferior. Incluso cae dentro de (-2, +2), es decir, es equivalente en la práctica. Que incluya el 0 solo significa que no podemos afirmar una diferencia, y esa no es la pregunta aquí."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "Two annotators agree on 92% of 100 items, but Cohen's kappa is about 0.29. Both labeled 'faithful' on 90 items. What best explains this?",
+        "es": "Dos anotadores coinciden en el 92% de 100 ítems, pero el kappa de Cohen es de aproximadamente 0.29. Ambos etiquetaron 'faithful' en 90 ítems. ¿Qué lo explica mejor?"
+      },
+      "options": {
+        "en": [
+          "A dominant class makes chance agreement very high, so kappa has little room (the kappa paradox)",
+          "Kappa was computed incorrectly; it can never be that low with 92% agreement",
+          "The annotators labeled too many items",
+          "Kappa only works for ordinal scales"
+        ],
+        "es": [
+          "Una clase dominante hace que el acuerdo por azar sea muy alto, así que el kappa tiene poco margen (la paradoja del kappa)",
+          "El kappa se calculó mal; nunca puede ser tan bajo con 92% de acuerdo",
+          "Los anotadores etiquetaron demasiados ítems",
+          "El kappa solo funciona con escalas ordinales"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "With 94% 'faithful' from each annotator, expected chance agreement is about 0.887, so kappa = (0.92 - 0.887) / (1 - 0.887) ≈ 0.29. The fix is to oversample the rare class for agreement studies and report per-class agreement, not to ignore kappa.",
+        "es": "Con 94% de 'faithful' por cada anotador, el acuerdo esperado por azar es de unos 0.887, así que kappa = (0.92 - 0.887) / (1 - 0.887) ≈ 0.29. La solución es sobremuestrear la clase rara en los estudios de acuerdo y reportar el acuerdo por clase, no ignorar el kappa."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "single",
+      "prompt": {
+        "en": "You compare model X (current) with model Y (candidate). Your only judge is a model from Y's family. What is the main risk?",
+        "es": "Comparas el modelo X (actual) con el modelo Y (candidato). Tu único juez es un modelo de la familia de Y. ¿Cuál es el riesgo principal?"
+      },
+      "options": {
+        "en": [
+          "Self-preference bias inflates Y's scores; use a jury from several providers",
+          "Position bias, which only matters in pointwise grading",
+          "The judge will be too slow for 600 documents",
+          "There is no risk if the judge prompt includes a rubric"
+        ],
+        "es": [
+          "El sesgo de autopreferencia infla los puntajes de Y; usa un jurado de varios proveedores",
+          "El sesgo de posición, que solo importa en calificación por puntos",
+          "El juez será demasiado lento para 600 documentos",
+          "No hay riesgo si el prompt del juez incluye una rúbrica"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "LLM judges tend to rate outputs from their own model family higher. In a migration that is a conflict of interest. A jury of judges from different providers, calibrated against human labels, reduces the bias.",
+        "es": "Los jueces LLM tienden a calificar más alto las salidas de su propia familia de modelos. En una migración eso es un conflicto de interés. Un jurado de jueces de distintos proveedores, calibrado contra etiquetas humanas, reduce el sesgo."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "A judge scores 5,000 production items and humans label a random subset of 200 of them. What does prediction-powered inference (PPI) add?",
+        "es": "Un juez puntúa 5,000 ítems de producción y humanos etiquetan un subconjunto aleatorio de 200. ¿Qué agrega la prediction-powered inference (PPI)?"
+      },
+      "options": {
+        "en": [
+          "It corrects the judge's average bias using the human-minus-judge difference on the labeled subset, giving an unbiased estimate with a CI",
+          "It replaces the human labels with judge labels to save money",
+          "It retrains the judge on the 200 human labels",
+          "It removes the need for a random subset; hard cases chosen by hand work equally well"
+        ],
+        "es": [
+          "Corrige el sesgo promedio del juez usando la diferencia humano-menos-juez en el subconjunto etiquetado, dando una estimación sin sesgo con un CI",
+          "Reemplaza las etiquetas humanas por etiquetas del juez para ahorrar dinero",
+          "Reentrena al juez con las 200 etiquetas humanas",
+          "Elimina la necesidad de un subconjunto aleatorio; los casos difíciles elegidos a mano funcionan igual"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "PPI estimates the judge's bias (the rectifier) on a random human-labeled subset and adds it to the judge's mean on all items. The labeled subset must be random, otherwise the bias estimate is itself biased.",
+        "es": "La PPI estima el sesgo del juez (el rectificador) en un subconjunto aleatorio etiquetado por humanos y lo suma a la media del juez sobre todos los ítems. El subconjunto debe ser aleatorio; si no, la estimación del sesgo también queda sesgada."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "multi",
+      "prompt": {
+        "en": "Which practices reduce the risk that LLM-generated eval data inflates your scores? Select all that apply.",
+        "es": "¿Qué prácticas reducen el riesgo de que los datos de eval generados por LLM inflen tus puntajes? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Seed generation from real, anonymized inputs and ask for variations",
+          "Use a different model family for generation than for the system under test",
+          "Deduplicate against the golden set and the prompt's few-shot examples",
+          "Let the system under test write the expected answers",
+          "Report one combined metric for real and synthetic items"
+        ],
+        "es": [
+          "Sembrar la generación desde entradas reales anonimizadas y pedir variaciones",
+          "Usar una familia de modelos distinta para generar que la del sistema bajo prueba",
+          "Deduplicar contra el golden set y los ejemplos few-shot del prompt",
+          "Dejar que el sistema bajo prueba escriba las respuestas esperadas",
+          "Reportar una sola métrica combinada para ítems reales y sintéticos"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Seeding from reality, using a different family and deduplicating all fight the known biases. Letting the system write its own expected answers measures self-agreement, and mixing sources hides that synthetic items are often easier. Tag provenance and report per source.",
+        "es": "Sembrar desde la realidad, usar otra familia y deduplicar combaten los sesgos conocidos. Dejar que el sistema escriba sus propias respuestas esperadas mide auto-acuerdo, y mezclar orígenes esconde que los ítems sintéticos suelen ser más fáciles. Etiqueta la procedencia y reporta por origen."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "multi",
+      "prompt": {
+        "en": "Which of these are metamorphic relations for a ticket triage system? Select all that apply.",
+        "es": "¿Cuáles de estas son relaciones metamórficas para un sistema de triage de tickets? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Replacing the customer's name must not change the predicted category",
+          "Appending 'my lawyer will contact you' must not lower the priority",
+          "Adding a polite greeting must not change the category or priority",
+          "The predicted category must equal the gold label",
+          "The output embedding must have cosine similarity above 0.9 with the reference"
+        ],
+        "es": [
+          "Reemplazar el nombre del cliente no debe cambiar la categoría predicha",
+          "Agregar 'mi abogado los contactará' no debe bajar la prioridad",
+          "Agregar un saludo cortés no debe cambiar la categoría ni la prioridad",
+          "La categoría predicha debe ser igual a la etiqueta gold",
+          "El embedding de la salida debe tener similitud coseno mayor a 0.9 con la referencia"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "A metamorphic relation links the outputs for a source input and a transformed input, without needing a gold answer: invariance (name swap, greeting) or direction (legal threat raises or keeps priority). Matching a gold label is an example-based test, and embedding similarity to a reference is a reference-based metric.",
+        "es": "Una relación metamórfica vincula las salidas de una entrada fuente y de una entrada transformada, sin necesitar respuesta gold: invariancia (cambio de nombre, saludo) o dirección (la amenaza legal sube o mantiene la prioridad). Coincidir con una etiqueta gold es una prueba basada en ejemplos, y la similitud de embeddings con una referencia es una métrica con referencia."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "multi",
+      "prompt": {
+        "en": "You ran 3 runs per item on 200 items, and also evaluated 50 multi-turn conversations of about 8 turns each. Which resampling choices are correct for bootstrap CIs? Select all that apply.",
+        "es": "Corriste 3 veces cada uno de 200 ítems y además evaluaste 50 conversaciones multi-turno de unos 8 turnos cada una. ¿Qué decisiones de remuestreo son correctas para los CIs bootstrap? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Average the 3 runs per item, then resample items",
+          "Resample whole conversations, not turns",
+          "Resample the 600 individual runs as if they were independent",
+          "Treat the 400 turns as 400 independent samples"
+        ],
+        "es": [
+          "Promediar las 3 corridas por ítem y luego remuestrear ítems",
+          "Remuestrear conversaciones completas, no turnos",
+          "Remuestrear las 600 corridas individuales como si fueran independientes",
+          "Tratar los 400 turnos como 400 muestras independientes"
+        ]
+      },
+      "answer": [0, 1],
+      "explanation": {
+        "en": "Always resample the unit of analysis. Runs of the same item and turns of the same conversation are correlated; treating them as independent produces intervals that are far too narrow.",
+        "es": "Remuestrea siempre la unidad de análisis. Las corridas del mismo ítem y los turnos de la misma conversación están correlacionados; tratarlos como independientes produce intervalos demasiado estrechos."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "multi",
+      "prompt": {
+        "en": "Your judge provider is retiring the model you use as a judge. Which steps are appropriate? Select all that apply.",
+        "es": "Tu proveedor va a retirar el modelo que usas como juez. ¿Qué pasos son apropiados? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "Run the old and new judge on a frozen human-labeled calibration set and compare kappa",
+          "Re-score the stored baseline outputs with the new judge before comparing new runs",
+          "Annotate dashboards with the date of the judge change",
+          "Compare new runs scored by the new judge directly against the old baseline scores",
+          "Ship the judge upgrade in the same PR as a prompt change to save CI time"
+        ],
+        "es": [
+          "Correr el juez viejo y el nuevo sobre un set de calibración congelado etiquetado por humanos y comparar el kappa",
+          "Volver a puntuar con el nuevo juez las salidas del baseline guardadas antes de comparar corridas nuevas",
+          "Anotar en los dashboards la fecha del cambio de juez",
+          "Comparar directamente las corridas nuevas puntuadas por el juez nuevo con los puntajes del baseline viejo",
+          "Publicar la actualización del juez en el mismo PR que un cambio de prompt para ahorrar tiempo de CI"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Treat the judge as a versioned dependency: validate the new version against humans, re-baseline, and make the discontinuity visible. Never compare scores from different judges, and never change the oracle and the system under test in the same change.",
+        "es": "Trata al juez como una dependencia versionada: valida la nueva versión contra humanos, vuelve a calcular el baseline y haz visible la discontinuidad. Nunca compares puntajes de jueces distintos ni cambies el oráculo y el sistema bajo prueba en el mismo cambio."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps for turning a production failure into a regression case.",
+        "es": "Ordena los pasos para convertir un fallo de producción en un caso de regresión."
+      },
+      "items": {
+        "en": [
+          "Triage: assign severity and error category",
+          "Identify the root cause (prompt, retrieval, data, model, tool)",
+          "Minimize the case and remove personal data",
+          "Add it to the regression set with provenance",
+          "Verify it fails on the current version and passes with the fix"
+        ],
+        "es": [
+          "Triage: asignar severidad y categoría de error",
+          "Identificar la causa raíz (prompt, retrieval, datos, modelo, herramienta)",
+          "Minimizar el caso y quitar los datos personales",
+          "Agregarlo al set de regresión con su procedencia",
+          "Verificar que falla en la versión actual y pasa con el fix"
+        ]
+      },
+      "explanation": {
+        "en": "This mirrors the defect lifecycle: classify, diagnose, reduce to a reproducible and safe case, store it with traceability, then prove the test catches the bug and the fix resolves it.",
+        "es": "Refleja el ciclo de vida de un defecto: clasificar, diagnosticar, reducir a un caso reproducible y seguro, guardarlo con trazabilidad y luego demostrar que la prueba atrapa el bug y que el fix lo resuelve."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of a decision-grade model migration evaluation.",
+        "es": "Ordena los pasos de una evaluación de migración de modelo lista para decidir."
+      },
+      "items": {
+        "en": [
+          "Preregister metrics, margins and the decision rule with stakeholders",
+          "Run a pilot to estimate the discordant rate and required sample size",
+          "Run both models on the same documents with caching",
+          "Compute paired differences with confidence intervals",
+          "Break results down by segment and build the risk register",
+          "Write the go/no-go report and rollout plan"
+        ],
+        "es": [
+          "Pre-registrar métricas, márgenes y la regla de decisión con los stakeholders",
+          "Correr un piloto para estimar la tasa de discordancia y el tamaño de muestra requerido",
+          "Correr ambos modelos sobre los mismos documentos con caché",
+          "Calcular las diferencias pareadas con intervalos de confianza",
+          "Desglosar los resultados por segmento y armar el registro de riesgos",
+          "Escribir el reporte go/no-go y el plan de despliegue"
+        ]
+      },
+      "explanation": {
+        "en": "Decide the rules before seeing results, size the study from a pilot, collect paired data, analyze it, look for segment risks, and only then decide and communicate.",
+        "es": "Define las reglas antes de ver resultados, dimensiona el estudio con un piloto, recolecta datos pareados, analízalos, busca riesgos por segmento y solo entonces decide y comunica."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of a human evaluation program.",
+        "es": "Ordena los pasos de un programa de evaluación humana."
+      },
+      "items": {
+        "en": [
+          "Write a versioned guideline with definitions and borderline examples",
+          "Run a calibration round where all annotators label the same items",
+          "Double-label the main set blind to the model, with gold questions",
+          "Measure inter-annotator agreement with confidence intervals",
+          "Adjudicate disagreements and update the guideline"
+        ],
+        "es": [
+          "Escribir una guía versionada con definiciones y ejemplos frontera",
+          "Hacer una ronda de calibración donde todos los anotadores etiquetan los mismos ítems",
+          "Etiquetar dos veces el set principal sin conocer el modelo, con preguntas gold",
+          "Medir el acuerdo entre anotadores con intervalos de confianza",
+          "Adjudicar los desacuerdos y actualizar la guía"
+        ]
+      },
+      "explanation": {
+        "en": "The guideline comes first, a calibration round fixes early ambiguity, then the main labeling, then measurement, then adjudication, which feeds the next guideline version.",
+        "es": "Primero la guía, luego una ronda de calibración que corrige la ambigüedad inicial, después el etiquetado principal, luego la medición y por último la adjudicación, que alimenta la siguiente versión de la guía."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "code",
+      "prompt": {
+        "en": "This function is meant to give a CI for the difference between two prompts scored on the same items. What is wrong with it?",
+        "es": "Esta función debería dar un CI para la diferencia entre dos prompts evaluados sobre los mismos ítems. ¿Qué tiene de malo?"
+      },
+      "code": "import numpy as np\n\nrng = np.random.default_rng(7)\n\ndef diff_ci(a: np.ndarray, b: np.ndarray, iters: int = 10_000):\n    n = len(a)\n    diffs = []\n    for _ in range(iters):\n        ia = rng.integers(0, n, n)\n        ib = rng.integers(0, n, n)\n        diffs.append(b[ib].mean() - a[ia].mean())\n    return np.percentile(diffs, [2.5, 97.5])",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "It draws independent indices for a and b, so it ignores the pairing and gives a needlessly wide interval",
+          "It should use np.median instead of mean",
+          "The percentiles should be 5 and 95 for a 95% interval",
+          "Nothing is wrong; this is a correct paired bootstrap"
+        ],
+        "es": [
+          "Toma índices independientes para a y b, así que ignora el pareo y da un intervalo innecesariamente ancho",
+          "Debería usar np.median en lugar de mean",
+          "Los percentiles deberían ser 5 y 95 para un intervalo al 95%",
+          "No tiene nada de malo; es un bootstrap pareado correcto"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A paired bootstrap draws one set of indices per iteration and uses it for both prompts (or bootstraps b - a directly). Independent indices throw away the shared item difficulty, which is exactly what makes paired analysis powerful.",
+        "es": "Un bootstrap pareado toma un solo conjunto de índices por iteración y lo usa para ambos prompts (o hace bootstrap directamente de b - a). Los índices independientes desechan la dificultad compartida de los ítems, que es justo lo que da potencia al análisis pareado."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "code",
+      "prompt": {
+        "en": "What does this snippet print?",
+        "es": "¿Qué imprime este fragmento?"
+      },
+      "code": "import math\nfrom scipy.stats import norm\n\ndef n_for_margin(p: float, margin: float, conf: float = 0.95) -> int:\n    z = norm.ppf(1 - (1 - conf) / 2)\n    return math.ceil(z**2 * p * (1 - p) / margin**2)\n\nprint(n_for_margin(0.80, 0.03))",
+      "codeLang": "python",
+      "options": {
+        "en": ["683", "178", "2732", "97"],
+        "es": ["683", "178", "2732", "97"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "z is about 1.96, so n = 3.84 × 0.16 / 0.0009 ≈ 682.9, rounded up to 683. That is how many independent items you need for a ±3-point 95% interval at 80% accuracy.",
+        "es": "z es aproximadamente 1.96, así que n = 3.84 × 0.16 / 0.0009 ≈ 682.9, redondeado hacia arriba a 683. Son los ítems independientes que necesitas para un intervalo al 95% de ±3 puntos con 80% de accuracy."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "code",
+      "prompt": {
+        "en": "The model returns the text \" Billing_Refund\\n\" for this test. What is the result of the equals assertion?",
+        "es": "El modelo devuelve el texto \" Billing_Refund\\n\" para esta prueba. ¿Cuál es el resultado de la aserción equals?"
+      },
+      "code": "defaultTest:\n  options:\n    transform: output.trim().toLowerCase()\ntests:\n  - vars:\n      ticket: \"I was charged twice, refund me today.\"\n    assert:\n      - type: equals\n        value: billing_refund",
+      "codeLang": "yaml",
+      "options": {
+        "en": [
+          "It passes, because the transform trims and lowercases the output before assertions run",
+          "It fails, because equals is case-sensitive and the transform only applies to vars",
+          "It fails, because defaultTest options are ignored when a test has its own assert",
+          "It errors, because transform must be a file reference"
+        ],
+        "es": [
+          "Pasa, porque el transform recorta y pasa a minúsculas la salida antes de que corran las aserciones",
+          "Falla, porque equals distingue mayúsculas y el transform solo se aplica a vars",
+          "Falla, porque las opciones de defaultTest se ignoran cuando una prueba tiene su propio assert",
+          "Da error, porque transform debe ser una referencia a archivo"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "In promptfoo, options.transform in defaultTest is applied to the output of every test before its assertions. After trim and toLowerCase the output is exactly billing_refund. Normalizing in one place keeps assertions simple, just like normalizers in your own metrics.",
+        "es": "En promptfoo, options.transform en defaultTest se aplica a la salida de cada prueba antes de sus aserciones. Tras trim y toLowerCase la salida es exactamente billing_refund. Normalizar en un solo lugar mantiene simples las aserciones, igual que los normalizadores en tus propias métricas."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "code",
+      "prompt": {
+        "en": "Using this DeepEval custom metric with fields [\"governing_law\", \"notice_days\", \"term_months\"], gold {\"governing_law\": \"delaware\", \"notice_days\": \"30\", \"term_months\": \"12\"} and prediction {\"governing_law\": \"delaware\", \"notice_days\": \"60\", \"term_months\": null}, what are the score and success?",
+        "es": "Usando esta métrica personalizada de DeepEval con los campos [\"governing_law\", \"notice_days\", \"term_months\"], el gold {\"governing_law\": \"delaware\", \"notice_days\": \"30\", \"term_months\": \"12\"} y la predicción {\"governing_law\": \"delaware\", \"notice_days\": \"60\", \"term_months\": null}, ¿cuáles son el score y el success?"
+      },
+      "code": "class FieldF1Metric(BaseMetric):\n    def __init__(self, fields: list[str], threshold: float = 0.9):\n        self.fields = fields\n        self.threshold = threshold\n\n    def measure(self, test_case: LLMTestCase) -> float:\n        gold = json.loads(test_case.expected_output)\n        pred = json.loads(test_case.actual_output)\n        tp = sum(1 for f in self.fields if gold.get(f) is not None and pred.get(f) == gold.get(f))\n        fp = sum(1 for f in self.fields if pred.get(f) is not None and pred.get(f) != gold.get(f))\n        fn = sum(1 for f in self.fields if gold.get(f) is not None and pred.get(f) != gold.get(f))\n        self.score = 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 1.0\n        self.success = self.score >= self.threshold\n        return self.score",
+      "codeLang": "python",
+      "options": {
+        "en": ["score 0.4, success False", "score 0.5, success False", "score 0.67, success False", "score 0.33, success False"],
+        "es": ["score 0.4, success False", "score 0.5, success False", "score 0.67, success False", "score 0.33, success False"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "governing_law matches: tp = 1. notice_days is wrong: it counts as one fp and one fn. term_months is missing: one fn, no fp because the prediction is null. So tp = 1, fp = 1, fn = 2 and F1 = 2 / (2 + 1 + 2) = 0.4, below the 0.9 threshold.",
+        "es": "governing_law coincide: tp = 1. notice_days es incorrecto: cuenta como un fp y un fn. term_months falta: un fn, sin fp porque la predicción es null. Entonces tp = 1, fp = 1, fn = 2 y F1 = 2 / (2 + 1 + 2) = 0.4, por debajo del umbral de 0.9."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "code",
+      "prompt": {
+        "en": "What does this snippet print?",
+        "es": "¿Qué imprime este fragmento?"
+      },
+      "code": "from math import comb\n\ndef pass_hat_k(results: dict[str, list[bool]], k: int) -> float:\n    per_task = [comb(sum(r), k) / comb(len(r), k) for r in results.values()]\n    return sum(per_task) / len(per_task)\n\nresults = {\n    \"refund\": [True, True, True, True],\n    \"address\": [True, True, True, False],\n}\nprint(pass_hat_k(results, 2))",
+      "codeLang": "python",
+      "options": {
+        "en": ["0.75", "0.875", "0.5", "1.0"],
+        "es": ["0.75", "0.875", "0.5", "1.0"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "For 'refund', C(4,2)/C(4,2) = 1. For 'address', C(3,2)/C(4,2) = 3/6 = 0.5. The mean is 0.75. Average success is 0.875, so pass^2 exposes the flakiness of the address flow.",
+        "es": "Para 'refund', C(4,2)/C(4,2) = 1. Para 'address', C(3,2)/C(4,2) = 3/6 = 0.5. La media es 0.75. El éxito promedio es 0.875, así que pass^2 expone la inestabilidad del flujo de dirección."
+      }
+    }
+  ]
+}

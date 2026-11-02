@@ -1,15 +1,15 @@
-<ClientBrief company="Lexora" industry="Legal tech / Contract intelligence" duration="5 days" />
+<ClientBrief company="Clausewell" industry="Legal tech / Contract intelligence" duration="5 days" />
 
 ## Company context
 
-Lexora is a fictional legal-tech SaaS company. Mid-size law firms and in-house legal teams upload commercial contracts, and Lexora's **Clause Extract** feature returns two things for each document:
+Clausewell is a fictional legal-tech SaaS company. Mid-size law firms and in-house legal teams upload commercial contracts, and Clausewell's **Clause Extract** feature returns two things for each document:
 
 1. A structured record of **14 fields**: parties, effective date, term, renewal type (auto, manual, none), renewal notice days, termination for convenience (yes/no), termination notice days, governing law, liability cap (amount or multiple of fees), liability cap carve-outs, indemnification (mutual, one-way, none), confidentiality term, assignment restrictions, and payment terms.
 2. A **risk summary** of 3–5 sentences that flags unusual or one-sided terms for the reviewing lawyer.
 
 Clause Extract processes roughly 180,000 documents a month. It runs on a large, expensive model today (`BASELINE_MODEL` in config). Lawyers review every record before it reaches a client, and their corrections are logged. Model spend is now the largest line in the cost of goods sold, and the product team wants to move to a cheaper or newer model (`CANDIDATE_MODEL`, for example a smaller tier from the same provider or a model from another provider; read both from config and check current pricing at report time).
 
-Last year a prompt change shipped based on "it looked fine on 30 examples". It quietly broke liability-cap extraction for scanned leases. Two enterprise customers noticed before Lexora did. Nobody wants a repeat. You have been hired to produce a **decision-grade evaluation**: one that a lawyer, a CFO and a staff engineer will all accept.
+Last year a prompt change shipped based on "it looked fine on 30 examples". It quietly broke liability-cap extraction for scanned leases. Two enterprise customers noticed before Clausewell did. Nobody wants a repeat. You have been hired to produce a **decision-grade evaluation**: one that a lawyer, a CFO and a staff engineer will all accept.
 
 ## Stakeholders
 

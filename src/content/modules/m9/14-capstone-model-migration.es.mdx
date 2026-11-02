@@ -1,0 +1,140 @@
+<ClientBrief company="Clausewell" industry="Legal tech / Inteligencia de contratos" duration="5 días" />
+
+## Contexto de la empresa
+
+Clausewell es una empresa SaaS legal-tech ficticia. Despachos de abogados medianos y equipos legales internos suben contratos comerciales, y la funcionalidad **Clause Extract** de Clausewell devuelve dos cosas por cada documento:
+
+1. Un registro estructurado de **14 campos**: partes, fecha de entrada en vigor, plazo, tipo de renovación (automática, manual, ninguna), días de preaviso de renovación, terminación por conveniencia (sí/no), días de preaviso de terminación, ley aplicable, tope de responsabilidad (monto o múltiplo de honorarios), excepciones al tope de responsabilidad, indemnización (mutua, unilateral, ninguna), plazo de confidencialidad, restricciones de cesión y condiciones de pago.
+2. Un **resumen de riesgos** de 3–5 oraciones que señala términos inusuales o desequilibrados para el abogado revisor.
+
+Clause Extract procesa unos 180,000 documentos al mes. Hoy corre sobre un modelo grande y caro (`BASELINE_MODEL` en la configuración). Los abogados revisan cada registro antes de que llegue a un cliente, y sus correcciones quedan registradas. El gasto en modelos ya es la línea más grande del costo de ventas, y el equipo de producto quiere pasar a un modelo más barato o más nuevo (`CANDIDATE_MODEL`, por ejemplo un nivel más pequeño del mismo proveedor o un modelo de otro proveedor; lee ambos desde la configuración y revisa los precios vigentes al momento del reporte).
+
+El año pasado se publicó un cambio de prompt basado en "se veía bien en 30 ejemplos". Rompió en silencio la extracción del tope de responsabilidad en arrendamientos escaneados. Dos clientes enterprise lo notaron antes que Clausewell. Nadie quiere que se repita. Te contrataron para producir una **evaluación lista para tomar decisiones**: una que acepten a la vez un abogado, un CFO y un staff engineer.
+
+## Stakeholders
+
+| Stakeholder | Rol | Qué le importa |
+|---|---|---|
+| Dana Okafor | VP de Producto | Un go/no-go claro, el ahorro y un plan de despliegue que proteja a las cuentas clave |
+| Miguel Herrera | Abogado senior, Head of Legal Ops | Los campos críticos (tope de responsabilidad, renovación, terminación, indemnización) no deben empeorar; los resúmenes no deben inventar riesgos ni omitirlos |
+| Priya Nair | Socia de Finanzas | Costo por cada 1,000 documentos, con supuestos que pueda auditar |
+| Tomás Rivera | Staff ML engineer | Pipeline reproducible, estadística honesta, un juez en el que pueda confiar |
+| Grace Liu | Líder de Customer Success | Clientes enterprise con muchos arrendamientos escaneados y contratos en español |
+| Seguridad y cumplimiento | Protección de datos | Los documentos de los clientes son confidenciales; solo el set de evaluación anonimizado puede salir del entorno de producción |
+
+## Objetivo de negocio
+
+Decidir, con riesgo cuantificado, si Clause Extract puede migrar al modelo candidato. La meta es reducir el costo de modelo por cada 1,000 documentos en **al menos 40%** sin una pérdida de calidad significativa, y saber exactamente **dónde** es más débil el candidato para que el despliegue pueda evitar o mitigar esos segmentos.
+
+## Requisitos funcionales
+
+1. **Dataset de evaluación.** 600 contratos anonimizados de clientes piloto que dieron su consentimiento para uso en evaluación. 400 ya tienen registros gold derivados de salidas corregidas por abogados; tú etiquetas o adjudicas 200 más para llenar huecos de segmentos. Etiqueta cada documento con segmentos: tipo de contrato (NDA, MSA, contrato SaaS, arrendamiento comercial), longitud (menos de 10 páginas, 10–40, más de 40), idioma (inglés, español), calidad de origen (digital nativo, OCR escaneado).
+2. **Justificación del tamaño de muestra.** Antes de correr nada, estima a partir de un piloto de 60 documentos cuántos documentos necesitas para probar no inferioridad en el F1 por campo global y en el recall de campos críticos. Explica el resultado en el reporte.
+3. **Métricas de tarea para la extracción.** Precision, recall y F1 por campo con normalizadores versionados y con pruebas unitarias (fechas, montos, duraciones, jurisdicciones). Campos críticos reportados por separado. Un valor incorrecto cuenta como falso positivo y como falso negativo.
+4. **Subconjunto de resúmenes etiquetado por humanos.** 150 documentos, los resúmenes de ambos modelos, etiquetados a ciegas por dos anotadores (paralegales o, en tu versión de laboratorio, tú más otra persona) en `accurate` (sí/no) y `risk_coverage` (1–4 anclado) con una guía versionada. Adjudica los desacuerdos. Reporta el kappa de Cohen y el alpha de Krippendorff con CIs.
+5. **Juez calibrado.** Un jurado de jueces guiado por referencia (al menos dos proveedores, no solo la familia del candidato) para la exactitud del resumen y la cobertura de riesgos. Calíbralo contra las etiquetas adjudicadas por segmento. Úsalo para puntuar los 600 documentos y corrige las métricas principales de resúmenes con prediction-powered inference usando el subconjunto etiquetado por humanos.
+6. **Comparación estadística.** Comparaciones pareadas por documento: CIs de bootstrap pareado sobre la diferencia en F1 por campo, recall de campos críticos y métricas de resúmenes; McNemar exacto sobre la corrección de campos críticos a nivel de documento. Márgenes de no inferioridad acordados de antemano (ver abajo). Corrección de Holm sobre las hipótesis principales.
+7. **Robustez.** Verificaciones metamórficas y de perturbación sobre al menos 100 documentos: ruido estilo OCR, reordenamiento de cláusulas, cambio de nombres de las partes y cambios de formato de moneda. Reporta las tasas de violación de ambos modelos.
+8. **Costo y latencia.** Tokens de entrada y salida por documento, costo (con precios publicados vigentes y su fecha) y latencia p50/p95 medida con concurrencia realista. Costo por cada 1,000 documentos y costo por registro de campos críticos *correcto*.
+9. **Análisis de riesgo por segmento.** Cada métrica desglosada por segmento con CIs, más un registro de riesgos: segmentos donde el candidato es no inferior, no concluyente o peor.
+10. **Reporte go/no-go.** Un reporte listo para stakeholders con una decisión GO, CONDITIONAL GO (con condiciones y segmentos nombrados) o NO-GO, y un plan de despliegue y monitoreo.
+
+## Requisitos no funcionales
+
+| Requisito | Objetivo |
+|---|---|
+| No inferioridad, F1 por campo global | Límite inferior del CI pareado al 95% de (candidato menos baseline) por encima de menos 1.5 puntos |
+| No inferioridad, recall de campos críticos | Límite inferior por encima de menos 2.0 puntos, global y en cada segmento con al menos 60 documentos |
+| Exactitud de resúmenes (corregida con PPI) | Límite inferior por encima de menos 3.0 puntos |
+| Costo | Al menos 40% menos costo por cada 1,000 documentos que el baseline |
+| Latencia | p95 menor a 25 segundos por documento con 10 solicitudes concurrentes |
+| Calidad del juez | Kappa del jurado vs gold adjudicado de al menos 0.6 global y no más de 0.1 por debajo del kappa humano-humano en ningún segmento reportado |
+| Reproducibilidad | Un comando reproduce cada número del reporte a partir de las salidas de modelo en caché |
+| Manejo de datos | Solo se usa el set anonimizado; ningún dato de cliente en el repo; salidas en caché local y en gitignore si contienen texto de documentos |
+
+## Fuera de alcance
+
+- Cambiar el esquema de extracción o la UI del producto.
+- Hacer fine-tuning de cualquier modelo.
+- Optimización de prompts más allá de una pasada de adaptación para el candidato (puedes adaptar el prompt a las buenas prácticas del candidato, pero registra el cambio; la misma versión del prompt debe usarse en todas las corridas reportadas).
+- Despliegue en producción. Entregas la evaluación, la decisión y el plan de despliegue.
+
+## Entregables
+
+1. Repositorio `model-migration-eval` con el pipeline, pruebas, guía, versiones de rúbrica y resultados en caché.
+2. `reports/DECISION.md`: el reporte go/no-go (estructura abajo).
+3. `reports/EXEC_SUMMARY.md`: una página para Dana y Priya, sin jerga.
+4. `reports/risk_register.csv`: segmento, métrica, estimación, CI, estado, mitigación.
+5. `reports/rollout_plan.md`: modo sombra, canary por segmento, disparadores de rollback, monitoreo.
+6. Una grabación de 10 minutos o un esquema de diapositivas (opcional pero recomendado para entrevistas).
+
+Estructura de `DECISION.md`: decisión y condiciones en las primeras 5 líneas; qué se comparó (ids de modelo, versiones de prompt, fechas); dataset y segmentos; métricas y márgenes; tabla de resultados con CIs; tabla de segmentos; calibración del juez; robustez; costo y latencia; riesgos y mitigaciones; limitaciones; apéndice con métodos.
+
+## Criterios de aceptación
+
+- Los márgenes, las métricas principales y la regla de decisión se hacen commit **antes** de la primera corrida completa (un `PREREGISTRATION.md` con fecha).
+- Ambos modelos corren exactamente sobre los mismos 600 documentos con la misma versión de prompt; todos los análisis son pareados.
+- Cada métrica reportada tiene un CI al 95% calculado remuestreando documentos.
+- El acuerdo humano, la calibración del juez y la corrección PPI se reportan con sus números, no solo con "validado".
+- Al menos un hallazgo a nivel de segmento se explica con ejemplos concretos (ids de documentos y diferencias de campos).
+- El costo por cada 1,000 documentos muestra los conteos de tokens, los precios usados y su fecha.
+- La decisión se desprende mecánicamente de las reglas pre-registradas, y cualquier juicio propio se marca como tal.
+
+## Arquitectura sugerida
+
+<Diagram caption="Pipeline de evaluación de migración de modelo" chart={`flowchart LR
+  A["Contratos anonimizados (600)"] --> B["Etiquetador de segmentos"]
+  B --> C["Runner: baseline + candidato (caché, repeticiones)"]
+  C --> D["Métricas de extracción (F1 por campo, normalizadores)"]
+  C --> E["Jurado de jueces de resúmenes"]
+  H["Etiquetas humanas (150, adjudicadas)"] --> F["Calibración del juez + PPI"]
+  E --> F
+  C --> G["Verificaciones metamórficas y de perturbación"]
+  C --> I["Registro de costo y latencia"]
+  D --> J["Estadística pareada (bootstrap, McNemar, Holm)"]
+  F --> J
+  G --> J
+  I --> J
+  J --> K["Registro de riesgos por segmento"]
+  K --> L["DECISION.md + resumen ejecutivo"]`} />
+
+## Rúbrica de evaluación
+
+| Área | Peso | Cómo se ve lo excelente |
+|---|---|---|
+| Diseño del eval y pre-registro | 15% | Decisión clara, márgenes acordados de antemano, métricas mapeadas al riesgo de negocio, tamaño de muestra justificado con un piloto |
+| Métricas de extracción | 15% | Métricas por campo con normalizadores probados, campos críticos por separado, conteos de support en todas partes |
+| Evaluación humana | 15% | Guía versionada con ejemplos frontera, doble etiquetado a ciegas, acuerdo con CIs, rastro de adjudicación |
+| Calidad del juez | 15% | Jurado multi-proveedor, calibración por segmento, métrica principal corregida con PPI, versiones del juez fijadas |
+| Rigor estadístico | 20% | Análisis pareados, unidad de remuestreo correcta, lógica de no inferioridad, control de comparaciones múltiples, veredictos "no concluyente" honestos |
+| Costo, latencia y robustez | 10% | Modelo de costo reproducible con precios fechados, prueba de latencia realista, tasas de violación metamórfica para ambos modelos |
+| Comunicación | 10% | Decisión en cinco líneas, riesgos por segmento accionables para alguien no especialista, plan de despliegue y rollback |
+
+## Cronograma sugerido
+
+**Día 1: diseño y datos.** Escribe `PREREGISTRATION.md` con los márgenes de los stakeholders. Construye el cargador del dataset, las etiquetas de segmento y los normalizadores con pruebas unitarias. Corre el piloto de 60 documentos en ambos modelos y calcula la estimación del tamaño de muestra.
+
+**Día 2: corridas y métricas de extracción.** Corre ambos modelos sobre todos los documentos con caché y 2 repeticiones en un subconjunto de 100 documentos para medir varianza. Calcula las métricas por campo, el recall de campos críticos y los CIs pareados. Registra costo y latencia.
+
+**Día 3: etiquetas humanas y juez.** Termina la guía, recolecta el doble etiquetado de 150 resúmenes, adjudica y calcula el acuerdo. Construye y calibra el jurado de jueces por segmento. Puntúa todos los resúmenes y aplica PPI.
+
+**Día 4: robustez y segmentos.** Corre las verificaciones metamórficas y de perturbación. Arma la tabla de segmentos y el registro de riesgos. Investiga el peor segmento con ejemplos concretos.
+
+**Día 5: decisión y comunicación.** Aplica la regla de decisión pre-registrada, escribe `DECISION.md`, el resumen ejecutivo y el plan de despliegue. Haz un ensayo de la presentación.
+
+## Definition of Done
+
+<Checklist id="m9-14-dod" title="Definition of Done" items={["PREREGISTRATION.md con márgenes, métricas principales y regla de decisión tiene commit antes de la primera corrida completa", "El tamaño de muestra está justificado con un piloto y la tasa de discordancia", "Ambos modelos corrieron sobre los mismos documentos con la misma versión de prompt; cada comparación es pareada", "Las métricas por campo usan normalizadores versionados y con pruebas unitarias; los campos críticos se reportan por separado", "150 resúmenes tuvieron doble etiquetado a ciegas y adjudicación; kappa y alpha se reportan con CIs", "El jurado de jueces usa al menos dos proveedores y está calibrado por segmento contra etiquetas adjudicadas", "Las métricas principales de resúmenes están corregidas con PPI", "Cada métrica tiene un CI al 95% remuestreando documentos; se aplica corrección de Holm a las hipótesis principales", "Se reportan las tasas de violación metamórfica y de perturbación para ambos modelos", "El costo por cada 1,000 documentos muestra tokens, precios y su fecha; la latencia p95 se midió con concurrencia", "El registro de riesgos clasifica cada segmento como no inferior, no concluyente o peor, con mitigaciones", "DECISION.md indica GO, CONDITIONAL GO o NO-GO en las primeras cinco líneas y sigue la regla pre-registrada", "Un comando reproduce todos los números a partir de las salidas en caché, y no hay datos de clientes en el repo"]} />
+
+## Cómo presentar esto en una entrevista
+
+Abre con la decisión y el dinero: "El candidato reduce el costo de modelo por cada 1,000 documentos en aproximadamente X% y es no inferior en F1 por campo global, pero en arrendamientos escaneados su recall del tope de responsabilidad no es concluyente, así que recomendamos un go condicional que mantiene los arrendamientos escaneados en el baseline hasta tener más datos." Esa frase muestra a la vez enfoque de negocio, estadística y gestión de riesgos.
+
+Luego recorre las cuatro ideas que hacen que la evaluación sirva para decidir:
+
+1. **Pre-registro.** Los márgenes y la regla de decisión se acordaron con el abogado senior y finanzas antes de que existiera cualquier resultado. Nadie pudo mover la portería.
+2. **Estadística pareada y no inferioridad.** Mismos documentos, diferencias por documento, CIs remuestreando documentos y un margen en lugar de "¿es significativamente mejor?". Menciona la estimación de tamaño de muestra del piloto.
+3. **Humanos y jueces.** Doble etiquetado a ciegas con acuerdo medido, un jurado multi-proveedor calibrado por segmento y PPI para corregir el sesgo del juez en el número principal. Menciona el sesgo de autopreferencia como la razón por la que la familia del candidato no podía juzgar sola.
+4. **Segmentos y robustez.** El promedio escondía un segmento débil. Las pruebas metamórficas mostraron que el candidato era más sensible al ruido de OCR. Ese hallazgo dio forma al despliegue.
+
+Espera preguntas de seguimiento como "¿y si el CI hubiera cruzado el margen a nivel global?" (respuesta: no concluyente, recolectar más datos o no-go, nunca "casi alcanza"), "¿cómo elegiste el margen?" (a partir del costo de los errores y la tasa actual de correcciones de los abogados, acordado con los stakeholders) y "¿cómo monitorearías después del despliegue?" (modo sombra, revisión muestreada de producción con ponderaciones, dashboards por segmento, disparadores de rollback). Lleva un ejemplo concreto de una diferencia de campos: los entrevistadores recuerdan los detalles.

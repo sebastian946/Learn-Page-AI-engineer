@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m9-iv-01",
+    "level": "mid",
+    "tags": ["metrics", "classification", "eval-design"],
+    "question": {
+      "en": "Why is accuracy a poor primary metric for an LLM ticket router, and what would you report instead?",
+      "es": "¿Por qué la accuracy es una mala métrica principal para un router de tickets con LLM y qué reportarías en su lugar?"
+    },
+    "answer": {
+      "en": "Ticket classes are imbalanced. A router that sends almost everything to the majority class can score high accuracy and still miss every rare, expensive ticket such as legal threats or fraud.\n\nI report per-class precision and recall with support counts, the confusion matrix, and macro-F1, which treats rare classes as equally important. For the classes with the highest error cost I set a dedicated recall target. Finally I check that the metric tracks a business outcome, for example misrouted tickets and handling time on historical data, so the number we gate on actually protects something.",
+      "es": "Las clases de tickets están desbalanceadas. Un router que manda casi todo a la clase mayoritaria puede sacar una accuracy alta y aun así fallar todos los tickets raros y caros, como amenazas legales o fraude.\n\nReporto precision y recall por clase con conteos de support, la matriz de confusión y el macro-F1, que trata a las clases raras como igual de importantes. Para las clases con mayor costo de error fijo un objetivo de recall dedicado. Por último verifico que la métrica siga un resultado de negocio, por ejemplo tickets mal ruteados y tiempo de atención en datos históricos, para que el número que usamos como gate proteja algo de verdad."
+    }
+  },
+  {
+    "id": "m9-iv-02",
+    "level": "mid",
+    "tags": ["extraction", "field-f1", "normalization"],
+    "question": {
+      "en": "How do you score a structured extraction feature with many fields?",
+      "es": "¿Cómo evalúas una funcionalidad de extracción estructurada con muchos campos?"
+    },
+    "answer": {
+      "en": "At the field level, not the document level. For each field I compute precision, recall and F1 after normalization. A correct value is a true positive. A wrong value counts as both a false positive and a false negative, because a confident wrong value is worse than an empty field that goes to human review. A hallucinated value for a field the gold leaves empty is a false positive.\n\nNormalizers for dates, amounts and durations are part of the metric, so they are versioned and unit-tested. I report support next to every number and report critical fields separately with their own targets.",
+      "es": "A nivel de campo, no de documento. Para cada campo calculo precision, recall y F1 tras normalizar. Un valor correcto es un verdadero positivo. Un valor incorrecto cuenta como falso positivo y falso negativo, porque un valor incorrecto confiado es peor que un campo vacío que va a revisión humana. Un valor alucinado para un campo que el gold deja vacío es un falso positivo.\n\nLos normalizadores de fechas, montos y duraciones son parte de la métrica, así que están versionados y con pruebas unitarias. Reporto el support junto a cada número y reporto los campos críticos por separado con sus propios objetivos."
+    }
+  },
+  {
+    "id": "m9-iv-03",
+    "level": "senior",
+    "tags": ["statistics", "paired-test", "bootstrap"],
+    "question": {
+      "en": "A teammate says prompt B beats prompt A by 3 points on 120 items. How do you decide if that is real?",
+      "es": "Un compañero dice que el prompt B le gana al A por 3 puntos en 120 ítems. ¿Cómo decides si es real?"
+    },
+    "answer": {
+      "en": "I make the comparison paired: both prompts on the same items, ideally several runs each averaged per item. Then I bootstrap the per-item differences by resampling items and report the mean difference with a 95% CI. For pass/fail I add an exact McNemar test on the discordant pairs.\n\nI compare the effect to an A/A noise floor, running A against itself. On 120 items a 3-point gain is often inside the interval, so the honest answer may be \"no evidence yet\". In that case I estimate the required sample size from the observed discordant rate instead of shipping on a hunch.",
+      "es": "Hago la comparación pareada: ambos prompts sobre los mismos ítems, idealmente varias corridas de cada uno promediadas por ítem. Luego hago bootstrap de las diferencias por ítem remuestreando ítems y reporto la diferencia media con un CI al 95%. Para aprobado/reprobado agrego una prueba exacta de McNemar sobre los pares discordantes.\n\nComparo el efecto con un piso de ruido A/A, corriendo A contra sí mismo. Con 120 ítems una ganancia de 3 puntos suele estar dentro del intervalo, así que la respuesta honesta puede ser \"todavía no hay evidencia\". En ese caso estimo el tamaño de muestra necesario a partir de la tasa de discordancia observada en lugar de publicar por intuición."
+    }
+  },
+  {
+    "id": "m9-iv-04",
+    "level": "senior",
+    "tags": ["non-inferiority", "model-migration", "statistics"],
+    "question": {
+      "en": "How would you decide whether to migrate a production feature to a cheaper model?",
+      "es": "¿Cómo decidirías si migrar una funcionalidad de producción a un modelo más barato?"
+    },
+    "answer": {
+      "en": "I frame it as non-inferiority, not superiority. With stakeholders I preregister the primary metrics, a margin per metric based on error cost, and the decision rule. A pilot gives me the discordant rate and the sample size.\n\nBoth models run on the same documents, and I compute paired CIs on candidate minus baseline. If the lower bound is above minus the margin, the candidate is non-inferior. I repeat this per segment, add robustness checks, compare cost per correct result and p95 latency, and write a GO, CONDITIONAL GO or NO-GO with named segments and a rollout plan in shadow mode first.",
+      "es": "Lo planteo como no inferioridad, no como superioridad. Con los stakeholders pre-registro las métricas principales, un margen por métrica basado en el costo del error y la regla de decisión. Un piloto me da la tasa de discordancia y el tamaño de muestra.\n\nAmbos modelos corren sobre los mismos documentos y calculo CIs pareados de candidato menos baseline. Si el límite inferior está por encima de menos el margen, el candidato es no inferior. Repito esto por segmento, agrego verificaciones de robustez, comparo el costo por resultado correcto y la latencia p95, y escribo un GO, CONDITIONAL GO o NO-GO con segmentos nombrados y un plan de despliegue que empieza en modo sombra."
+    }
+  },
+  {
+    "id": "m9-iv-05",
+    "level": "mid",
+    "tags": ["variance", "non-determinism", "claude"],
+    "question": {
+      "en": "How do you control run-to-run variance in evals when you cannot rely on temperature 0?",
+      "es": "¿Cómo controlas la varianza entre corridas en los evals cuando no puedes depender de temperature 0?"
+    },
+    "answer": {
+      "en": "I treat it like a flaky environment. Current Claude models reject sampling parameters, and even where temperature 0 is accepted, outputs still vary. So I pin the exact model id, version the prompt and rubric, fix the effort level and record all of it with each result.\n\nThen I measure the noise: an A/A run of the same configuration twice, and a within-item vs between-item variance split. I run each item several times, average per item, and report bootstrap CIs over items. Tolerances in CI gates come from the measured noise, not from a guess.",
+      "es": "Lo trato como un entorno flaky. Los modelos Claude actuales rechazan los parámetros de muestreo, y aun donde se acepta temperature 0, las salidas siguen variando. Así que fijo el id exacto del modelo, versiono el prompt y la rúbrica, fijo el nivel de effort y registro todo eso con cada resultado.\n\nLuego mido el ruido: una corrida A/A de la misma configuración dos veces y una separación de varianza dentro del ítem vs entre ítems. Corro cada ítem varias veces, promedio por ítem y reporto CIs bootstrap sobre ítems. Las tolerancias de los gates de CI salen del ruido medido, no de una suposición."
+    }
+  },
+  {
+    "id": "m9-iv-06",
+    "level": "mid",
+    "tags": ["human-eval", "kappa", "annotation"],
+    "question": {
+      "en": "How do you measure and improve agreement between human annotators?",
+      "es": "¿Cómo mides y mejoras el acuerdo entre anotadores humanos?"
+    },
+    "answer": {
+      "en": "I start with a versioned guideline: purpose, definitions, a decision procedure and borderline examples. After a calibration round on shared items, two or more annotators label an overlapping set blind to the model.\n\nI use Cohen's kappa for two annotators, weighted kappa for ordinal scales, Fleiss' kappa for several annotators on every item, and Krippendorff's alpha when labels are missing. I bootstrap items for CIs and report per-class agreement to catch the kappa paradox. Disagreements go to an adjudicator, and each unclear rule becomes a guideline change with a new borderline example.",
+      "es": "Empiezo con una guía versionada: propósito, definiciones, un procedimiento de decisión y ejemplos frontera. Tras una ronda de calibración sobre ítems compartidos, dos o más anotadores etiquetan un set solapado sin saber el modelo.\n\nUso el kappa de Cohen para dos anotadores, kappa ponderado para escalas ordinales, el kappa de Fleiss para varios anotadores en todos los ítems y el alpha de Krippendorff cuando faltan etiquetas. Hago bootstrap sobre ítems para los CIs y reporto el acuerdo por clase para detectar la paradoja del kappa. Los desacuerdos van a un adjudicador, y cada regla poco clara se convierte en un cambio de la guía con un nuevo ejemplo frontera."
+    }
+  },
+  {
+    "id": "m9-iv-07",
+    "level": "senior",
+    "tags": ["llm-judge", "jury", "calibration"],
+    "question": {
+      "en": "When is a single LLM judge not enough, and what do you do instead?",
+      "es": "¿Cuándo no basta un solo juez LLM y qué haces en su lugar?"
+    },
+    "answer": {
+      "en": "When the decision is high-stakes, when the judge shares a model family with a system being compared, or when calibration shows weak segments. One judge has idiosyncratic errors and self-preference bias.\n\nI use a jury of judges from different providers, with a reference-guided, decomposed rubric. The aggregation follows risk: mean for quality, strict for safety. Jury disagreement routes items to humans. I calibrate per segment against adjudicated labels and compare judge-human kappa to human-human kappa. For headline numbers I correct the judge's bias with a random human-labeled subset using prediction-powered inference.",
+      "es": "Cuando la decisión es de alto riesgo, cuando el juez comparte familia de modelos con un sistema que se compara, o cuando la calibración muestra segmentos débiles. Un solo juez tiene errores idiosincráticos y sesgo de autopreferencia.\n\nUso un jurado de jueces de distintos proveedores, con una rúbrica guiada por referencia y descompuesta. La agregación sigue al riesgo: media para calidad, estricta para seguridad. El desacuerdo del jurado envía ítems a humanos. Calibro por segmento contra etiquetas adjudicadas y comparo el kappa juez-humano con el humano-humano. Para los números principales corrijo el sesgo del juez con un subconjunto aleatorio etiquetado por humanos usando prediction-powered inference."
+    }
+  },
+  {
+    "id": "m9-iv-08",
+    "level": "mid",
+    "tags": ["frameworks", "promptfoo", "deepeval", "inspect"],
+    "question": {
+      "en": "Compare promptfoo, DeepEval and Inspect AI. How do you avoid lock-in?",
+      "es": "Compara promptfoo, DeepEval e Inspect AI. ¿Cómo evitas el lock-in?"
+    },
+    "answer": {
+      "en": "promptfoo is a YAML-driven CLI that is excellent for side-by-side prompt and model comparisons with a viewer and many built-in assertions. DeepEval is a pytest-style Python framework with many judge-based metrics and easy custom metrics. Inspect AI, from the UK AI Security Institute, is built for rigorous model and agent evals with epochs, sandboxed tools and strong logs.\n\nTo avoid lock-in I own the dataset format, the scoring functions as pure, unit-tested Python, and a results schema with model id, prompt hash and judge id. Frameworks become thin adapters, and every output is exported to that one schema.",
+      "es": "promptfoo es una CLI basada en YAML, excelente para comparar prompts y modelos lado a lado con un visor y muchas aserciones integradas. DeepEval es un framework de Python al estilo pytest con muchas métricas basadas en jueces y métricas personalizadas fáciles. Inspect AI, del UK AI Security Institute, está hecho para evals rigurosos de modelos y agentes con epochs, herramientas en sandbox y buenos logs.\n\nPara evitar el lock-in soy dueño del formato del dataset, de las funciones de puntuación como Python puro con pruebas unitarias y de un esquema de resultados con model id, prompt hash y judge id. Los frameworks se vuelven adaptadores delgados y cada salida se exporta a ese único esquema."
+    }
+  },
+  {
+    "id": "m9-iv-09",
+    "level": "senior",
+    "tags": ["metamorphic-testing", "robustness", "sdet"],
+    "question": {
+      "en": "Explain metamorphic testing and how you would apply it to an LLM feature.",
+      "es": "Explica metamorphic testing y cómo lo aplicarías a una funcionalidad con LLM."
+    },
+    "answer": {
+      "en": "Metamorphic testing addresses the oracle problem: instead of knowing the correct output for every input, I define relations between the outputs for an input and a transformed input. Invariance relations say the output must not change under a name swap, typos or passage reordering. Directional relations say it must move a known way, for example adding a legal threat must not lower priority.\n\nI generate transforms with deterministic code, spot-check any LLM paraphrases, measure the system's self-inconsistency as a noise floor, and report violation rates per relation with CIs. Confirmed violations become regression cases. It is property-based testing for language.",
+      "es": "Metamorphic testing ataca el problema del oráculo: en lugar de conocer la salida correcta para cada entrada, defino relaciones entre las salidas de una entrada y de una entrada transformada. Las relaciones de invariancia dicen que la salida no debe cambiar ante un cambio de nombre, errores de tipeo o reordenamiento de pasajes. Las direccionales dicen que debe moverse de una forma conocida; por ejemplo, agregar una amenaza legal no debe bajar la prioridad.\n\nGenero las transformaciones con código determinista, reviso por muestreo cualquier paráfrasis de LLM, mido la auto-inconsistencia del sistema como piso de ruido y reporto tasas de violación por relación con CIs. Las violaciones confirmadas se vuelven casos de regresión. Es property-based testing para el lenguaje."
+    }
+  },
+  {
+    "id": "m9-iv-10",
+    "level": "senior",
+    "tags": ["agents", "multi-turn", "simulated-users", "pass-k"],
+    "question": {
+      "en": "How do you evaluate a tool-using support agent across multi-turn conversations?",
+      "es": "¿Cómo evalúas un agente de soporte que usa herramientas en conversaciones multi-turno?"
+    },
+    "answer": {
+      "en": "Scripted scenarios cover critical paths deterministically in CI. LLM-simulated users add breadth: each gets a persona, a goal, private facts revealed only when asked and a stop token, ideally from a different model family, and I check their realism on a sample.\n\nSuccess is the end state of a sandbox database, not what the agent says. Policy rules run over the tool trace: verification before writes, correct amounts, no duplicate side effects, required escalations. I report success with CIs over conversations, pass^k for reliability, violations per 100 conversations, turns to resolution, cost per successful task and budget-cap hits.",
+      "es": "Los escenarios con guion cubren los caminos críticos de forma determinista en CI. Los usuarios simulados por LLM agregan amplitud: cada uno recibe una persona, un objetivo, hechos privados que solo revela si se los piden y un token de parada, idealmente de otra familia de modelos, y verifico su realismo en una muestra.\n\nEl éxito es el estado final de una base de datos sandbox, no lo que dice el agente. Las reglas de política corren sobre la traza de herramientas: verificación antes de escribir, montos correctos, sin efectos secundarios duplicados, escalamientos requeridos. Reporto el éxito con CIs sobre conversaciones, pass^k para la confiabilidad, violaciones por cada 100 conversaciones, turnos hasta la resolución, costo por tarea exitosa y límites de presupuesto alcanzados."
+    }
+  },
+  {
+    "id": "m9-iv-11",
+    "level": "mid",
+    "tags": ["production", "feedback", "sampling", "regression"],
+    "question": {
+      "en": "How do you use production traffic to keep your eval suite relevant?",
+      "es": "¿Cómo usas el tráfico de producción para mantener vigente tu suite de evals?"
+    },
+    "answer": {
+      "en": "I sample traces by strata: a small random slice for unbiased estimates, plus thumbs-down, low judge scores, cost and latency outliers, and inputs far from the golden set. When I estimate overall quality from that mix, I weight by inverse sampling probability.\n\nConfirmed failures follow the defect lifecycle: severity and category, root cause, minimization and anonymization, then a regression case with provenance that must fail before the fix and pass after. I also calibrate implicit signals such as regenerations and edits against human labels before trusting them, and I keep a sealed holdout that is never used for tuning.",
+      "es": "Muestreo trazas por estratos: una pequeña porción aleatoria para estimaciones sin sesgo, más pulgares abajo, puntajes bajos del juez, valores atípicos de costo y latencia, y entradas lejanas al golden set. Cuando estimo la calidad global a partir de esa mezcla, pondero por el inverso de la probabilidad de muestreo.\n\nLos fallos confirmados siguen el ciclo de vida de un defecto: severidad y categoría, causa raíz, minimización y anonimización, y luego un caso de regresión con procedencia que debe fallar antes del fix y pasar después. También calibro las señales implícitas, como regeneraciones y ediciones, contra etiquetas humanas antes de confiar en ellas, y mantengo un split sellado que nunca se usa para ajustar."
+    }
+  },
+  {
+    "id": "m9-iv-12",
+    "level": "senior",
+    "tags": ["benchmarks", "contamination", "fairness"],
+    "question": {
+      "en": "How do you read public benchmark results, and how do you evaluate fairness for your own product?",
+      "es": "¿Cómo lees los resultados de benchmarks públicos y cómo evalúas la equidad de tu propio producto?"
+    },
+    "answer": {
+      "en": "Public benchmarks such as MMLU measure broad skills, often near saturation, with possible contamination and strong sensitivity to prompt format and few-shot setup. Preference leaderboards reflect general taste, including style. I use them to shortlist models, then decide on a private, versioned benchmark built from my task distribution, with a sealed holdout.\n\nFor fairness I run counterfactual metamorphic tests that swap names, genders, nationalities or dialect markers and measure decision and quality flip rates with CIs. I compare refusal and escalation rates across segments I can legitimately observe, track over-refusal next to harmful compliance, and document what was not tested.",
+      "es": "Los benchmarks públicos como MMLU miden habilidades amplias, a menudo cerca de la saturación, con posible contaminación y mucha sensibilidad al formato del prompt y a la configuración few-shot. Los leaderboards de preferencia reflejan gustos generales, incluido el estilo. Los uso para preseleccionar modelos y luego decido con un benchmark privado y versionado construido desde mi distribución de tareas, con un split sellado.\n\nPara la equidad corro pruebas metamórficas contrafactuales que cambian nombres, géneros, nacionalidades o marcadores dialectales y mido las tasas de cambio de decisión y calidad con CIs. Comparo tasas de rechazo y escalamiento entre segmentos que puedo observar legítimamente, sigo el sobre-rechazo junto al cumplimiento dañino y documento lo que no se probó."
+    }
+  }
+]
