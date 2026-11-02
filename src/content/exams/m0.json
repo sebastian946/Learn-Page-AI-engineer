@@ -1,0 +1,11 @@
+{
+  "moduleId": "m0",
+  "title": { "en": "Sample exam", "es": "Examen de ejemplo" },
+  "timeLimitMinutes": 10,
+  "passingScore": 70,
+  "questions": [
+    { "id": "q1", "type": "single", "prompt": { "en": "2+2?", "es": "2+2?" }, "options": { "en": ["3", "4"], "es": ["3", "4"] }, "answer": [1], "explanation": { "en": "Math.", "es": "Mate." } },
+    { "id": "q2", "type": "order", "prompt": { "en": "Order", "es": "Ordena" }, "items": { "en": ["A", "B", "C"], "es": ["A", "B", "C"] }, "explanation": { "en": "ABC", "es": "ABC" } },
+    { "id": "q3", "type": "code", "prompt": { "en": "Returns?", "es": "Retorna?" }, "code": "def f():\n    return 1", "codeLang": "python", "options": { "en": ["1", "None"], "es": ["1", "None"] }, "answer": [0], "explanation": { "en": "1", "es": "1" } }
+  ]
+}

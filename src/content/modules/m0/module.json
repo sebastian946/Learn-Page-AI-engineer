@@ -1,0 +1,13 @@
+{
+  "id": "m0",
+  "order": 0,
+  "days": 1,
+  "hours": 6,
+  "title": { "en": "Sample module", "es": "Modulo de ejemplo" },
+  "summary": { "en": "Pipeline smoke test.", "es": "Prueba del pipeline." },
+  "lessons": [
+    { "slug": "01-sample", "type": "concept", "minutes": 10, "title": { "en": "Sample lesson", "es": "Leccion de ejemplo" } },
+    { "slug": "02-exam", "type": "exam", "minutes": 20, "title": { "en": "Exam", "es": "Examen" } }
+  ],
+  "repos": [{ "id": "m0-sample", "name": "sample-repo", "description": { "en": "Sample", "es": "Ejemplo" } }]
+}
