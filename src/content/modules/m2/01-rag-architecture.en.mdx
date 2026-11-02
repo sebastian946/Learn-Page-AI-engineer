@@ -46,7 +46,7 @@ As an SDET you already know this split: it is like test data setup (fixtures) ve
 | Vector store | index type, distance | HNSW, cosine | no metadata, so no filtering |
 | Retriever | k, filters, hybrid | k = 4, vector only | right doc ranked 9th |
 | Prompt | grounding instructions | "answer only from context, cite sources" | model answers from memory |
-| LLM | model, temperature | mid-tier model, temperature 0 | verbose, uncited answers |
+| LLM | model, effort | mid-tier model, default effort (current Claude models reject `temperature`) | verbose, uncited answers |
 
 Each row gets its own lesson in this module. Today you wire all of them together with sensible defaults so you have a baseline to improve and measure against.
 
@@ -114,7 +114,7 @@ def format_context(chunks: list[Document]) -> str:
 
 def answer(store: InMemoryVectorStore, question: str, k: int = 4) -> str:
     chunks = store.similarity_search(question, k=k)
-    llm = ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    llm = ChatAnthropic(model=CHAT_MODEL, max_tokens=800)
     messages = PROMPT.invoke({"context": format_context(chunks), "question": question})
     return llm.invoke(messages).content
 
@@ -147,7 +147,7 @@ chain = (
     {"context": retriever | RunnableLambda(format_context),
      "question": RunnablePassthrough()}
     | PROMPT
-    | ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    | ChatAnthropic(model=CHAT_MODEL, max_tokens=800)
     | StrOutputParser()
 )
 

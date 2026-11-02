@@ -48,7 +48,7 @@ class Plan(BaseModel):
     steps: list[Step] = Field(max_length=6)
     risky: bool = Field(description="True if any step changes customer-visible state")
 
-planner = ChatAnthropic(model="claude-sonnet-5-5", temperature=0).with_structured_output(Plan)
+planner = ChatAnthropic(model="claude-sonnet-5-5").with_structured_output(Plan)
 
 PLANNER_PROMPT = """You plan work for a logistics support agent.
 Tools: get_order, get_carrier_rates, reschedule_delivery, create_ticket.
@@ -92,7 +92,7 @@ class Critique(BaseModel):
     policy_ok: bool = Field(description="No promises of refunds or dates not confirmed by tools")
     problems: list[str]
 
-critic = ChatAnthropic(model="claude-haiku-5-5", temperature=0).with_structured_output(Critique)
+critic = ChatAnthropic(model="claude-haiku-5-5").with_structured_output(Critique)
 
 async def reflect(draft: str, tool_results: str, max_rounds: int = 2) -> str:
     for _ in range(max_rounds):

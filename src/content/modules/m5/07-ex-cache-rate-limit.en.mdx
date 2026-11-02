@@ -17,7 +17,7 @@ Why it matters: in exercise 12 you will load test this service. With a cache and
 
 - [ ] `docker compose up` starts Redis alongside the API, Postgres and pgvector. The API reads `REDIS_URL` from `Settings`.
 - [ ] `POST /v1/chat` and `POST /v1/chat/stream` check the exact cache first. A hit returns in under 50 ms locally and makes no LLM call.
-- [ ] The cache key includes tenant id (as prefix), normalized question, model id, prompt version, corpus version and temperature.
+- [ ] The cache key includes tenant id (as prefix), normalized question, model id, prompt version, corpus version and effort.
 - [ ] Only complete, successful answers are cached. Errors, guardrail blocks and interrupted streams are never cached.
 - [ ] A streaming cache hit still emits `token`, `citations` and `done` SSE events, in that order.
 - [ ] Each tenant (from `X-Tenant-ID`) has a request bucket and a token bucket. Limits come from `Settings`, with an optional per-tenant override map.
@@ -86,7 +86,7 @@ async def chat(req: ChatRequest, tenant: str = Depends(tenant_id),
     key = cache_key(tenant_id=tenant, question=req.question, model=s.llm_model,
                     prompt_version=s.prompt_version,
                     corpus_version=await deps.corpus_version(tenant),
-                    temperature=s.temperature)
+                    effort=s.effort)
     # TODO 1: cache lookup (fail open on RedisError), count hit/miss.
     # TODO 2: estimate tokens = len(prompt chars) // 4 + s.max_tokens, then reserve.
     # TODO 3: on denial, raise HTTPException(429, headers={"Retry-After": ...}).

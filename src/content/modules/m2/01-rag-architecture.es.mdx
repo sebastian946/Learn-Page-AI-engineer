@@ -46,7 +46,7 @@ Como SDET ya conoces esta separación: es como la preparación de datos de prueb
 | Vector store | tipo de índice, distancia | HNSW, coseno | sin metadata, así que no hay filtrado |
 | Retriever | k, filtros, híbrido | k = 4, solo vector | el documento correcto queda en el puesto 9 |
 | Prompt | instrucciones de grounding | "responde solo con el contexto, cita fuentes" | el modelo responde de memoria |
-| LLM | modelo, temperatura | modelo de gama media, temperatura 0 | respuestas largas y sin citas |
+| LLM | modelo, effort | modelo de gama media, effort por defecto (los modelos actuales de Claude rechazan `temperature`) | respuestas largas y sin citas |
 
 Cada fila tiene su propia lección en este módulo. Hoy conectas todas con valores por defecto razonables para tener una línea base que mejorar y contra la cual medir.
 
@@ -114,7 +114,7 @@ def format_context(chunks: list[Document]) -> str:
 
 def answer(store: InMemoryVectorStore, question: str, k: int = 4) -> str:
     chunks = store.similarity_search(question, k=k)
-    llm = ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    llm = ChatAnthropic(model=CHAT_MODEL, max_tokens=800)
     messages = PROMPT.invoke({"context": format_context(chunks), "question": question})
     return llm.invoke(messages).content
 
@@ -147,7 +147,7 @@ chain = (
     {"context": retriever | RunnableLambda(format_context),
      "question": RunnablePassthrough()}
     | PROMPT
-    | ChatAnthropic(model=CHAT_MODEL, temperature=0, max_tokens=800)
+    | ChatAnthropic(model=CHAT_MODEL, max_tokens=800)
     | StrOutputParser()
 )
 

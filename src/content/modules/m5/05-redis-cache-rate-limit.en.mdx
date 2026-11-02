@@ -24,7 +24,7 @@ For a RAG answer, the response depends on more than the question text. It depend
 - the **prompt version** (you changed the system prompt, old answers are no longer valid),
 - the **retrieval corpus version** (a policy PDF was updated, the old answer may cite a dead rule),
 - the **tenant** (tenant A must never see an answer built from tenant B's documents),
-- generation parameters that change output (temperature, max tokens).
+- generation parameters that change output (effort, max tokens).
 
 Hash all of that into one key. Use the corpus version from your ingestion pipeline. A simple approach is a hash of the sorted `(doc_id, doc_version)` pairs of the documents that were retrieved. A coarser approach is a single `corpus_version` counter you bump on every ingestion run. The coarse one is simpler and invalidates everything at once. That is usually fine for daily ingestion.
 
@@ -48,10 +48,10 @@ def normalize(question: str) -> str:
     return _ws.sub(" ", question.strip().lower()).rstrip("?!. ")
 
 def cache_key(*, tenant_id: str, question: str, model: str,
-              prompt_version: str, corpus_version: str, temperature: float) -> str:
+              prompt_version: str, corpus_version: str, effort: str) -> str:
     payload = json.dumps(
         {"q": normalize(question), "m": model, "pv": prompt_version,
-         "cv": corpus_version, "t": temperature},
+         "cv": corpus_version, "e": effort},
         sort_keys=True,
     )
     digest = hashlib.sha256(payload.encode()).hexdigest()
@@ -204,7 +204,7 @@ Also keep a **global** bucket per provider key, set slightly below the provider'
 
 <InterviewQuestion question="How would you design the cache key for a multi-tenant RAG answer cache?" level="mid">
 
-Hash the normalized question together with every input that changes the answer: model id, prompt version, corpus or retrieved-document versions, and generation parameters like temperature. Prefix the key with the tenant id so tenants are isolated and so you can purge one tenant with a prefix scan. Version fields do the invalidation; the TTL is only a safety net. Only cache complete, successful answers, never errors or truncated streams.
+Hash the normalized question together with every input that changes the answer: model id, prompt version, corpus or retrieved-document versions, and generation parameters like effort and max tokens. Prefix the key with the tenant id so tenants are isolated and so you can purge one tenant with a prefix scan. Version fields do the invalidation; the TTL is only a safety net. Only cache complete, successful answers, never errors or truncated streams.
 
 </InterviewQuestion>
 

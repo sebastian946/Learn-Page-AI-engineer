@@ -17,7 +17,7 @@ Por qué importa: en el ejercicio 12 harás pruebas de carga sobre este servicio
 
 - [ ] `docker compose up` levanta Redis junto con la API, Postgres y pgvector. La API lee `REDIS_URL` desde `Settings`.
 - [ ] `POST /v1/chat` y `POST /v1/chat/stream` revisan primero la caché exacta. Un hit responde en menos de 50 ms en local y no hace llamada al LLM.
-- [ ] La clave de caché incluye el id del tenant (como prefijo), la pregunta normalizada, el id del modelo, la versión del prompt, la versión del corpus y la temperature.
+- [ ] La clave de caché incluye el id del tenant (como prefijo), la pregunta normalizada, el id del modelo, la versión del prompt, la versión del corpus y el effort.
 - [ ] Solo se guardan respuestas completas y exitosas. Los errores, bloqueos de guardrail y streams interrumpidos nunca se guardan.
 - [ ] Un hit de caché en streaming sigue emitiendo los eventos SSE `token`, `citations` y `done`, en ese orden.
 - [ ] Cada tenant (desde `X-Tenant-ID`) tiene un bucket de requests y un bucket de tokens. Los límites vienen de `Settings`, con un mapa opcional de overrides por tenant.
@@ -86,7 +86,7 @@ async def chat(req: ChatRequest, tenant: str = Depends(tenant_id),
     key = cache_key(tenant_id=tenant, question=req.question, model=s.llm_model,
                     prompt_version=s.prompt_version,
                     corpus_version=await deps.corpus_version(tenant),
-                    temperature=s.temperature)
+                    effort=s.effort)
     # TODO 1: cache lookup (fail open on RedisError), count hit/miss.
     # TODO 2: estimate tokens = len(prompt chars) // 4 + s.max_tokens, then reserve.
     # TODO 3: on denial, raise HTTPException(429, headers={"Retry-After": ...}).

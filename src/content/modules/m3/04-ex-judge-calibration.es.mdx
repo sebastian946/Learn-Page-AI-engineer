@@ -84,7 +84,7 @@ async def judge(case: LabeledCase, rubric: str, model: str) -> Verdict:
     key = hashlib.sha256(f"{model}|{rubric}|{case.id}".encode()).hexdigest()[:16]
     cached = CACHE_DIR / f"{key}.json"
     # TODO(you): return the cached Verdict if the file exists
-    # TODO(you): call client.messages.create(model=model, system=rubric, temperature=0, ...)
+    # TODO(you): call client.messages.create(model=model, system=rubric, ...)  # no temperature on Claude
     #            with question, numbered contexts and the answer wrapped in <answer> tags
     # TODO(you): validate with Verdict.model_validate_json, write to cache, return it
     raise NotImplementedError

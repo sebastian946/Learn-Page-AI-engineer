@@ -187,13 +187,13 @@ Because every image is tagged with a SHA, a rollback is "deploy the previous SHA
 - **Rebuilding the image for production.** Staging tested a different artifact. Promote the same image.
 - **Long-lived AWS keys in secrets.** Use OIDC with narrowly scoped roles.
 - **`cancel-in-progress: true` on `main`.** A new merge can cancel a deploy in the middle of a rollout.
-- **Flaky evals blocking merges.** Use a fixed seed where possible, temperature 0 for the system under test, a pinned judge, and thresholds with a small tolerance. Track the score trend, not just pass or fail.
+- **Flaky evals blocking merges.** Pin exact model ids and prompt versions, run repeated samples, use a pinned judge with a versioned rubric, and set thresholds with a small tolerance. Track the score trend, not just pass or fail.
 
 ## How this shows up in interviews
 
 <InterviewQuestion question="How do you add LLM evals to CI without making the pipeline slow, flaky and expensive?" level="senior">
 
-Treat evals as the top of the test pyramid. Unit tests with a mocked LLM run on every push. The eval gate runs only when prompts, retrieval code, model config or the dataset change, using a path filter, and it runs a smoke subset of maybe 50 golden questions with a hard dollar budget cap. The full suite runs nightly against main to catch provider drift. To manage non-determinism: temperature 0, pinned model and judge versions, versioned datasets, and thresholds with a tolerance band plus trend tracking. The eval key is a separate key with a provider-side spend limit.
+Treat evals as the top of the test pyramid. Unit tests with a mocked LLM run on every push. The eval gate runs only when prompts, retrieval code, model config or the dataset change, using a path filter, and it runs a smoke subset of maybe 50 golden questions with a hard dollar budget cap. The full suite runs nightly against main to catch provider drift. To manage non-determinism: pinned model and judge versions (current Claude models reject temperature, so there is no sampling knob), versioned datasets, and thresholds with a tolerance band plus trend tracking. The eval key is a separate key with a provider-side spend limit.
 
 </InterviewQuestion>
 

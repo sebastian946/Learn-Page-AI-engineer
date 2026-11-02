@@ -100,7 +100,7 @@ async def poisoned_index(test_index):
 Notes:
 
 - Mark the suite (`@pytest.mark.redteam`) and run it nightly and on changes to prompts, guards or retrieval. It is slower and costlier than unit tests.
-- Pin the judge model and temperature 0, and calibrate it like any other judge: label 30–50 responses by hand and check agreement.
+- Pin the exact judge model id and rubric version, and calibrate it like any other judge: label 30–50 responses by hand and check agreement.
 - Because outputs are non-deterministic, run each attack 3–5 times. An attack that works 1 time in 5 *works*.
 
 ## Step 4: metrics

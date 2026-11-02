@@ -131,7 +131,7 @@ def abstention_rate(items: list[GoldenItem], runs: dict[str, RunRecord]) -> floa
 <Hints>
   <Hint>Escribe primero el dataset, a partir de los documentos, no de las respuestas de tu sistema. Si copias lo que dice tu pipeline en `reference`, estás haciendo snapshot testing de tus bugs. Abre el PDF, encuentra el párrafo, escribe la referencia con tus palabras y anota el ID del chunk.</Hint>
   <Hint>Separa la generación de la puntuación. Ejecuta el pipeline una vez y guarda las salidas crudas en `runs/`. La puntuación luego lee ese archivo. Vas a ajustar la puntuación y el análisis muchas veces; no quieres pagar 30 generaciones cada vez.</Hint>
-  <Hint>Ragas llama al juez muchas veces por muestra (extracción de afirmaciones, verificación). Si chocas con rate limits, usa un `RunConfig(max_workers=4, timeout=120)` y pásalo a `evaluate`. Pon la temperatura del juez en 0.</Hint>
+  <Hint>Ragas llama al juez muchas veces por muestra (extracción de afirmaciones, verificación). Si chocas con rate limits, usa un `RunConfig(max_workers=4, timeout=120)` y pásalo a `evaluate`. No le pases `temperature` al juez de Claude (los modelos actuales lo rechazan); en su lugar fija el id exacto del modelo juez.</Hint>
   <Hint>Para el análisis de los 5 peores, ordena el dataframe por muestra según faithfulness y según context recall. Context recall bajo más el `(doc_id, section)` esperado ausente de `retrieved_sources` significa retrieval. Context recall alto más faithfulness baja significa generación. Escribe ese diagnóstico en una línea por ítem.</Hint>
 </Hints>
 

@@ -21,7 +21,7 @@ Tiempo: 90 minutos. Usa un subconjunto de 20 ítems de tu golden set para iterar
 
 - [ ] `evals/datasets/golden_v1.jsonl` tiene al menos 20 ítems con el formato del curso (id, question, reference_answer, reference_doc_ids, tags, difficulty, source, version).
 - [ ] `harness/runner.py` corre la suite de forma concurrente (acotada con un semáforo) y devuelve resultados por ítem más puntajes agregados.
-- [ ] `harness/judges.py` califica el faithfulness con `claude-sonnet-5-5` a `temperature=0`, usando una rúbrica versionada y salida JSON estructurada.
+- [ ] `harness/judges.py` califica el faithfulness con `claude-sonnet-5-5` (id de modelo fijado, sin parámetros de sampling), usando una rúbrica versionada y salida JSON estructurada.
 - [ ] Las llamadas al juez se cachean en `.eval_cache/` con una clave que incluye el modelo, la versión de la rúbrica, la respuesta y los contextos.
 - [ ] `tests/test_regression.py` falla cuando el faithfulness está por debajo de `baseline - tolerance` e imprime el puntaje, el baseline y el CI en el mensaje.
 - [ ] `harness/report.py` escribe `reports/eval_report.md` con puntajes agregados, delta contra el baseline, costo y los 5 peores ítems.
@@ -62,13 +62,12 @@ class Verdict(BaseModel):
 
 async def judge_faithfulness(client: AsyncAnthropic, answer: str, contexts: list[str]) -> Verdict:
     user = f"CONTEXTS:\n{json.dumps(contexts, indent=1)}\n\nANSWER:\n{answer}"
-    key = cache.cache_key(JUDGE_MODEL, SYSTEM + RUBRIC_VERSION, [{"role": "user", "content": user}], {"temperature": 0}, 0)
+    key = cache.cache_key(JUDGE_MODEL, SYSTEM + RUBRIC_VERSION, [{"role": "user", "content": user}], {"max_tokens": 1024}, 0)
     if (hit := cache.get(key)) is not None:
         return Verdict.model_validate(hit)
     msg = await client.messages.create(
         model=JUDGE_MODEL,
         max_tokens=1024,
-        temperature=0,
         system=SYSTEM,
         messages=[{"role": "user", "content": user}],
     )

@@ -84,7 +84,8 @@ resp = client.chat.completions.create(
         {"role": "user", "content": "Is mold covered after a roof leak?"},
     ],
     max_tokens=400,
-    temperature=0.0,
+    # No temperature: this endpoint routes to Claude, which rejects sampling params.
+    # Llama or DBRX pay-per-token endpoints still accept it.
 )
 print(resp.choices[0].message.content)
 print(resp.usage)

@@ -10,7 +10,7 @@ Building a demo is easy. Knowing whether version 2 is better than version 1 is h
 
 **1. There is no single correct output.** A unit test asserts `add(2, 2) == 4`. An LLM answering "What is the minimum down payment for an FHA loan?" can be correct in hundreds of phrasings. Exact-match assertions break on the first synonym.
 
-**2. Outputs are non-deterministic.** The same prompt, same model, same temperature can produce different text across calls. Even `temperature=0` is not a hard guarantee: providers batch requests, run on different hardware and update model snapshots. You get *mostly* stable outputs, not bit-identical ones.
+**2. Outputs are non-deterministic.** The same prompt and same model can produce different text across calls. On providers that still expose `temperature`, even `temperature=0` is not a hard guarantee: providers batch requests, run on different hardware and update model snapshots. You get *mostly* stable outputs, not bit-identical ones. Current Claude models do not accept `temperature` at all, so that knob is not even available.
 
 **3. Quality is multi-dimensional.** An answer can be faithful to the retrieved documents but irrelevant to the question. It can be relevant but cite the wrong source. It can be perfect but take 9 seconds and cost 4x the budget. You need several metrics, and they trade off against each other.
 
@@ -24,8 +24,8 @@ You already know the cure for flaky tests: find the source of randomness, contro
 
 Your levers:
 
-- **Pin what you can.** Pin the model snapshot id, the prompt version, the retrieval index version and the decoding parameters. Log them with every result. An unpinned model id is like an unpinned dependency.
-- **Lower temperature for evaluation runs** of extraction or classification tasks. Keep production temperature for generative tasks, because that is what users get.
+- **Pin what you can.** Pin the model snapshot id, the prompt version, the retrieval index version and the generation settings (`effort`, `max_tokens`). Log them with every result. An unpinned model id is like an unpinned dependency.
+- **Constrain the output, evaluate at production settings.** Current Claude models reject `temperature`, `top_p` and `top_k`, so you cannot lower variance with sampling knobs. Use structured outputs to constrain the shape of the answer, and evaluate with the same model id and `effort` that production uses, because that is what users get. (On providers that still expose temperature, lowering it for extraction evals is an option.)
 - **Use seeds where supported**, but treat them as best-effort. Some providers expose a `seed` parameter; none promise identical outputs forever.
 - **Sample repeatedly.** Run each case `k` times (3–5 is common) and score the distribution. A case that passes 5/5 is solid. One that passes 3/5 is unstable, and that is a finding in itself.
 - **Use statistical thresholds, not single assertions.** Instead of "this answer must be faithful", assert "faithfulness over the dataset is at least 0.85, and did not drop more than 0.03 versus baseline."

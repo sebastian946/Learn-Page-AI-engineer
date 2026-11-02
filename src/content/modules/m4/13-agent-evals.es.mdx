@@ -20,7 +20,7 @@ Tus instintos de SDET aplican directamente. Un eval solo de salida es como un te
 | Nivel | Qué verifica | Costo | Determinismo |
 |---|---|---|---|
 | Unitario | Herramientas, guardas, routers como funciones puras | muy bajo | total |
-| Un solo paso | Dado este estado, ¿el modelo elige la herramienta y los args correctos? | bajo | alto con temperature 0 |
+| Un solo paso | Dado este estado, ¿el modelo elige la herramienta y los args correctos? | bajo | alto con id de modelo fijado y schemas de tools estrictos |
 | Trayectoria | Ejecución completa de un escenario, comparar la secuencia de herramientas con una referencia | medio | medio |
 | Estado final | Ejecución completa contra un backend falso, assert sobre efectos secundarios | medio | medio |
 | LLM-as-judge | ¿La trayectoria fue razonable, eficiente, segura? | más alto | más bajo |
@@ -150,7 +150,7 @@ Reviso tres capas. Trayectoria: comparo las tool calls con una referencia usando
 </InterviewQuestion>
 
 <InterviewQuestion question="Tu suite de evals de trayectoria es flaky. La mitad de las fallas son variaciones inofensivas. ¿Qué haces?" level="senior">
-La trato como una suite de tests flaky. Primero, clasifico las fallas desde los reportes: regresiones reales frente a expectativas sobreespecificadas. Aflojo las expectativas donde el orden o las lecturas extra no importan: paso de strict a superset o unordered, comparo solo los argumentos clave, ignoro campos generados como las idempotency keys. Muevo los asserts importantes a verificaciones de estado final, que son estables porque prueban resultados. Ejecuto cada escenario varias veces y bloqueo por tasa de aprobación con un umbral, no por una sola ejecución. Fijo temperature y versión del modelo para los evals. Registro una tasa de flakiness por escenario y pongo en cuarentena los que la superan hasta arreglarlos, para que el gate siga siendo confiable.
+La trato como una suite de tests flaky. Primero, clasifico las fallas desde los reportes: regresiones reales frente a expectativas sobreespecificadas. Aflojo las expectativas donde el orden o las lecturas extra no importan: paso de strict a superset o unordered, comparo solo los argumentos clave, ignoro campos generados como las idempotency keys. Muevo los asserts importantes a verificaciones de estado final, que son estables porque prueban resultados. Ejecuto cada escenario varias veces y bloqueo por tasa de aprobación con un umbral, no por una sola ejecución. Fijo el id exacto del modelo y la versión del prompt para los evals (los modelos actuales de Claude rechazan temperature, así que no hay perilla de sampling que fijar). Registro una tasa de flakiness por escenario y pongo en cuarentena los que la superan hasta arreglarlos, para que el gate siga siendo confiable.
 </InterviewQuestion>
 
 <Callout type="interview" title="Ángulo SDET">

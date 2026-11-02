@@ -29,13 +29,13 @@
         "es": "Tu eval de faithfulness da 0.86 en una corrida y 0.82 en la siguiente sin cambios de código. ¿Qué acciones tratan correctamente este no determinismo? (Selecciona todas las que apliquen.)"
       },
       "options": {
-        "en": ["Run each case several times and gate on the mean or a confidence interval", "Set the gate to fail only if the score drops below baseline minus a tolerance", "Mark the test as flaky and skip it in CI", "Use temperature 0 for the judge and cache judge calls keyed on inputs", "Rerun the job until it passes"],
-        "es": ["Correr cada caso varias veces y hacer el gate sobre la media o un intervalo de confianza", "Configurar el gate para fallar solo si el puntaje baja de la línea base menos una tolerancia", "Marcar el test como flaky y saltarlo en CI", "Usar temperatura 0 para el juez y cachear las llamadas del juez por sus entradas", "Volver a correr el job hasta que pase"]
+        "en": ["Run each case several times and gate on the mean or a confidence interval", "Set the gate to fail only if the score drops below baseline minus a tolerance", "Mark the test as flaky and skip it in CI", "Pin the exact judge model id and rubric version, and cache judge calls keyed on inputs", "Rerun the job until it passes"],
+        "es": ["Correr cada caso varias veces y hacer el gate sobre la media o un intervalo de confianza", "Configurar el gate para fallar solo si el puntaje baja de la línea base menos una tolerancia", "Marcar el test como flaky y saltarlo en CI", "Fijar el id exacto del modelo juez y la versión de la rúbrica, y cachear las llamadas del juez por sus entradas", "Volver a correr el job hasta que pase"]
       },
       "answer": [0, 1, 3],
       "explanation": {
-        "en": "LLM outputs are statistical. Repeated sampling, tolerance bands and reducing judge variance (temperature 0, caching) make the signal stable. Skipping or rerunning-until-green hides real regressions, exactly like abusing retries on flaky UI tests.",
-        "es": "Las salidas de un LLM son estadísticas. El muestreo repetido, las bandas de tolerancia y reducir la varianza del juez (temperatura 0, caché) estabilizan la señal. Saltar el test o reintentar hasta que pase esconde regresiones reales, igual que abusar de reintentos en tests de UI flaky."
+        "en": "LLM outputs are statistical. Repeated sampling, tolerance bands and reducing judge variance (pinned judge model and rubric, caching; current Claude judges don't accept temperature) make the signal stable. Skipping or rerunning-until-green hides real regressions, exactly like abusing retries on flaky UI tests.",
+        "es": "Las salidas de un LLM son estadísticas. El muestreo repetido, las bandas de tolerancia y reducir la varianza del juez (modelo y rúbrica del juez fijados, caché; los jueces actuales de Claude no aceptan temperature) estabilizan la señal. Saltar el test o reintentar hasta que pase esconde regresiones reales, igual que abusar de reintentos en tests de UI flaky."
       }
     },
     {

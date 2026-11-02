@@ -131,7 +131,7 @@ def abstention_rate(items: list[GoldenItem], runs: dict[str, RunRecord]) -> floa
 <Hints>
   <Hint>Write the dataset first, from the documents, not from your system's answers. If you copy what your pipeline says into `reference`, you are snapshot-testing your bugs. Open the PDF, find the paragraph, write the reference in your own words, and note the chunk ID.</Hint>
   <Hint>Separate generation from scoring. Run the pipeline once and save raw outputs to `runs/`. Scoring then reads that file. You will tweak scoring and analysis many times; you do not want to pay for 30 generations each time.</Hint>
-  <Hint>Ragas calls the judge many times per sample (claims extraction, verification). If you hit rate limits, use a `RunConfig(max_workers=4, timeout=120)` and pass it to `evaluate`. Set the judge temperature to 0.</Hint>
+  <Hint>Ragas calls the judge many times per sample (claims extraction, verification). If you hit rate limits, use a `RunConfig(max_workers=4, timeout=120)` and pass it to `evaluate`. Don't pass `temperature` to the Claude judge (current models reject it); pin the exact judge model id instead.</Hint>
   <Hint>For the worst-5 analysis, sort the per-sample dataframe by faithfulness and by context recall. Low context recall plus the expected `(doc_id, section)` missing from `retrieved_sources` means retrieval. High context recall plus low faithfulness means generation. Write that diagnosis in one line per item.</Hint>
 </Hints>
 

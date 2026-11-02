@@ -57,7 +57,7 @@ from ragas.metrics import (
     ResponseRelevancy,
 )
 
-judge = LangchainLLMWrapper(ChatAnthropic(model="claude-sonnet-5-5", temperature=0))
+judge = LangchainLLMWrapper(ChatAnthropic(model="claude-sonnet-5-5"))
 embeddings = LangchainEmbeddingsWrapper(
     OpenAIEmbeddings(model=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"))  # example
 )

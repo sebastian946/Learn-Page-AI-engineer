@@ -20,7 +20,7 @@ Your SDET instincts map directly. An output-only eval is like a UI test that che
 | Level | What it checks | Cost | Determinism |
 |---|---|---|---|
 | Unit | Tools, guards, routers as pure functions | very low | full |
-| Single step | Given this state, does the model pick the right next tool and args? | low | high with temperature 0 |
+| Single step | Given this state, does the model pick the right next tool and args? | low | high with a pinned model id and strict tool schemas |
 | Trajectory | Full run on a scenario, compare tool sequence to a reference | medium | medium |
 | Final state | Full run against a fake backend, assert side effects | medium | medium |
 | LLM-as-judge | Was the trajectory reasonable, efficient, safe? | higher | lower |
@@ -150,7 +150,7 @@ I check three layers. Trajectory: compare the tool calls to a reference with the
 </InterviewQuestion>
 
 <InterviewQuestion question="Your trajectory eval suite is flaky. Half the failures are harmless variations. What do you do?" level="senior">
-Treat it like a flaky test suite. First, classify failures from the reports: real regressions versus over-specified expectations. Loosen expectations where order or extra reads do not matter: move from strict to superset or unordered, compare only key arguments, ignore generated fields like idempotency keys. Move the important assertions to final-state checks, which are stable because they test outcomes. Run each scenario several times and gate on pass rate with a threshold, not on a single run. Pin temperature and model version for evals. Track a per-scenario flake rate and quarantine scenarios above it until fixed, so the gate stays trusted.
+Treat it like a flaky test suite. First, classify failures from the reports: real regressions versus over-specified expectations. Loosen expectations where order or extra reads do not matter: move from strict to superset or unordered, compare only key arguments, ignore generated fields like idempotency keys. Move the important assertions to final-state checks, which are stable because they test outcomes. Run each scenario several times and gate on pass rate with a threshold, not on a single run. Pin the exact model id and prompt version for evals (current Claude models reject temperature, so there is no sampling knob to pin). Track a per-scenario flake rate and quarantine scenarios above it until fixed, so the gate stays trusted.
 </InterviewQuestion>
 
 <Callout type="interview" title="SDET angle">

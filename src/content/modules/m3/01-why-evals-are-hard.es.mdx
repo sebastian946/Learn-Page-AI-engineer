@@ -10,7 +10,7 @@ Construir una demo es fácil. Saber si la versión 2 es mejor que la versión 1 
 
 **1. No existe una única salida correcta.** Un test unitario afirma `add(2, 2) == 4`. Un LLM que responde "¿Cuál es el pago inicial mínimo para un préstamo FHA?" puede acertar con cientos de redacciones distintas. Las aserciones de coincidencia exacta se rompen con el primer sinónimo.
 
-**2. Las salidas son no deterministas.** El mismo prompt, el mismo modelo y la misma temperatura pueden producir textos distintos entre llamadas. Ni siquiera `temperature=0` es una garantía absoluta: los proveedores agrupan peticiones en batches, corren en hardware distinto y actualizan snapshots del modelo. Obtienes salidas *mayormente* estables, no idénticas bit a bit.
+**2. Las salidas son no deterministas.** El mismo prompt y el mismo modelo pueden producir textos distintos entre llamadas. En los proveedores que todavía exponen `temperature`, ni siquiera `temperature=0` es una garantía absoluta: los proveedores agrupan peticiones en batches, corren en hardware distinto y actualizan snapshots del modelo. Obtienes salidas *mayormente* estables, no idénticas bit a bit. Los modelos actuales de Claude ni siquiera aceptan `temperature`, así que esa perilla ni siquiera está disponible.
 
 **3. La calidad es multidimensional.** Una respuesta puede ser fiel a los documentos recuperados pero irrelevante para la pregunta. Puede ser relevante pero citar la fuente equivocada. Puede ser perfecta pero tardar 9 segundos y costar 4 veces el presupuesto. Necesitas varias métricas, y compiten entre sí.
 
@@ -24,8 +24,8 @@ Ya conoces la cura para los tests flaky: encontrar la fuente de aleatoriedad, co
 
 Tus palancas:
 
-- **Fija todo lo que puedas.** Fija el id del snapshot del modelo, la versión del prompt, la versión del índice de retrieval y los parámetros de decodificación. Regístralos junto a cada resultado. Un id de modelo sin fijar es como una dependencia sin versión fija.
-- **Baja la temperatura en las corridas de evaluación** de tareas de extracción o clasificación. Mantén la temperatura de producción en tareas generativas, porque eso es lo que reciben los usuarios.
+- **Fija todo lo que puedas.** Fija el id del snapshot del modelo, la versión del prompt, la versión del índice de retrieval y la configuración de generación (`effort`, `max_tokens`). Regístralos junto a cada resultado. Un id de modelo sin fijar es como una dependencia sin versión fija.
+- **Restringe la salida y evalúa con la configuración de producción.** Los modelos actuales de Claude rechazan `temperature`, `top_p` y `top_k`, así que no puedes bajar la varianza con perillas de sampling. Usa structured outputs para restringir la forma de la respuesta y evalúa con el mismo id de modelo y el mismo `effort` que usa producción, porque eso es lo que reciben los usuarios. (En los proveedores que todavía exponen temperature, bajarla en evals de extracción es una opción.)
 - **Usa seeds donde estén disponibles**, pero trátalas como un "mejor esfuerzo". Algunos proveedores exponen un parámetro `seed`; ninguno promete salidas idénticas para siempre.
 - **Muestrea repetidamente.** Corre cada caso `k` veces (3–5 es común) y puntúa la distribución. Un caso que pasa 5/5 es sólido. Uno que pasa 3/5 es inestable, y eso ya es un hallazgo.
 - **Usa umbrales estadísticos, no aserciones únicas.** En vez de "esta respuesta debe ser fiel", afirma "el faithfulness sobre el dataset es al menos 0.85 y no bajó más de 0.03 frente al baseline".

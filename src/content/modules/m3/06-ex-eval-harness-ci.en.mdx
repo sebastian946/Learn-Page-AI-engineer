@@ -21,7 +21,7 @@ Time box: 90 minutes. Use a 20-item subset of your golden set to keep iterations
 
 - [ ] `evals/datasets/golden_v1.jsonl` has at least 20 items using the course format (id, question, reference_answer, reference_doc_ids, tags, difficulty, source, version).
 - [ ] `harness/runner.py` runs the suite concurrently (bounded with a semaphore) and returns per-item results plus aggregate scores.
-- [ ] `harness/judges.py` scores faithfulness with `claude-sonnet-5-5` at `temperature=0`, using a versioned rubric and structured JSON output.
+- [ ] `harness/judges.py` scores faithfulness with `claude-sonnet-5-5` (pinned model id, no sampling params), using a versioned rubric and structured JSON output.
 - [ ] Judge calls are cached in `.eval_cache/` with a key that includes model, rubric version, answer and contexts.
 - [ ] `tests/test_regression.py` fails when faithfulness is below `baseline - tolerance` and prints score, baseline and CI in the message.
 - [ ] `harness/report.py` writes `reports/eval_report.md` with aggregate scores, delta vs baseline, cost, and the 5 worst items.
@@ -62,13 +62,12 @@ class Verdict(BaseModel):
 
 async def judge_faithfulness(client: AsyncAnthropic, answer: str, contexts: list[str]) -> Verdict:
     user = f"CONTEXTS:\n{json.dumps(contexts, indent=1)}\n\nANSWER:\n{answer}"
-    key = cache.cache_key(JUDGE_MODEL, SYSTEM + RUBRIC_VERSION, [{"role": "user", "content": user}], {"temperature": 0}, 0)
+    key = cache.cache_key(JUDGE_MODEL, SYSTEM + RUBRIC_VERSION, [{"role": "user", "content": user}], {"max_tokens": 1024}, 0)
     if (hit := cache.get(key)) is not None:
         return Verdict.model_validate(hit)
     msg = await client.messages.create(
         model=JUDGE_MODEL,
         max_tokens=1024,
-        temperature=0,
         system=SYSTEM,
         messages=[{"role": "user", "content": user}],
     )

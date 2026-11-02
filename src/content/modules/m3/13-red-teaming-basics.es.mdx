@@ -100,7 +100,7 @@ async def poisoned_index(test_index):
 Notas:
 
 - Marca la suite (`@pytest.mark.redteam`) y córrela cada noche y ante cambios en prompts, guards o retrieval. Es más lenta y más cara que las pruebas unitarias.
-- Fija el modelo juez y temperatura 0, y calíbralo como a cualquier otro juez: etiqueta a mano 30–50 respuestas y revisa el acuerdo.
+- Fija el id exacto del modelo juez y la versión de la rúbrica, y calíbralo como a cualquier otro juez: etiqueta a mano 30–50 respuestas y revisa el acuerdo.
 - Como las salidas no son deterministas, corre cada ataque 3–5 veces. Un ataque que funciona 1 de cada 5 veces *funciona*.
 
 ## Paso 4: métricas

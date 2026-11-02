@@ -93,12 +93,12 @@ Notice the failure message. It prints the score, the baseline, the tolerance and
 
 ## Non-determinism: the flaky test you can't delete
 
-With a flaky UI test, you fix the race condition. With an LLM, variance is a feature of the system. Even at `temperature=0`, outputs can change between runs because of batching and floating-point effects on the provider side. Judges add their own variance.
+With a flaky UI test, you fix the race condition. With an LLM, variance is a feature of the system. Current Claude models don't accept `temperature` at all, and even on providers that do, `temperature=0` does not stop outputs from changing between runs because of batching and floating-point effects on the provider side. Judges add their own variance.
 
 Tactics, from cheapest to most robust:
 
-1. **Lower the temperature** of the system under test for evals, unless production uses a higher one. Then evaluate at production settings, because that is what users see.
-2. **Pin the judge.** Fixed judge model id, `temperature=0`, fixed rubric version. Changing the judge changes the ruler. Treat it as a baseline reset.
+1. **Constrain the output and evaluate at production settings.** You cannot lower temperature on current Claude models, so use structured outputs where the task allows it and evaluate with the same model id and `effort` that production uses, because that is what users see.
+2. **Pin the judge.** Exact judge model id, fixed rubric version, structured verdict output. Changing the judge changes the ruler. Treat it as a baseline reset.
 3. **Repeated sampling.** Run each question `k` times (3 is a common start) and average. This reduces variance by roughly the square root of `k`.
 4. **Confidence intervals.** Report the mean with a bootstrap CI. If the CI of a PR overlaps the baseline heavily, the "drop" is probably noise.
 
@@ -197,7 +197,7 @@ Treat prompts as code with a regression suite. I keep a versioned golden dataset
 
 <InterviewQuestion question="Your eval gate fails randomly about one run in five. What do you do?" level="senior">
 
-That is a flaky test, so I diagnose before I retry. First I measure variance: run the same commit ten times and look at the spread of each metric. If the spread is larger than my tolerance, the gate is mis-specified. Fixes: pin the judge model and set its temperature to 0, sample each question 3 times and average, report bootstrap confidence intervals, and grow the dataset so the CI narrows. Then I set the tolerance from the measured noise, not from a guess. I also check for real non-determinism sources like retrieval ties or unstable sort orders. A blind "retry on failure" just hides regressions.
+That is a flaky test, so I diagnose before I retry. First I measure variance: run the same commit ten times and look at the spread of each metric. If the spread is larger than my tolerance, the gate is mis-specified. Fixes: pin the exact judge model id and rubric version (current Claude judges don't accept temperature, so that is not a lever), sample each question 3 times and average or majority-vote, report bootstrap confidence intervals, and grow the dataset so the CI narrows. Then I set the tolerance from the measured noise, not from a guess. I also check for real non-determinism sources like retrieval ties or unstable sort orders. A blind "retry on failure" just hides regressions.
 
 </InterviewQuestion>
 

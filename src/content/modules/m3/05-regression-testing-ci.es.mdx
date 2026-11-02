@@ -93,12 +93,12 @@ Fíjate en el mensaje de falla. Imprime el puntaje, el baseline, la tolerancia y
 
 ## No determinismo: el test flaky que no puedes borrar
 
-Con un test de UI flaky, arreglas la condición de carrera. Con un LLM, la varianza es una característica del sistema. Incluso con `temperature=0`, las salidas pueden cambiar entre corridas por efectos de batching y punto flotante del lado del proveedor. Los jueces agregan su propia varianza.
+Con un test de UI flaky, arreglas la condición de carrera. Con un LLM, la varianza es una característica del sistema. Los modelos actuales de Claude ni siquiera aceptan `temperature`, e incluso en los proveedores que sí lo aceptan, `temperature=0` no impide que las salidas cambien entre corridas por efectos de batching y punto flotante del lado del proveedor. Los jueces agregan su propia varianza.
 
 Tácticas, de la más barata a la más robusta:
 
-1. **Baja la temperatura** del sistema bajo prueba para los evals, salvo que producción use una más alta. En ese caso evalúa con la configuración de producción, porque eso es lo que ven los usuarios.
-2. **Fija el juez.** Model id fijo del juez, `temperature=0`, versión fija de la rúbrica. Cambiar el juez cambia la regla de medir. Trátalo como un reinicio del baseline.
+1. **Restringe la salida y evalúa con la configuración de producción.** No puedes bajar la temperatura en los modelos actuales de Claude, así que usa structured outputs donde la tarea lo permita y evalúa con el mismo id de modelo y el mismo `effort` que producción, porque eso es lo que ven los usuarios.
+2. **Fija el juez.** Model id exacto del juez, versión fija de la rúbrica, veredicto con salida estructurada. Cambiar el juez cambia la regla de medir. Trátalo como un reinicio del baseline.
 3. **Muestreo repetido.** Corre cada pregunta `k` veces (3 es un inicio común) y promedia. Esto reduce la varianza aproximadamente en la raíz cuadrada de `k`.
 4. **Intervalos de confianza.** Reporta la media con un CI por bootstrap. Si el CI de un PR se superpone mucho con el baseline, la "caída" probablemente es ruido.
 
@@ -197,7 +197,7 @@ Trato los prompts como código con una suite de regresión. Mantengo un golden d
 
 <InterviewQuestion question="Tu gate de evals falla al azar más o menos una de cada cinco corridas. ¿Qué haces?" level="senior">
 
-Es un test flaky, así que diagnostico antes de reintentar. Primero mido la varianza: corro el mismo commit diez veces y miro la dispersión de cada métrica. Si la dispersión es mayor que mi tolerancia, el gate está mal especificado. Arreglos: fijar el modelo juez con temperatura 0, muestrear cada pregunta 3 veces y promediar, reportar intervalos de confianza por bootstrap y hacer crecer el dataset para que el CI se angoste. Luego fijo la tolerancia a partir del ruido medido, no de una suposición. También reviso fuentes reales de no determinismo, como empates en retrieval u ordenamientos inestables. Un "retry on failure" a ciegas solo esconde regresiones.
+Es un test flaky, así que diagnostico antes de reintentar. Primero mido la varianza: corro el mismo commit diez veces y miro la dispersión de cada métrica. Si la dispersión es mayor que mi tolerancia, el gate está mal especificado. Arreglos: fijar el id exacto del modelo juez y la versión de la rúbrica (los jueces actuales de Claude no aceptan temperature, así que esa palanca no existe), muestrear cada pregunta 3 veces y promediar o tomar el voto mayoritario, reportar intervalos de confianza por bootstrap y hacer crecer el dataset para que el CI se angoste. Luego fijo la tolerancia a partir del ruido medido, no de una suposición. También reviso fuentes reales de no determinismo, como empates en retrieval u ordenamientos inestables. Un "retry on failure" a ciegas solo esconde regresiones.
 
 </InterviewQuestion>
 

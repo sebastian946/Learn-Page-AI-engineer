@@ -187,13 +187,13 @@ Como cada imagen está etiquetada con un SHA, un rollback es "desplegar el SHA a
 - **Reconstruir la imagen para producción.** Staging probó un artefacto distinto. Promueve la misma imagen.
 - **Llaves de AWS de larga duración en secrets.** Usa OIDC con roles de alcance acotado.
 - **`cancel-in-progress: true` en `main`.** Un nuevo merge puede cancelar un deploy en pleno rollout.
-- **Evals inestables (flaky) bloqueando merges.** Usa una semilla fija cuando sea posible, temperature 0 en el sistema bajo prueba, un juez fijado y umbrales con una pequeña tolerancia. Sigue la tendencia del score, no solo aprobado o reprobado.
+- **Evals inestables (flaky) bloqueando merges.** Fija ids exactos de modelo y versiones de prompt, corre muestras repetidas, usa un juez fijado con rúbrica versionada y define umbrales con una pequeña tolerancia. Sigue la tendencia del score, no solo aprobado o reprobado.
 
 ## Cómo aparece esto en entrevistas
 
 <InterviewQuestion question="¿Cómo agregas evals de LLM a CI sin que el pipeline sea lento, inestable y caro?" level="senior">
 
-Trata los evals como la cima de la pirámide de tests. Los tests unitarios con un LLM simulado corren en cada push. El eval gate corre solo cuando cambian prompts, código de retrieval, configuración del modelo o el dataset, usando un filtro de paths, y ejecuta un subconjunto smoke de unas 50 preguntas golden con un tope duro de presupuesto en dólares. La suite completa corre cada noche contra main para detectar drift del proveedor. Para manejar el no determinismo: temperature 0, versiones fijadas de modelo y juez, datasets versionados y umbrales con una banda de tolerancia más seguimiento de tendencia. La key de evals es una key separada con límite de gasto en el proveedor.
+Trata los evals como la cima de la pirámide de tests. Los tests unitarios con un LLM simulado corren en cada push. El eval gate corre solo cuando cambian prompts, código de retrieval, configuración del modelo o el dataset, usando un filtro de paths, y ejecuta un subconjunto smoke de unas 50 preguntas golden con un tope duro de presupuesto en dólares. La suite completa corre cada noche contra main para detectar drift del proveedor. Para manejar el no determinismo: versiones fijadas de modelo y juez (los modelos actuales de Claude rechazan temperature, así que no hay perilla de sampling), datasets versionados y umbrales con una banda de tolerancia más seguimiento de tendencia. La key de evals es una key separada con límite de gasto en el proveedor.
 
 </InterviewQuestion>
 
