@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m0-iv-01",
+    "level": "mid",
+    "tags": ["career-change", "motivation", "behavioral"],
+    "question": {
+      "en": "Why are you moving from QA to AI engineering?",
+      "es": "¿Por qué te estás pasando de QA a ingeniería de IA?"
+    },
+    "answer": {
+      "en": "Keep it positive and forward-looking. Never frame it as escaping testing.\n\nExample: \"Over the last years the most interesting quality problems I saw were in LLM features: how do you test something non-deterministic, and how do you catch a regression in answer quality? I realized the hardest part of AI engineering is what I am already good at: defining what correct means, building the harness and gating releases on it. So I went deliberately deeper. I built a cited RAG assistant, an eval harness that blocks PRs in GitHub Actions and an agent with human-in-the-loop, all public on my GitHub. I am not leaving quality behind. I am bringing it to where it is most needed right now, and adding the engineering skills to build the systems myself.\"\n\n- Lead with the pull of the new role, not the push of the old one.\n- Back it with concrete projects.",
+      "es": "Mantén la respuesta positiva y mirando hacia adelante. Nunca la plantees como un escape del testing.\n\nEjemplo: \"En los últimos años, los problemas de calidad más interesantes que vi estaban en funcionalidades con LLM: ¿cómo pruebas algo no determinista y cómo detectas una regresión en la calidad de las respuestas? Me di cuenta de que lo más difícil de la ingeniería de IA es aquello en lo que ya soy bueno: definir qué significa correcto, construir el harness y condicionar los releases a él. Así que profundicé de forma deliberada. Construí un asistente de RAG con citas, un harness de evals que bloquea PRs en GitHub Actions y un agente con human-in-the-loop, todo público en mi GitHub. No dejo atrás la calidad. La llevo a donde más se necesita hoy y sumo las habilidades de ingeniería para construir yo mismo los sistemas.\"\n\n- Empieza por lo que te atrae del nuevo rol, no por lo que te aleja del anterior.\n- Respáldalo con proyectos concretos."
+    }
+  },
+  {
+    "id": "m0-iv-02",
+    "level": "mid",
+    "tags": ["role-definition", "ml-vs-ai"],
+    "question": {
+      "en": "What does an AI engineer do that an ML engineer doesn't?",
+      "es": "¿Qué hace un AI engineer que no hace un ML engineer?"
+    },
+    "answer": {
+      "en": "An ML engineer mostly builds and improves models: training pipelines, feature engineering, fine-tuning, inference optimization. An AI engineer mostly builds products on top of existing foundation models, usually accessed through an API.\n\nMy daily work as an AI engineer is retrieval pipelines, prompt and tool design, agents, evaluation, and serving these systems with good latency and cost. The ML engineer asks \"how do I make the model better?\". The AI engineer asks \"how do I make the system around the model useful, correct and affordable?\".\n\nThe overlap is real, especially in evaluation and deployment, and the line moves by company. But for most AI engineer roles the model is a dependency, and the hard problems are data quality, measurement and integration with existing systems.",
+      "es": "Un ML engineer principalmente construye y mejora modelos: pipelines de entrenamiento, feature engineering, fine-tuning, optimización de inferencia. Un AI engineer principalmente construye productos sobre modelos fundacionales existentes, a los que normalmente accede por API.\n\nMi trabajo diario como AI engineer son pipelines de retrieval, diseño de prompts y herramientas, agentes, evaluación y servir estos sistemas con buena latencia y costo. El ML engineer pregunta \"¿cómo hago que el modelo sea mejor?\". El AI engineer pregunta \"¿cómo hago que el sistema alrededor del modelo sea útil, correcto y asequible?\".\n\nEl solapamiento es real, sobre todo en evaluación y despliegue, y la frontera cambia según la empresa. Pero en la mayoría de los roles de AI engineer el modelo es una dependencia, y los problemas difíciles son la calidad de los datos, la medición y la integración con los sistemas existentes."
+    }
+  },
+  {
+    "id": "m0-iv-03",
+    "level": "mid",
+    "tags": ["portfolio", "storytelling", "behavioral"],
+    "question": {
+      "en": "Walk me through a project you're proud of.",
+      "es": "Cuéntame sobre un proyecto del que estés orgulloso."
+    },
+    "answer": {
+      "en": "Use your README structure: problem, architecture, evaluation, cost, trade-off, limitation. Aim for about two minutes.\n\nExample: \"I built an internal knowledge assistant for a fictional mortgage lender. Loan officers ask policy questions and get cited answers from about 300 pages of PDFs. Ingestion uses document-aware chunking; retrieval is hybrid BM25 plus pgvector, followed by a cross-encoder re-ranker; Claude generates answers with mandatory citations. The part I am proudest of is evaluation: 60 golden questions, measured for faithfulness and context recall, running in GitHub Actions on every PR. Adding the re-ranker clearly improved context precision for a small latency cost, and I documented that trade-off. I compared two models on cost per 1k requests and chose the cheaper one because it met the quality bar. The main limitation is tables in scanned PDFs.\"\n\n- Numbers and one honest limitation make it credible.",
+      "es": "Usa la estructura de tu README: problema, arquitectura, evaluación, costo, trade-off, limitación. Apunta a unos dos minutos.\n\nEjemplo: \"Construí un asistente de conocimiento interno para un prestamista hipotecario ficticio. Los oficiales de crédito hacen preguntas sobre políticas y reciben respuestas con citas a partir de unas 300 páginas de PDFs. La ingesta usa chunking consciente del documento; el retrieval es híbrido, BM25 más pgvector, seguido de un re-ranker cross-encoder; Claude genera las respuestas con citas obligatorias. De lo que más orgulloso estoy es de la evaluación: 60 preguntas golden, medidas en faithfulness y context recall, corriendo en GitHub Actions en cada PR. Agregar el re-ranker mejoró claramente el context precision con un costo de latencia pequeño, y documenté ese trade-off. Comparé dos modelos por costo por 1k requests y elegí el más barato porque cumplía el umbral de calidad. La principal limitación son las tablas en PDFs escaneados.\"\n\n- Los números y una limitación honesta lo hacen creíble."
+    }
+  },
+  {
+    "id": "m0-iv-04",
+    "level": "senior",
+    "tags": ["qa-transfer", "evals", "behavioral"],
+    "question": {
+      "en": "How does your QA background make you a better AI engineer?",
+      "es": "¿Cómo te convierte tu experiencia en QA en un mejor AI engineer?"
+    },
+    "answer": {
+      "en": "The hardest part of shipping LLM features is knowing whether they work. That is a testing problem, and I have owned test strategy for years.\n\n- A golden dataset is a regression suite. I know how to curate it, version it and keep it representative.\n- Faithfulness or schema validity are assertions with thresholds instead of binary checks.\n- Prompt changes go through CI with an eval gate, exactly like code changes.\n- Flaky-test experience maps to non-determinism: control what you can, measure variance, set tolerances.\n- Exploratory testing maps to red-teaming and prompt-injection probing.\n\nI also think about failure modes first, which is what you want with hallucinations and retrieval misses. The new parts for me were the system under test and fuzzier oracles like LLM-as-judge, which I validate against human labels before trusting.",
+      "es": "Lo más difícil de lanzar funcionalidades con LLM es saber si funcionan. Ese es un problema de testing, y llevo años siendo dueño de estrategias de pruebas.\n\n- Un golden dataset es una suite de regresión. Sé cómo curarlo, versionarlo y mantenerlo representativo.\n- Faithfulness o validez de esquema son assertions con umbrales en lugar de checks binarios.\n- Los cambios de prompt pasan por CI con un gate de evals, exactamente como los cambios de código.\n- La experiencia con tests flaky se corresponde con el no determinismo: controlas lo que puedes, mides la varianza, defines tolerancias.\n- El testing exploratorio se corresponde con el red-teaming y las pruebas de prompt injection.\n\nTambién pienso primero en los modos de falla, que es lo que quieres frente a alucinaciones y fallos de retrieval. Lo nuevo para mí fue el sistema bajo prueba y oráculos más difusos como LLM-as-judge, que valido contra etiquetas humanas antes de confiar en ellos."
+    }
+  },
+  {
+    "id": "m0-iv-05",
+    "level": "mid",
+    "tags": ["skills", "rag", "market"],
+    "question": {
+      "en": "What do you think is the most important skill for an AI engineer right now?",
+      "es": "¿Cuál crees que es la habilidad más importante de un AI engineer hoy?"
+    },
+    "answer": {
+      "en": "Building reliable retrieval-augmented systems with evaluation built in from day one.\n\nMost of the value companies get from LLMs today comes from connecting a model to their own data: documents, tickets, policies. That is RAG. A RAG demo takes an afternoon; a RAG product takes real engineering. The hard parts are chunking and retrieval quality, citations users can trust, catching regressions when you change a prompt or a retriever, and keeping latency and cost under control.\n\nSo my answer is retrieval plus evals, not one or the other. Without evals you cannot tell if a retrieval change helped. I treat the golden dataset like a regression suite and put it in CI. Avoid quoting precise market percentages here; say \"most postings\" and move to your own example.",
+      "es": "Construir sistemas de RAG confiables con la evaluación integrada desde el primer día.\n\nHoy, la mayor parte del valor que las empresas obtienen de los LLM viene de conectar un modelo con sus propios datos: documentos, tickets, políticas. Eso es RAG. Una demo de RAG se hace en una tarde; un producto de RAG requiere ingeniería real. Lo difícil es la calidad del chunking y del retrieval, citas en las que los usuarios puedan confiar, detectar regresiones cuando cambias un prompt o un retriever, y mantener la latencia y el costo bajo control.\n\nAsí que mi respuesta es retrieval más evals, no uno u otro. Sin evals no puedes saber si un cambio de retrieval ayudó. Trato el golden dataset como una suite de regresión y lo pongo en CI. Evita citar porcentajes precisos del mercado aquí; di \"la mayoría de las ofertas\" y pasa a tu propio ejemplo."
+    }
+  },
+  {
+    "id": "m0-iv-06",
+    "level": "senior",
+    "tags": ["fine-tuning", "rag", "trade-offs"],
+    "question": {
+      "en": "When would you choose fine-tuning over RAG?",
+      "es": "¿Cuándo elegirías fine-tuning en lugar de RAG?"
+    },
+    "answer": {
+      "en": "Rarely as a first step.\n\n- **RAG** is the default when the problem is knowledge: the model needs facts it was not trained on, and those facts change. It also gives you citations and easy updates.\n- **Fine-tuning** helps when the problem is behavior or format: a consistent style, a narrow classification task, or an output structure that prompting cannot hold reliably. It can also cut cost and latency by letting a smaller model do a task that otherwise needs a large one.\n\nBefore fine-tuning I exhaust prompt design, structured outputs, few-shot examples and retrieval, and I have an eval set that proves the ceiling. Fine-tuning without evals is guessing. I also weigh the ongoing cost: a training pipeline, data curation, model versioning and re-training when the base model changes. The two are not exclusive; a fine-tuned model can still sit behind a retriever.",
+      "es": "Rara vez como primer paso.\n\n- **RAG** es la opción por defecto cuando el problema es de conocimiento: el modelo necesita hechos con los que no fue entrenado y esos hechos cambian. Además te da citas y actualizaciones sencillas.\n- **El fine-tuning** ayuda cuando el problema es de comportamiento o formato: un estilo consistente, una tarea de clasificación acotada o una estructura de salida que el prompting no logra sostener de forma confiable. También puede reducir costo y latencia al permitir que un modelo más pequeño haga una tarea que de otro modo necesita uno grande.\n\nAntes de hacer fine-tuning agoto el diseño de prompts, las salidas estructuradas, los ejemplos few-shot y el retrieval, y tengo un set de evals que demuestra el techo. Hacer fine-tuning sin evals es adivinar. También considero el costo continuo: un pipeline de entrenamiento, curaduría de datos, versionado de modelos y re-entrenar cuando cambia el modelo base. No son excluyentes; un modelo con fine-tuning puede seguir detrás de un retriever."
+    }
+  },
+  {
+    "id": "m0-iv-07",
+    "level": "mid",
+    "tags": ["job-search", "motivation"],
+    "question": {
+      "en": "Why are you interested in this role specifically?",
+      "es": "¿Por qué te interesa específicamente este rol?"
+    },
+    "answer": {
+      "en": "Map the posting's concrete daily work and must-haves to your projects. Show you read it carefully.\n\nExample for a fintech RAG role: \"Three things in the posting match what I have been building. You need a cited assistant over policy documents; I built one over mortgage policies with hybrid retrieval and citations. You want evaluation pipelines that catch regressions before release; that is my SDET background, and my project has more than 50 golden questions running in GitHub Actions. And you deploy on AWS with Docker and CI/CD, which I have done for years on the testing side. I also like that it is a regulated domain: traceability and test evidence matter, and that is where I am strongest.\"\n\n- Three specific matches beat ten generic compliments.\n- End with a reason that fits your strengths.",
+      "es": "Relaciona el trabajo diario concreto y los imprescindibles de la oferta con tus proyectos. Demuestra que la leíste con atención.\n\nEjemplo para un rol de RAG en fintech: \"Tres cosas de la oferta coinciden con lo que he estado construyendo. Necesitan un asistente con citas sobre documentos de políticas; yo construí uno sobre políticas hipotecarias con retrieval híbrido y citas. Quieren pipelines de evaluación que detecten regresiones antes del release; ese es mi background de SDET, y mi proyecto tiene más de 50 preguntas golden corriendo en GitHub Actions. Y despliegan en AWS con Docker y CI/CD, algo que hago desde hace años del lado de testing. También me gusta que sea un dominio regulado: la trazabilidad y la evidencia de pruebas importan, y ahí es donde soy más fuerte.\"\n\n- Tres coincidencias específicas valen más que diez elogios genéricos.\n- Cierra con una razón que encaje con tus fortalezas."
+    }
+  },
+  {
+    "id": "m0-iv-08",
+    "level": "senior",
+    "tags": ["evals", "quality", "production"],
+    "question": {
+      "en": "How do you know your LLM project actually works?",
+      "es": "¿Cómo sabes que tu proyecto con LLM realmente funciona?"
+    },
+    "answer": {
+      "en": "I define \"works\" before I build, as measurable criteria.\n\n- **Offline:** a golden dataset of realistic questions with expected answers and source documents. Target thresholds, for example faithfulness above 0.85, context recall above 0.8, schema validity at 100%, and a p95 latency budget.\n- **Separate stages:** I measure retrieval and generation independently, so I know whether a failure comes from missing context or from the model.\n- **CI gate:** the suite runs on every PR that touches prompts, retrieval or models, and blocks regressions.\n- **Judge validation:** if I use LLM-as-judge, I check a sample against my own labels first.\n- **Online:** tracing, cost and latency dashboards, and a sample of real conversations reviewed weekly, feeding new cases back into the golden set.\n\nIt is test strategy applied to a non-deterministic system: define the oracle, automate it, gate on it, monitor in production.",
+      "es": "Defino qué significa \"funciona\" antes de construir, como criterios medibles.\n\n- **Offline:** un golden dataset de preguntas realistas con respuestas esperadas y documentos fuente. Umbrales objetivo, por ejemplo faithfulness por encima de 0.85, context recall por encima de 0.8, validez de esquema del 100% y un presupuesto de latencia p95.\n- **Etapas separadas:** mido retrieval y generación de forma independiente, para saber si una falla viene de contexto faltante o del modelo.\n- **Gate en CI:** la suite corre en cada PR que toca prompts, retrieval o modelos, y bloquea regresiones.\n- **Validación del juez:** si uso LLM-as-judge, primero comparo una muestra con mis propias etiquetas.\n- **Online:** tracing, dashboards de costo y latencia, y una muestra de conversaciones reales revisada cada semana, que alimenta nuevos casos en el golden set.\n\nEs una estrategia de pruebas aplicada a un sistema no determinista: definir el oráculo, automatizarlo, usarlo como gate y monitorear en producción."
+    }
+  },
+  {
+    "id": "m0-iv-09",
+    "level": "mid",
+    "tags": ["learning", "behavioral"],
+    "question": {
+      "en": "How do you keep up with such a fast-moving field?",
+      "es": "¿Cómo te mantienes al día en un campo que cambia tan rápido?"
+    },
+    "answer": {
+      "en": "With a fixed system instead of chasing every announcement.\n\n- I follow a few primary sources: provider docs and changelogs, and a handful of engineering blogs, not social media hype.\n- When something new looks relevant, I test it against an eval set I already have. I judge it by measured results on my own task, not by public benchmarks. When a new model version ships, I run my golden dataset and compare quality, latency and cost before recommending a switch.\n- I keep a short daily learning log and a spaced-review deck so concepts stick.\n- I build something small with each important new idea, because reading alone does not stay.\n\nIt is the same discipline I used in QA to evaluate new testing tools: a hypothesis, a controlled comparison and a written decision.",
+      "es": "Con un sistema fijo en lugar de perseguir cada anuncio.\n\n- Sigo unas pocas fuentes primarias: la documentación y los changelogs de los proveedores y un puñado de blogs de ingeniería, no el hype de redes sociales.\n- Cuando algo nuevo parece relevante, lo pruebo contra un set de evals que ya tengo. Lo juzgo por resultados medidos en mi propia tarea, no por benchmarks públicos. Cuando sale una nueva versión de un modelo, corro mi golden dataset y comparo calidad, latencia y costo antes de recomendar un cambio.\n- Llevo un registro breve de aprendizaje diario y un mazo de repaso espaciado para que los conceptos se queden.\n- Construyo algo pequeño con cada idea nueva importante, porque solo leer no se retiene.\n\nEs la misma disciplina que usaba en QA para evaluar herramientas de testing nuevas: una hipótesis, una comparación controlada y una decisión por escrito."
+    }
+  },
+  {
+    "id": "m0-iv-10",
+    "level": "senior",
+    "tags": ["career-change", "experience-gap", "behavioral"],
+    "question": {
+      "en": "You haven't held the AI Engineer title before. Why should we trust you with production LLM work?",
+      "es": "Nunca tuviste el título de AI Engineer. ¿Por qué deberíamos confiarte trabajo con LLM en producción?"
+    },
+    "answer": {
+      "en": "Acknowledge the gap directly, then replace the title with evidence.\n\nExample: \"That's fair, the title is new for me. What I can show is the work. My GitHub has end-to-end projects with the same pieces this role needs: a RAG service with hybrid retrieval and citations, an eval harness that gates PRs, an agent with human-in-the-loop, and a deployment on AWS with CI/CD and a load test. Each README documents evals, cost per 1k requests and the trade-offs I made. On top of that, I bring years of production experience from the quality side: I have owned CI pipelines, debugged flaky systems under release pressure and been the person who says no when the evidence is not there. Production LLM work fails mostly on reliability and measurement, and that is exactly my background.\"\n\n- Do not apologize. Show evidence and connect it to the risk they worry about.",
+      "es": "Reconoce la brecha de forma directa y luego reemplaza el título con evidencia.\n\nEjemplo: \"Es justo, el título es nuevo para mí. Lo que puedo mostrar es el trabajo. Mi GitHub tiene proyectos de punta a punta con las mismas piezas que necesita este rol: un servicio de RAG con retrieval híbrido y citas, un harness de evals que bloquea PRs, un agente con human-in-the-loop y un despliegue en AWS con CI/CD y una prueba de carga. Cada README documenta evals, costo por 1k requests y los trade-offs que tomé. Además, traigo años de experiencia en producción desde el lado de la calidad: fui dueño de pipelines de CI, depuré sistemas inestables bajo presión de release y fui la persona que dice que no cuando no hay evidencia. El trabajo con LLM en producción falla sobre todo en confiabilidad y medición, y ese es exactamente mi background.\"\n\n- No te disculpes. Muestra evidencia y conéctala con el riesgo que les preocupa."
+    }
+  },
+  {
+    "id": "m0-iv-11",
+    "level": "mid",
+    "tags": ["portfolio", "cost", "production"],
+    "question": {
+      "en": "Why do you include a cost analysis in your project READMEs?",
+      "es": "¿Por qué incluyes un análisis de costos en los README de tus proyectos?"
+    },
+    "answer": {
+      "en": "Because cost is a design constraint for LLM systems, not an afterthought, and the README is where I show I treat it that way.\n\nI measure average input and output tokens from the `usage` field of real runs, keep model prices in a config file with the date I checked them, and compute cost per request and per 1k requests for each candidate model. Then I pair it with quality: for example, the smaller model met the faithfulness threshold at a fraction of the cost, so production uses it and escalates low-confidence answers to a larger model.\n\nThat table answers the question every engineering manager eventually asks: what will this cost at our volume? Showing it up front signals that I can make model choices with numbers, not preferences.",
+      "es": "Porque el costo es una restricción de diseño en los sistemas con LLM, no algo secundario, y el README es donde muestro que lo trato así.\n\nMido los tokens promedio de entrada y salida desde el campo `usage` de ejecuciones reales, guardo los precios de los modelos en un archivo de configuración con la fecha en que los revisé y calculo el costo por request y por 1k requests de cada modelo candidato. Luego lo combino con la calidad: por ejemplo, el modelo más pequeño cumplió el umbral de faithfulness por una fracción del costo, así que producción lo usa y escala las respuestas de baja confianza a un modelo más grande.\n\nEsa tabla responde la pregunta que todo engineering manager termina haciendo: ¿cuánto va a costar esto con nuestro volumen? Mostrarla de entrada indica que sé elegir modelos con números, no con preferencias."
+    }
+  },
+  {
+    "id": "m0-iv-12",
+    "level": "senior",
+    "tags": ["role-types", "job-search", "questions-to-ask"],
+    "question": {
+      "en": "What questions would you ask us to decide whether this AI role is a good fit?",
+      "es": "¿Qué preguntas nos harías para decidir si este rol de IA es un buen encaje?"
+    },
+    "answer": {
+      "en": "Good questions show you understand where AI projects fail. A senior candidate might ask:\n\n- \"Is AI the core product here, or a capability added to an existing product?\" This tells you the role family and what they value.\n- \"How do you measure answer quality today, and who owns the eval dataset?\" Probes whether evaluation exists.\n- \"Where does the data live, and do we already have access?\" Data access blocks many knowledge-assistant projects.\n- \"What are the latency and cost targets per request?\" Shows production thinking.\n- \"Who else works on AI features, and how do they review prompt changes?\" Reveals team size and process.\n- \"What does success look like for this role in six months?\"\n\nListen for specifics. Vague answers on evaluation or data access are the most common warning signs.",
+      "es": "Las buenas preguntas muestran que entiendes dónde fallan los proyectos de IA. Un candidato senior podría preguntar:\n\n- \"¿La IA es el producto central aquí, o una capacidad agregada a un producto existente?\" Te dice la familia de roles y qué valoran.\n- \"¿Cómo miden hoy la calidad de las respuestas y quién es dueño del dataset de evaluación?\" Explora si existe evaluación.\n- \"¿Dónde viven los datos y ya tenemos acceso?\" El acceso a los datos bloquea muchos proyectos de asistentes de conocimiento.\n- \"¿Cuáles son los objetivos de latencia y costo por request?\" Muestra mentalidad de producción.\n- \"¿Quién más trabaja en funcionalidades de IA y cómo revisan los cambios de prompt?\" Revela el tamaño del equipo y el proceso.\n- \"¿Cómo se ve el éxito en este rol dentro de seis meses?\"\n\nPresta atención a los detalles concretos. Las respuestas vagas sobre evaluación o acceso a datos son las señales de alerta más comunes."
+    }
+  }
+]

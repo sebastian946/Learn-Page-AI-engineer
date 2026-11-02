@@ -1,11 +1,340 @@
 {
   "moduleId": "m0",
-  "title": { "en": "Sample exam", "es": "Examen de ejemplo" },
-  "timeLimitMinutes": 10,
+  "title": { "en": "Module 0 exam", "es": "Examen del módulo 0" },
+  "timeLimitMinutes": 25,
   "passingScore": 70,
   "questions": [
-    { "id": "q1", "type": "single", "prompt": { "en": "2+2?", "es": "2+2?" }, "options": { "en": ["3", "4"], "es": ["3", "4"] }, "answer": [1], "explanation": { "en": "Math.", "es": "Mate." } },
-    { "id": "q2", "type": "order", "prompt": { "en": "Order", "es": "Ordena" }, "items": { "en": ["A", "B", "C"], "es": ["A", "B", "C"] }, "explanation": { "en": "ABC", "es": "ABC" } },
-    { "id": "q3", "type": "code", "prompt": { "en": "Returns?", "es": "Retorna?" }, "code": "def f():\n    return 1", "codeLang": "python", "options": { "en": ["1", "None"], "es": ["1", "None"] }, "answer": [0], "explanation": { "en": "1", "es": "1" } }
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "Based on the job-posting analysis behind this course, which skill is the most requested single skill for AI Engineer roles?",
+        "es": "Según el análisis de ofertas en el que se basa este curso, ¿cuál es la habilidad individual más pedida en los roles de AI Engineer?"
+      },
+      "options": {
+        "en": ["Retrieval-augmented generation (RAG)", "Fine-tuning with LoRA/QLoRA", "Training models from scratch in PyTorch", "Self-hosting models with vLLM"],
+        "es": ["Retrieval-augmented generation (RAG)", "Fine-tuning con LoRA/QLoRA", "Entrenar modelos desde cero en PyTorch", "Hacer self-hosting de modelos con vLLM"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "RAG sits at the top of Tier 1. Companies want LLMs that answer from their own data with citations. Fine-tuning and self-hosting are Tier 3, and training from scratch belongs to ML Engineer roles.",
+        "es": "RAG está en lo más alto del Nivel 1. Las empresas quieren LLM que respondan a partir de sus propios datos con citas. El fine-tuning y el self-hosting son Nivel 3, y entrenar desde cero corresponde a roles de ML Engineer."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "multi",
+      "prompt": {
+        "en": "Which skills belong to Tier 1 (near-universal) in the demand map? Select all that apply.",
+        "es": "¿Qué habilidades pertenecen al Nivel 1 (casi universales) del mapa de demanda? Selecciona todas las que correspondan."
+      },
+      "options": {
+        "en": ["Prompt engineering", "LLM integration via provider APIs", "Python", "Fine-tuning", "Databricks"],
+        "es": ["Prompt engineering", "Integración de LLM vía APIs de proveedores", "Python", "Fine-tuning", "Databricks"]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Tier 1 is RAG, prompt engineering, LLM integration and Python. Fine-tuning and data platforms like Databricks are Tier 3: useful, but secondary for most AI Engineer roles.",
+        "es": "El Nivel 1 es RAG, prompt engineering, integración de LLM y Python. El fine-tuning y las plataformas de datos como Databricks son Nivel 3: útiles, pero secundarios para la mayoría de los roles de AI Engineer."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "A posting is titled 'AI Engineer'. Its first three responsibilities are: train large models on GPU clusters, design model architectures, and optimize training throughput. Which role family is it?",
+        "es": "Una oferta se titula 'AI Engineer'. Sus tres primeras responsabilidades son: entrenar modelos grandes en clusters de GPU, diseñar arquitecturas de modelos y optimizar el throughput de entrenamiento. ¿A qué familia de roles pertenece?"
+      },
+      "options": {
+        "en": ["ML Engineer / ML Scientist", "AI-support", "AI-first product", "Prompt engineer"],
+        "es": ["ML Engineer / ML Scientist", "AI-support", "Producto AI-first", "Prompt engineer"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Read the responsibilities, not the title. Training, GPUs and model architecture are the core of ML Engineer work, whatever the header says.",
+        "es": "Lee las responsabilidades, no el título. Entrenamiento, GPUs y arquitectura de modelos son el núcleo del trabajo de ML Engineer, diga lo que diga el encabezado."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "A regional bank wants to add an internal policy assistant to its existing loan platform. Which role family describes this job, and why is it a strong fit for a senior SDET?",
+        "es": "Un banco regional quiere agregar un asistente de políticas internas a su plataforma de créditos existente. ¿Qué familia de roles describe este trabajo y por qué encaja bien con un SDET senior?"
+      },
+      "options": {
+        "en": [
+          "AI-support: integration, reliability, risk and evaluation matter most, which match QA strengths",
+          "AI-first: the bank sells AI as its main product",
+          "ML Engineer: the bank will need to pre-train its own model",
+          "AI-support: it mostly requires frontend design skills"
+        ],
+        "es": [
+          "AI-support: lo que más importa es la integración, la confiabilidad, el riesgo y la evaluación, que coinciden con las fortalezas de QA",
+          "AI-first: el banco vende IA como su producto principal",
+          "ML Engineer: el banco necesitará pre-entrenar su propio modelo",
+          "AI-support: requiere principalmente habilidades de diseño frontend"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "An established company adding AI to an existing product is AI-support. These roles emphasize integration, cost, reliability and risk, and they need strong evaluation. That is where QA experience transfers best.",
+        "es": "Una empresa establecida que agrega IA a un producto existente es AI-support. Estos roles priorizan integración, costo, confiabilidad y riesgo, y necesitan una evaluación sólida. Ahí es donde mejor se transfiere la experiencia en QA."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "multi",
+      "prompt": {
+        "en": "Which pairs correctly map an SDET practice to its AI engineering equivalent? Select all that apply.",
+        "es": "¿Qué pares relacionan correctamente una práctica de SDET con su equivalente en ingeniería de IA? Selecciona todos los que correspondan."
+      },
+      "options": {
+        "en": [
+          "Regression suite → golden dataset run on every prompt change",
+          "Flaky test triage → handling model non-determinism and measuring variance",
+          "CI quality gate → blocking a PR when eval scores drop",
+          "Exploratory testing → choosing the embedding dimension",
+          "Load testing with k6 → writing the system prompt"
+        ],
+        "es": [
+          "Suite de regresión → golden dataset ejecutado en cada cambio de prompt",
+          "Triage de tests flaky → manejar el no determinismo del modelo y medir la varianza",
+          "Quality gate en CI → bloquear un PR cuando bajan los puntajes de evals",
+          "Testing exploratorio → elegir la dimensión de los embeddings",
+          "Pruebas de carga con k6 → escribir el system prompt"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Regression suites, flaky-test handling and CI gates map directly to golden datasets, non-determinism management and eval gates. Exploratory testing maps to red-teaming, and k6 load testing maps to load testing LLM endpoints, not to the other pairs listed.",
+        "es": "Las suites de regresión, el manejo de tests flaky y los gates de CI se corresponden directamente con golden datasets, manejo del no determinismo y gates de evals. El testing exploratorio se corresponde con el red-teaming, y las pruebas de carga con k6 con las pruebas de carga de endpoints de LLM, no con los pares listados."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "order",
+      "prompt": {
+        "en": "Order the four passes for reading a job posting.",
+        "es": "Ordena las cuatro pasadas para leer una oferta de empleo."
+      },
+      "items": {
+        "en": [
+          "Identify the role family (AI-first, AI-support or ML)",
+          "Rewrite the responsibilities as concrete daily work",
+          "Separate must-haves from nice-to-haves",
+          "List red flags and turn them into interview questions"
+        ],
+        "es": [
+          "Identificar la familia de roles (AI-first, AI-support o ML)",
+          "Reescribir las responsabilidades como trabajo diario concreto",
+          "Separar imprescindibles de deseables",
+          "Listar señales de alerta y convertirlas en preguntas de entrevista"
+        ]
+      },
+      "explanation": {
+        "en": "Family first, because an ML training role is a stop. Then daily work tells you which project to show, must-haves tell you if you match, and red flags become your questions.",
+        "es": "Primero la familia, porque un rol de entrenamiento de ML es un punto de parada. Luego el trabajo diario te dice qué proyecto mostrar, los imprescindibles te dicen si encajas y las señales de alerta se convierten en tus preguntas."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "multi",
+      "prompt": {
+        "en": "Which signals suggest a requirement is a must-have rather than a nice-to-have? Select all that apply.",
+        "es": "¿Qué señales indican que un requisito es imprescindible y no deseable? Selecciona todas las que correspondan."
+      },
+      "options": {
+        "en": [
+          "It appears in both the responsibilities and the requirements",
+          "It uses strong wording such as 'proven experience' or 'you have shipped'",
+          "It is tied directly to the product the team builds",
+          "It appears under a 'Bonus' heading",
+          "It is one item in a long list of interchangeable frameworks"
+        ],
+        "es": [
+          "Aparece tanto en las responsabilidades como en los requisitos",
+          "Usa palabras fuertes como 'proven experience' o 'you have shipped'",
+          "Está ligado directamente al producto que construye el equipo",
+          "Aparece bajo un encabezado 'Bonus'",
+          "Es un elemento dentro de una larga lista de frameworks intercambiables"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Repetition across sections, strong wording and a direct link to the product signal a must-have. 'Bonus' sections and long tool lists usually mean they want one of them, or none is required.",
+        "es": "La repetición entre secciones, las palabras fuertes y el vínculo directo con el producto indican un imprescindible. Las secciones 'Bonus' y las listas largas de herramientas suelen significar que quieren una de ellas, o que ninguna es obligatoria."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "single",
+      "prompt": {
+        "en": "Which of these is the strongest red flag in an AI Engineer posting?",
+        "es": "¿Cuál de estas es la señal de alerta más fuerte en una oferta de AI Engineer?"
+      },
+      "options": {
+        "en": [
+          "It requires '5+ years of production LLM experience' and lists every agent framework as mandatory",
+          "It mentions AWS and Docker",
+          "It asks for experience with evaluation pipelines",
+          "It lists LangGraph as nice to have"
+        ],
+        "es": [
+          "Exige 'más de 5 años de experiencia con LLM en producción' y lista todos los frameworks de agentes como obligatorios",
+          "Menciona AWS y Docker",
+          "Pide experiencia con pipelines de evaluación",
+          "Lista LangGraph como deseable"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Unrealistic year counts in a young field and 'every tool required' signal copied requirements and a team that does not yet know what it needs. The other options are normal, healthy signals.",
+        "es": "Años de experiencia irreales en un campo joven y 'todas las herramientas obligatorias' indican requisitos copiados y un equipo que todavía no sabe qué necesita. Las otras opciones son señales normales y sanas."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "single",
+      "prompt": {
+        "en": "A hiring manager spends about two minutes on your repo. Which README element is the strongest single signal of a production mindset, and the one most candidates skip?",
+        "es": "Un hiring manager dedica unos dos minutos a tu repo. ¿Qué elemento del README es la señal individual más fuerte de mentalidad de producción, y la que más candidatos omiten?"
+      },
+      "options": {
+        "en": [
+          "A cost and latency table with cost per 1k requests and p50/p95 latency",
+          "A long list of every library used",
+          "A badge showing the number of GitHub stars",
+          "Detailed installation instructions at the very top"
+        ],
+        "es": [
+          "Una tabla de costo y latencia con costo por 1k requests y latencia p50/p95",
+          "Una larga lista de todas las librerías usadas",
+          "Un badge con la cantidad de estrellas en GitHub",
+          "Instrucciones de instalación detalladas al principio de todo"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Cost and latency numbers show you think about running the system, not just demoing it. Installation instructions matter but belong lower in the README, after results.",
+        "es": "Los números de costo y latencia muestran que piensas en operar el sistema, no solo en hacer una demo. Las instrucciones de instalación importan, pero van más abajo en el README, después de los resultados."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "order",
+      "prompt": {
+        "en": "Order the sections of the course's project README contract, from top to bottom.",
+        "es": "Ordena las secciones del contrato de README de proyecto del curso, de arriba hacia abajo."
+      },
+      "items": {
+        "en": [
+          "Title, one-line pitch and demo GIF",
+          "Problem",
+          "Architecture",
+          "Evaluation",
+          "Cost & latency",
+          "Run it",
+          "Limitations & next steps"
+        ],
+        "es": [
+          "Título, pitch de una línea y GIF de demo",
+          "Problem",
+          "Architecture",
+          "Evaluation",
+          "Cost & latency",
+          "Run it",
+          "Limitations & next steps"
+        ]
+      },
+      "explanation": {
+        "en": "Results come first: what it is, the demo, the problem and design, then evidence (evals, cost). Instructions and honest limitations come last. Trade-offs sit between Cost and Run it in the full template.",
+        "es": "Primero van los resultados: qué es, la demo, el problema y el diseño, luego la evidencia (evals, costo). Las instrucciones y las limitaciones honestas van al final. En la plantilla completa, Trade-offs va entre Cost y Run it."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "code",
+      "prompt": {
+        "en": "Using the example prices in the comments, what does this function return for 2,000 input tokens and 500 output tokens?",
+        "es": "Usando los precios de ejemplo de los comentarios, ¿qué devuelve esta función para 2.000 tokens de entrada y 500 tokens de salida?"
+      },
+      "code": "# Example prices only - check the provider's current pricing.\nINPUT_PER_MTOK = 3.0    # USD per 1M input tokens\nOUTPUT_PER_MTOK = 15.0  # USD per 1M output tokens\n\ndef cost_per_request(input_tokens: int, output_tokens: int) -> float:\n    return (input_tokens * INPUT_PER_MTOK + output_tokens * OUTPUT_PER_MTOK) / 1_000_000\n\nprint(round(cost_per_request(2_000, 500), 4))",
+      "codeLang": "python",
+      "options": {
+        "en": ["0.0135", "0.0090", "0.0225", "13.5"],
+        "es": ["0.0135", "0.0090", "0.0225", "13.5"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "2,000 × 3.0 = 6,000 and 500 × 15.0 = 7,500. The sum is 13,500, divided by 1,000,000 gives 0.0135 USD per request, or 13.50 USD per 1k requests. Note that output tokens cost more per token, so they can dominate even when there are fewer of them.",
+        "es": "2.000 × 3,0 = 6.000 y 500 × 15,0 = 7.500. La suma es 13.500, dividida por 1.000.000 da 0,0135 USD por request, o 13,50 USD por 1k requests. Fíjate que los tokens de salida cuestan más por token, así que pueden dominar aunque sean menos."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "code",
+      "prompt": {
+        "en": "What does this README check print?",
+        "es": "¿Qué imprime este check de README?"
+      },
+      "code": "import re\n\nREQUIRED = [\"Problem\", \"Architecture\", \"Evaluation\"]\n\ndef missing(md: str) -> list[str]:\n    found = {h.strip().lower() for h in re.findall(r\"^## (.+)$\", md, re.MULTILINE)}\n    return [s for s in REQUIRED if s.lower() not in found]\n\nreadme = \"\"\"# Demo\n## problem\nText\n### Architecture\nDiagram\n## Evaluation\nTable\n\"\"\"\nprint(missing(readme))",
+      "codeLang": "python",
+      "options": {
+        "en": ["['Architecture']", "[]", "['Problem', 'Architecture']", "['Architecture', 'Evaluation']"],
+        "es": ["['Architecture']", "[]", "['Problem', 'Architecture']", "['Architecture', 'Evaluation']"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The comparison is case-insensitive, so '## problem' counts. '### Architecture' is a level-3 heading and does not match the '^## ' pattern, so Architecture is reported as missing. 'Evaluation' is present.",
+        "es": "La comparación no distingue mayúsculas, así que '## problem' cuenta. '### Architecture' es un encabezado de nivel 3 y no coincide con el patrón '^## ', por lo que Architecture se reporta como faltante. 'Evaluation' está presente."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "code",
+      "prompt": {
+        "en": "A card is in box 3 and you fail to answer it. After calling grade(card, remembered=False), what are its box and its next review interval?",
+        "es": "Una tarjeta está en la caja 3 y no logras responderla. Después de llamar a grade(card, remembered=False), ¿cuál es su caja y su próximo intervalo de repaso?"
+      },
+      "code": "INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}\n\ndef grade(card, remembered: bool) -> None:\n    card.box = min(card.box + 1, 5) if remembered else 1\n    card.due = today() + timedelta(days=INTERVALS[card.box])",
+      "codeLang": "python",
+      "options": {
+        "en": ["Box 1, review again in 1 day", "Box 2, review again in 3 days", "Box 3, review again in 7 days", "Box 4, review again in 14 days"],
+        "es": ["Caja 1, repasar de nuevo en 1 día", "Caja 2, repasar de nuevo en 3 días", "Caja 3, repasar de nuevo en 7 días", "Caja 4, repasar de nuevo en 14 días"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "In a Leitner system a miss sends the card back to box 1, whatever box it was in. Box 1 has an interval of 1 day, so you see it again tomorrow.",
+        "es": "En un sistema de Leitner, un fallo devuelve la tarjeta a la caja 1, sin importar en qué caja estaba. La caja 1 tiene un intervalo de 1 día, así que la ves de nuevo mañana."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "single",
+      "prompt": {
+        "en": "On this platform, when does the next module unlock?",
+        "es": "En esta plataforma, ¿cuándo se desbloquea el siguiente módulo?"
+      },
+      "options": {
+        "en": [
+          "When your best score on the current module's exam is at least 70%, or you choose 'Unlock anyway'",
+          "When you mark every concept lesson as complete",
+          "After a fixed number of calendar days",
+          "When your day streak reaches 7"
+        ],
+        "es": [
+          "Cuando tu mejor puntaje en el examen del módulo actual es de al menos 70 %, o eliges 'Desbloquear de todos modos'",
+          "Cuando marcas todas las lecciones de concepto como completadas",
+          "Después de una cantidad fija de días de calendario",
+          "Cuando tu racha de días llega a 7"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The gate is the exam: a best score of 70% or more unlocks the next module. 'Unlock anyway' exists for content you already know, not for skipping hard exams.",
+        "es": "El gate es el examen: un mejor puntaje de 70 % o más desbloquea el siguiente módulo. 'Desbloquear de todos modos' existe para contenido que ya conoces, no para saltarte exámenes difíciles."
+      }
+    }
   ]
 }

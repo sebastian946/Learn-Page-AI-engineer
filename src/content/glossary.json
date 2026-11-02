@@ -1,1 +1,163 @@
-[]
+[
+  {
+    "term": "AI Engineer",
+    "termEs": "AI Engineer (ingeniero de IA)",
+    "module": "m0",
+    "en": "A software engineer who builds products on top of existing foundation models: retrieval pipelines, prompts, tools, agents, evaluation and reliable serving. Also titled Applied AI Engineer, LLM Engineer or Software Engineer, GenAI.",
+    "es": "Un ingeniero de software que construye productos sobre modelos fundacionales existentes: pipelines de retrieval, prompts, herramientas, agentes, evaluación y serving confiable. También se titula Applied AI Engineer, LLM Engineer o Software Engineer, GenAI."
+  },
+  {
+    "term": "AI-first company",
+    "termEs": "Empresa AI-first",
+    "module": "m0",
+    "en": "A company whose product is the AI itself, such as a coding agent or an AI support platform. Fast iteration, broad scope and heavy focus on quality measurement.",
+    "es": "Una empresa cuyo producto es la propia IA, como un agente de programación o una plataforma de soporte con IA. Iteración rápida, alcance amplio y fuerte foco en medir la calidad."
+  },
+  {
+    "term": "AI-support role",
+    "termEs": "Rol AI-support",
+    "module": "m0",
+    "en": "An AI engineering role in an established company that adds AI features to an existing product. Emphasizes integration, cost, reliability, security and risk. The largest family by number of postings.",
+    "es": "Un rol de ingeniería de IA en una empresa establecida que agrega funcionalidades de IA a un producto existente. Prioriza integración, costo, confiabilidad, seguridad y riesgo. La familia más grande por número de ofertas."
+  },
+  {
+    "term": "Conventional Commits",
+    "termEs": "Conventional Commits",
+    "module": "m0",
+    "en": "A commit message convention with typed prefixes such as feat, fix, docs, test, ci and chore, which keeps history readable and enables automated changelogs.",
+    "es": "Una convención de mensajes de commit con prefijos tipados como feat, fix, docs, test, ci y chore, que mantiene el historial legible y permite generar changelogs automáticos."
+  },
+  {
+    "term": "Cost per 1k requests",
+    "termEs": "Costo por 1k requests",
+    "module": "m0",
+    "en": "The cost of serving one thousand requests, computed from average input and output tokens and the provider's per-token prices. A standard way to compare models and budget LLM features.",
+    "es": "El costo de servir mil requests, calculado a partir de los tokens promedio de entrada y salida y los precios por token del proveedor. Una forma estándar de comparar modelos y presupuestar funcionalidades con LLM."
+  },
+  {
+    "term": "Demo GIF",
+    "termEs": "GIF de demo",
+    "module": "m0",
+    "en": "A short (10 to 20 second) animated recording at the top of a README that shows the project producing a realistic result, recorded with tools like VHS, ScreenToGif or Playwright video.",
+    "es": "Una grabación animada corta (de 10 a 20 segundos) al principio de un README que muestra al proyecto produciendo un resultado realista, grabada con herramientas como VHS, ScreenToGif o el video de Playwright."
+  },
+  {
+    "term": "Exam gate",
+    "termEs": "Gate del examen",
+    "module": "m0",
+    "en": "The platform rule that unlocks the next module only when the current module's best exam score is at least 70%, with a manual override for content you already know.",
+    "es": "La regla de la plataforma que desbloquea el siguiente módulo solo cuando el mejor puntaje del examen del módulo actual es de al menos 70 %, con una opción manual para contenido que ya conoces."
+  },
+  {
+    "term": "Foundation model",
+    "termEs": "Modelo fundacional",
+    "module": "m0",
+    "en": "A large pre-trained model (for example Claude or GPT models) that can be adapted to many tasks through prompting, retrieval or fine-tuning, usually accessed through a provider API.",
+    "es": "Un modelo grande pre-entrenado (por ejemplo los modelos Claude o GPT) que puede adaptarse a muchas tareas mediante prompting, retrieval o fine-tuning, normalmente accedido a través de la API de un proveedor."
+  },
+  {
+    "term": "Four-pass method",
+    "termEs": "Método de las cuatro pasadas",
+    "module": "m0",
+    "en": "A way to read a job posting: identify the role family, rewrite responsibilities as daily work, separate must-haves from nice-to-haves, then list red flags as interview questions.",
+    "es": "Una forma de leer una oferta de empleo: identificar la familia de roles, reescribir las responsabilidades como trabajo diario, separar imprescindibles de deseables y luego listar las señales de alerta como preguntas de entrevista."
+  },
+  {
+    "term": "Job posting red flag",
+    "termEs": "Señal de alerta en una oferta",
+    "module": "m0",
+    "en": "A sign of risk in a posting, such as unrealistic years of LLM experience, every tool listed as mandatory, no mention of evaluation, or no clear data access.",
+    "es": "Un indicio de riesgo en una oferta, como años irreales de experiencia con LLM, todas las herramientas como obligatorias, ninguna mención a evaluación o falta de claridad sobre el acceso a los datos."
+  },
+  {
+    "term": "Learning log",
+    "termEs": "Registro de aprendizaje",
+    "module": "m0",
+    "en": "A daily three-bullet note (what I learned, what confused me, what I shipped) kept in the portfolio hub. A source of interview stories and motivation.",
+    "es": "Una nota diaria de tres viñetas (qué aprendí, qué me confundió, qué entregué) guardada en el hub del portafolio. Una fuente de historias para entrevistas y de motivación."
+  },
+  {
+    "term": "Leitner system",
+    "termEs": "Sistema de Leitner",
+    "module": "m0",
+    "en": "A simple spaced-repetition scheme with numbered boxes: a correct answer moves a card to a box reviewed less often; a miss sends it back to box 1.",
+    "es": "Un esquema simple de repetición espaciada con cajas numeradas: una respuesta correcta mueve la tarjeta a una caja que se repasa con menos frecuencia; un fallo la devuelve a la caja 1."
+  },
+  {
+    "term": "LLM integration",
+    "termEs": "Integración de LLM",
+    "module": "m0",
+    "en": "Calling model provider APIs from real services, including streaming, retries, rate-limit handling, tool calling and cost control.",
+    "es": "Llamar a las APIs de proveedores de modelos desde servicios reales, incluyendo streaming, reintentos, manejo de rate limits, tool calling y control de costos."
+  },
+  {
+    "term": "ML Engineer",
+    "termEs": "ML Engineer (ingeniero de machine learning)",
+    "module": "m0",
+    "en": "An engineer who trains, fine-tunes and optimizes models: training pipelines, feature engineering, GPUs and inference optimization. Different from an AI Engineer, who mostly consumes models through APIs.",
+    "es": "Un ingeniero que entrena, ajusta y optimiza modelos: pipelines de entrenamiento, feature engineering, GPUs y optimización de inferencia. Distinto de un AI Engineer, que principalmente consume modelos a través de APIs."
+  },
+  {
+    "term": "Must-have requirement",
+    "termEs": "Requisito imprescindible (must-have)",
+    "module": "m0",
+    "en": "A job posting requirement the hiring team will actually screen for. Signals: it appears in both responsibilities and requirements, uses strong wording and is tied to the product.",
+    "es": "Un requisito de una oferta que el equipo de contratación realmente va a filtrar. Señales: aparece en las responsabilidades y en los requisitos, usa palabras fuertes y está ligado al producto."
+  },
+  {
+    "term": "Nice-to-have requirement",
+    "termEs": "Requisito deseable (nice-to-have)",
+    "module": "m0",
+    "en": "A posting item listed as bonus or preferred, or buried in a long list of interchangeable tools. Missing it rarely disqualifies a candidate.",
+    "es": "Un elemento de una oferta listado como bonus o preferido, o perdido en una larga lista de herramientas intercambiables. No tenerlo rara vez descalifica a un candidato."
+  },
+  {
+    "term": "Portfolio hub",
+    "termEs": "Hub del portafolio",
+    "module": "m0",
+    "en": "A single repo (here ai-engineer-portfolio) that introduces you, links every project with its key result and holds the shared templates and conventions.",
+    "es": "Un único repo (aquí ai-engineer-portfolio) que te presenta, enlaza cada proyecto con su resultado clave y contiene las plantillas y convenciones compartidas."
+  },
+  {
+    "term": "Production mindset",
+    "termEs": "Mentalidad de producción",
+    "module": "m0",
+    "en": "Thinking about latency, cost per request, failure modes, monitoring and regressions from the start, not only about a working demo. A trait postings ask for repeatedly.",
+    "es": "Pensar desde el principio en latencia, costo por request, modos de falla, monitoreo y regresiones, no solo en una demo que funciona. Un rasgo que las ofertas piden una y otra vez."
+  },
+  {
+    "term": "Pull request template",
+    "termEs": "Plantilla de pull request",
+    "module": "m0",
+    "en": "A .github/pull_request_template.md file that pre-fills every PR description. In this course it asks for before/after eval results and cost/latency impact.",
+    "es": "Un archivo .github/pull_request_template.md que completa de antemano la descripción de cada PR. En este curso pide resultados de evals antes/después e impacto en costo/latencia."
+  },
+  {
+    "term": "README contract",
+    "termEs": "Contrato del README",
+    "module": "m0",
+    "en": "The fixed README structure every course project follows: pitch and demo GIF, Problem, Architecture, Evaluation, Cost & latency, Trade-offs, Run it, Limitations. Results come before instructions.",
+    "es": "La estructura fija de README que sigue cada proyecto del curso: pitch y GIF de demo, Problem, Architecture, Evaluation, Cost & latency, Trade-offs, Run it, Limitations. Los resultados van antes que las instrucciones."
+  },
+  {
+    "term": "Skill demand tier",
+    "termEs": "Nivel de demanda de habilidades",
+    "module": "m0",
+    "en": "A qualitative grouping of skills by how often they appear in job postings: Tier 1 near-universal (RAG, prompt engineering, LLM integration, Python), Tier 2 very common (agents, evals, FastAPI, Docker/CI-CD, AWS, vector DBs), Tier 3 secondary (fine-tuning, data platforms).",
+    "es": "Una agrupación cualitativa de habilidades según la frecuencia con que aparecen en las ofertas: Nivel 1 casi universales (RAG, prompt engineering, integración de LLM, Python), Nivel 2 muy comunes (agentes, evals, FastAPI, Docker/CI-CD, AWS, bases vectoriales), Nivel 3 secundarias (fine-tuning, plataformas de datos)."
+  },
+  {
+    "term": "Spaced repetition",
+    "termEs": "Repetición espaciada",
+    "module": "m0",
+    "en": "A study technique that reviews an item just before you would forget it, increasing the interval each time you recall it correctly.",
+    "es": "Una técnica de estudio que repasa un elemento justo antes de olvidarlo, aumentando el intervalo cada vez que lo recuerdas correctamente."
+  },
+  {
+    "term": "Two-minute review",
+    "termEs": "Revisión de dos minutos",
+    "module": "m0",
+    "en": "The quick scan a hiring manager gives a portfolio repo without cloning it: first screen of the README, architecture, eval numbers, cost and latency, a code skim and the commit history.",
+    "es": "La revisión rápida que un hiring manager hace de un repo del portafolio sin clonarlo: primera pantalla del README, arquitectura, números de evals, costo y latencia, un vistazo al código y el historial de commits."
+  }
+]
