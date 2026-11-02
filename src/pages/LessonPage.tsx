@@ -4,6 +4,7 @@ import { MDXProvider } from '@mdx-js/react'
 import { ArrowLeft, ArrowRight, CheckCircle2, Clock, Lock } from 'lucide-react'
 import { findLesson, hasLocaleFile, lessonKey, lessonLoader, modules } from '../content'
 import { isModuleUnlocked } from '../lib/course'
+import { formatMinutes } from '../lib/dates'
 import { useT } from '../i18n'
 import { useProgress } from '../store/progress'
 import { mdxComponents } from '../components/mdx'
@@ -70,7 +71,7 @@ export function LessonPage() {
           <span>·</span>
           <span className="flex items-center gap-1">
             <Clock className="h-3.5 w-3.5" aria-hidden />
-            {lesson.minutes} {t('unit.min')}
+            {formatMinutes(lesson.minutes, { min: t('unit.min'), hours: t('unit.hours') })}
           </span>
         </p>
         <h1 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">{l(lesson.title)}</h1>

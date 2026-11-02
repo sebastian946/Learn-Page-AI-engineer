@@ -13,7 +13,7 @@ Choices made while building the platform where the spec left room. Newest last.
 ## Content pipeline
 - **Lesson metadata lives in `module.json`, not MDX frontmatter.** The sidebar, dashboard and portfolio tracker need every lesson's title, type and duration up front. Keeping it in JSON avoids bundling every MDX file into the main chunk. MDX files are lazy-loaded per lesson.
 - **Exercise and capstone pages are MDX + components** (`<AcceptanceCriteria>`, `<StarterCode>`, `<Hints>`, `<CommitBox>`, `<ClientBrief>`, `<Checklist>`), not a rigid JSON schema. Authors keep full control of the writing; the components give each section a consistent look.
-- **Syntax highlighting runs at build time** with `@shikijs/rehype` (dual light/dark themes through CSS variables), so lessons ship no highlighter JS. Exam code snippets come from JSON, so they use a lazy-loaded Shiki core with only 7 grammars.
+- **Syntax highlighting runs at build time** with `@shikijs/rehype` (dual light/dark themes through CSS variables), so lessons ship no highlighter JS. Exam code snippets come from JSON, so they use a lazy-loaded Shiki core with only the 9 grammars the exams use.
 - **Mermaid is lazy-loaded** on the first `<Diagram>`. It is large (~700 kB) and most pages don't need it.
 - **`scripts/validate-content.mjs`** compiles every MDX file and checks manifests, exams (12–20 questions, all four types, valid answer indexes, en/es parity), interview banks and the glossary. It runs in CI.
 - **`CURRICULUM.md` is generated** from the manifests (`npm run curriculum`), so it can't drift from the app.

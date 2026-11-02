@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import { ArrowRight, CheckCircle2, Flame, FolderGit2, Lock, Trophy } from 'lucide-react'
 import { modules } from '../content'
 import { isModuleUnlocked, moduleProgress, nextLesson, overallProgress } from '../lib/course'
-import { computeStreak } from '../lib/dates'
+import { computeStreak, formatMinutes } from '../lib/dates'
 import { useT } from '../i18n'
 import { useProgress } from '../store/progress'
 import { DataControls } from '../components/DataControls'
@@ -73,7 +73,7 @@ export function Dashboard() {
             <div className="flex-1">
               <p className="text-lg font-semibold">{l(next.lesson.title)}</p>
               <p className="text-sm text-slate-500">
-                {t(`type.${next.lesson.type}`)} · {next.lesson.minutes} {t('unit.min')} · {t('common.module')} {next.module.order}
+                {t(`type.${next.lesson.type}`)} · {formatMinutes(next.lesson.minutes, { min: t('unit.min'), hours: t('unit.hours') })} · {t('common.module')} {next.module.order}
               </p>
             </div>
             <Link to={`/learn/${next.module.id}/${next.lesson.slug}`} className="btn-primary">

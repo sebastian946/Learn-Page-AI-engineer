@@ -21,3 +21,7 @@ export function computeStreak(days: Iterable<string>, today: Date = new Date()):
   }
   return streak
 }
+
+/** "45 min" for lessons, "30 h" for multi-hour capstones. */
+export const formatMinutes = (minutes: number, units: { min: string; hours: string }) =>
+  minutes >= 120 ? `${Math.round(minutes / 60)} ${units.hours}` : `${minutes} ${units.min}`
