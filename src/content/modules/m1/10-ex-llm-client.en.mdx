@@ -1,0 +1,208 @@
+## Goal
+
+Build `llm-provider-client`: a small, typed, async Python library that every later project in this course can reuse. It hides Anthropic, OpenAI and Bedrock behind one interface and owns the production concerns from lessons 4–9: **streaming, retries with jitter, rate limiting, timeouts and per-request cost logging**.
+
+This is milestone 1 of the repo. Milestones 2 (structured extraction) and 3 (tool calling) build on it in the next two exercises.
+
+Time box: 90 minutes for the core. Bedrock and OpenAI adapters can be thin; the Anthropic adapter and the fake provider must be complete. Unit tests must not call any real API.
+
+## What you are building
+
+```text
+LLMClient.complete(request)  -> LLMResponse     (retries, limits, cost record)
+LLMClient.stream(request)    -> AsyncIterator[StreamEvent]  (idle timeout, cost record at end)
+```
+
+Features call `LLMClient` with a **logical model name** (`"fast"`, `"smart"`) and `metadata` (`feature`, `prompt_version`). The client resolves the concrete model from `models.toml`, picks the adapter, applies policies, and writes one JSON cost record per attempt to `logs/llm_costs.jsonl`.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `src/llm_client/types.py` defines `LLMRequest`, `LLMResponse`, `Usage`, `ToolCall`, `StopReason` and `StreamEvent`; no vendor SDK types leak out of `providers/`.
+- [ ] `LLMProvider` protocol with `complete()` and `stream()`; adapters for Anthropic (complete) and OpenAI and Bedrock (at least `complete()`), plus a `FakeProvider` with scripted responses and failures.
+- [ ] Model ids come from `models.toml` via logical names; capability flags drop unsupported params (e.g. `temperature`).
+- [ ] Vendor errors are mapped to `LLMError` / `RateLimited` / `ProviderError` with a `retryable` flag; SDK-level retries are disabled.
+- [ ] Retries use exponential backoff with full jitter, respect `retry_after`, stop at `max_attempts` and a total deadline, and never retry non-retryable errors.
+- [ ] A semaphore caps concurrency and a token bucket caps requests per minute (both configurable).
+- [ ] Streaming yields text deltas, enforces an idle timeout between chunks, and emits a final event with usage and stop reason.
+- [ ] Every attempt (including failed and retried ones that returned usage) appends a JSON line with request_id, feature, prompt_version, provider, model, attempt, tokens, latency and `cost_usd` computed with `Decimal` from `pricing.toml`.
+- [ ] Requests without `metadata["feature"]` are rejected with a clear error.
+- [ ] `pytest` passes offline: retry behavior (429 then success, 400 not retried, deadline respected), cost math, idle timeout and stream cancellation are covered with the fake provider.
+- [ ] `examples/demo.py` streams one answer from a real provider and prints the cost line.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# src/llm_client/client.py
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from collections.abc import AsyncIterator
+from decimal import Decimal
+
+from .config import ModelRegistry
+from .cost import CostLogger
+from .errors import LLMError
+from .limits import TokenBucket
+from .retry import with_retries
+from .types import LLMRequest, LLMResponse, StreamEvent
+from .providers.base import LLMProvider
+
+
+class LLMClient:
+    def __init__(
+        self,
+        providers: dict[str, LLMProvider],
+        registry: ModelRegistry,
+        cost_logger: CostLogger,
+        *,
+        max_concurrency: int = 10,
+        requests_per_minute: float = 50,
+        max_attempts: int = 4,
+        deadline_s: float = 60.0,
+        stream_idle_timeout_s: float = 20.0,
+    ) -> None:
+        self._providers = providers
+        self._registry = registry
+        self._costs = cost_logger
+        self._sem = asyncio.Semaphore(max_concurrency)
+        self._rpm = TokenBucket(rate_per_s=requests_per_minute / 60, capacity=max(1, requests_per_minute / 6))
+        self._max_attempts = max_attempts
+        self._deadline_s = deadline_s
+        self._idle = stream_idle_timeout_s
+
+    def _validate(self, req: LLMRequest) -> None:
+        if not req.metadata.get("feature"):
+            raise ValueError("metadata['feature'] is required for cost attribution")
+        req.metadata.setdefault("request_id", str(uuid.uuid4()))
+
+    async def complete(self, req: LLMRequest) -> LLMResponse:
+        self._validate(req)
+        spec = self._registry.resolve(req.model)
+        provider = self._providers[spec.provider]
+        attempt = 0
+
+        async def one_attempt() -> LLMResponse:
+            nonlocal attempt
+            attempt += 1
+            async with self._sem:
+                await self._rpm.acquire()
+                resp = await provider.complete(req, spec)
+            self._costs.record(resp, req, attempt)
+            return resp
+
+        return await with_retries(one_attempt, max_attempts=self._max_attempts,
+                                  deadline_s=self._deadline_s)
+
+    async def stream(self, req: LLMRequest) -> AsyncIterator[StreamEvent]:
+        # 1. validate + resolve spec + provider
+        # 2. acquire semaphore and rate-limit slot
+        # 3. iterate provider.stream(...) with asyncio.wait_for(idle timeout) per chunk
+        # 4. yield text events; on the final event, record cost and yield it
+        # 5. retry only if no text has been yielded yet
+        raise NotImplementedError
+        yield  # pragma: no cover  (makes this an async generator)
+```
+
+```python
+# tests/test_retry.py
+import pytest
+from llm_client.errors import ProviderError, RateLimited
+from llm_client.providers.fake import FakeProvider, ok
+
+@pytest.mark.asyncio
+async def test_retries_429_then_succeeds(make_client):
+    fake = FakeProvider(script=[RateLimited("fake", retry_after=0.01), ok("hello")])
+    client = make_client(fake)
+    resp = await client.complete(req(feature="test"))
+    assert resp.text == "hello"
+    assert fake.calls == 2
+
+@pytest.mark.asyncio
+async def test_does_not_retry_400(make_client):
+    fake = FakeProvider(script=[ProviderError("fake", 400, retryable=False)])
+    client = make_client(fake)
+    with pytest.raises(ProviderError):
+        await client.complete(req(feature="test"))
+    assert fake.calls == 1
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Start with `types.py`, `errors.py` and `FakeProvider`, and get the retry tests green before touching any real SDK. The fake takes a list where each item is either a response or an exception to raise, and counts calls. Patch `asyncio.sleep` (or inject a `sleep` function into `with_retries`) so tests run in milliseconds.</Hint>
+  <Hint>For the Anthropic adapter, construct `AsyncAnthropic(max_retries=0)` and map `anthropic.RateLimitError`, `anthropic.APIStatusError` (check `status_code`: 5xx and 529 retryable), `anthropic.APIConnectionError` and `anthropic.APITimeoutError`. Read `retry-after` from `e.response.headers` and convert to float, tolerating missing or malformed values.</Hint>
+  <Hint>For streaming, the Anthropic adapter can wrap `client.messages.stream(...)`: yield `StreamEvent(type="text", text=...)` from `text_stream`, then after the loop call `await stream.get_final_message()` and yield `StreamEvent(type="final", usage=..., stop_reason=...)`. In the client, get the iterator with `__aiter__()` and wrap each `__anext__()` in `asyncio.wait_for(..., self._idle)`.</Hint>
+  <Hint>Cost logger: load `pricing.toml` with `tomllib`, build `Decimal` prices, and append `json.dumps(record) + "\n"` to the JSONL file. Write `cost_usd` as a string to keep precision. For cancellation tests, start the stream in a task, consume one event, call `task.cancel()`, and assert the fake's `closed` flag became True.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-provider-client">
+
+```text
+llm-provider-client/
+  pyproject.toml            # python >=3.11, anthropic, openai, boto3, pydantic, pytest, pytest-asyncio
+  README.md
+  models.toml
+  pricing.toml
+  src/llm_client/
+    __init__.py             # exports LLMClient, LLMRequest, LLMResponse
+    types.py
+    errors.py
+    config.py               # ModelRegistry + ModelSpec from models.toml
+    retry.py                # with_retries (full jitter, retry_after, deadline)
+    limits.py               # TokenBucket
+    cost.py                 # load_prices, cost_usd, CostLogger (JSONL)
+    client.py               # LLMClient facade
+    providers/
+      base.py               # LLMProvider protocol
+      anthropic_provider.py
+      openai_provider.py
+      bedrock_provider.py
+      fake.py
+  examples/demo.py
+  tests/
+    conftest.py
+    test_retry.py
+    test_cost.py
+    test_stream.py
+  milestones/               # filled in by the next two exercises
+```
+
+**README outline**
+
+1. What it is (one paragraph) and why a custom thin layer instead of a framework.
+2. Architecture diagram (Mermaid): features, LLMClient, providers, cost log.
+3. Quickstart: install, set `ANTHROPIC_API_KEY`, run `examples/demo.py`.
+4. Configuration: `models.toml` (logical names, capabilities) and `pricing.toml` (dated prices).
+5. Reliability: error taxonomy table, retry policy, rate limiting, timeouts.
+6. Cost logging: record schema and an example query.
+7. Testing: how the fake provider works, how to run tests offline.
+8. Limitations and next steps.
+
+**Suggested commits**
+
+- `feat: normalized types, error hierarchy and fake provider`
+- `feat: retry policy with full jitter, retry-after and deadline`
+- `feat: anthropic adapter with error mapping`
+- `feat: openai and bedrock adapters`
+- `feat: streaming with idle timeout and final usage event`
+- `feat: per-attempt cost logging from dated pricing config`
+- `test: offline tests for retries, cost math and stream cancellation`
+- `docs: README with architecture and configuration`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m1-10-review" title="Self-review before you commit" items={["No vendor SDK type is imported outside providers/", "SDK retries are disabled and retries happen in exactly one place", "400/401/403/404 are never retried; 429, 5xx, overloaded and timeouts are", "Backoff uses full jitter and respects retry_after and a total deadline", "Streaming has an idle timeout and never retries after text was yielded", "Every attempt with usage writes a cost record with feature and prompt_version", "Unknown model prices raise instead of logging $0", "All tests pass with no network access", "README explains configuration, error policy and cost record schema"]} />

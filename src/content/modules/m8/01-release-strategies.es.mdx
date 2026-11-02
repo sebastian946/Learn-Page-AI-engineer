@@ -1,0 +1,206 @@
+## Por qué los cambios de LLM necesitan estrategias de release reales
+
+En el Módulo 5 hiciste deploys con rolling updates, un eval gate en CI y feature flags para prompts. Es una buena base. No alcanza cuando muchos usuarios dependen del servicio.
+
+El problema es simple. **Una evaluación offline solo prueba que el cambio es bueno en tu golden dataset.** El tráfico de producción es más amplio, más desordenado y cambia con el tiempo. Un prompt nuevo puede pasar todos los checks de CI y aun así:
+
+- duplicar la longitud promedio de la respuesta, y con ella tu costo y tu latencia;
+- empezar a rechazar una categoría de preguntas que tu dataset nunca cubrió;
+- romper un contrato JSON para el 2% de los inputs que contienen caracteres raros;
+- provocar más throttling del proveedor porque usa otro modelo con una cuota menor.
+
+Nada de esto aparece como HTTP 500. Un rolling deploy clásico reemplazará feliz todos los pods con la versión mala, y tus health checks seguirán en verde.
+
+Por eso, en apps LLM un "release" abarca más que la imagen del contenedor. Cualquiera de estos cambios es un release y merece el mismo cuidado:
+
+| Cambio | Por qué es riesgoso |
+|---|---|
+| Template de prompt o system prompt | Cambio de comportamiento sin cambio de código |
+| Id o versión del modelo | Otra calidad, latencia, costo y cuota |
+| Parámetros de sampling (temperature, max tokens) | Cambian la longitud y el determinismo |
+| Configuración de retrieval (top-k, re-ranker, chunking) | Cambian el grounding y la faithfulness |
+| Schemas de tools de un agente | Cambian las trayectorias, aparecen nuevos modos de falla |
+
+La analogía de QA: las evaluaciones offline son tu suite de regresión. El progressive delivery es tu **smoke test en producción con un kill switch**. Necesitas ambos.
+
+## Los tres patrones
+
+### Blue/green
+
+Corres dos entornos completos. Blue sirve el 100% del tráfico. Despliegas green, lo pruebas y luego cambias el router. El rollback es volver a mover el switch.
+
+- **Bueno para:** cambios de infraestructura, upgrades de dependencias, cualquier cosa donde quieras un rollback instantáneo y completo.
+- **Débil para cambios de LLM:** el cambio es todo o nada. Te enteras de una regresión de comportamiento solo cuando todos los usuarios ya la vieron.
+- **Costo:** doble capacidad durante la ventana del cambio. Para un modelo autoalojado en GPU puede salir caro.
+
+### Canary
+
+Envías una pequeña parte del tráfico (1%, 5%, 25%...) a la versión nueva. Observas métricas. Subes paso a paso. Abortas si una métrica rompe un umbral.
+
+- **Bueno para:** cambios de prompt y de modelo. Usuarios reales, radio de impacto limitado.
+- **Requisito clave:** métricas que distingan el canary de la versión estable. Cada log y cada métrica de request debe llevar una etiqueta `version`.
+- **Trampa:** con el 1% de un servicio de poco tráfico puedes tener 30 requests en 10 minutos. No basta para ver una caída de 2 puntos en el puntaje de un juez. Ajusta pasos y pausas al volumen de tráfico.
+
+### Shadow traffic (mirroring)
+
+Copias requests reales hacia la versión nueva, pero **descartas sus respuestas**. Los usuarios solo ven la respuesta estable. Comparas los outputs offline: puntajes del juez, longitud, latencia, validez del schema, rechazos.
+
+- **Bueno para:** cambios de modelo, sobre todo al pasar a un modelo autoalojado. Cero riesgo para el usuario.
+- **Costos:** pagas cada request dos veces. Con una API paga, haz shadow del 5–10% del tráfico, no del 100%.
+- **Peligro:** efectos secundarios. Un agente en modo shadow no debe enviar emails, escribir en la base de datos ni llamar APIs de pago. Usa stubs o desactiva las tools en el camino shadow.
+
+Una secuencia común para cambiar de modelo: **primero shadow** (¿se comporta bien?), luego **canary** (¿los usuarios reaccionan bien?), luego rollout completo.
+
+## Señales de evaluación online como gates del rollout
+
+Un canary es tan bueno como sus gates. Para apps LLM, usa tres capas de señales:
+
+1. **Señales técnicas duras** (rápidas, baratas, en cada request): tasa de errores, tasa de 429/5xx del proveedor, p95 del tiempo al primer token, tasa de timeouts.
+2. **Señales de contrato** (en cada request, deterministas): validez del JSON schema, presencia de citas, longitud dentro de rangos, tasa de patrones de rechazo.
+3. **Señales de calidad** (muestreadas, más lentas): un juez LLM sobre una muestra del tráfico canary y estable, tasa de pulgares abajo, tasa de escalamiento a humano.
+
+Las capas 1 y 2 pueden controlar cada paso. La capa 3 necesita volumen. Úsala en los pasos posteriores y más grandes, o como análisis en segundo plano durante todo el rollout.
+
+Aquí un pequeño esbozo de cómo el servicio exporta las señales. Cada serie debe terminar con una etiqueta `version` para que Prometheus compare canary contra estable. En Kubernetes, Prometheus la agrega desde la etiqueta del pod (se muestra más abajo), así que las métricas del camino del request no conocen la versión. El worker del juez corre en otro lado, así que pone `version` él mismo a partir del request registrado.
+
+```python
+from prometheus_client import Counter, Histogram
+from pydantic import BaseModel, ValidationError
+
+REQUESTS = Counter("llm_requests_total", "LLM requests", ["status"])
+CONTRACT = Counter("llm_contract_checks_total", "Output contract checks", ["result"])
+TTFT = Histogram("llm_ttft_seconds", "Time to first token",
+                 buckets=(0.25, 0.5, 1, 2, 4, 8))
+JUDGE = Histogram("llm_judge_score", "Sampled judge score 0..1", ["version"],
+                  buckets=(0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0))
+
+class TriageAnswer(BaseModel):
+    category: str
+    confidence: float
+    reply: str
+
+def record_contract(raw_json: str) -> TriageAnswer | None:
+    try:
+        parsed = TriageAnswer.model_validate_json(raw_json)
+    except ValidationError:
+        CONTRACT.labels("invalid").inc()
+        return None
+    CONTRACT.labels("valid").inc()
+    return parsed
+```
+
+El juez corre fuera de banda: un worker muestrea, por ejemplo, el 5% de las respuestas registradas por versión, las puntúa con un modelo juez barato y registra `llm_judge_score`. Nunca pongas el juez en el camino del request.
+
+## Implementar canaries: Argo Rollouts
+
+En Kubernetes, Argo Rollouts reemplaza un `Deployment` por un `Rollout` que conoce pasos canary y análisis. Un `AnalysisTemplate` define el gate como una consulta de Prometheus.
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: llm-canary-health
+spec:
+  args:
+    - name: version
+  metrics:
+    - name: error-rate
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      successCondition: result[0] < 0.02
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring:80
+          query: |
+            sum(rate(llm_requests_total{version="{{args.version}}",status="error"}[2m]))
+            /
+            sum(rate(llm_requests_total{version="{{args.version}}"}[2m]))
+    - name: contract-valid
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      successCondition: result[0] > 0.98
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring:80
+          query: |
+            sum(rate(llm_contract_checks_total{version="{{args.version}}",result="valid"}[5m]))
+            /
+            sum(rate(llm_contract_checks_total{version="{{args.version}}"}[5m]))
+```
+
+Luego el Rollout ejecuta los pasos. Si algún análisis falla, Argo **aborta**: escala el canary a cero y devuelve todo el tráfico a la versión estable. No hace falta un humano a las 3 a.m.
+
+```yaml
+strategy:
+  canary:
+    canaryMetadata:
+      labels: { version: canary }
+    stableMetadata:
+      labels: { version: stable }
+    steps:
+      - setWeight: 10
+      - analysis:
+          templates: [{ templateName: llm-canary-health }]
+          args: [{ name: version, value: canary }]
+      - setWeight: 50
+      - pause: { duration: 10m }
+      - setWeight: 100
+```
+
+`canaryMetadata` y `stableMetadata` ponen una etiqueta `version` en los pods. Para llevarla a tus métricas, mapea las etiquetas del pod a etiquetas de métrica en la configuración de scrape de Prometheus (la regla común de `labelmap` sobre `__meta_kubernetes_pod_label_(.+)` lo hace). No la leas en una variable de entorno con la Downward API: Argo vuelve a etiquetar los pods cuando promueve el canary, y las variables de entorno quedan fijas al iniciar el pod, así que la etiqueta quedaría desactualizada.
+
+Sin un traffic router (NGINX, Istio, plugin de Gateway API), `setWeight` se aproxima con la proporción de réplicas. Con 4 réplicas, 10% en realidad significa "1 de 4 pods". Usa un traffic router cuando necesites porcentajes pequeños y precisos.
+
+## Implementar canaries en ECS
+
+En ECS tienes dos opciones principales:
+
+- **Blue/green de CodeDeploy para ECS** con una configuración de deployment como `CodeDeployDefault.ECSCanary10Percent5Minutes`. Dos target groups detrás del ALB. Asocias alarmas de CloudWatch al deployment group, y CodeDeploy hace rollback automático si una alarma se dispara.
+- **Estrategias de deployment nativas de ECS.** Versiones recientes de ECS agregaron deployments blue/green integrados (y luego canary y linear) con lifecycle hooks y rollback basado en alarmas, sin CodeDeploy. Revisa la documentación actual de ECS para ver qué soporta tu región.
+
+En ambos casos el gate es una alarma de CloudWatch. Publica las mismas métricas (tasa de errores, validez del contrato) como métricas custom de CloudWatch con una dimensión `version`, o usa metric math sobre las métricas del target group del ALB.
+
+## Prompts y modelos como configuración: la decisión de ruteo
+
+Aquí hay una decisión de diseño escondida. ¿Publicas un cambio de prompt como **imagen nueva** o como **cambio de configuración**?
+
+- **Imagen nueva** (archivos de prompt dentro de la imagen): la maquinaria canary de arriba funciona sin más. Versión = tag de la imagen. Simple y reproducible.
+- **Configuración en runtime** (registro de prompts, feature flag del Módulo 5): más rápido de cambiar, pero tu herramienta de deploy no ve el cambio. Debes implementar el canary en la app, por ejemplo haciendo hash del user id en buckets y registrando `prompt_version` en cada request.
+
+Muchos equipos hacen ambas cosas: los cambios de prompt pasan por el pipeline de imágenes por defecto; el sistema de flags es un override de emergencia. La lección 10 cubre los registros en detalle.
+
+## Errores comunes
+
+- **Controlar solo con errores HTTP.** Las regresiones de LLM son casi siempre 200 OK. Agrega señales de contrato y de calidad.
+- **Sin etiqueta `version`.** Si se mezclan las métricas de canary y estable, el análisis compara la flota consigo misma.
+- **Pausas demasiado cortas para el volumen de tráfico.** Calcula cuántos requests esperas por paso. Si son menos de unos cientos, la señal de calidad es ruido.
+- **Ignorar las sesiones sticky.** Una conversación de chat que salta entre versiones de prompt a mitad del hilo parece rota. Rutea por conversación o por user id.
+- **Hacer shadow de un agente con tools reales.** El tráfico espejo no debe tener efectos secundarios.
+- **Olvidar la caché.** Una caché semántica cuya clave no incluye la versión del prompt sirve respuestas estables a usuarios del canary y oculta el cambio. Incluye `prompt_version` y `model` en la clave de caché.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo harías el rollout seguro de una nueva versión de modelo en una funcionalidad LLM con 50 mil usuarios diarios?" level="senior">
+
+Empiezo offline: el golden dataset y las evaluaciones de regresión en CI deben pasar. Luego hago shadow del 5–10% del tráfico al modelo nuevo con los efectos secundarios desactivados, y comparo durante un día puntajes del juez, longitud, latencia, validez del schema y rechazos por categoría.
+
+Después, canary con ruteo sticky por user id: 5%, luego 25%, luego 50%, luego 100%. Cada paso se controla automáticamente con tasa de errores, p95 del tiempo al primer token y validez del contrato. Un análisis en segundo plano sigue un puntaje de juez muestreado y la tasa de pulgares abajo. Cualquier gate que falle aborta y devuelve todo el tráfico a la versión estable.
+
+Cada request se etiqueta con la versión de modelo y de prompt, y la clave de caché las incluye. Dimensionaría la duración de cada paso según el volumen de tráfico para que la señal de calidad sea estadísticamente significativa, no solo con un temporizador fijo.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuál es la diferencia entre shadow traffic y un canary, y cuándo eliges cada uno?" level="mid">
+
+El shadow traffic duplica los requests hacia la versión nueva y descarta sus respuestas, así que los usuarios nunca la ven. Tiene cero riesgo para el usuario, pero duplica el costo de la parte espejada y solo te da comparaciones offline. Un canary sirve respuestas reales a una pequeña parte de los usuarios, así obtienes señales reales (feedback, escalamientos) con un radio de impacto limitado. Usa primero shadow para cambios riesgosos como una nueva familia de modelos o un modelo autoalojado; usa canary para la validación final frente al usuario.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Documentación de Argo Rollouts (canary, análisis): https://argo-rollouts.readthedocs.io/en/stable/
+- Tipos de deployment de Amazon ECS: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-types.html
+- Configuraciones de deployment de CodeDeploy para ECS: https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-configurations.html
+- Fundamentos de consultas en Prometheus: https://prometheus.io/docs/prometheus/latest/querying/basics/

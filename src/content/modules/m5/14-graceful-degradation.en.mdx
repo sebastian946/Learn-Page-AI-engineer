@@ -1,0 +1,223 @@
+## Your provider will fail. Plan the answer.
+
+Your LLM provider is a dependency you do not control. It will have elevated error rates, regional incidents, slow periods and rate-limit storms. Your own Redis or Postgres can also blip. The question is not "will it fail" but "what does the user see when it does".
+
+Graceful degradation means the service keeps doing something useful, at lower quality, instead of returning a stack trace. As an SDET you already think in failure modes. Here you design the behavior for each one and then test it like any other requirement.
+
+The degradation ladder for the mortgage knowledge assistant looks like this:
+
+| Level | Condition | Behavior |
+|---|---|---|
+| 0 — Normal | All healthy | `claude-sonnet-5-5`, full retrieval, re-ranking |
+| 1 — Slow primary | Primary TTFT above budget | Hedge or switch to `claude-haiku-5-5` |
+| 2 — Primary down | Circuit open on primary | Fallback model (same or second provider) |
+| 3 — All models down | Every circuit open | Cached answer for a similar question, clearly labeled |
+| 4 — Nothing to serve | No cache hit | Top retrieved passages with links, "the assistant is unavailable" |
+| 5 — Retrieval down | Postgres unreachable | Friendly error with a status page link, HTTP 503 |
+
+Every level is a product decision. Write it down with your stakeholders. "Show raw policy passages when the model is down" might be great for internal loan officers and unacceptable for a public chatbot.
+
+## Timeouts: the foundation
+
+Every other pattern depends on timeouts. Without them, a slow provider holds your connections until the pool is exhausted and the whole service dies. That is how one slow dependency becomes a full outage.
+
+Set timeouts at several layers:
+
+- **Connect timeout**: short, 2–5 s. A provider you cannot reach is down.
+- **Time to first token**: a budget like 8 s. If no token arrives, give up and fall back.
+- **Idle timeout between tokens**: e.g. 15 s. Catches stalled streams.
+- **Total request deadline**: e.g. 60 s. Matches your load balancer idle timeout minus a margin.
+
+The Anthropic SDK accepts `timeout` and `max_retries` on the client. Keep SDK retries low (0–1) when you have your own fallback logic, or retries will multiply your latency before the fallback ever runs.
+
+## Circuit breakers
+
+A circuit breaker stops calling a dependency that is failing. It has three states:
+
+- **Closed**: calls flow. Count failures in a rolling window.
+- **Open**: after N failures (or an error rate above a threshold), stop calling. Fail fast for a cooldown period.
+- **Half-open**: after the cooldown, let one probe call through. Success closes the circuit; failure opens it again.
+
+Why not just retry? Because retries against a struggling provider add load and latency. The breaker protects your latency budget and the provider. In a multi-task deployment, keep breaker state per task (simple, slightly slower to react) or in Redis (shared, one more dependency). Per task is fine for most teams.
+
+```python
+# app/resilience.py
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class CircuitBreaker:
+    name: str
+    failure_threshold: int = 5
+    cooldown_s: float = 30.0
+    _failures: int = 0
+    _opened_at: float | None = None
+    _half_open_probe: bool = field(default=False)
+
+    def allow(self) -> bool:
+        if self._opened_at is None:
+            return True
+        if time.monotonic() - self._opened_at >= self.cooldown_s and not self._half_open_probe:
+            self._half_open_probe = True  # let exactly one probe through
+            return True
+        return False
+
+    def record_success(self) -> None:
+        self._failures, self._opened_at, self._half_open_probe = 0, None, False
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._half_open_probe or self._failures >= self.failure_threshold:
+            self._opened_at = time.monotonic()
+            self._half_open_probe = False
+
+    @property
+    def state(self) -> str:
+        if self._opened_at is None:
+            return "closed"
+        return "half_open" if self._half_open_probe else "open"
+```
+
+Count only failures that mean "the dependency is unhealthy": timeouts, 5xx, 529 overloaded, connection errors. Do **not** count 400 validation errors or content-policy refusals. Those are your bugs or the user's input, and opening the circuit on them hides the real problem.
+
+## A fallback chain
+
+Put the breaker, timeouts and fallbacks together. The chain tries each model in order, skips open circuits and enforces a TTFT budget on the first token.
+
+```python
+# app/llm_chain.py
+import asyncio
+from collections.abc import AsyncIterator
+
+import anthropic
+
+from app.resilience import CircuitBreaker
+
+RETRYABLE = (anthropic.APITimeoutError, anthropic.APIConnectionError,
+             anthropic.InternalServerError, anthropic.RateLimitError)
+
+
+class AllModelsDown(Exception):
+    pass
+
+
+async def stream_with_fallback(
+    client: anthropic.AsyncAnthropic,
+    models: list[tuple[str, CircuitBreaker]],
+    system: str,
+    messages: list[dict],
+    ttft_budget_s: float = 8.0,
+) -> AsyncIterator[tuple[str, str]]:
+    """Yields (model_id, text_chunk). Falls back only before the first token."""
+    for model_id, breaker in models:
+        if not breaker.allow():
+            continue
+        try:
+            async with client.messages.stream(
+                model=model_id, max_tokens=800, system=system, messages=messages
+            ) as stream:
+                chunks = stream.text_stream.__aiter__()
+                first = await asyncio.wait_for(chunks.__anext__(), timeout=ttft_budget_s)
+                breaker.record_success()
+                yield model_id, first
+                async for text in chunks:
+                    yield model_id, text
+                return
+        except (asyncio.TimeoutError, *RETRYABLE):
+            breaker.record_failure()
+            continue  # try the next model
+    raise AllModelsDown()
+```
+
+Note the rule in the docstring: **fall back only before the first token**. Once you have streamed half an answer from Sonnet, switching to Haiku mid-sentence produces garbage. After the first token, a failure becomes an in-band `error` event (lesson 01), and the client can retry.
+
+At the API layer, catch `AllModelsDown` and move down the ladder: semantic-cache lookup, then retrieved passages, then 503. Always tell the client which level served the answer, for example a `degraded` field in the `done` event and a metric label. Silent degradation is a support nightmare.
+
+## Cached answers as a fallback
+
+The semantic cache from lesson 05 has a stricter threshold for normal traffic because a wrong hit is a wrong answer. During an outage the trade-off changes. You can serve a cached answer with a slightly lower similarity threshold, **with a visible label**: "The assistant is in limited mode. This answer was generated earlier for a similar question." Keep tenant scoping and corpus-version checks. Never relax those.
+
+## Feature flags for prompts
+
+Prompts are code that changes behavior in production. They deserve the same release controls as code, plus one more: **you want to change them without a deploy**, and roll back in seconds.
+
+A feature flag for prompts maps a request context (tenant, user cohort, percentage bucket) to a prompt version. Use cases:
+
+- **Canary a new prompt** to 5% of traffic, compare online metrics, then ramp.
+- **Kill switch**: flip back to the previous version instantly when the new one misbehaves.
+- **Per-tenant variants**: a client with a stricter compliance tone.
+- **Degradation switches**: a flag that disables re-ranking or forces the cheap model during an incident.
+
+You can use a vendor (LaunchDarkly, Unleash, AWS AppConfig) or a small table in Postgres cached in memory for 30 s. Whatever you use, the prompt **content** lives in the repo, versioned and covered by the eval gate. The flag only chooses **which reviewed version** runs.
+
+```python
+# app/prompts.py
+import hashlib
+from pathlib import Path
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+
+def bucket(tenant_id: str, flag: str) -> int:
+    """Stable 0-99 bucket so a tenant always sees the same variant."""
+    digest = hashlib.sha256(f"{flag}:{tenant_id}".encode()).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def select_prompt(tenant_id: str, flags: dict) -> tuple[str, str]:
+    cfg = flags.get("answer_prompt", {"default": "v3", "canary": None, "percent": 0})
+    version = cfg["default"]
+    if cfg.get("canary") and bucket(tenant_id, "answer_prompt") < cfg["percent"]:
+        version = cfg["canary"]
+    text = (PROMPTS_DIR / f"answer_{version}.md").read_text(encoding="utf-8")
+    return version, text
+```
+
+Log the prompt version on every trace and include it in the cache key (lesson 05). Otherwise you cannot tell which version produced a bad answer, and the cache serves v3 answers to v4 traffic.
+
+## Testing degradation
+
+Untested fallbacks fail when you need them. Treat them as test cases:
+
+- **Unit**: the breaker opens after N failures, half-opens after cooldown, ignores 400s.
+- **Integration**: the mock provider (`LLM_PROVIDER=mock`) supports fault modes, like `MOCK_FAIL_RATE` and `MOCK_TTFT_MS=20000`. Assert the response comes from the fallback model and carries `degraded: true`.
+- **Game day**: in staging, block egress to the provider with a security group change and watch dashboards, alerts and the user experience. Write down what surprised you.
+
+## Common mistakes
+
+- **No timeouts, or only a total timeout.** A stalled stream with no TTFT budget holds a connection for minutes.
+- **SDK retries plus your own fallback.** Three hidden retries at 10 s each mean the fallback starts after 30 s. Turn SDK retries down.
+- **Falling back mid-stream.** Mixing two models in one answer. Fall back before the first token only.
+- **Counting client errors as failures.** A burst of bad input opens the circuit and takes down the service for everyone.
+- **Silent degradation.** Users and support cannot tell why answers got worse. Label it in the payload, in logs and in metrics.
+- **Prompt text in the flag system.** The flag tool becomes an unreviewed, unevaluated deploy path. Store content in git, flags select versions.
+- **Fallback model never evaluated.** If Haiku is your fallback, run the eval suite against it too, and know its faithfulness score before the incident.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your LLM provider has a 30-minute partial outage. Walk me through what your service does." level="senior">
+
+Timeouts detect it first: connect timeout and a TTFT budget around 8 s, with SDK retries turned down. Failures (timeouts, 5xx, overloaded) feed a per-model circuit breaker. After five failures the primary circuit opens, and new requests go straight to the fallback model with no wasted latency. The fallback has been evaluated, so we know its quality. If every circuit is open, we serve a labeled semantic-cache answer scoped to the tenant, then retrieved passages with links, then a 503 with a status link. Every response carries a `degraded` level, which drives a dashboard panel and an alert. Half-open probes close the circuit when the provider recovers. Afterwards we review the incident: time to detect, percent of traffic degraded, cost impact. We also check whether the thresholds were right.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you roll out a new system prompt safely?" level="mid">
+
+The prompt lives in git as a new version file, and the eval gate runs on it in CI. After merge, a feature flag sends a small, stable percentage of tenants (hash bucketing) to the new version. I compare online metrics by prompt version: thumbs-down rate, groundedness score from sampled online evals, latency and tokens. Then I ramp up or flip the kill switch. The prompt version is logged on every trace and is part of the cache key.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Connect it to your QA background">
+
+Fallbacks are code paths that almost never run in production, which makes them the classic untested branch. Say you test them with fault injection in the mock provider and game days in staging. That is a strong SDET-to-AI signal.
+
+</Callout>
+
+## Further reading
+
+- Anthropic API errors and status codes: https://docs.anthropic.com/en/api/errors
+- Anthropic streaming messages: https://docs.anthropic.com/en/docs/build-with-claude/streaming
+- AWS Builders' Library, "Timeouts, retries, and backoff with jitter": https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/
+- AWS AppConfig feature flags: https://docs.aws.amazon.com/appconfig/latest/userguide/what-is-appconfig.html
+- Martin Fowler, "CircuitBreaker": https://martinfowler.com/bliki/CircuitBreaker.html

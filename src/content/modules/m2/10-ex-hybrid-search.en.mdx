@@ -1,0 +1,158 @@
+## Goal
+
+Add a keyword leg to your pgvector retriever, fuse the two legs with reciprocal rank fusion, enforce metadata filters on both legs, and prove with numbers that hybrid beats vector-only on your mortgage corpus, especially on questions with exact identifiers.
+
+Folder: `rag-lab/04-hybrid/`. It builds on the database and indexer from `03-pgvector/` (same compose stack) and the golden set from `02-chunking/`.
+
+### Extend the golden set first
+
+Your current golden set probably under-represents the cases hybrid is meant to fix. Before writing code, add at least 12 questions in three categories and tag each with `category`:
+
+- `exact_term` (at least 5): form numbers, section references, product codes. "What does Form 4506-C authorize?", "Section 50(a)(6) cash-out limits".
+- `filtered` (at least 4): questions whose correct answer depends on jurisdiction or date, with `filters` recorded in the golden row, e.g. `{"jurisdiction": "US-TX"}` or an `as_of` date that selects the older FHA version.
+- `paraphrase` (at least 3): no shared keywords with the source. "Highest debt ratio we'll take on a conforming loan?"
+
+Per-category metrics will tell a much clearer story than one global number.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] A migration `002_fulltext.sql` adds a generated `tsvector` column (section + content) with a GIN index. Your `exact_term` identifiers are verified to survive tokenization (a unit test calls `to_tsvector` on each and checks the lexemes), with a fix if any break.
+- [ ] `keyword_search` and `vector_search` each return the top N candidate chunk IDs (default 40) with filters applied **inside** each leg.
+- [ ] `rrf(lists, k=60, weights)` is implemented in Python with unit tests on a hand-computed example, and an equivalent single-SQL hybrid query returns the same top 10 for at least 5 golden questions (asserted in a test).
+- [ ] Filters supported: `jurisdictions` (list, always including `US`), `doc_type`, `as_of` date (selects the version effective on that date) and `current_only`. A property-style test runs every golden question and asserts no returned chunk violates its filters.
+- [ ] Optional filter extraction from the question with a cheap Claude model and a Pydantic schema; extracted values are validated against allow-lists, and an empty filtered result falls back to unfiltered with a flag in the response.
+- [ ] `python -m hybrid bench` compares `vector`, `keyword`, `hybrid_rrf` and `hybrid_rrf_weighted` reporting hit@5 and MRR@10 overall and per category, plus p50/p95 retrieval latency.
+- [ ] A small grid search over RRF `k` in (10, 30, 60, 100) and vector weight in (0.3, 0.5, 0.7) is run, and the chosen setting is recorded with the caveat that it was tuned on the same set it is reported on.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# 04-hybrid/hybrid/retrieve.py
+from dataclasses import dataclass, field
+from datetime import date
+
+import numpy as np
+from psycopg import AsyncConnection
+
+from .fusion import rrf
+
+
+@dataclass
+class Filters:
+    jurisdictions: list[str] = field(default_factory=lambda: ["US"])
+    doc_type: str | None = None
+    as_of: date | None = None
+    current_only: bool = True
+
+
+def filter_sql(f: Filters) -> tuple[str, dict]:
+    where = ["d.jurisdiction = ANY(%(jur)s)"]
+    params: dict = {"jur": sorted(set(f.jurisdictions) | {"US"})}
+    if f.doc_type:
+        where.append("d.doc_type = %(doc_type)s"); params["doc_type"] = f.doc_type
+    if f.as_of:
+        # TODO: select the version effective on as_of (latest effective_date <= as_of
+        #       per document family). current_only must be ignored in this case.
+        raise NotImplementedError
+    elif f.current_only:
+        where.append("d.is_current")
+    return " AND ".join(where), params
+
+
+async def vector_search(conn: AsyncConnection, qvec: np.ndarray, f: Filters, n: int = 40) -> list[str]:
+    where, params = filter_sql(f)
+    cur = await conn.execute(f"""
+        SELECT c.chunk_id FROM chunks c JOIN documents d USING (doc_id)
+        WHERE {where}
+        ORDER BY c.embedding <=> %(q)s LIMIT %(n)s""", {**params, "q": qvec, "n": n})
+    return [r["chunk_id"] for r in await cur.fetchall()]
+
+
+async def keyword_search(conn: AsyncConnection, text: str, f: Filters, n: int = 40) -> list[str]:
+    where, params = filter_sql(f)
+    # TODO: websearch_to_tsquery + ts_rank_cd over c.tsv, same filters
+    raise NotImplementedError
+
+
+async def hybrid_search(conn, qvec, text, f: Filters, k: int = 8,
+                        rrf_k: int = 60, w_vec: float = 0.5) -> list[str]:
+    vec_ids = await vector_search(conn, qvec, f)
+    kw_ids = await keyword_search(conn, text, f)
+    fused = rrf([vec_ids, kw_ids], k=rrf_k, weights=[w_vec, 1 - w_vec], top_n=k)
+    return [chunk_id for chunk_id, _ in fused]
+```
+
+```python
+# 04-hybrid/tests/test_fusion.py
+from hybrid.fusion import rrf
+
+def test_rrf_prefers_items_in_both_lists():
+    fused = dict(rrf([["a", "b", "c"], ["c", "d", "a"]], k=60))
+    # a: 1/61 + 1/63, c: 1/63 + 1/61 -> tie; both beat b and d
+    assert abs(fused["a"] - fused["c"]) < 1e-12
+    assert fused["a"] > fused["b"] and fused["a"] > fused["d"]
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Run the two legs concurrently with `asyncio.gather`, each on its own connection from a pool (`psycopg_pool.AsyncConnectionPool`). A single connection cannot run two queries at the same time.</Hint>
+  <Hint>Check identifier tokenization in `psql` first: `SELECT to_tsvector('english', 'Form 4506-C and Section 50(a)(6)');`. If an identifier is split into pieces that also match unrelated chunks, add a second generated column using the `simple` configuration over a normalized copy of the text (strip hyphens and parentheses), and OR both tsqueries in the keyword leg.</Hint>
+  <Hint>For `as_of`, you need a document family key that is stable across versions (for example the slug from the file path in `01-ingestion`). Use `DISTINCT ON (family) ... ORDER BY family, effective_date DESC` restricted to `effective_date <= as_of` in a CTE, and join chunks to that set.</Hint>
+  <Hint>Expect the per-category table to show keyword winning on `exact_term`, vector winning on `paraphrase`, and hybrid close to the best of both on each. If hybrid loses on `paraphrase`, your keyword weight is too high or each leg returns too few candidates; if it loses on `exact_term`, check tokenization before touching weights.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  04-hybrid/
+    README.md
+    pyproject.toml
+    migrations/
+      002_fulltext.sql
+    data/
+      golden_hybrid.jsonl     # extended golden set with category + filters
+    hybrid/
+      __init__.py
+      __main__.py             # search | bench | grid
+      fusion.py
+      retrieve.py
+      hybrid.sql              # single-query version
+      filters_extract.py      # optional LLM filter extraction with allow-lists
+      bench.py
+    tests/
+      test_fusion.py
+      test_tokenization.py
+      test_filters_property.py
+      test_sql_matches_python.py
+    results/
+      bench.md
+      grid.csv
+```
+
+**README outline for `04-hybrid/`:** problem statement with two real misses from vector-only, design (two legs, filters in each leg, RRF), tokenization findings and fix, filter sources (request context first, extraction second, allow-lists), results table overall and per category, grid-search result with the overfitting caveat, latency impact, when you would switch to real BM25 (ParadeDB or OpenSearch).
+
+**Suggested commits:**
+
+- `feat(hybrid): full-text tsvector column with GIN index and tokenization tests`
+- `feat(hybrid): keyword and vector legs with shared filter builder`
+- `feat(hybrid): reciprocal rank fusion in Python and single SQL query`
+- `feat(hybrid): as_of version filtering and property test for filter safety`
+- `feat(hybrid): per-category benchmark and RRF grid search; docs`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m2-10-review" title="Self-review" items={["Every exact_term identifier survives tokenization, proven by a test", "Filters are applied inside both legs, before fusion", "No retrieved chunk violates its filters across the whole golden set", "Python RRF and the SQL hybrid query agree on the top 10", "Results are reported per category, not only overall", "The tuned RRF k and weights are documented with an overfitting caveat", "Retrieval latency with hybrid is measured and compared with vector-only"]} />

@@ -1,0 +1,172 @@
+## Más allá de un solo juez con una rúbrica
+
+El módulo 3 te dio lo básico: escribir una rúbrica, pedirle un veredicto a un modelo fuerte, vigilar los sesgos de posición y de verbosidad, y verificar el kappa de Cohen contra etiquetas humanas antes de usarlo como gate en CI. Ese juez es un buen oráculo de pruebas para una métrica sobre un dataset.
+
+A escala aparecen problemas nuevos. Un solo modelo juez tiene puntos ciegos y favorece salidas que se parecen a las suyas. Los criterios abiertos producen puntajes inestables. El propio proveedor del juez lo actualiza y tu línea de tendencia histórica se desplaza de un día para otro. Y un juez con 85% de exactitud te sigue dando una **estimación sesgada** de la tasa real de aprobación. Esta lección cubre las técnicas que atacan cada problema.
+
+## Juicio guiado por referencia
+
+Un juez al que le preguntas "¿esta respuesta es correcta?" tiene que resolver la tarea él mismo. Si la tarea es difícil (un cálculo de impuestos, un caso borde legal), el juez falla justo donde lo necesitas. Dale una **respuesta de referencia** y cambia la pregunta a "¿el candidato es equivalente a la referencia para esta pregunta?". Esa es una tarea mucho más fácil. El paper de MT-Bench mostró que calificar con referencia mejora claramente la exactitud del juez en preguntas de matemáticas y razonamiento.
+
+Reglas para jueces guiados por referencia:
+
+- Dile al juez qué significa equivalencia: mismos hechos y números, la redacción puede variar, el detalle extra correcto está bien, el detalle extra sin respaldo no.
+- Pon la referencia en su propio bloque etiquetado para que el juez nunca la confunda con el candidato.
+- Mantén las referencias cortas y factuales. Una referencia larga invita a juzgar "¿qué tan parecido es el estilo?".
+- Cuando hay varias respuestas válidas, da una lista de referencias aceptables o de hechos clave, no un solo ejemplar.
+
+## Rúbricas con chain-of-thought al estilo G-Eval
+
+G-Eval (Liu et al., 2023) tiene dos ideas que vale la pena conservar:
+
+1. **Pasos de evaluación.** Convierte un criterio vago ("coherencia") en pasos explícitos que el juez ejecuta antes de puntuar. Puedes pedirle a un LLM que redacte los pasos a partir del criterio una vez, y luego revisarlos y congelarlos como parte de la rúbrica.
+2. **Puntajes ponderados por probabilidad.** El método original lee las probabilidades de los tokens de cada valor de puntaje y toma el valor esperado, lo que da puntajes más finos y con menos empates. Cuando tu proveedor no expone log-probabilities, el sustituto práctico es muestrear al juez varias veces y promediar.
+
+Un patrón relacionado es la **descomposición**: en lugar de un puntaje holístico, el juez extrae afirmaciones y verifica cada una (así funcionan por dentro las métricas de faithfulness de Ragas y DeepEval). Los juicios descompuestos son más fáciles de auditar, porque puedes señalar la afirmación exacta sin respaldo.
+
+```python
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.AsyncAnthropic()
+
+class JudgeOut(BaseModel):
+    steps: list[str]
+    score: int = Field(ge=1, le=4)
+
+RUBRIC_V3 = """You grade the ACCURACY of a contract clause summary.
+Follow these evaluation steps in order and write one line per step:
+1. List every factual claim in the candidate summary.
+2. Check each claim against the clause text: supported, contradicted, or not in the clause.
+3. Compare with the reference: list key points the candidate omits.
+4. Score with this scale:
+   4 = all claims supported, no key point missing
+   3 = all claims supported, one minor omission
+   2 = one unsupported claim, or a key point missing
+   1 = any contradicted claim (amounts, parties, dates, obligations)
+Return only JSON: {"steps": ["..."], "score": 1-4}"""
+
+async def judge_accuracy(model: str, clause: str, reference: str, candidate: str, samples: int = 3) -> float:
+    scores: list[int] = []
+    for _ in range(samples):
+        msg = await client.messages.create(
+            model=model,
+            max_tokens=800,
+            system=RUBRIC_V3,
+            messages=[{"role": "user", "content": (
+                f"<clause>\n{clause}\n</clause>\n<reference>\n{reference}\n</reference>\n"
+                f"<candidate>\n{candidate}\n</candidate>"
+            )}],
+        )
+        scores.append(JudgeOut.model_validate_json(msg.content[0].text).score)
+    return sum(scores) / len(scores)  # sampling average as a stand-in for probability weighting
+```
+
+En producción, usa tool use o structured outputs en lugar de parsear texto libre, y guarda en caché por `(judge model, rubric hash, item id, sample index)`.
+
+## Ensambles de jueces (jurados)
+
+Un solo modelo juez tiene errores idiosincráticos y un conocido **sesgo de autopreferencia**: tiende a calificar más alto las salidas de su propia familia de modelos. El paper "Replacing Judges with Juries" (Verga et al., 2024) mostró que un panel de modelos más pequeños de distintas familias puede igualar o superar a un solo juez grande en acuerdo con humanos, a menor costo.
+
+Decisiones de diseño:
+
+- **Diversidad antes que tamaño.** Tres jueces de distintos proveedores le ganan a tres muestras del mismo modelo.
+- **La política de agregación sigue al riesgo.** Media o mayoría para métricas de calidad. "Si un juez reprueba, se reprueba" para verificaciones de seguridad y cumplimiento.
+- **El desacuerdo es una señal de ruteo.** Cuando los puntajes de los jueces se separan 2 puntos o más en una escala de 4, manda el ítem a un humano. Obtienes una estimación de incertidumbre barata gratis.
+- **Nunca dejes que la familia del candidato juzgue sola.** Esto importa mucho en una migración de modelo (proyecto final): si comparas el modelo X vs el modelo Y, un juez de la familia de X es un conflicto de interés.
+
+```python
+import asyncio
+import os
+from statistics import mean
+
+from llm_client import judge_call  # your provider-agnostic client from Module 1
+
+JURY = ["claude-sonnet-5-5", os.environ["JUDGE_MODEL_B"], os.environ["JUDGE_MODEL_C"]]  # different providers
+
+async def jury_score(item: dict, policy: str = "mean") -> dict:
+    scores = await asyncio.gather(*(judge_call(m, item) for m in JURY))
+    value = min(scores) if policy == "strict" else mean(scores)
+    return {
+        "scores": dict(zip(JURY, scores)),
+        "value": value,
+        "needs_human": max(scores) - min(scores) >= 2,
+    }
+```
+
+## Calibrar jueces contra humanos
+
+El kappa es el titular, pero la calibración necesita más detalle:
+
+- **Matriz de confusión por segmento.** Un juez con kappa 0.75 global puede tener 0.4 en documentos largos o en entradas en español. Reporta el kappa por cada segmento que importa para la decisión.
+- **Ajuste del umbral.** Para puntajes continuos, elige el umbral de aprobación en un split de desarrollo para lograr una tasa objetivo de falsos aprobados (el error peligroso) y luego confírmalo en un split reservado.
+- **Juez vs humano comparado con humano vs humano.** Si dos humanos llegan a kappa 0.70 y el juez llega a 0.68 con cada uno, el juez es tan bueno como otro anotador. Pedir 0.90 cuando los humanos coinciden en 0.70 es pedir lo imposible.
+- **Corrección de sesgo en las estimaciones.** Incluso un buen juez se equivoca en algunos ítems, y sus errores rara vez son simétricos. Si el juez dice 82% de aprobación en 5,000 ítems, la tasa real puede ser 78%.
+
+### Corregir el sesgo del juez con una pequeña muestra humana
+
+La **prediction-powered inference** (Angelopoulos et al., 2023) da una solución con fundamento. Corre el juez sobre todo (`N` ítems). Haz que humanos etiqueten un subconjunto aleatorio (`n` ítems) que el juez también puntuó. La diferencia promedio humano-menos-juez en ese subconjunto estima el sesgo del juez, y la restas.
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+def ppi_mean(judge_all: np.ndarray, judge_lab: np.ndarray, human_lab: np.ndarray, conf: float = 0.95):
+    """judge_all: judge scores on N unlabeled items; judge_lab/human_lab: same n labeled items."""
+    rectifier = human_lab - judge_lab                 # judge bias on the labeled subset
+    estimate = judge_all.mean() + rectifier.mean()
+    se = np.sqrt(judge_all.var(ddof=1) / len(judge_all) + rectifier.var(ddof=1) / len(rectifier))
+    z = norm.ppf(1 - (1 - conf) / 2)
+    return estimate, estimate - z * se, estimate + z * se
+```
+
+El subconjunto etiquetado debe ser una muestra **aleatoria** de la misma población, no casos difíciles elegidos a mano. Mientras mejor sea el juez, menor será la varianza del rectificador y más estrecho el intervalo. Con un juez decente, 200 etiquetas humanas más 5,000 puntajes del juez pueden dar un intervalo más estrecho y sin sesgo que 200 etiquetas humanas solas.
+
+## Drift del juez
+
+Tu juez es una dependencia. Los proveedores lanzan versiones nuevas y retiran las viejas. Si tu juez cambia en silencio, cada métrica que depende de él también cambia, y perseguirás una "regresión" que en realidad es un calificador nuevo.
+
+Trata al juez como cualquier dependencia versionada con una prueba de contrato:
+
+1. **Fija un id de modelo exacto** y guárdalo, junto con el hash de la rúbrica y los parámetros de muestreo, con cada resultado.
+2. Mantén un **set de calibración del juez** congelado (100–300 ítems etiquetados por humanos, repartidos entre segmentos).
+3. Cuando el modelo juez tenga que cambiar, corre el juez viejo y el nuevo sobre el set de calibración. Reporta el kappa de cada uno contra humanos y el kappa entre los dos jueces.
+4. Si el nuevo juez es aceptable, **vuelve a puntuar el baseline** con él antes de comparar cualquier corrida nueva. Nunca compares puntajes producidos por jueces distintos.
+5. Marca el cambio en los dashboards para que las líneas de tendencia muestren una discontinuidad, no una caída falsa.
+
+<Callout type="tip" title="Lente SDET">
+
+Es la misma disciplina que actualizar Playwright o una versión de navegador en CI. Corres la versión vieja y la nueva sobre una suite conocida, investigas las diferencias y luego actualizas el baseline en un commit deliberado. Nunca actualizas el oráculo y el sistema bajo prueba en el mismo cambio.
+
+</Callout>
+
+## Errores comunes
+
+- **Juzgar tareas difíciles sin referencia.** El juez falla justo en los ítems difíciles.
+- **Un juez de la familia de modelos del candidato.** El sesgo de autopreferencia infla al candidato.
+- **Promediar un ensamble para verificaciones de seguridad.** Usa una política estricta: un fallo reprueba.
+- **Reportar la tasa de aprobación cruda del juez como la verdad.** Corrígela con un subconjunto humano aleatorio o, al menos, reporta las tasas medidas de falsos aprobados y falsos reprobados del juez.
+- **Actualizar el juez y el prompt en el mismo PR.** No puedes atribuir el cambio.
+- **Calibrar solo sobre el agregado.** Revisa los segmentos donde el juez puede ser débil.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo harías que un juez LLM fuera lo bastante confiable para respaldar una decisión de migración de modelo?" level="senior">
+
+Uso una rúbrica guiada por referencia con pasos de evaluación explícitos y una verificación descompuesta por afirmación, para que los veredictos sean auditables. Uso un jurado de jueces de al menos dos proveedores, y ninguno de la familia del modelo candidato por sí solo, por el sesgo de autopreferencia. Calibro contra etiquetas humanas adjudicadas en un split reservado, por segmento, y comparo el kappa juez-humano con el kappa humano-humano. Los ítems donde los jurados discrepan van a humanos. Para la tasa de aprobación principal corrijo el sesgo del juez con un subconjunto aleatorio etiquetado por humanos usando prediction-powered inference, para que el intervalo sea estrecho y sin sesgo. El id del juez y el hash de la rúbrica están fijados y se guardan con cada puntaje.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu proveedor de juez depreca el modelo que usas. ¿Qué haces?" level="mid">
+
+Lo trato como una actualización de dependencia. Corro el modelo juez viejo y el nuevo sobre mi set de calibración congelado, calculo el kappa de cada uno contra las etiquetas humanas y el kappa entre ellos, e inspecciono los desacuerdos. Si el nuevo juez cumple el mismo estándar, vuelvo a puntuar con él las salidas del baseline guardadas, hago commit del nuevo baseline en un cambio dedicado y anoto en los dashboards la fecha del cambio. Nunca comparo una corrida nueva puntuada por el juez nuevo con un baseline puntuado por el viejo.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena": https://arxiv.org/abs/2306.05685
+- Liu et al., "G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment": https://arxiv.org/abs/2303.16634
+- Verga et al., "Replacing Judges with Juries: Evaluating LLM Generations with a Panel of Diverse Models": https://arxiv.org/abs/2404.18796
+- Angelopoulos et al., "Prediction-Powered Inference": https://arxiv.org/abs/2301.09633
+- Métrica G-Eval de DeepEval: https://docs.confident-ai.com

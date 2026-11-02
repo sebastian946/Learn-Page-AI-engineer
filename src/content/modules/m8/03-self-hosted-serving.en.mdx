@@ -1,0 +1,201 @@
+## From "vLLM exists" to running it
+
+Module 6 explained when self-hosting makes sense and what vLLM does conceptually (PagedAttention, continuous batching). This lesson is the practical side: which server, which GPU, how much memory, and how to autoscale something that takes minutes to start.
+
+Recall the usual reasons to self-host:
+
+- **Data control.** PII or PHI must not leave your network, or a contract forbids third-party processors.
+- **Steady, high volume.** A GPU that is busy most of the day can be cheaper per token than an API. A GPU that idles is not.
+- **Latency control or custom models.** A fine-tuned or small specialized model with predictable latency.
+
+If none of these apply, an API provider is almost always simpler. Self-hosting turns a per-token bill into an on-call rotation.
+
+## The serving stack
+
+| Option | What it is | When to pick it |
+|---|---|---|
+| **vLLM** | High-throughput inference server with an OpenAI-compatible API, continuous batching, PagedAttention, prefix caching, quantization support | The default for most teams |
+| **SGLang** | Similar server with strong structured-output and prefix-sharing performance | Heavy structured output or agent workloads; benchmark against vLLM |
+| **TGI** (Hugging Face) | Hugging Face's inference server | Existing HF-centric stacks; check the project's current maintenance status before adopting it |
+| **KServe** | Kubernetes model-serving layer (CRDs, autoscaling, canaries) that can run vLLM underneath | You want a platform: many models, standard rollout and scaling |
+| **Managed** (SageMaker, Bedrock Custom Model Import, Databricks) | Someone else runs the GPUs | You need self-hosted weights without running GPU nodes |
+
+vLLM's OpenAI-compatible API is the key design property. Your app, your gateway (lesson 5) and your eval harness talk to it exactly like a provider. Switching between a hosted model and a self-hosted one becomes a config change.
+
+## GPU memory: the back-of-envelope math
+
+Every serving decision starts here. GPU memory holds three things:
+
+1. **Weights:** parameters times bytes per parameter. FP16/BF16 is 2 bytes, FP8 is 1, 4-bit (AWQ/GPTQ) is about 0.5 plus some overhead.
+2. **KV cache:** the attention keys and values for every token of every active sequence.
+3. **Overhead:** activations, CUDA graphs, fragmentation. Budget 1–3 GB.
+
+KV cache per token is:
+
+`2 (K and V) × layers × kv_heads × head_dim × bytes_per_value`
+
+For a Llama-3.1-8B-shaped model (32 layers, 8 KV heads with grouped-query attention, head dim 128) in FP16: 2 × 32 × 8 × 128 × 2 = 131,072 bytes, so **128 KiB per token**. An 8K-token conversation needs 1 GiB of KV cache.
+
+Make it a script you keep in the repo:
+
+```python
+from dataclasses import dataclass
+
+GiB = 1024**3
+
+@dataclass
+class ModelShape:
+    params_b: float      # billions of parameters
+    layers: int
+    kv_heads: int
+    head_dim: int
+
+def plan(m: ModelShape, gpu_gib: float, n_gpus: int = 1, weight_bytes: float = 2.0,
+         kv_bytes: float = 2.0, mem_util: float = 0.90, overhead_gib: float = 2.0,
+         avg_tokens_per_seq: int = 2048) -> dict[str, float]:
+    total = gpu_gib * n_gpus * mem_util
+    weights = m.params_b * 1e9 * weight_bytes / GiB
+    kv_per_token = 2 * m.layers * m.kv_heads * m.head_dim * kv_bytes
+    kv_budget = total - weights - overhead_gib * n_gpus
+    if kv_budget <= 0:
+        return {"fits": 0, "weights_gib": round(weights, 1)}
+    kv_tokens = kv_budget * GiB / kv_per_token
+    return {
+        "fits": 1,
+        "weights_gib": round(weights, 1),
+        "kv_budget_gib": round(kv_budget, 1),
+        "kv_tokens": int(kv_tokens),
+        "concurrent_seqs": int(kv_tokens // avg_tokens_per_seq),
+    }
+
+llama8b = ModelShape(params_b=8.0, layers=32, kv_heads=8, head_dim=128)
+print(plan(llama8b, gpu_gib=24))                    # FP16 on one 24 GB GPU
+print(plan(llama8b, gpu_gib=24, weight_bytes=0.55)) # 4-bit AWQ weights
+```
+
+Typical results (approximate; real numbers vary by version and settings):
+
+| Setup | Weights | KV budget | Concurrent 2K-token sequences |
+|---|---|---|---|
+| 8B FP16, one 24 GB GPU | ~15 GiB | ~4.7 GiB | ~19 |
+| 8B AWQ 4-bit, one 24 GB GPU | ~4 GiB | ~15.5 GiB | ~62 |
+| 70B FP16, 2 × 80 GB | ~130 GiB | ~10 GiB | ~15 |
+| 70B FP8, 2 × 80 GB | ~65 GiB | ~75 GiB | ~120 |
+
+The lesson from the table: **memory decides concurrency, and concurrency decides throughput.** A model that barely fits serves almost nobody.
+
+Two more knobs: `--kv-cache-dtype fp8` halves the KV cache size with usually small quality impact, and `--max-model-len` caps the longest sequence. Do not advertise a 128K context if your KV budget holds 40K tokens in total.
+
+## Quantization trade-offs
+
+| Format | Weight size vs FP16 | Notes |
+|---|---|---|
+| **FP8** | ~50% | Near-lossless on most tasks; needs hardware with FP8 support (Hopper, Ada, newer) for full speed |
+| **AWQ** (4-bit) | ~25–30% | Activation-aware; good quality and fast kernels in vLLM |
+| **GPTQ** (4-bit) | ~25–30% | Older, widely available checkpoints; quality similar to AWQ for many models |
+| **GGUF** | varies | llama.cpp ecosystem; great for CPU and laptops, less common in GPU production |
+
+Rules that hold up in practice:
+
+- **Never assume quantization is free.** Run your Module 3 eval suite on the quantized model. Long-context reasoning, math and strict JSON output tend to degrade first.
+- **Prefer a published quantized checkpoint** from the model provider or a trusted source over quantizing yourself on day one.
+- **4-bit trades quality for concurrency.** On a memory-bound deployment that can be a great trade. Measure both.
+
+## Throughput vs latency
+
+Generation has two phases:
+
+- **Prefill** processes the prompt. It is compute-bound and sets **time to first token (TTFT)**.
+- **Decode** generates one token per step per sequence. It is memory-bandwidth-bound and sets **inter-token latency (ITL)**.
+
+A useful upper bound for single-stream decode speed: memory bandwidth divided by weight bytes. A GPU with roughly 300 GB/s of bandwidth reading 16 GB of weights tops out around 19 tokens per second per step. Batching many sequences shares each weight read, so **total** throughput grows with concurrency while **per-user** speed drops slowly.
+
+Your operating point is a product decision. A chat UI needs fast TTFT and at least reading speed per user. A batch summarization job wants maximum total tokens per second and does not care about TTFT. Run them on different deployments or at least different `--max-num-seqs` settings.
+
+## Running vLLM on Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: vllm-llama8b }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: vllm-llama8b } }
+  template:
+    metadata: { labels: { app: vllm-llama8b } }
+    spec:
+      nodeSelector: { node.kubernetes.io/instance-type: g6.xlarge }  # example: one 24 GB GPU
+      tolerations: [{ key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.11.0   # pin a version you tested
+          args: ["--model", "/models/llama-3.1-8b-instruct-awq",
+                 "--served-model-name", "llama-8b",
+                 "--max-model-len", "8192", "--gpu-memory-utilization", "0.90",
+                 "--kv-cache-dtype", "fp8", "--max-num-seqs", "64"]
+          ports: [{ containerPort: 8000 }]
+          resources: { limits: { nvidia.com/gpu: "1" } }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 60        # allow up to 10 minutes to load
+          readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 5 }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - { name: models, persistentVolumeClaim: { claimName: model-weights } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 8Gi } }
+```
+
+Notes: the `startupProbe` stops Kubernetes from killing a pod that is still loading weights. Shared memory matters for tensor-parallel runs. Weights come from a pre-populated volume, not a download from the internet at every start. With KServe you get the same thing as an `InferenceService` using the Hugging Face runtime (`modelFormat: huggingface`), which runs vLLM under the hood, plus built-in canary rollouts.
+
+## Autoscaling GPUs and cold starts
+
+**GPU utilization is a poor scaling signal.** It reads near 100% under almost any load. Scale on what the server knows about its queue:
+
+- `vllm:num_requests_waiting` above 0 for a sustained period means you are out of batch slots.
+- KV cache usage (`vllm:kv_cache_usage_perc`, named `gpu_cache_usage_perc` in older releases) near 90–100% means preemption is coming.
+- p95 TTFT from `vllm:time_to_first_token_seconds`.
+
+Feed one of these to KEDA or the HPA (lesson 2).
+
+A cold start has four stages: provision a GPU node (1–5 minutes, sometimes longer if capacity is scarce), pull a large image, load weights, warm up (CUDA graph capture). Mitigations:
+
+- Keep `minReplicas` at 1 or more for interactive traffic. Scale to zero only for batch.
+- Pre-pull images on GPU node AMIs and keep weights on fast local or network storage close to the node.
+- Use streaming model loaders where supported, and smaller quantized weights that load faster.
+- Overflow to an API provider during scale-up. That is exactly what the gateway in lesson 5 is for.
+
+## Common mistakes
+
+- **Sizing by weights only.** Forgetting the KV cache gives you a model that loads and then serves two users.
+- **Advertising the full context window** when the KV budget cannot hold it, causing preemption and timeouts under load.
+- **Quantizing without running evals.** "It looks fine" is not a test.
+- **Liveness probes that kill loading pods.** Use a `startupProbe` with a generous budget.
+- **Scaling on GPU utilization.** Use queue depth, KV usage and TTFT.
+- **Downloading weights from the internet at pod start.** Slow, flaky, and a supply-chain risk. Mirror and checksum them.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Estimate whether an 8B model can serve 50 concurrent chat sessions on one 24 GB GPU." level="senior">
+
+Weights in FP16 are about 16 GB. With 90% memory utilization I have about 21.6 GB, and after weights and roughly 2 GB overhead only about 4–5 GB remain for KV cache. A Llama-3-8B-shaped model uses about 128 KiB of KV per token, so that is around 35–40K tokens. At 2K tokens per session that is under 20 sessions, so FP16 does not meet 50.
+
+With 4-bit AWQ weights (about 5 GB), the KV budget grows to about 15 GB, roughly 120K tokens, around 60 sessions. FP8 KV cache doubles that again. So yes with quantization, after confirming quality with the eval suite and checking that per-user decode speed stays above reading speed under that batch size.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Name the right metrics">
+
+Say "TTFT, inter-token latency, total tokens per second, queue depth and KV cache usage" instead of "GPU utilization". It shows you have actually operated an inference server.
+
+</Callout>
+
+## Further reading
+
+- vLLM documentation: https://docs.vllm.ai/en/latest/
+- vLLM production metrics: https://docs.vllm.ai/en/latest/usage/metrics.html
+- KServe documentation: https://kserve.github.io/website/
+- Efficient Memory Management for LLM Serving with PagedAttention (Kwon et al., 2023): https://arxiv.org/abs/2309.06180
+- AWQ: Activation-aware Weight Quantization (Lin et al., 2023): https://arxiv.org/abs/2306.00978

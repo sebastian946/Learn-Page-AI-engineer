@@ -1,0 +1,176 @@
+## Objetivo
+
+Milestone 3 de `llm-provider-client`. Agrega **tool calling neutral al proveedor** a tu cliente y úsalo para construir un asistente de soporte de pedidos que complete un ciclo completo: el modelo solicita tools, tu código las valida y ejecuta (en paralelo cuando es posible), los resultados vuelven y el modelo produce una respuesta final. La misma conversación debe funcionar en Anthropic y en OpenAI sin cambios en el código de la feature.
+
+Tiempo: 60 minutos. Las tools corren contra un almacén de pedidos falso en memoria, así que no necesitas un backend real.
+
+## Las tools
+
+| Tool | Tipo | Comportamiento |
+|---|---|---|
+| `get_order(order_id)` | lectura | Devuelve estado, ítems, transportadora, número de tracking y fecha prometida |
+| `get_tracking(tracking_number)` | lectura | Devuelve los eventos de la transportadora (escaneado, en tránsito, entregado) |
+| `create_return_label(order_id, item_skus, confirmed)` | escritura | Crea una etiqueta solo si `confirmed` es true y el pedido tiene menos de 30 días; si no, devuelve un error que el modelo debe manejar |
+
+La tool de escritura está protegida a propósito. El modelo debe pedirle confirmación al cliente antes de llamarla con `confirmed=true`. Tu código aplica las reglas de negocio sin importar lo que diga el modelo.
+
+## Extender los tipos normalizados
+
+Hasta ahora tu `LLMRequest.messages` contenía texto plano. El tool calling necesita turnos estructurados. Mantenlos neutrales al proveedor:
+
+```python
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    schema: dict[str, Any]          # from Pydantic model_json_schema()
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    content: str                    # JSON string
+    is_error: bool = False
+
+@dataclass
+class Turn:
+    role: Literal["user", "assistant"]
+    text: str = ""
+    tool_calls: list["ToolCall"] = field(default_factory=list)     # assistant only
+    tool_results: list[ToolResult] = field(default_factory=list)   # user only
+```
+
+Cada adaptador traduce los objetos `Turn` a su formato de transmisión: bloques `tool_use` / `tool_result` de Anthropic, o `tool_calls` de OpenAI más un mensaje `role: "tool"` por resultado. El código de la feature solo ve `Turn`, `ToolSpec`, `ToolCall` y `ToolResult`.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] `ToolSpec`, `ToolResult` y `Turn` agregados a `types.py`; los adaptadores de Anthropic y OpenAI los traducen en ambas direcciones, incluyendo varias tool calls en un mismo turno del asistente.
+- [ ] Los schemas de input de las tools se generan desde modelos Pydantic; los inputs se validan con `model_validate` antes de ejecutar, y los errores de validación se devuelven al modelo como resultados de error.
+- [ ] `run_tool_loop()` se detiene ante una respuesta final, aplica `max_steps` (por defecto 6) y un timeout por tool, y lanza un error claro cuando se alcanza el límite de pasos.
+- [ ] Las tool calls paralelas de un turno del asistente se ejecutan de forma concurrente y todos los resultados se devuelven en un único turno, emparejados por id de llamada.
+- [ ] Las excepciones de las tools nunca rompen el bucle: se convierten en `ToolResult(is_error=True)` con un mensaje corto.
+- [ ] `create_return_label` se niega salvo que `confirmed=true` y el pedido esté dentro de los 30 días, aplicado en Python, no en el prompt.
+- [ ] Cada tool call se registra como JSON: request_id, paso, tool, argumentos validados, latency_ms, is_error y tamaño del resultado en bytes.
+- [ ] Tres escenarios programados pasan con `FakeProvider`: una sola tool de lectura, dos lecturas en paralelo y la escritura protegida que primero falla sin confirmación y luego tiene éxito.
+- [ ] `examples/tool_demo.py` ejecuta el mismo escenario contra Anthropic y OpenAI (ids de modelo desde `models.toml`) e imprime la transcripción y el costo total de cada uno.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```python
+# milestones/m3_tool_calling/loop.py
+import asyncio, json, time, logging
+from collections.abc import Awaitable, Callable
+from pydantic import BaseModel, ValidationError
+
+from llm_client import LLMClient, LLMRequest
+from llm_client.types import StopReason, ToolCall, ToolResult, ToolSpec, Turn
+
+log = logging.getLogger("tools")
+
+class Tool:
+    def __init__(self, name: str, description: str, input_model: type[BaseModel],
+                 fn: Callable[[BaseModel], Awaitable[dict]], timeout_s: float = 5.0) -> None:
+        self.name, self.input_model, self.fn, self.timeout_s = name, input_model, fn, timeout_s
+        self.spec = ToolSpec(name, description, input_model.model_json_schema())
+
+async def execute(tool: Tool, call: ToolCall, request_id: str, step: int) -> ToolResult:
+    start = time.perf_counter()
+    try:
+        args = tool.input_model.model_validate(call.arguments)
+        async with asyncio.timeout(tool.timeout_s):
+            output = await tool.fn(args)
+        result = ToolResult(call.id, json.dumps(output))
+    except ValidationError as exc:
+        result = ToolResult(call.id, json.dumps({"error": "invalid_arguments",
+                                                 "details": exc.errors(include_url=False)},
+                                                default=str), is_error=True)
+    except Exception as exc:
+        result = ToolResult(call.id, json.dumps({"error": type(exc).__name__,
+                                                 "message": str(exc)[:200]}), is_error=True)
+    log.info(json.dumps({"request_id": request_id, "step": step, "tool": tool.name,
+                         "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+                         "is_error": result.is_error, "bytes": len(result.content)}))
+    return result
+
+async def run_tool_loop(client: LLMClient, system: str, history: list[Turn],
+                        tools: dict[str, Tool], request_id: str, max_steps: int = 6) -> str:
+    for step in range(1, max_steps + 1):
+        resp = await client.complete(LLMRequest(
+            model="smart", system=system, messages=history,
+            tools=[t.spec for t in tools.values()], max_tokens=2048,
+            metadata={"feature": "order_support", "request_id": request_id},
+        ))
+        # 1. append the assistant Turn (text + tool_calls)
+        # 2. if stop_reason != TOOL_USE: return resp.text
+        # 3. execute all tool calls concurrently (unknown tool name -> error result)
+        # 4. append ONE user Turn with all tool_results
+        ...
+    raise RuntimeError(f"tool loop exceeded {max_steps} steps")
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Haz primero los adaptadores y pruébalos de forma aislada: construye una `list[Turn]` con un turno del asistente que tenga dos tool calls y un turno de usuario con dos resultados, tradúcela y verifica la forma exacta de transmisión para cada proveedor. La mayoría de los bugs de este ejercicio son bugs de forma de mensaje, y son baratos de detectar sin ninguna llamada a la API.</Hint>
+  <Hint>Para Anthropic, un turno del asistente se convierte en una lista de contenido de bloques `text` y `tool_use` (`id`, `name`, `input`); un turno de usuario con resultados se convierte en una lista de bloques `tool_result` con `tool_use_id`, `content` e `is_error`. Para OpenAI, el mensaje del asistente lleva `tool_calls` con `function.arguments` como string JSON (`json.dumps`), y cada resultado se convierte en su propio mensaje `role: "tool"` con `tool_call_id`.</Hint>
+  <Hint>Ejecuta las llamadas paralelas con `asyncio.gather(*(execute(...) for call in resp.tool_calls))`. `execute` ya convierte las excepciones en resultados de error, así que gather no lanzará. Conserva el orden de las llamadas al construir el turno de resultados; los proveedores emparejan por id, no por posición, pero un orden estable hace legibles los logs.</Hint>
+  <Hint>Para el escenario de escritura protegida, programa el proveedor falso: el paso 1 llama a `create_return_label` con `confirmed=false`; tu tool devuelve un error diciendo que se requiere confirmación; el paso 2 devuelve texto preguntándole al cliente; el test agrega entonces un turno de usuario "sí, confirmo" y el paso 3 llama a la tool con `confirmed=true`. Verifica que la etiqueta exista en el almacén falso solo después del paso 3.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="llm-provider-client">
+
+```text
+llm-provider-client/
+  src/llm_client/
+    types.py                      # + ToolSpec, ToolResult, Turn
+    providers/
+      anthropic_provider.py       # + tool translation both ways
+      openai_provider.py          # + tool translation both ways
+  milestones/
+    m3_tool_calling/
+      __init__.py
+      store.py                    # in-memory orders and tracking fixtures
+      tools.py                    # Pydantic inputs + async tool functions
+      loop.py                     # execute() and run_tool_loop()
+      README.md
+  examples/tool_demo.py
+  tests/
+    test_tool_translation.py
+    test_m3_tool_loop.py
+```
+
+**Estructura de la sección del README (milestone 3)**
+
+1. Las tres tools, sus schemas y por qué la tool de escritura está protegida en código.
+2. Diagrama de secuencia (Mermaid) del escenario de lecturas en paralelo.
+3. Tabla de diferencias entre proveedores y cómo `Turn` las oculta.
+4. Seguridad: validación, timeouts, límite de pasos, resultados de error, logging.
+5. Transcripciones y costo de Anthropic vs OpenAI en el mismo escenario.
+
+**Commits sugeridos**
+
+- `feat(m3): provider-neutral ToolSpec, ToolResult and Turn types`
+- `feat(m3): anthropic and openai tool translation`
+- `test(m3): wire-shape tests for tool turns`
+- `feat(m3): tool loop with parallel execution, timeouts and step limit`
+- `feat(m3): guarded create_return_label tool`
+- `test(m3): scripted scenarios with fake provider`
+- `docs(m3): transcripts and provider comparison`
+
+</CommitBox>
+
+## Autorrevisión
+
+<Checklist id="m1-12-review" title="Autorrevisión antes de hacer commit" items={["El código de la feature nunca toca bloques tool_use ni tool_calls directamente", "El turno completo del asistente (texto y tool calls) se agrega antes de los resultados", "Todos los resultados de un turno se devuelven juntos, emparejados por id", "Los inputs se validan con Pydantic antes de ejecutar cualquier tool", "Los errores de tools y las tools desconocidas devuelven resultados de error en vez de lanzar excepciones", "El bucle tiene un límite de pasos y cada tool tiene un timeout", "La tool de escritura aplica la confirmación y la regla de 30 días en Python", "El mismo escenario corre en Anthropic y OpenAI sin cambios de código"]} />

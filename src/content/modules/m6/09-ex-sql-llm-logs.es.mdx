@@ -1,0 +1,167 @@
+# Ejercicio: analiza logs de requests de LLM con SQL y crea un dataset de evaluación
+
+**Escenario (estilo certificación).** Te unes al equipo de plataforma de IA de una aseguradora. Su asistente de reclamos lleva un mes en producción. Producto dice "la calidad bajó después del último cambio de prompt" y finanzas dice "los costos subieron". Tienes una tabla de logs de requests. Responde ambas inquietudes con SQL y luego convierte los logs en un dataset de evaluación versionado y sin PII que usarán los dos ejercicios siguientes.
+
+Puedes hacerlo en **PostgreSQL** (Docker, recomendado si no tienes workspace) o en **Databricks SQL** (Free Edition sirve). El código inicial apunta a Postgres; las notas para Databricks están en las pistas.
+
+**Tiempo:** 60–75 minutos.
+
+## Tareas
+
+- **Tarea 1 — Latencia.** Latencia p50 y p95 por modelo y por día para requests exitosos.
+- **Tarea 2 — Costo.** Costo total y costo por cada 1k requests por tenant en los últimos 30 días, los 5 tenants principales.
+- **Tarea 3 — Confiabilidad.** Tasa de error (cualquier status distinto de `ok`) por `prompt_version`, con conteo de requests.
+- **Tarea 4 — Regresión.** Compara `v7` vs `v8` del prompt en tasa de thumbs-down y tasa de respuestas sin citas, **por ruta**, y marca las rutas donde `v8` es peor por más de 5 puntos porcentuales.
+- **Tarea 5 — Dataset de evaluación.** Construye una muestra estratificada: por ruta, 14 ejemplos normales y 6 de falla (falla = thumbs-down, status distinto de ok o cero citas), deduplicada por pregunta normalizada, sin PII, exportada como JSONL con `inputs` / `expectations` / `tags`, más un manifiesto.
+
+<AcceptanceCriteria>
+
+- [ ] `docker compose up` levanta Postgres y `python seed.py` carga al menos 20,000 filas sintéticas con 3 modelos, 2 versiones de prompt, 4 rutas y más de 10 tenants
+- [ ] Cada tarea tiene su propio archivo en `sql/` (`01_latency.sql` … `05_eval_sample.sql`) que corre sin modificaciones
+- [ ] La Tarea 1 usa percentiles, no promedios; los requests fallidos se excluyen
+- [ ] La Tarea 4 usa CTEs y devuelve una fila por ruta con las tasas de ambas versiones, el delta y una columna booleana `regressed`
+- [ ] Salida de la Tarea 5: `data/eval_v1.jsonl` con 60–80 registros, sin preguntas normalizadas duplicadas y sin emails ni teléfonos (verificado por un test)
+- [ ] `data/eval_v1.manifest.json` registra el archivo de consulta, el rango de fechas, el número de filas, la semilla y la versión del scrubber
+- [ ] `pytest` pasa: al menos un test para el scrubber y uno para las invariantes del dataset
+- [ ] El README incluye las respuestas a las Tareas 1–4 como tablas pequeñas y dos frases de interpretación para cada una
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: llmlogs
+    ports: ["5432:5432"]
+```
+
+```python
+# seed.py — synthetic LLM request logs (deterministic)
+import json
+import random
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import psycopg
+
+random.seed(42)
+MODELS = {"model-small": 0.4, "model-medium": 1.0, "model-large": 3.0}  # relative cost units
+ROUTES = ["coverage", "claims_status", "billing", "documents"]
+QUESTIONS = {
+    "coverage": ["Is water damage from a burst pipe covered?", "Does my policy cover mold?"],
+    "claims_status": ["What is the status of claim {n}?", "When will my claim be paid?"],
+    "billing": ["Why did my premium go up?", "Can I pay monthly?"],
+    "documents": ["Which documents do I need for a theft claim?", "Where do I upload photos?"],
+}
+PII_SUFFIX = [" My email is jane.doe{n}@example.com", " Call me at 555-01{n:02d}", ""]
+
+def row(i: int, start: datetime) -> tuple:
+    route = random.choice(ROUTES)
+    version = "v7" if i % 2 == 0 else "v8"
+    model = random.choices(list(MODELS), weights=[5, 3, 1])[0]
+    q = random.choice(QUESTIONS[route]).format(n=random.randint(1000, 9999))
+    q += random.choice(PII_SUFFIX).format(n=random.randint(0, 99))
+    bad = version == "v8" and route == "coverage" and random.random() < 0.25
+    status = random.choices(["ok", "error", "timeout"], weights=[95, 3, 2])[0]
+    cites = [] if bad or random.random() < 0.08 else [{"doc_id": f"POL-{random.randint(1, 40)}"}]
+    inp, out = random.randint(300, 4000), random.randint(50, 600)
+    cost = (inp + 3 * out) / 1_000_000 * MODELS[model]
+    feedback = -1 if bad and random.random() < 0.6 else random.choice([1, None, None, -1 if random.random() < 0.05 else None])
+    return (uuid.uuid4(), start + timedelta(minutes=i * 2), f"tenant-{random.randint(1, 12):02d}", model,
+            version, inp, out, int(random.lognormvariate(7.2, 0.5)), status, round(cost, 6),
+            json.dumps({"question": q, "route": route, "retries": random.choice([0, 0, 0, 1, 2])}),
+            json.dumps({"answer": "...", "citations": cites}), feedback)
+
+if __name__ == "__main__":
+    start = datetime.now(timezone.utc) - timedelta(days=30)
+    with psycopg.connect("postgresql://postgres:postgres@localhost/llmlogs") as conn:
+        conn.execute(open("sql/00_schema.sql").read())
+        with conn.cursor() as cur:
+            cur.executemany("INSERT INTO llm_requests VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            [row(i, start) for i in range(21_600)])
+```
+
+```python
+# build_eval.py — skeleton for Task 5
+import json
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+class EvalRecord(BaseModel):
+    inputs: dict[str, str]
+    expectations: dict[str, str | None] = Field(default_factory=lambda: {"expected_response": None})
+    tags: dict[str, str]
+
+def scrub(text: str) -> str:
+    raise NotImplementedError("regex for emails and phone numbers; Presidio optional")
+
+def main() -> None:
+    # 1. run sql/05_eval_sample.sql with a fixed seed
+    # 2. scrub every question, re-check dedup after scrubbing
+    # 3. write data/eval_v1.jsonl and data/eval_v1.manifest.json
+    ...
+
+if __name__ == "__main__":
+    main()
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Empieza con `sql/00_schema.sql` copiado de la lección 1. Para la Tarea 1, `percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)` agrupado por `date_trunc('day', ts)` y `model`. En Databricks SQL usa `percentile_approx(latency_ms, 0.95)`.</Hint>
+
+<Hint>Tarea 4: un CTE calcula las tasas por `(route, prompt_version)`; un segundo pivotea con `max(rate) FILTER (WHERE prompt_version = 'v8')` y lo mismo para `v7`. El bug sembrado vive en la ruta `coverage`, así que esa es la fila que deberías ver marcada.</Hint>
+
+<Hint>Tarea 5: calcula `qhash` sobre la pregunta normalizada, usa `DISTINCT ON (qhash)` ordenado para que ganen las fallas y luego `row_number() OVER (PARTITION BY route, bucket ORDER BY random())`. Ejecuta `SELECT setseed(0.42)` en la misma sesión antes de la consulta para que sea reproducible. En Databricks, usa `QUALIFY` y `rand(42)`.</Hint>
+
+<Hint>Elimina la PII antes de la verificación final de duplicados: "Call me at 555-0101" y "Call me at 555-0177" colapsan en la misma pregunta limpia. Un test de invariantes del dataset puede cargar el JSONL y verificar que no haya coincidencias de regex de emails o teléfonos, que las preguntas normalizadas sean únicas y que haya al menos 3 ejemplos de falla por ruta.</Hint>
+
+</Hints>
+
+<CommitBox repo="databricks-genai-lab">
+
+Estructura de carpetas:
+
+```text
+databricks-genai-lab/
+  README.md
+  01-sql-llm-logs/
+    docker-compose.yml
+    seed.py
+    build_eval.py
+    sql/
+      00_schema.sql
+      01_latency.sql
+      02_cost_by_tenant.sql
+      03_error_rate.sql
+      04_prompt_regression.sql
+      05_eval_sample.sql
+    data/
+      eval_v1.jsonl
+      eval_v1.manifest.json
+    tests/
+      test_scrub.py
+      test_eval_dataset.py
+    README.md
+```
+
+Esquema del README de `01-sql-llm-logs/`: planteamiento del problema, cómo ejecutarlo (3 comandos), resultados de las Tareas 1–4 como tablas con interpretación, diseño del dataset de evaluación (estratos, proporción de fallas, deduplicación, PII), limitaciones (datos sintéticos, las expectativas aún requieren etiquetado).
+
+Commits sugeridos:
+
+- `feat(sql-logs): add schema, docker compose and deterministic seed`
+- `feat(sql-logs): latency, cost, error-rate and regression queries`
+- `feat(sql-logs): stratified, scrubbed eval dataset export with manifest`
+- `test(sql-logs): scrubber and dataset invariant tests`
+- `docs(sql-logs): results and interpretation`
+
+</CommitBox>
+
+<Checklist id="m6-09-review" title="Autoevaluación" items={["Percentiles, no promedios, para la latencia; errores excluidos o reportados aparte", "La regresión se compara dentro de cada ruta, no solo de forma global", "La regresión de la ruta coverage se detecta y se explica en el README", "La deduplicación corre después del scrub, y las fallas sobreviven la deduplicación", "Sin PII en el JSONL, comprobado por un test", "El manifiesto registra consulta, rango de fechas, semilla, número de filas y versión del scrubber", "Las respuestas esperadas quedan para etiquetado humano, no se copian de las respuestas de producción"]} />

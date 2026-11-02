@@ -1,0 +1,160 @@
+## Los humanos son tu oráculo más caro. Trátalos como tal.
+
+Cada métrica automatizada de este módulo se valida, al final, contra el juicio humano. Tu juez LLM se calibra contra etiquetas humanas. Tu golden dataset tiene referencias escritas por humanos. Si las etiquetas humanas son ruidosas, todo lo que se construye sobre ellas también lo es, y nadie lo nota porque los números se ven precisos.
+
+En el módulo 3 etiquetaste 30 ítems tú mismo para calibrar un juez. Eso funciona para un lab. No funciona cuando las etiquetas deciden la migración de modelo de un despacho de abogados. Esta lección trata de operar la evaluación humana como un **programa**: guías, múltiples anotadores, medición de acuerdo, adjudicación, herramientas y presupuesto.
+
+El paralelo SDET es un equipo de pruebas manuales. Nunca le darías a los testers "revisen si la app funciona". Les das casos de prueba con pasos, resultados esperados y definiciones de severidad. Revisas sus reportes de bugs para ver si son consistentes. La anotación es lo mismo.
+
+## Guías de anotación
+
+Una guía es un contrato entre tú y los anotadores. Una buena guía tiene:
+
+1. **Propósito.** Un párrafo: para qué son las etiquetas y qué decisión alimentan. Los anotadores deciden mejor cuando conocen lo que está en juego.
+2. **Unidad y tarea.** "Verás una pregunta, los pasajes recuperados y una respuesta. Califica solo la respuesta, no los pasajes."
+3. **Definiciones de etiquetas con fronteras.** Cada etiqueta tiene una definición, un ejemplo positivo, un ejemplo negativo y al menos un **ejemplo frontera** con la decisión y la razón. Los ejemplos frontera hacen la mayor parte del trabajo.
+4. **Procedimiento de decisión.** Una lista ordenada. "Primero busca afirmaciones sin respaldo. Si alguna afirmación contradice los pasajes, etiqueta `unfaithful` sin importar lo demás."
+5. **Qué hacer ante la duda.** Una opción `cannot_judge` con nota obligatoria. Obligar a adivinar esconde la ambigüedad de la guía.
+6. **Versión y changelog.** Las guías cambian a medida que descubres casos borde. Cada etiqueta registra la versión de la guía bajo la que se hizo.
+
+### Diseño de rúbricas
+
+- **Prefiere escalas binarias o de 3 puntos por criterio** en lugar de un solo puntaje 1–10. "¿Cada afirmación está respaldada? sí/no" es mucho más confiable que "califica la faithfulness de 1 a 10".
+- **Separa los criterios.** Exactitud, completitud, tono y formato son preguntas distintas. Juntarlas obliga a los anotadores a ponderarlas de forma distinta en su cabeza.
+- **Ancla cada punto.** Si usas 1–4, escribe cómo se ve un 2 y qué lo separa de un 3.
+- **Comparación pareada cuando la calidad es relativa.** "¿Cuál de estos dos resúmenes es mejor?" es más fácil y consistente que las calificaciones absolutas para cualidades subjetivas. Aleatoriza el orden izquierda/derecha.
+- **Oculta el origen.** Los anotadores no deben saber qué modelo o prompt produjo una salida.
+
+## Acuerdo entre anotadores
+
+Haz que al menos dos personas etiqueten el mismo subconjunto (20–30% de los ítems, o todos en sets pequeños de alto riesgo). Luego mide el acuerdo. El porcentaje de acuerdo bruto engaña, porque parte del acuerdo ocurre por azar.
+
+**El kappa de Cohen** compara a dos anotadores y corrige por azar: `kappa = (p_o - p_e) / (1 - p_e)`, donde `p_o` es el acuerdo observado y `p_e` es el acuerdo esperado si ambos etiquetaran al azar con sus propias frecuencias de etiquetas.
+
+Ejemplo resuelto: 100 ítems, ambos dicen "sí" en 45, ambos "no" en 35 y discrepan en 20. `p_o = 0.80`. Cada uno dijo "sí" el 55% de las veces, así que `p_e = 0.55 × 0.55 + 0.45 × 0.45 = 0.505`. `kappa = (0.80 - 0.505) / 0.495 = 0.60`.
+
+Otros coeficientes y cuándo usarlos:
+
+| Situación | Coeficiente |
+|---|---|
+| Dos anotadores, etiquetas nominales | Kappa de Cohen |
+| Dos anotadores, escala ordinal (1–4) | Kappa de Cohen ponderado (pesos cuadráticos): un desacuerdo 1 vs 4 cuesta más que 3 vs 4 |
+| Tres o más anotadores, todos etiquetan todos los ítems | Kappa de Fleiss |
+| Cualquier número de anotadores, etiquetas faltantes, datos nominales/ordinales/de intervalo | Alpha de Krippendorff |
+
+Interpretación aproximada (Landis y Koch para kappa): 0.41–0.60 moderado, 0.61–0.80 sustancial, por encima de 0.80 casi perfecto. Krippendorff sugiere un alpha de al menos 0.80 para conclusiones confiables y 0.667 como piso para conclusiones tentativas. Son convenciones, no leyes. La prueba real es si el nivel de acuerdo alcanza para la decisión.
+
+### La paradoja del kappa
+
+Cuando una etiqueta domina, el kappa puede ser bajo aunque el acuerdo sea alto. Ejemplo: 100 ítems, ambos dicen "faithful" en 90, ambos dicen "unfaithful" en 2 y discrepan en 8. El acuerdo es 92%. Pero `p_e` es de aproximadamente 0.887, así que el kappa es solo de alrededor de 0.29. La solución no es ignorar el kappa. Sobremuestrea la clase rara para el estudio de acuerdo y reporta el acuerdo por clase junto al coeficiente.
+
+### Código: reporte de acuerdo
+
+```python
+import numpy as np
+import krippendorff
+from sklearn.metrics import cohen_kappa_score
+from statsmodels.stats.inter_rater import aggregate_raters, fleiss_kappa
+
+def agreement_report(ratings: np.ndarray) -> dict[str, float]:
+    """ratings: shape (n_items, n_raters), ordinal ints 1-4, np.nan where a rater skipped."""
+    a, b = ratings[:, 0], ratings[:, 1]
+    both = ~np.isnan(a) & ~np.isnan(b)
+    report = {
+        "pct_agree_r1_r2": float((a[both] == b[both]).mean()),
+        "cohen_r1_r2": cohen_kappa_score(a[both], b[both]),
+        "cohen_quadratic_r1_r2": cohen_kappa_score(a[both], b[both], weights="quadratic"),
+        # krippendorff expects shape (n_raters, n_items) and handles missing values
+        "kripp_alpha_ordinal": krippendorff.alpha(
+            reliability_data=ratings.T, level_of_measurement="ordinal"
+        ),
+    }
+    complete = ratings[~np.isnan(ratings).any(axis=1)].astype(int)
+    table, _ = aggregate_raters(complete)       # items x categories count table
+    report["fleiss_kappa_complete_items"] = fleiss_kappa(table, method="fleiss")
+    return report
+
+ratings = np.array([[4, 4, 3], [2, 3, 2], [1, 1, np.nan], [3, 3, 3], [4, 2, 4], [2, 2, 1]])
+print(agreement_report(ratings))
+```
+
+Con seis ítems los números no significan nada. Ese es el punto de la demo: córrelo sobre al menos 50 ítems solapados y haz bootstrap del coeficiente sobre ítems para obtener un intervalo, igual que en la lección 02.
+
+## Adjudicación
+
+Los desacuerdos son señal, no desperdicio. Un flujo estándar:
+
+1. Dos anotadores etiquetan de forma independiente.
+2. Los acuerdos se convierten en etiquetas gold.
+3. Los desacuerdos van a un **adjudicador** (un experto senior del dominio) que ve ambas etiquetas y notas, y decide.
+4. Cada adjudicación que revela una regla poco clara se convierte en un **cambio de guía**, con un nuevo ejemplo frontera.
+5. Conserva las etiquetas originales, la etiqueta adjudicada y la versión de la guía. Nunca sobrescribas el historial.
+
+Haz una **ronda de calibración** antes del trabajo real: todos los anotadores etiquetan los mismos 20–30 ítems, discuten juntos cada desacuerdo y actualizas la guía. Después inserta **preguntas gold** (ítems con respuesta conocida) en un 5–10% de la cola para detectar drift y fatiga. Es el equivalente en QA de los defectos sembrados.
+
+## Herramientas de etiquetado
+
+- **Argilla** (open source, ahora parte de Hugging Face): hecha para datos de LLM. Campos de texto, preguntas de etiqueta, calificación, ranking y texto libre, distribución de tareas con un mínimo de anotadores por registro y un SDK de Python.
+- **Label Studio** (open source, HumanSignal): interfaces muy flexibles configuradas con XML, muchos tipos de datos, buena para tareas mixtas como documentos con bounding boxes más etiquetas de texto.
+- **Las hojas de cálculo** sirven para un piloto de 50 ítems. Más allá de eso pierdes el ocultamiento, la aleatorización, el seguimiento por anotador y el historial de auditoría.
+
+Una configuración mínima de Argilla (SDK de Python de Argilla 2.x; revisa la documentación para la API actual):
+
+```python
+import argilla as rg
+
+client = rg.Argilla(api_url="http://localhost:6900", api_key="argilla.apikey")
+settings = rg.Settings(
+    guidelines=open("guidelines/faithfulness_v3.md", encoding="utf-8").read(),
+    fields=[rg.TextField(name="question"), rg.TextField(name="passages"), rg.TextField(name="answer")],
+    questions=[
+        rg.LabelQuestion(name="faithful", labels=["yes", "no", "cannot_judge"]),
+        rg.RatingQuestion(name="completeness", values=[1, 2, 3, 4]),
+        rg.TextQuestion(name="note", required=False),
+    ],
+    distribution=rg.TaskDistribution(min_submitted=2),  # two annotators per record
+)
+dataset = rg.Dataset(name="mortgage-faithfulness-v3", settings=settings, client=client)
+dataset.create()
+dataset.records.log([{"question": q, "passages": p, "answer": a} for q, p, a in rows])
+```
+
+## Costo y throughput
+
+Presupuesta antes de empezar. Mide la mediana de segundos por ítem en el piloto y luego:
+
+`hours = items × annotators_per_item × minutes_per_item / 60`, más el tiempo de adjudicación según la tasa de desacuerdo.
+
+Ejemplo: 400 ítems, 2 anotadores, 2.5 minutos cada uno son unas 33 horas. Si el 15% necesita adjudicación a 4 minutos, suma 4 horas. Con una tarifa de ejemplo de 40 dólares por hora para expertos del dominio (las tarifas varían mucho), eso es aproximadamente 1,500 dólares. Compáralo con el costo de una decisión de migración equivocada. Normalmente es barato.
+
+Formas de gastar menos sin perder confiabilidad: etiqueta doble solo en un solapamiento del 25% una vez que el acuerdo sea estable; usa un juez LLM para preclasificar y enviar a humanos los ítems inciertos y de alto riesgo (lección 5); etiqueta en pares los criterios subjetivos; mantén las sesiones por debajo de 90 minutos para limitar la fatiga.
+
+## Errores comunes
+
+- **Un solo anotador, sin medir acuerdo.** No puedes distinguir el ruido de las etiquetas del error del modelo.
+- **Escalas 1–10 vagas.** Acuerdo bajo garantizado. Usa criterios binarios o de 3–4 puntos anclados.
+- **Mostrar el nombre del modelo o el veredicto del juez.** Sesgo de anclaje.
+- **Sobrescribir etiquetas tras la adjudicación.** Pierdes la evidencia de que la guía era ambigua.
+- **Reportar kappa con un reparto de clases 95/5 sin números por clase.** La paradoja te engañará.
+- **Sin preguntas gold.** El drift de los anotadores pasa desapercibido durante semanas.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Tus dos anotadores coinciden el 92% de las veces pero el kappa de Cohen es 0.3. ¿Qué está pasando y qué haces?" level="senior">
+
+Es la paradoja del kappa. Probablemente una etiqueta domina, por ejemplo 90% "faithful", así que el acuerdo por azar ya es muy alto y el kappa tiene poco margen. El acuerdo bruto alto refleja sobre todo la tasa base. Miraría la tabla de confusión: si los anotadores rara vez coinciden en los casos raros "unfaithful", esa es justo la clase que importa, así que el kappa bajo dice la verdad. Sobremuestrearía los fallos probables para el estudio de acuerdo, reportaría el acuerdo por clase, revisaría los desacuerdos en una sesión de calibración y agregaría ejemplos frontera a la guía antes de volver a etiquetar.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo montarías una evaluación humana para una funcionalidad LLM de alto riesgo?" level="mid">
+
+Escribo una guía versionada con propósito, definiciones de etiquetas, ejemplos frontera y un procedimiento de decisión. Hago una ronda de calibración donde todos los anotadores etiquetan los mismos 25 ítems y discutimos los desacuerdos. Después dos anotadores etiquetan cada ítem sin saber el modelo, en una herramienta como Argilla o Label Studio, con un 5–10% de preguntas gold. Mido el kappa de Cohen o el alpha de Krippendorff sobre el solapamiento, envío los desacuerdos a un adjudicador experto del dominio e incorporo los nuevos casos borde a la guía. Registro los minutos por ítem para pronosticar costo y throughput.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Documentación de Argilla: https://docs.argilla.io
+- Documentación de Label Studio: https://labelstud.io/guide/
+- Paquete de Python para el alpha de Krippendorff: https://github.com/pln-fing-udelar/fast-krippendorff
+- Módulo inter-rater de statsmodels: https://www.statsmodels.org/stable/stats.html#interrater-reliability-and-agreement

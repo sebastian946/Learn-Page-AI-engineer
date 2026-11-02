@@ -1,0 +1,164 @@
+## Objetivo
+
+En el módulo 3 etiquetaste 30 ítems solo y verificaste un juez contra tus propias etiquetas. Ahora vas a operar un programa de evaluación humana pequeño pero real, y a exigirle a un juez LLM el estándar humano:
+
+1. Escribe una **guía de anotación** versionada para dos criterios sobre respuestas de un bot de soporte: `correct` (yes/no/cannot_judge) y `helpfulness` (1–4 anclado).
+2. Recolecta etiquetas de **al menos tres anotadores** sobre 60 ítems.
+3. Mide el acuerdo correctamente: kappa de Cohen por pareja, kappa ponderado cuadrático y alpha de Krippendorff (ordinal) para helpfulness, todos con CIs bootstrap.
+4. **Adjudica** los desacuerdos, actualiza la guía a v2 con nuevos ejemplos frontera y vuelve a etiquetar un lote nuevo para mostrar si el acuerdo mejoró.
+5. Corre un **jurado de jueces** de dos modelos y compara el kappa juez-vs-gold con el kappa humano-vs-humano, por segmento.
+
+Esta es la carpeta `02-annotation/` de `llm-eval-lab`.
+
+## Contexto
+
+Usa respuestas de cualquier asistente de soporte que hayas construido (el bot `support-assistant-prod` del módulo 5, o el router de tickets del módulo 1 extendido con un paso de respuesta). Necesitas 60 ítems para la ronda 1 y 30 ítems nuevos para la ronda 2. Incluye al menos dos segmentos, por ejemplo `billing` vs `technical`, o conversaciones `short` vs `long`. Asegúrate de que aproximadamente un tercio de las respuestas tenga problemas reales.
+
+Sobre los anotadores: pídele a dos colegas o amigos que etiqueten. Si de verdad no consigues a dos personas más, usa a otra persona más **tú mismo de nuevo tras al menos cinco días**, sin mirar tus primeras etiquetas. Repórtalo como confiabilidad intra-anotador y dilo claramente. No uses LLMs como "anotadores" para el estudio de acuerdo humano; eso anula el propósito.
+
+Formato del archivo de etiquetas, una fila por (ítem, anotador) en `labels/round1.jsonl`:
+
+```json
+{"item_id": "s-017", "rater": "r2", "guideline_version": "v1", "correct": "no", "helpfulness": 2, "seconds": 74, "note": "Refund window is 30 days in policy, answer says 14"}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `guidelines/v1.md` contiene propósito, unidad de trabajo, definiciones, un procedimiento de decisión, una regla de `cannot_judge` y al menos 2 ejemplos frontera por criterio, con cada punto de helpfulness anclado
+- [ ] Al menos 3 anotadores etiquetaron los 60 ítems de la ronda 1, sin saber qué versión del bot produjo cada respuesta, en orden aleatorio
+- [ ] `agreement.py` reporta el kappa de Cohen por pareja para `correct`, el kappa ponderado cuadrático y el alpha de Krippendorff (ordinal) para `helpfulness`, cada uno con un CI bootstrap al 95% que remuestrea ítems
+- [ ] Se reporta el acuerdo por clase para `correct`, para exponer cualquier paradoja del kappa
+- [ ] `adjudicated.jsonl` contiene la etiqueta gold por ítem, conservando todas las etiquetas originales y la razón del adjudicador; ninguna etiqueta original fue sobrescrita
+- [ ] `guidelines/v2.md` tiene un changelog que vincula cada cambio con desacuerdos específicos; la ronda 2 (30 ítems nuevos) reporta el acuerdo bajo v2
+- [ ] `judge.py` corre un jurado de dos modelos juez de distintos proveedores sobre los 90 ítems, con caché en disco
+- [ ] El reporte compara el kappa juez-vs-gold con el kappa humano-vs-humano promedio, global y por segmento, y lista los ítems donde los jurados discreparon
+- [ ] Se incluyen la mediana de segundos por ítem y un costo proyectado para etiquetar 1,000 ítems con 2 anotadores más adjudicación (indica la tarifa por hora que asumes)
+- [ ] `REPORT.md` termina con una decisión: ¿puede el jurado reemplazar a un anotador humano en esta tarea y bajo qué condiciones?
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 02-annotation/agreement.py
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import Literal
+
+import krippendorff
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.metrics import cohen_kappa_score
+
+SEED = 11
+
+
+class Label(BaseModel):
+    item_id: str
+    rater: str
+    guideline_version: str
+    correct: Literal["yes", "no", "cannot_judge"]
+    helpfulness: int = Field(ge=1, le=4)
+    seconds: int
+    note: str = ""
+
+
+def load(path: Path) -> list[Label]:
+    return [Label.model_validate_json(l) for l in path.read_text("utf-8").splitlines() if l.strip()]
+
+
+def matrix(labels: list[Label], field: str, items: list[str], raters: list[str]) -> np.ndarray:
+    """Returns shape (n_raters, n_items) with np.nan for missing or cannot_judge."""
+    lookup = {(l.item_id, l.rater): getattr(l, field) for l in labels}
+    codes = {"yes": 1.0, "no": 0.0}
+    out = np.full((len(raters), len(items)), np.nan)
+    for r, rater in enumerate(raters):
+        for i, item in enumerate(items):
+            v = lookup.get((item, rater))
+            if v is None or v == "cannot_judge":
+                continue
+            out[r, i] = codes.get(v, v) if isinstance(v, str) else float(v)
+    return out
+
+
+def bootstrap(stat_fn, data: np.ndarray, iters: int = 2_000) -> tuple[float, float, float]:
+    """data: (n_raters, n_items). Resample ITEMS (columns)."""
+    rng = np.random.default_rng(SEED)
+    # TODO(you): point = stat_fn(data); loop iters: idx = rng.integers(0, n_items, n_items)
+    #            vals.append(stat_fn(data[:, idx])); skip nan results
+    # TODO(you): return point, 2.5th and 97.5th percentiles
+    raise NotImplementedError
+
+
+def pairwise_cohen(m: np.ndarray, weights: str | None = None) -> dict[str, float]:
+    # TODO(you): for each rater pair, mask items where both have a value, call cohen_kappa_score
+    raise NotImplementedError
+
+
+def kripp_ordinal(m: np.ndarray) -> float:
+    return krippendorff.alpha(reliability_data=m, level_of_measurement="ordinal")
+
+
+def per_class_agreement(m: np.ndarray) -> dict[str, float]:
+    # TODO(you): for class 1 (yes) and 0 (no): of all rater pairs where at least one said the class,
+    #            what fraction had both say it? (positive/negative specific agreement)
+    raise NotImplementedError
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Escribe primero los ejemplos frontera, antes de que las definiciones te parezcan "terminadas". Elige de tu pool 4–6 respuestas en las que tú mismo dudaste. Para cada una, escribe la decisión y una frase de razonamiento. Esos ejemplos moverán tu kappa más que pulir las definiciones.</Hint>
+  <Hint>Haz bootstrap del acuerdo remuestreando columnas (ítems) de la matriz anotadores-por-ítems, nunca etiquetas individuales. El alpha de Krippendorff puede devolver nan en un remuestreo sin variación; sáltalos y reporta cuántos saltaste.</Hint>
+  <Hint>El acuerdo específico hace visible la paradoja del kappa. El acuerdo positivo es `2 * both_yes / (2 * both_yes + disagreements)`, y el negativo es lo mismo con `no`. Si el acuerdo positivo es 0.95 y el negativo es 0.50, tus anotadores coinciden en los aprobados fáciles y discrepan en los fallos, que es donde vive el riesgo.</Hint>
+  <Hint>Para la comparación con el juez, calcula el kappa humano-humano como la media de los tres kappas por pareja, y el kappa juez-gold contra la etiqueta adjudicada. Luego calcula también el kappa del juez contra cada anotador. Si el jurado coincide con cada anotador más o menos tanto como los anotadores coinciden entre sí, se comporta como otro anotador. Desglosa todo esto por segmento; un jurado que va bien en billing y flojo en respuestas técnicas es un "sí" condicional.</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  02-annotation/
+    README.md
+    guidelines/
+      v1.md
+      v2.md               # with changelog
+    data/
+      items_round1.jsonl  # 60 items, randomized order, no model names
+      items_round2.jsonl  # 30 fresh items
+    labels/
+      round1.jsonl
+      round2.jsonl
+      adjudicated.jsonl
+    agreement.py
+    judge.py
+    rubrics/
+      correct_v1.md
+      helpfulness_v1.md
+    .cache/               # gitignored
+    REPORT.md
+    tests/
+      test_agreement.py   # kappa and alpha against small hand-computed tables
+```
+
+Esquema de `02-annotation/README.md`:
+
+- La tarea y por qué importan las etiquetas humanas para ella
+- Anotadores: cuántos, perfil, cómo se hizo el ocultamiento y la aleatorización (sin datos personales)
+- Versiones de la guía y qué cambió entre ellas
+- Resultados: tabla de acuerdo por ronda con CIs, tabla juez vs humano por segmento
+- Costo y throughput: mediana de segundos por ítem, proyección para 1,000 ítems
+- Decisión sobre usar el jurado, con condiciones
+
+Commits sugeridos:
+
+- `docs(annotation): guideline v1 with anchored scale and borderline examples`
+- `feat(annotation): agreement metrics with item-level bootstrap CIs`
+- `data(annotation): round 1 labels from 3 raters and adjudication`
+- `docs(annotation): guideline v2 changelog from adjudication`
+- `feat(annotation): two-provider judge jury and judge-vs-human report`
+
+</CommitBox>
+
+<Checklist id="m9-06-review" title="Autorrevisión" items={["Mi guía tiene puntos de escala anclados y ejemplos frontera para cada criterio", "Los anotadores no sabían la versión del bot y vieron los ítems en orden aleatorio", "Los CIs de acuerdo vienen de remuestrear ítems, no etiquetas", "Reporto el acuerdo por clase junto al kappa", "Las etiquetas originales se conservan; la adjudicación agrega una etiqueta gold con una razón", "Los cambios de la guía v2 se rastrean hasta desacuerdos específicos, y la ronda 2 mide su efecto", "El kappa juez-vs-gold se compara con el kappa humano-vs-humano, global y por segmento", "La proyección de costo indica sus supuestos", "La decisión final es condicional a la evidencia, no un sí o no generalizado"]} />

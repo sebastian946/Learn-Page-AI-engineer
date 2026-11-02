@@ -1,0 +1,171 @@
+<ClientBrief company="CareSlot" industry="SaaS de salud / Agendamiento de citas" duration="5 días" />
+
+## Contexto de la empresa
+
+CareSlot vende software de agendamiento de citas a unas 1,200 clínicas ambulatorias en EE. UU.: fisioterapia, odontología, dermatología y pequeñas consultas de medicina familiar. El personal de las clínicas usa CareSlot para manejar calendarios, recordatorios, listas de espera y datos de seguros. Los pacientes usan una página de reservas con la marca de cada clínica.
+
+El equipo de soporte de CareSlot tiene 14 agentes. Atienden unos 9,000 tickets al mes, en su mayoría del personal de las clínicas: "¿Cómo configuro citas recurrentes?", "¿Por qué no salió el recordatorio por SMS?", "¿Cómo exporto las inasistencias del mes pasado?". Cerca del 70% de los tickets se responde con un artículo existente del centro de ayuda. Los agentes copian y pegan. La mediana del tiempo de primera respuesta es de 6 horas, y las clínicas se quejan.
+
+El trimestre pasado, un ingeniero construyó un prototipo de asistente de soporte sobre el centro de ayuda. Funciona en una laptop. A la dirección le gustó la demo y aprobó un lanzamiento en producción dentro de la app de administración de CareSlot. Entonces el equipo de plataforma hizo preguntas difíciles: ¿Cómo escala? ¿Cuánto cuesta? ¿Qué pasa cuando el proveedor de LLM se cae? ¿A quién le llega el page? Nadie tenía respuestas.
+
+Te contratan como AI engineer por contrato para llevar el asistente a producción. El trabajo de calidad de RAG ya está hecho. Tu trabajo es **serving, confiabilidad, costo y operación**.
+
+## Stakeholders
+
+| Persona | Rol | Qué le importa |
+|---|---|---|
+| Dana Okafor | VP de Experiencia del Cliente (sponsor) | Menos tickets repetitivos, respuestas más rápidas para las clínicas |
+| Luis Herrera | Head of Platform Engineering | SLOs, carga de on-call, deploy estándar en AWS, sin casos especiales |
+| Priya Raman | Líder de Seguridad y Compliance | Nada de PHI al LLM, manejo de secretos, logs de auditoría, postura HIPAA |
+| Marco Bellini | Socio de Finanzas | Costo mensual predecible, costo por 1k peticiones |
+| Agentes de soporte (14) | Usuarios del camino de escalamiento | Traspaso limpio con el contexto de la conversación |
+
+## Objetivo de negocio
+
+Desviar al menos el 35% de los tickets de tipo "¿cómo hago...?" mediante un asistente self-serve en la app de administración, con respuestas en segundos en lugar de horas. Lograrlo con un costo predecible y sin sumar una carga de on-call que el equipo de plataforma no pueda sostener.
+
+## Requisitos funcionales
+
+1. **API de chat.** `POST /v1/chat/stream` hace streaming de respuestas por SSE con eventos `token`, `citations`, `done` y `error`. `POST /v1/chat` devuelve la respuesta completa en JSON para integraciones.
+2. **Respuestas con grounding y citas** a artículos del centro de ayuda (`article_id`, título, URL). Si la confianza del retrieval es baja, el asistente lo dice y ofrece escalar.
+3. **Escalamiento.** `POST /v1/escalations` crea un ticket de soporte (mockea la API de ticketing) con la transcripción de la conversación. Requiere un header `Idempotency-Key`, para que un doble clic nunca cree dos tickets.
+4. **Multi-tenant.** Cada petición trae `X-Tenant-ID` (la clínica). Las entradas de caché, los rate limits y los logs están acotados por tenant.
+5. **Guardia de PHI.** Antes de llamar al LLM, detecta y redacta patrones obvios de PHI (nombres de pacientes después de "patient", fechas de nacimiento, teléfonos, IDs de afiliado). Registra solo que hubo una redacción, nunca el valor.
+6. **Job de ingesta del centro de ayuda.** Un job en segundo plano (scheduled task de ECS o un worker) re-indexa cada noche los artículos modificados en Postgres + pgvector e incrementa un `corpus_version`.
+7. **Caché y rate limits.** Caché exacta con key por tenant, pregunta normalizada, modelo, versión del prompt y versión del corpus. Token buckets por tenant para peticiones por minuto y tokens de entrada por minuto, con 429 y `Retry-After`.
+8. **Degradación elegante.** Modelo primario `claude-sonnet-5-5`, fallback `claude-haiku-5-5`, circuit breakers por modelo, luego una respuesta cacheada etiquetada y luego links a los artículos principales. El evento `done` reporta el nivel de degradación.
+9. **Feature flags de prompts.** Las versiones de prompt viven en git. Un flag selecciona la versión activa y un porcentaje de canary por bucket de tenant.
+10. **Salud visible para administración.** `GET /healthz` (liveness) y `GET /readyz` (Postgres, Redis y estados de los breakers).
+
+## Requisitos no funcionales (SLOs)
+
+Estos son los objetivos para los que diseñas, que mides y reportas. Se miden sobre 28 días móviles salvo que se indique otra cosa.
+
+| SLO | Objetivo | Medición |
+|---|---|---|
+| Disponibilidad | 99.5% de las peticiones devuelve una respuesta no-5xx (las respuestas degradadas cuentan como éxito) | Métricas del ALB/app |
+| Latencia p95 de punta a punta (`/v1/chat`) | 9 s o menos | Histograma de la app |
+| p95 del time to first token (stream) | 2.5 s o menos | `ttft_ms` del evento `done` e histograma del servidor |
+| Alerta de consumo del error budget | Page con burn de 14.4x en 1 h, ticket con 6x en 6 h | Alertas de burn rate multi-ventana |
+| Costo por 1k peticiones | $12 o menos combinado (presupuesto de ejemplo — basado en los precios actuales del proveedor) | `usage` registrado × precios en config |
+| Gasto mensual en LLM | Alerta al 80% del presupuesto mensual | Job diario de gasto |
+| Calidad de respuesta | Faithfulness de 0.85 o más en el golden set de 60 preguntas, gate en CI | Eval harness del Módulo 3 |
+| Carga | Sostener 15 rps en pico con menos de 1% de errores (proveedor mock) | k6 |
+
+Otras restricciones:
+
+- Deploy en **AWS ECS Fargate** detrás de un ALB, en la VPC estándar del equipo de plataforma. RDS PostgreSQL con pgvector, ElastiCache Redis. Infraestructura como código (Terraform o CDK).
+- Secretos en AWS Secrets Manager, inyectados por la task definition. Nada en imágenes ni en el repo.
+- CI/CD con GitHub Actions y OIDC hacia AWS. Sin llaves de AWS de larga duración.
+- Logs JSON estructurados con `request_id`, `tenant_id`, `prompt_version`, `model`, `degraded` y conteos de tokens. Sin texto de la pregunta en los logs para tenants marcados como sensibles a PHI.
+- Traces con OpenTelemetry (o Langfuse) que cubran retrieval, llamada al LLM y caché.
+
+## Fuera de alcance
+
+- Mejorar la calidad de RAG más allá del umbral actual del golden set.
+- Chat para pacientes. Este release es solo para el personal de las clínicas.
+- Una integración real de ticketing (mockéala detrás de una interfaz).
+- Multi-región active-active. Documéntalo como opción futura.
+- Self-hosting de modelos.
+
+## Entregables
+
+1. **Repositorio `support-assistant-prod`** con el servicio, Dockerfile, docker-compose, IaC, workflows, scripts de k6 y documentación.
+2. **Pipeline de CI/CD**: lint, type check, pruebas unitarias y de contrato, eval gate (en cambios de prompt y retrieval), build de la imagen y push a ECR, deploy automático a staging y a producción con aprobación manual, smoke test después de cada deploy.
+3. **Monitoreo**: un dashboard en CloudWatch (o Grafana) con tasa de peticiones, tasa de errores, latencia p50/p95, TTFT p95, cache hit rate, tasa de 429, nivel de degradación, tokens y costo por 1k peticiones. Alarmas de burn rate para los SLOs de disponibilidad y latencia.
+4. **`docs/SLOs.md`**: definiciones de SLO, SLIs, cómo se mide cada uno, política de error budget.
+5. **`docs/RUNBOOK.md`**: deploy, rollback, rotar un secreto, escalar horizontalmente, cambiar un flag de prompt, re-ejecutar la ingesta, aislar a un tenant problemático.
+6. **`docs/INCIDENT_PLAYBOOK.md`**: al menos cinco escenarios con detección, triage, mitigación y comunicación (ver criterios de aceptación).
+7. **`docs/COST_MODEL.md`**: costo por 1k peticiones por modelo y cache hit rate, proyección mensual en 3 niveles de tráfico, hoja de capacidad con chequeo de tokens por minuto del proveedor.
+8. **`loadtest/RESULTS.md`**: resultados de k6 contra staging con el proveedor mock, más una corrida pequeña y presupuestada contra el proveedor real.
+9. **README** con diagrama de arquitectura, tabla de SLOs, GIF de demo del chat con streaming y un link a cada documento anterior.
+
+## Criterios de aceptación
+
+- Un push a `main` despliega a staging sin pasos manuales. El deploy a producción requiere aprobación en un environment de GitHub. Un eval gate fallido bloquea el merge.
+- `docker compose up` levanta todo el stack localmente con `LLM_PROVIDER=mock`.
+- Tumbar el modelo primario (inyección de fallas: `MOCK_FAIL_RATE=1.0` para el primario) mantiene la disponibilidad por encima del SLO, y las respuestas reportan `degraded: 2`.
+- La misma `Idempotency-Key` enviada dos veces a `/v1/escalations` crea exactamente un ticket.
+- Un tenant que excede su presupuesto de tokens recibe 429 con `Retry-After`. Los demás tenants no se ven afectados (demostrado con un escenario de k6).
+- Una corrida de k6 a 15 rps durante 10 minutos pasa los thresholds: latencia p95, TTFT p95, tasa de error menor a 1%.
+- La alarma de burn rate se dispara en staging cuando inyectas 20% de errores durante 10 minutos (captura de pantalla en el PR).
+- El playbook de incidentes cubre: caída del proveedor, pico de latencia del proveedor, pico de costo por un tenant, release de prompt malo, ingesta desactualizada o rota, caída de Redis.
+- Los números de `docs/COST_MODEL.md` concuerdan con el uso registrado de la corrida de k6 contra el proveedor real con una diferencia de hasta 15%.
+- No hay secretos en la imagen (`docker history` y un secret scanner en CI lo demuestran).
+
+## Arquitectura sugerida
+
+<Diagram caption="Asistente de soporte de CareSlot en AWS" chart={`flowchart LR
+  U["Personal de la clínica (app admin)"] --> ALB["ALB (idle timeout 120s)"]
+  ALB --> API["FastAPI en ECS Fargate (2-6 tasks)"]
+  API --> RL["Rate limiter + caché exacta (ElastiCache Redis)"]
+  API --> PHI[Redacción de PHI]
+  API --> RET["Retriever (RDS Postgres + pgvector)"]
+  API --> CHAIN["Cadena de fallback + circuit breakers"]
+  CHAIN --> P1["claude-sonnet-5-5"]
+  CHAIN --> P2["claude-haiku-5-5"]
+  API --> ESC["Escalamientos (idempotentes) al mock de ticketing"]
+  JOB["Task de ingesta nocturna (ECS scheduled)"] --> RET
+  API --> OBS["Traces OTel + logs JSON + métricas"]
+  OBS --> DASH["Dashboard CloudWatch + alarmas de burn rate"]
+  DASH --> PAGE[Pager de on-call]
+  SM[Secrets Manager] -.-> API
+  GHA["GitHub Actions (OIDC)"] --> ECR[ECR] --> API`} />
+
+## Formato del playbook de incidentes
+
+Cada escenario en `docs/INCIDENT_PLAYBOOK.md` sigue la misma forma, para que el ingeniero de on-call pueda leerlo rápido a las 3 a. m.:
+
+```text
+## Provider latency spike
+Detection:   p95 TTFT alarm (above 2.5 s for 10 min) or breaker half-open flapping
+Impact:      slower answers; fallback traffic rises; cost per 1k may drop (Haiku)
+Triage:      1. Check provider status page  2. Dashboard: TTFT by model
+             3. Breaker states on /readyz   4. Is it one region or one tenant?
+Mitigation:  - Lower TTFT budget flag to fail over sooner
+             - Force fallback model via flag `force_model=haiku`
+             - Raise cache semantic threshold flag for degraded mode
+Comms:       Status note in admin app banner; #support-ops update every 30 min
+Exit:        TTFT p95 under target for 30 min; flags reset; ticket for review
+```
+
+El playbook se escribe en inglés porque el equipo de CareSlot opera en inglés; la estructura es lo importante.
+
+## Rúbrica de evaluación
+
+| Área | Peso | Excelente (4) | Adecuado (2) | Ausente (0) |
+|---|---|---|---|---|
+| Diseño del servicio | 15% | Streaming, desconexiones, idempotencia y timeouts, todo probado con pruebas de contrato | El streaming funciona, algunos casos borde sin probar | Solo respuestas bloqueantes |
+| Confiabilidad | 20% | Cadena de fallback, breakers, degradación etiquetada, pruebas de inyección de fallas pasan | Existe fallback pero sin probar o silencioso | Sin fallback |
+| CI/CD e IaC | 15% | OIDC, eval gate, environments, smoke tests, rollback con un comando | El pipeline despliega pero quedan pasos manuales | Deploys manuales |
+| Observabilidad y SLOs | 20% | El dashboard cubre cada SLO, alarmas de burn rate probadas en staging | Existe dashboard, alarmas con umbrales estáticos | Solo logs |
+| Costo y capacidad | 15% | El modelo concuerda con el uso real, la hoja de capacidad revisa el TPM del proveedor | Existe modelo, no validado | Sin análisis de costos |
+| Documentación de operación | 15% | Runbook y playbook específicos, probados en un game day | Documentación genérica | Ausente |
+
+Un puntaje ponderado de 3.0 o más está listo para el portafolio.
+
+## Cronograma sugerido
+
+| Día | Foco | Checkpoint al final del día |
+|---|---|---|
+| 1 | Repo, esqueleto del servicio, streaming, escalamientos con idempotencia, guardia de PHI, proveedor mock con modos de falla, docker-compose | Pruebas de contrato en verde localmente |
+| 2 | Caché y rate limits en Redis, cadena de fallback y breakers, flags de prompts, `/readyz` | Pruebas de inyección de fallas en verde |
+| 3 | Terraform/CDK para ECS, RDS, ElastiCache, ALB; GitHub Actions con OIDC, eval gate, deploy a staging | La URL de staging hace streaming de respuestas |
+| 4 | Dashboard, alarmas de burn rate, corridas de k6, conciliación del modelo de costos | `RESULTS.md` y `COST_MODEL.md` escritos |
+| 5 | Runbook, playbook de incidentes, game day en staging, README con GIF, deploy a producción con aprobación | Definition of Done completa |
+
+## Definition of Done
+
+<Checklist id="m5-16-dod" title="Definition of Done" items={["El chat con streaming, el chat JSON y los escalamientos idempotentes funcionan y tienen pruebas de contrato", "La redacción de PHI corre antes de cada llamada al LLM y tiene pruebas unitarias", "La caché exacta y los rate limits por tenant basados en tokens están implementados con 429 + Retry-After", "La cadena de fallback con circuit breakers y degradación etiquetada pasa las pruebas de inyección de fallas", "Las versiones de prompt viven en git y se seleccionan con un feature flag con soporte de canary", "La infraestructura está definida como código y despliega ECS Fargate, RDS con pgvector y ElastiCache", "GitHub Actions usa OIDC, corre el eval gate, despliega a staging automáticamente y a producción con aprobación", "El dashboard muestra cada SLO y las alarmas de burn rate se dispararon en staging", "Los resultados de k6 cumplen los thresholds a 15 rps y están documentados en loadtest/RESULTS.md", "COST_MODEL.md concuerda con el uso registrado con una diferencia de hasta 15%", "RUNBOOK.md e INCIDENT_PLAYBOOK.md cubren los seis escenarios requeridos", "No hay secretos en la imagen ni en el repo, verificado por un scanner en CI", "El README tiene el diagrama de arquitectura, la tabla de SLOs, el GIF de demo y links a todos los documentos"]} />
+
+## Cómo presentar esto en una entrevista
+
+Empieza por el resultado y las restricciones, no por el stack. Por ejemplo: "Llevé un asistente de soporte de una demo en laptop a producción para un SaaS de salud. Los objetivos eran 99.5% de disponibilidad, TTFT p95 menor a 2.5 segundos y un techo de costo por 1k peticiones. Cumplí los tres en pruebas de carga, y te puedo mostrar los dashboards".
+
+Luego recorre tres decisiones y sus trade-offs:
+
+1. **Degradación en lugar de falla.** Explica la escalera: modelo primario, modelo de fallback, caché etiquetada, links a artículos. Explica por qué las respuestas degradadas cuentan para la disponibilidad y cómo las etiquetaste para que soporte pudiera distinguirlas. Menciona que el fallback solo ocurre antes del primer token.
+2. **El costo como SLO.** Muestra el modelo de costos, cómo concordó con el uso real y qué palancas usaste (caché, `max_tokens`, recorte de contexto) con el eval gate cuidando la calidad.
+3. **Operabilidad.** Muestra una entrada del playbook y la alarma de burn rate que disparaste a propósito en staging. A los líderes de plataforma esto les importa más que la elección del modelo.
+
+Espera preguntas de seguimiento: "¿Por qué Fargate y no Lambda?" (streams de larga duración, idle timeouts del ALB, sin el tope de 15 minutos, tráfico estable). "¿Cómo mantuviste la PHI fuera del proveedor?" (redacción antes de la llamada, sin texto de la pregunta en logs para tenants sensibles, la pregunta del BAA escalada a compliance). "¿Qué harías con 10x de tráfico?" (primero el tier y el TPM del proveedor, luego un segundo proveedor, luego multi-región). Lleva números de tu `RESULTS.md`. Los números reales de tus propias corridas valen más que cualquier adjetivo.

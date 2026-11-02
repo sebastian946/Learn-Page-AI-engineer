@@ -1,0 +1,163 @@
+# Ejercicio: evalúa una cadena RAG con MLflow
+
+**Escenario (estilo certificación).** El equipo de reclamos quiere lanzar el prompt `v2` de su cadena de preguntas y respuestas sobre pólizas. Antes de aprobarlo, el tech lead pide evidencia: "Muéstrame que v2 es al menos tan correcto y fundamentado como v1, que cita fuentes y que se mantiene dentro del presupuesto de latencia. Usa MLflow para que podamos comparar corridas después."
+
+Vas a trazar una pequeña cadena RAG, evaluar dos versiones de prompt con `mlflow.genai.evaluate` usando jueces LLM integrados, un scorer `Guidelines` y dos scorers personalizados con código, comparar las corridas y escribir una recomendación.
+
+Funciona con **MLflow local** (`mlflow ui` o `mlflow server`) usando Anthropic u OpenAI como modelo de la app y juez, o en **Databricks** con endpoints de serving.
+
+**Tiempo:** 75–90 minutos.
+
+<Callout type="warning" title="Versiones de MLflow">
+
+Este ejercicio usa la API GenAI de MLflow 3 (`mlflow.genai.evaluate`, `mlflow.genai.scorers`). Si estás en MLflow 2, actualiza, o adáptalo a `mlflow.evaluate(..., model_type="databricks-agent")` en Databricks. El formato del URI del modelo juez depende de la versión de MLflow; revisa mlflow.org/docs.
+
+</Callout>
+
+## Tareas
+
+- **Tarea 1 — Dataset.** Toma 25 registros de `01-sql-llm-logs/data/eval_v1.jsonl` (o escribe los tuyos sobre los documentos del ejercicio 10). Etiqueta cada uno: agrega `expected_facts` (1–3 hechos cortos) en `expectations`. Guárdalo como `data/eval_labeled_v1.jsonl`. Incluye al menos 3 preguntas que los documentos **no pueden** responder, con el hecho esperado "The assistant says it does not have enough information".
+- **Tarea 2 — Cadena + tracing.** Implementa `answer(question, prompt_version)` usando el retriever del ejercicio 10 (o el pequeño retriever en memoria de abajo). Traza con autolog para el SDK de tu LLM más `@mlflow.trace(span_type=SpanType.RETRIEVER)` en el retrieval.
+- **Tarea 3 — Scorers.** Usa `Correctness`, `RelevanceToQuery`, `RetrievalGroundedness`, `Safety`, un scorer `Guidelines` (una regla del dominio que elijas) y dos scorers de código: `has_citation` y `latency_budget` (3 s).
+- **Tarea 4 — Comparar.** Ejecuta la evaluación una vez por versión de prompt como dos runs de MLflow con los params `prompt_version`, `dataset_version`, `judge_model`, `app_model`. Produce una tabla comparativa e inspecciona al menos 3 filas donde las versiones discrepan.
+- **Tarea 5 — Verificación del juez.** Etiqueta tú mismo `Correctness` en 10 filas y reporta el acuerdo con el juez.
+
+<AcceptanceCriteria>
+
+- [ ] `data/eval_labeled_v1.jsonl` tiene 25 registros con `inputs.question` y `expectations.expected_facts`, incluyendo al menos 3 preguntas sin respuesta
+- [ ] Cada fila evaluada produce un trace con un span RETRIEVER visible en la UI de MLflow
+- [ ] La evaluación usa al menos 4 jueces integrados, 1 scorer `Guidelines` y 2 funciones `@scorer` personalizadas
+- [ ] Existen dos runs de MLflow (v1, v2) en el mismo experimento con params idénticos de dataset y juez
+- [ ] `compare.py` imprime una tabla por métrica con v1, v2 y delta, leída desde MLflow (no escrita a mano)
+- [ ] Sección "Hallazgos" del README: tabla comparativa, 3 ejemplos de discrepancia con las justificaciones del juez, acuerdo juez vs humano en 10 filas y una recomendación de lanzar / no lanzar con umbrales
+- [ ] Los nombres de modelos vienen del entorno o la configuración, no escritos en la cadena
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# rag_chain.py
+import os
+import time
+
+import anthropic
+import mlflow
+from mlflow.entities import SpanType
+
+mlflow.anthropic.autolog()
+client = anthropic.Anthropic()
+APP_MODEL = os.environ.get("APP_MODEL", "claude-haiku-5-5")
+
+PROMPTS = {
+    "v1": "Answer the question using the context.",
+    "v2": ("Answer only from the context. Cite each claim as [doc_id]. "
+           "If the context does not contain the answer, say you do not have enough information."),
+}
+
+@mlflow.trace(span_type=SpanType.RETRIEVER)
+def retrieve(question: str, k: int = 4) -> list[dict]:
+    from retriever import search          # exercise 10 retriever, or the in-memory fallback
+    return [{"page_content": h.content, "metadata": {"doc_uri": h.doc_id, "chunk_id": h.chunk_id}}
+            for h in search(question, k=k)]
+
+@mlflow.trace
+def answer(question: str, prompt_version: str = "v1") -> str:
+    docs = retrieve(question)
+    context = "\n\n".join(f"[{d['metadata']['doc_uri']}] {d['page_content']}" for d in docs)
+    msg = client.messages.create(
+        model=APP_MODEL,
+        max_tokens=400,
+        system=PROMPTS[prompt_version],
+        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}],
+    )
+    return msg.content[0].text
+```
+
+```python
+# evaluate.py
+import json
+import os
+import re
+import sys
+
+import mlflow
+from mlflow.entities import Feedback
+from mlflow.genai.scorers import (
+    Correctness, Guidelines, RelevanceToQuery, RetrievalGroundedness, Safety, scorer,
+)
+from rag_chain import answer
+
+JUDGE = os.environ.get("JUDGE_MODEL", "anthropic:/claude-sonnet-5-5")  # check URI format for your MLflow version
+
+@scorer
+def has_citation(outputs: str) -> bool:
+    return bool(re.search(r"\[[^\]]+\]", outputs))
+
+@scorer
+def latency_budget(trace) -> Feedback:
+    ...  # TODO: read trace.info.execution_time_ms, compare with 3000
+
+def main(prompt_version: str) -> None:
+    data = [json.loads(line) for line in open("data/eval_labeled_v1.jsonl")]
+    mlflow.set_experiment("claims-rag-eval")
+    with mlflow.start_run(run_name=f"prompt-{prompt_version}"):
+        mlflow.log_params({"prompt_version": prompt_version, "dataset_version": "eval_labeled_v1",
+                           "judge_model": JUDGE, "app_model": os.environ.get("APP_MODEL", "")})
+        mlflow.genai.evaluate(
+            data=data,
+            predict_fn=lambda question: answer(question, prompt_version),
+            scorers=[...],  # TODO: built-in judges with model=JUDGE, Guidelines, custom scorers
+        )
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>¿No tienes el retriever del ejercicio 10? Crea `retriever.py` con 15 fragmentos de pólizas escritos a mano y un `search()` que ordene por coincidencia de palabras. El objetivo de este ejercicio es el ciclo de evaluación, no la calidad del retrieval.</Hint>
+
+<Hint>Si `RetrievalGroundedness` devuelve errores o valores vacíos, el juez no encuentra el contexto recuperado: confirma que la función del retriever está decorada con `span_type=SpanType.RETRIEVER` y devuelve documentos con `page_content`. Abre un trace en la UI para verificarlo.</Hint>
+
+<Hint>Pasa el modelo juez a cada juez integrado, por ejemplo `Correctness(model=JUDGE)`. Una buena regla `Guidelines` para este dominio: "The answer must not promise that a claim will be approved or paid." En las preguntas sin respuesta, v1 suele adivinar y v2 debería negarse; busca ahí tus ejemplos de discrepancia.</Hint>
+
+<Hint>En `compare.py`, usa `mlflow.search_runs(experiment_names=["claims-rag-eval"])` para obtener un DataFrame; las columnas de métricas tienen el prefijo `metrics.`. Pivotea por `params.prompt_version` y calcula los deltas. Para el acuerdo del juez, exporta los valores de `correctness` de 10 filas, agrega tus etiquetas y reporta el porcentaje de acuerdo simple.</Hint>
+
+</Hints>
+
+<CommitBox repo="databricks-genai-lab">
+
+Estructura de carpetas:
+
+```text
+databricks-genai-lab/
+  03-mlflow-rag-eval/
+    README.md
+    .env.example               # APP_MODEL, JUDGE_MODEL, API keys (never commit real keys)
+    data/
+      eval_labeled_v1.jsonl
+      judge_agreement.csv
+    rag_chain.py
+    retriever.py
+    evaluate.py
+    compare.py
+    tests/
+      test_scorers.py          # unit tests for has_citation and latency_budget
+```
+
+Esquema del README: objetivo, dataset (fuente, reglas de etiquetado, casos sin respuesta), cadena y prompts, scorers y por qué cada uno, cómo ejecutarlo (`mlflow ui`, `python evaluate.py v1`, `python evaluate.py v2`, `python compare.py`), tabla de hallazgos, análisis de discrepancias, calibración del juez, recomendación y umbrales, captura de pantalla de la vista de comparación de MLflow.
+
+Commits sugeridos:
+
+- `feat(mlflow-eval): labeled eval dataset with unanswerable cases`
+- `feat(mlflow-eval): traced RAG chain with two prompt versions`
+- `feat(mlflow-eval): genai evaluation with judges, guidelines and code scorers`
+- `feat(mlflow-eval): run comparison script`
+- `docs(mlflow-eval): findings, judge agreement and ship recommendation`
+
+</CommitBox>
+
+<Checklist id="m6-11-review" title="Autoevaluación" items={["Misma versión de dataset y mismo modelo juez en ambos runs, registrados como params", "Span del retriever tipado como RETRIEVER para que funcione groundedness", "Los scorers de código tienen tests unitarios", "Preguntas sin respuesta incluidas y analizadas", "Acuerdo del juez con etiquetas humanas medido, no asumido", "La recomendación declara umbrales explícitos, no solo 'v2 se ve mejor'", "Sin API keys ni nombres de modelo escritos en la cadena"]} />

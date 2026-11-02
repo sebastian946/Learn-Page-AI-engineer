@@ -1,0 +1,160 @@
+## Humans are your most expensive oracle. Treat them like one.
+
+Every automated metric in this module is ultimately validated against human judgment. Your LLM judge is calibrated against human labels. Your golden dataset has human-written references. If the human labels are noisy, everything built on them is noisy too, and nobody notices because the numbers look precise.
+
+In Module 3 you labeled 30 items yourself to calibrate a judge. That works for a lab. It does not work when the labels decide a model migration for a law firm. This lesson is about running human evaluation as a **program**: guidelines, multiple annotators, agreement measurement, adjudication, tooling and budget.
+
+The SDET parallel is a manual test team. You would never hand testers "check if the app works". You give them test cases with steps, expected results and severity definitions. You review their bug reports for consistency. Annotation is the same.
+
+## Annotation guidelines
+
+A guideline is a contract between you and the annotators. A good one has:
+
+1. **Purpose.** One paragraph: what the labels are for and what decision they feed. Annotators make better calls when they know the stakes.
+2. **Unit and task.** "You will see one question, the retrieved passages and one answer. Rate the answer only, not the passages."
+3. **Label definitions with boundaries.** Every label has a definition, a positive example, a negative example and at least one **borderline example** with the decision and the reason. Borderline examples do most of the work.
+4. **Decision procedure.** An ordered checklist. "First check for unsupported claims. If any claim contradicts the passages, label `unfaithful` regardless of anything else."
+5. **What to do when unsure.** A `cannot_judge` option with a required note. Forcing a guess hides ambiguity in the guideline.
+6. **Version and changelog.** Guidelines change as you discover edge cases. Every label records the guideline version it was made under.
+
+### Rubric design
+
+- **Prefer binary or 3-point scales per criterion** over a single 1–10 score. "Is every claim supported? yes/no" is far more reliable than "rate faithfulness 1–10".
+- **Split criteria.** Accuracy, completeness, tone and format are separate questions. Merging them forces annotators to weigh them differently in their heads.
+- **Anchor every point.** If you use 1–4, write what a 2 looks like and what separates it from a 3.
+- **Pairwise when quality is relative.** "Which of these two summaries is better?" is easier and more consistent than absolute ratings for subjective qualities. Randomize the left/right order.
+- **Blind the source.** Annotators should not know which model or prompt produced an output.
+
+## Inter-annotator agreement
+
+Have at least two people label the same subset (20–30% of items, or all of them for small, high-stakes sets). Then measure agreement. Raw percent agreement is misleading because some agreement happens by chance.
+
+**Cohen's kappa** compares two annotators and corrects for chance: `kappa = (p_o - p_e) / (1 - p_e)`, where `p_o` is observed agreement and `p_e` is the agreement expected if both labeled randomly with their own label frequencies.
+
+Worked example: 100 items, both say "yes" on 45, both "no" on 35, they disagree on 20. `p_o = 0.80`. Each said "yes" 55% of the time, so `p_e = 0.55 × 0.55 + 0.45 × 0.45 = 0.505`. `kappa = (0.80 - 0.505) / 0.495 = 0.60`.
+
+Other coefficients, and when to use them:
+
+| Situation | Coefficient |
+|---|---|
+| Two annotators, nominal labels | Cohen's kappa |
+| Two annotators, ordinal scale (1–4) | Weighted Cohen's kappa (quadratic weights): a 1-vs-4 disagreement costs more than 3-vs-4 |
+| Three or more annotators, everyone labels every item | Fleiss' kappa |
+| Any number of annotators, missing labels, nominal/ordinal/interval data | Krippendorff's alpha |
+
+Rough interpretation (Landis and Koch for kappa): 0.41–0.60 moderate, 0.61–0.80 substantial, above 0.80 almost perfect. Krippendorff suggests alpha of at least 0.80 for reliable conclusions and 0.667 as the floor for tentative ones. These are conventions, not laws. The real test is whether the agreement level is good enough for the decision.
+
+### The kappa paradox
+
+When one label dominates, kappa can be low even when agreement is high. Example: 100 items, both say "faithful" on 90, both say "unfaithful" on 2, they disagree on 8. Agreement is 92%. But `p_e` is about 0.887, so kappa is only about 0.29. The fix is not to ignore kappa. Oversample the rare class for the agreement study, and report per-class agreement next to the coefficient.
+
+### Code: agreement report
+
+```python
+import numpy as np
+import krippendorff
+from sklearn.metrics import cohen_kappa_score
+from statsmodels.stats.inter_rater import aggregate_raters, fleiss_kappa
+
+def agreement_report(ratings: np.ndarray) -> dict[str, float]:
+    """ratings: shape (n_items, n_raters), ordinal ints 1-4, np.nan where a rater skipped."""
+    a, b = ratings[:, 0], ratings[:, 1]
+    both = ~np.isnan(a) & ~np.isnan(b)
+    report = {
+        "pct_agree_r1_r2": float((a[both] == b[both]).mean()),
+        "cohen_r1_r2": cohen_kappa_score(a[both], b[both]),
+        "cohen_quadratic_r1_r2": cohen_kappa_score(a[both], b[both], weights="quadratic"),
+        # krippendorff expects shape (n_raters, n_items) and handles missing values
+        "kripp_alpha_ordinal": krippendorff.alpha(
+            reliability_data=ratings.T, level_of_measurement="ordinal"
+        ),
+    }
+    complete = ratings[~np.isnan(ratings).any(axis=1)].astype(int)
+    table, _ = aggregate_raters(complete)       # items x categories count table
+    report["fleiss_kappa_complete_items"] = fleiss_kappa(table, method="fleiss")
+    return report
+
+ratings = np.array([[4, 4, 3], [2, 3, 2], [1, 1, np.nan], [3, 3, 3], [4, 2, 4], [2, 2, 1]])
+print(agreement_report(ratings))
+```
+
+With six items the numbers are meaningless. That is the point of the demo: run it on at least 50 overlapping items, and bootstrap the coefficient over items to get an interval, exactly as in lesson 02.
+
+## Adjudication
+
+Disagreements are signal, not waste. A standard flow:
+
+1. Two annotators label independently.
+2. Agreements become gold labels.
+3. Disagreements go to an **adjudicator** (a senior domain expert) who sees both labels and notes, then decides.
+4. Every adjudication that reveals an unclear rule becomes a **guideline change**, with a new borderline example.
+5. Keep raw labels, the adjudicated label and the guideline version. Never overwrite history.
+
+Run a **calibration round** before the real work: all annotators label the same 20–30 items, you discuss every disagreement together, and update the guideline. Then insert **gold questions** (items with a known answer) at 5–10% of the queue to catch drift and fatigue. This is the QA equivalent of seeded defects.
+
+## Labeling tools
+
+- **Argilla** (open source, now part of Hugging Face): built for LLM data. Text fields, label, rating, ranking and free-text questions, task distribution with a minimum number of annotators per record, and a Python SDK.
+- **Label Studio** (open source, HumanSignal): very flexible XML-configured interfaces, many data types, good for mixed tasks such as documents with bounding boxes plus text labels.
+- **Spreadsheets** are fine for a 50-item pilot. Beyond that you lose blinding, randomization, per-annotator tracking and audit history.
+
+A minimal Argilla setup (Argilla 2.x Python SDK; check the docs for the current API):
+
+```python
+import argilla as rg
+
+client = rg.Argilla(api_url="http://localhost:6900", api_key="argilla.apikey")
+settings = rg.Settings(
+    guidelines=open("guidelines/faithfulness_v3.md", encoding="utf-8").read(),
+    fields=[rg.TextField(name="question"), rg.TextField(name="passages"), rg.TextField(name="answer")],
+    questions=[
+        rg.LabelQuestion(name="faithful", labels=["yes", "no", "cannot_judge"]),
+        rg.RatingQuestion(name="completeness", values=[1, 2, 3, 4]),
+        rg.TextQuestion(name="note", required=False),
+    ],
+    distribution=rg.TaskDistribution(min_submitted=2),  # two annotators per record
+)
+dataset = rg.Dataset(name="mortgage-faithfulness-v3", settings=settings, client=client)
+dataset.create()
+dataset.records.log([{"question": q, "passages": p, "answer": a} for q, p, a in rows])
+```
+
+## Cost and throughput
+
+Budget before you start. Measure median seconds per item in the pilot, then:
+
+`hours = items × annotators_per_item × minutes_per_item / 60`, plus adjudication time for the disagreement rate.
+
+Example: 400 items, 2 annotators, 2.5 minutes each is about 33 hours. If 15% need adjudication at 4 minutes, add 4 hours. At an example rate of 40 dollars per hour for domain experts (rates vary widely), that is roughly 1,500 dollars. Compare that with the cost of a wrong migration decision. It is usually cheap.
+
+Ways to spend less without losing reliability: double-label only a 25% overlap once agreement is stable; use an LLM judge to pre-sort and send humans the uncertain and high-stakes items (lesson 5); label pairwise for subjective criteria; keep sessions under 90 minutes to limit fatigue.
+
+## Common mistakes
+
+- **One annotator, no agreement measurement.** You cannot tell label noise from model error.
+- **Vague 1–10 scales.** Low agreement guaranteed. Use binary or anchored 3–4 point criteria.
+- **Showing the model name or the judge's verdict.** Anchoring bias.
+- **Overwriting labels after adjudication.** You lose the evidence that the guideline was ambiguous.
+- **Reporting kappa on a 95/5 class split without per-class numbers.** The paradox will mislead you.
+- **No gold questions.** Annotator drift goes undetected for weeks.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your two annotators agree 92% of the time but Cohen's kappa is 0.3. What is going on and what do you do?" level="senior">
+
+That is the kappa paradox. One label probably dominates, for example 90% "faithful", so chance agreement is already very high and kappa has little room. High raw agreement mostly reflects the base rate. I would look at the confusion table: if the annotators rarely agree on the rare "unfaithful" cases, that is exactly the class that matters, so the low kappa is telling the truth. I would oversample likely failures for the agreement study, report per-class agreement, review disagreements in a calibration session, and add borderline examples to the guideline before relabeling.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How would you set up human evaluation for a high-stakes LLM feature?" level="mid">
+
+I write a versioned guideline with purpose, label definitions, borderline examples and a decision procedure. I run a calibration round where all annotators label the same 25 items and we discuss disagreements. Then two annotators label each item blind to the model, in a tool like Argilla or Label Studio, with 5–10% gold questions. I measure Cohen's or Krippendorff's alpha on the overlap, send disagreements to a domain-expert adjudicator, and fold new edge cases into the guideline. I track minutes per item to forecast cost and throughput.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Argilla documentation: https://docs.argilla.io
+- Label Studio documentation: https://labelstud.io/guide/
+- Krippendorff's alpha Python package: https://github.com/pln-fing-udelar/fast-krippendorff
+- statsmodels inter-rater module: https://www.statsmodels.org/stable/stats.html#interrater-reliability-and-agreement

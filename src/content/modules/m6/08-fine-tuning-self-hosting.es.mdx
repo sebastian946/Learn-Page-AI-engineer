@@ -1,0 +1,177 @@
+# Fine-tuning (y cuándo no hacerlo), LoRA/QLoRA y autoalojamiento con vLLM
+
+Las ofertas de trabajo mencionan el fine-tuning mucho menos que RAG, evals e integración de LLMs. Cuando los entrevistadores lo sacan, normalmente quieren saber si puedes **decidir**, no si sabes ejecutar un loop de entrenamiento. Esta lección te da ese marco de decisión, el modelo mental de LoRA y QLoRA, y las ideas centrales detrás de autoalojar modelos con vLLM.
+
+## La escalera de decisión: prompting → RAG → fine-tuning
+
+Sube un escalón a la vez. Cada escalón cuesta más construirlo y mucho más mantenerlo.
+
+<Diagram caption="Escala solo cuando el paso más barato se midió y falló" chart={`flowchart TD
+  A["Problema con la salida del LLM"] --> B{"¿Falta conocimiento o hechos?"}
+  B -- Sí --> C["RAG: recuperar los hechos al momento de la consulta"]
+  B -- No --> D{"¿Formato, estilo o comportamiento incorrecto?"}
+  D -- Sí --> E["Prompting: instrucciones, few-shot, salidas estructuradas"]
+  E --> F{"¿Sigue fallando en un set de evaluación medido?"}
+  F -- No --> G["Ponerlo en producción"]
+  F -- Sí --> H{"¿Tarea estrecha y estable con 1k+ ejemplos de calidad?"}
+  H -- Sí --> I["Considerar fine-tuning (LoRA / QLoRA)"]
+  H -- No --> J["Mejorar datos, prompts, elección de modelo o descomposición de la tarea"]
+  C --> F`} />
+
+Reglas prácticas:
+
+- **Problemas de conocimiento → RAG.** El fine-tuning es una mala forma de enseñar hechos. Los hechos cambian; un modelo con fine-tuning queda congelado al momento del entrenamiento, no puede citar fuentes y aun así puede alucinar. RAG se actualiza re-indexando un documento.
+- **Problemas de comportamiento → primero prompting.** Formato, tono, política de rechazo y esquema de salida normalmente se arreglan con un mejor system prompt, algunos ejemplos y salidas estructuradas (Módulo 1).
+- **El fine-tuning encaja cuando:**
+  - La tarea es **estrecha y estable** (clasificar reclamos en 40 códigos internos, extraer campos de una familia de formularios, escribir con un estilo de la casa estricto).
+  - Tienes **de cientos a miles de ejemplos etiquetados de alta calidad**, y el set de evaluación para demostrar la mejora.
+  - Necesitas **menor costo o latencia**: un modelo pequeño con fine-tuning puede reemplazar a un modelo general grande en una tarea estrecha.
+  - Necesitas un modelo que **corra en tu propia infraestructura** por razones de residencia de datos y debe cerrar una brecha de calidad.
+
+### El costo oculto: el mantenimiento
+
+Un modelo con fine-tuning es un producto que tú mantienes:
+
+- **Pipeline de datos** para recolectar, limpiar, etiquetar y versionar los datos de entrenamiento (lección 2).
+- **Corridas de entrenamiento** que deben ser reproducibles: versión de datos, versión del modelo base, hiperparámetros, semilla.
+- **Evaluación** en cada re-entrenamiento, contra el modelo base y la versión anterior.
+- **Serving**: muchas veces capacidad aprovisionada o tus propias GPUs (lección 5 y más abajo).
+- **Cambio de base (re-basing)**: cuando sale un modelo base mejor, tu fine-tune no se actualiza solo. Re-entrenas o te quedas atrás. Mientras tanto, un modelo frontera con buen prompting mejora gratis.
+
+Pon esto en el README de cualquier proyecto de fine-tuning. Los entrevistadores notan a los candidatos que cuentan el mantenimiento.
+
+## LoRA y QLoRA a nivel conceptual
+
+El fine-tuning completo actualiza todos los pesos. Para un modelo de 7B parámetros eso significa guardar los pesos, los gradientes y los estados del optimizador de todos los parámetros; con Adam en precisión mixta son aproximadamente 16 bytes por parámetro, así que más de 100 GB de memoria de GPU antes de las activaciones. Eso es territorio de múltiples GPUs.
+
+**LoRA (Low-Rank Adaptation)** congela los pesos base y aprende una actualización pequeña para matrices de pesos seleccionadas. En lugar de aprender una matriz de actualización completa ΔW de tamaño d × d, aprende dos matrices delgadas B (d × r) y A (r × d) con un rango r pequeño (normalmente 8–64), de modo que ΔW = B·A. Para d = 4096 y r = 16, son unos 131 mil parámetros en lugar de 16.7 millones para esa matriz: menos del 1%.
+
+Consecuencias:
+
+- **Mucha menos memoria** para gradientes y estados del optimizador.
+- **Artefactos pequeños**: un adapter pesa megabytes, no gigabytes. Puedes tener un modelo base y muchos adapters (uno por tarea o por tenant).
+- **Intercambiables**: servidores como vLLM pueden cargar varios adapters LoRA sobre un modelo base y elegir por request.
+- La calidad suele acercarse al fine-tuning completo en tareas estrechas; no siempre en cambios grandes de dominio.
+
+**QLoRA** va más allá: carga el modelo base congelado en precisión de **4 bits** (cuantización NF4) y entrena adapters LoRA encima en mayor precisión. Los pesos de un modelo de 7B bajan de unos 14 GB en 16 bits a aproximadamente 4 GB, lo que hace posible el fine-tuning en una sola GPU de consumo o de gama media. El costo es un entrenamiento más lento y un pequeño riesgo de calidad por la cuantización.
+
+```python
+import torch
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+BASE = "meta-llama/Llama-3.1-8B-Instruct"   # example base model
+
+bnb = BitsAndBytesConfig(                    # QLoRA: 4-bit frozen base
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+model = AutoModelForCausalLM.from_pretrained(BASE, quantization_config=bnb, device_map="auto")
+
+lora = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora)
+model.print_trainable_parameters()   # typically well under 1% trainable
+```
+
+A partir de aquí usarías un trainer (por ejemplo `SFTTrainer` de TRL) sobre un dataset en formato de chat. Databricks también ofrece fine-tuning administrado para modelos foundation soportados, con el resultado registrado en Unity Catalog y servido con provisioned throughput; revisa la documentación para ver los modelos soportados actualmente.
+
+### Cómo se ven buenos datos de fine-tuning
+
+- Con el formato exacto de las entradas de producción, con el mismo system prompt.
+- Deduplicados, sin PII y divididos de modo que no se filtren casi duplicados del entrenamiento a la evaluación.
+- Cubriendo casos borde a propósito, no solo el camino feliz.
+- Idealmente construidos a partir de traces de producción revisados y correcciones de SMEs: los mismos activos que alimentan tu set de evaluación.
+
+## Autoalojamiento con vLLM
+
+Llamar a una API es la opción por defecto. Autoalojar significa correr modelos de pesos abiertos en GPUs que tú controlas. **vLLM** es el servidor de inferencia open source más común para esto. Dos ideas lo hacen rápido.
+
+### PagedAttention
+
+Durante la generación, el modelo guarda keys y values de cada token anterior: el **KV cache**. Es grande. Para Llama 3.1 8B (32 capas, 8 KV heads, dimensión de head 128, 16 bits), cada token cuesta 2 × 32 × 8 × 128 × 2 bytes = 128 KiB. Una secuencia de 8k tokens necesita alrededor de 1 GiB de KV cache.
+
+Los servidores ingenuos reservan un bloque contiguo por request con el tamaño de la longitud máxima, desperdiciando la mayor parte. **PagedAttention** divide el KV cache en bloques de tamaño fijo, como las páginas de memoria virtual de un sistema operativo, y los asigna bajo demanda. Menos fragmentación significa que caben más secuencias concurrentes en la misma GPU, y los prefijos idénticos (un system prompt compartido) pueden compartir bloques.
+
+### Continuous batching
+
+El batching estático espera a que se llene un lote y a que termine su secuencia más lenta. **Continuous batching** inserta requests nuevos en el lote en ejecución en cada paso de decodificación y retira los terminados de inmediato. La GPU se mantiene ocupada, el throughput sube mucho bajo carga concurrente y los requests cortos no quedan atrapados detrás de los largos.
+
+### Ejecutarlo
+
+vLLM expone una **API compatible con OpenAI**, así que tu cliente del Módulo 1 funciona sin cambios:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-lora \
+  --lora-modules claims-coder=./adapters/claims-coder
+```
+
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="unused-locally")
+
+async def classify(text: str) -> str:
+    resp = await client.chat.completions.create(
+        model="claims-coder",          # the LoRA adapter name, or the base model id
+        messages=[{"role": "user", "content": text}],
+        max_tokens=16, temperature=0,
+    )
+    return resp.choices[0].message.content
+```
+
+### Cuándo autoalojar le gana a las APIs
+
+Autoalojar gana cuando varias de estas condiciones se cumplen:
+
+- **Residencia de datos o cumplimiento** prohíben enviar datos a una API externa, y no existe una opción administrada aprobada.
+- **Volumen alto y estable** que mantiene las GPUs ocupadas. Una GPU ociosa cuesta lo mismo que una ocupada; las APIs por token no.
+- **Un modelo abierto pequeño o con fine-tuning es suficiente** para una tarea estrecha, así una GPU barata lo maneja.
+- **Control de latencia**: inferencia en la misma ubicación sin viajes por internet.
+
+Las APIs ganan cuando el volumen es bajo o variable, cuando necesitas calidad de nivel frontera o cuando no tienes el equipo para operar infraestructura de GPUs (drivers, autoescalado, actualizaciones, guardias). Compara el **costo total**: horas de GPU con una utilización realista más el tiempo de ingeniería, contra precios por token a tu volumen medido. Usa precios actuales de proveedores y nubes; el punto de cruce se mueve cada pocos meses.
+
+## Errores comunes
+
+- Hacer fine-tuning para agregar conocimiento que pertenece a RAG.
+- Hacer fine-tuning antes de construir un set de evaluación, así no puedes demostrar que ayudó.
+- Ignorar el costo de re-basing cuando sale el siguiente modelo base.
+- Entrenar con salidas del modelo sin revisar y amplificar sus errores.
+- Autoalojar para un prototipo con 100 requests al día.
+- Dimensionar GPUs solo por los pesos del modelo y olvidar el KV cache.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Un stakeholder te pide hacer fine-tuning de un modelo con los documentos de políticas de la empresa para que los 'conozca'. ¿Qué respondes?" level="mid">
+
+Recomendaría RAG en su lugar. El conocimiento de políticas cambia, necesita citas y debe ser auditable; un modelo con fine-tuning queda congelado al momento del entrenamiento, no puede citar y aun así alucina. RAG se actualiza re-indexando y muestra sus fuentes. Si después de RAG y del trabajo de prompts seguimos viendo una brecha medida — por ejemplo, un estilo de salida estricto o una tarea de clasificación estrecha — consideraría fine-tuning con LoRA sobre ejemplos revisados, con un set de evaluación para demostrar la mejora y un plan para re-entrenar cuando cambie el modelo base.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explica PagedAttention y continuous batching, y por qué importan para el costo." level="senior">
+
+El KV cache crece con cada token generado y domina la memoria de la GPU bajo carga. PagedAttention lo guarda en bloques de tamaño fijo asignados bajo demanda, como la memoria virtual de un sistema operativo, así hay poca fragmentación y los prefijos compartidos pueden reutilizar bloques; caben más secuencias por GPU. Continuous batching agrega y retira secuencias en cada paso de decodificación en lugar de esperar lotes completos, manteniendo la GPU ocupada y evitando que los requests cortos esperen detrás de los largos. Juntos suben el throughput por GPU, lo que baja el costo por token: la palanca principal al decidir si autoalojar le gana a una API.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Muestra la escalera">
+
+Cuando te pregunten "¿harías fine-tuning?", responde con la escalera: qué probarías primero, qué métrica te diría que falló y cuánto costaría mantener el fine-tuning. Esa estructura muestra más seniority que cualquier detalle de LoRA.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Paper de LoRA (Hu et al., 2021): https://arxiv.org/abs/2106.09685
+- Paper de QLoRA (Dettmers et al., 2023): https://arxiv.org/abs/2305.14314
+- Paper de PagedAttention / vLLM (Kwon et al., 2023): https://arxiv.org/abs/2309.06180
+- Documentación de vLLM: https://docs.vllm.ai
+- PEFT de Hugging Face: https://huggingface.co/docs/peft
+- Fine-tuning de modelos foundation en Databricks: https://docs.databricks.com/en/large-language-models/foundation-model-training/index.html

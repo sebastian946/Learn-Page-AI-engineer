@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m3-iv-01",
+    "level": "mid",
+    "tags": ["evals", "eval-pyramid", "qa-background"],
+    "question": {
+      "en": "How would you structure the evaluation strategy for a new RAG feature?",
+      "es": "¿Cómo estructurarías la estrategia de evaluación para una nueva funcionalidad RAG?"
+    },
+    "answer": {
+      "en": "I use an eval pyramid, the same idea as the test pyramid.\n\n- **Base: deterministic checks.** Output schema, citations present and pointing to retrieved docs, length limits, refusal on out-of-scope questions. They run on every commit and cost nothing.\n- **Middle: model-graded evals.** Faithfulness, answer relevance, context precision and recall with Ragas or a calibrated LLM judge, on a versioned golden dataset. They run on PRs that touch prompts or retrieval, with thresholds against a baseline.\n- **Top: human review.** A small weekly sample, focused on disagreements and high-risk tags.\n\nI also evaluate retrieval separately from generation, so a failure points to the right component. Online, I add sampled judging and user feedback signals.",
+      "es": "Uso una pirámide de evals, la misma idea que la pirámide de testing.\n\n- **Base: checks determinísticos.** Schema de salida, citas presentes y que apunten a documentos recuperados, límites de longitud, rechazo de preguntas fuera de alcance. Corren en cada commit y no cuestan nada.\n- **Medio: evals calificados por modelo.** Faithfulness, relevancia de respuesta, precisión y recall de contexto con Ragas o un juez LLM calibrado, sobre un golden dataset versionado. Corren en PRs que tocan prompts o retrieval, con umbrales contra una línea base.\n- **Cima: revisión humana.** Una muestra semanal pequeña, enfocada en desacuerdos y tags de alto riesgo.\n\nTambién evalúo el retrieval por separado de la generación, para que una falla apunte al componente correcto. Online, agrego juicio muestreado y señales de feedback de usuarios."
+    }
+  },
+  {
+    "id": "m3-iv-02",
+    "level": "mid",
+    "tags": ["non-determinism", "flaky-tests", "statistics"],
+    "question": {
+      "en": "LLM outputs are non-deterministic. How do you keep eval-based CI gates from being flaky?",
+      "es": "Las salidas de un LLM no son determinísticas. ¿Cómo evitas que los gates de CI basados en evals sean flaky?"
+    },
+    "answer": {
+      "en": "I treat scores as statistics, not booleans.\n\n- Gate on aggregate metrics over a dataset, not single cases, except for a small `critical` tag where any failure blocks.\n- Compare against a stored baseline with a tolerance, for example fail if faithfulness drops more than 0.03, plus an absolute floor.\n- Reduce variance: temperature 0 for the judge, pinned model versions, cached responses keyed on model, prompt hash and parameters.\n- For close calls, sample each case several times and use a bootstrap confidence interval.\n\nWhat I never do is rerun until green. That is the LLM version of hiding a flaky test behind retries, and it lets real regressions through.",
+      "es": "Trato los puntajes como estadísticas, no como booleanos.\n\n- Hago el gate sobre métricas agregadas del dataset, no sobre casos individuales, salvo un tag `critical` pequeño donde cualquier falla bloquea.\n- Comparo contra una línea base guardada con tolerancia, por ejemplo fallar si faithfulness baja más de 0.03, más un piso absoluto.\n- Reduzco la varianza: temperatura 0 para el juez, versiones de modelo fijadas, respuestas cacheadas por modelo, hash del prompt y parámetros.\n- En casos al límite, muestreo cada caso varias veces y uso un intervalo de confianza por bootstrap.\n\nLo que nunca hago es reintentar hasta que pase. Es la versión LLM de esconder un test flaky detrás de reintentos, y deja pasar regresiones reales."
+    }
+  },
+  {
+    "id": "m3-iv-03",
+    "level": "senior",
+    "tags": ["llm-as-judge", "calibration", "bias"],
+    "question": {
+      "en": "Your team wants to use an LLM as a judge for answer quality. What are the risks and how do you make it trustworthy?",
+      "es": "Tu equipo quiere usar un LLM como juez de calidad de respuestas. ¿Cuáles son los riesgos y cómo lo haces confiable?"
+    },
+    "answer": {
+      "en": "The risks are known biases and silent miscalibration. Position bias in pairwise comparisons, verbosity bias toward longer answers, and self-preference toward the same model family.\n\nMitigations:\n\n- A rubric with explicit, binary or low-cardinality criteria and examples. Structured output with a short rationale.\n- Swap order in pairwise mode and only count consistent wins.\n- Use a judge from a different family than the system under test when possible.\n- **Calibrate**: humans label 50 to 100 samples, I compute Cohen's kappa and the confusion matrix, and iterate the rubric until kappa is at least about 0.6 and the false-pass rate is acceptable.\n- Freeze judge prompt and model version, and re-calibrate when either changes.\n\nThe judge is a measuring instrument. You validate the instrument before you trust the reading.",
+      "es": "Los riesgos son sesgos conocidos y una descalibración silenciosa. Sesgo de posición en comparaciones pairwise, sesgo de verbosidad hacia respuestas largas y autopreferencia hacia la misma familia de modelos.\n\nMitigaciones:\n\n- Una rúbrica con criterios explícitos, binarios o de pocos niveles, con ejemplos. Salida estructurada con una justificación corta.\n- Intercambiar el orden en modo pairwise y contar solo victorias consistentes.\n- Usar un juez de otra familia distinta al sistema bajo prueba cuando sea posible.\n- **Calibrar**: humanos etiquetan de 50 a 100 muestras, calculo el kappa de Cohen y la matriz de confusión, e itero la rúbrica hasta que kappa sea al menos ~0.6 y la tasa de falsos aprobados sea aceptable.\n- Congelar el prompt y la versión del modelo del juez, y recalibrar cuando cambie cualquiera.\n\nEl juez es un instrumento de medición. Validas el instrumento antes de confiar en la lectura."
+    }
+  },
+  {
+    "id": "m3-iv-04",
+    "level": "mid",
+    "tags": ["golden-dataset", "versioning", "coverage"],
+    "question": {
+      "en": "How do you build and maintain a golden dataset for an LLM application?",
+      "es": "¿Cómo construyes y mantienes un golden dataset para una aplicación LLM?"
+    },
+    "answer": {
+      "en": "I start with 50 to 100 cases written or approved by domain experts, then grow it from three sources: real production queries (sampled and anonymized), failures found in review or incidents, and carefully generated synthetic cases.\n\nEach row has an id, question, reference answer, reference document ids, tags, difficulty, source and version. Tags drive a coverage matrix: topics, edge cases, out-of-scope, adversarial. I look for empty cells, like a traceability matrix.\n\nThe dataset is versioned in git (or DVC for large files), and every eval report states which version it used, so scores stay comparable. Synthetic cases get deduplicated, reviewed by a human, and generated by a different model than the one under test.",
+      "es": "Empiezo con 50 a 100 casos escritos o aprobados por expertos del dominio y luego lo hago crecer desde tres fuentes: consultas reales de producción (muestreadas y anonimizadas), fallas encontradas en revisiones o incidentes, y casos sintéticos generados con cuidado.\n\nCada fila tiene id, pregunta, respuesta de referencia, ids de documentos de referencia, tags, dificultad, fuente y versión. Los tags alimentan una matriz de cobertura: temas, casos borde, fuera de alcance, adversariales. Busco celdas vacías, como en una matriz de trazabilidad.\n\nEl dataset se versiona en git (o DVC para archivos grandes) y cada reporte de evals indica qué versión usó, para que los puntajes sean comparables. Los casos sintéticos se deduplican, los revisa un humano y los genera un modelo distinto al que se prueba."
+    }
+  },
+  {
+    "id": "m3-iv-05",
+    "level": "senior",
+    "tags": ["ci-cd", "cost", "github-actions"],
+    "question": {
+      "en": "Design a CI pipeline that evaluates prompt changes. How do you balance signal, speed and cost?",
+      "es": "Diseña un pipeline de CI que evalúe cambios de prompts. ¿Cómo equilibras señal, velocidad y costo?"
+    },
+    "answer": {
+      "en": "Three tiers.\n\n- **Every commit**: deterministic checks and unit tests with mocked LLM calls. Seconds, zero spend.\n- **PRs touching prompts, retrieval or datasets**: a stratified subset of the golden set (for example 40 to 60 cases covering every tag), model-graded metrics, compared against `baseline.json` with tolerances. A job that always runs and decides internally whether evals are needed, so the required check never hangs. Results posted as a PR comment and uploaded as an artifact.\n- **Nightly on main**: the full dataset, repeated sampling, red-team suite, trend report.\n\nCost control: response cache keyed on model, prompt hash and params; a cheap judge for screening; a hard budget per run that fails loudly. The baseline only updates from main through an explicit, reviewed step.",
+      "es": "Tres niveles.\n\n- **Cada commit**: checks determinísticos y unit tests con llamadas al LLM mockeadas. Segundos, gasto cero.\n- **PRs que tocan prompts, retrieval o datasets**: un subconjunto estratificado del golden set (por ejemplo 40 a 60 casos que cubren todos los tags), métricas calificadas por modelo, comparadas contra `baseline.json` con tolerancias. Un job que siempre corre y decide internamente si hacen falta evals, para que el check requerido nunca quede colgado. Resultados publicados como comentario en el PR y subidos como artifact.\n- **Cada noche en main**: el dataset completo, muestreo repetido, suite de red-team, reporte de tendencias.\n\nControl de costos: caché de respuestas por modelo, hash del prompt y parámetros; un juez barato para filtrar; un presupuesto duro por corrida que falla de forma visible. La línea base solo se actualiza desde main con un paso explícito y revisado."
+    }
+  },
+  {
+    "id": "m3-iv-06",
+    "level": "mid",
+    "tags": ["offline-evals", "online-evals"],
+    "question": {
+      "en": "What is the difference between offline and online evals, and why do you need both?",
+      "es": "¿Cuál es la diferencia entre evals offline y online, y por qué necesitas ambos?"
+    },
+    "answer": {
+      "en": "Offline evals run before release on a fixed dataset. They are reproducible and cheap to compare across versions: my regression suite.\n\nOnline evals run on real production traffic: sampled LLM-judge scores, user signals like thumbs, edits and escalations, plus latency and cost. They catch what the golden set does not cover, such as new question types or drift after a provider update.\n\nYou need both because offline is only as good as its dataset, and online is noisy and arrives after users are exposed. The loop that matters is feeding online failures back into the golden dataset, the same way production bugs become regression tests.",
+      "es": "Los evals offline corren antes del release sobre un dataset fijo. Son reproducibles y baratos para comparar versiones: mi suite de regresión.\n\nLos evals online corren sobre tráfico real de producción: puntajes de un juez LLM muestreados, señales de usuarios como pulgares, ediciones y escalamientos, más latencia y costo. Detectan lo que el golden set no cubre, como nuevos tipos de preguntas o drift después de una actualización del proveedor.\n\nNecesitas ambos porque el offline solo es tan bueno como su dataset, y el online es ruidoso y llega después de que los usuarios ya están expuestos. El ciclo importante es llevar las fallas online de vuelta al golden dataset, igual que los bugs de producción se vuelven tests de regresión."
+    }
+  },
+  {
+    "id": "m3-iv-07",
+    "level": "senior",
+    "tags": ["ab-testing", "experimentation", "statistics"],
+    "question": {
+      "en": "How would you A/B test a new system prompt in production?",
+      "es": "¿Cómo harías un A/B test de un nuevo system prompt en producción?"
+    },
+    "answer": {
+      "en": "First, the new prompt must pass the offline gate. A/B testing is not a substitute for regression tests.\n\nThen:\n\n- Pick one primary metric tied to the business goal, such as answer accepted without edit, and guardrail metrics: latency p95, cost per request, escalation rate, sampled faithfulness.\n- Randomize by user with a stable hash behind a feature flag, so each user sees one variant.\n- Compute sample size up front from baseline rate, minimum detectable effect, alpha and power.\n- Do not peek and stop early; use a fixed horizon or a sequential test.\n- Run at least one or two weekly cycles so novelty fades, and check for sample ratio mismatch.\n\nShip only if the primary metric wins and no guardrail regresses.",
+      "es": "Primero, el nuevo prompt debe pasar el gate offline. El A/B testing no reemplaza las pruebas de regresión.\n\nLuego:\n\n- Elegir una métrica principal ligada al objetivo de negocio, como respuesta aceptada sin edición, y métricas de guardrail: latencia p95, costo por petición, tasa de escalamiento, faithfulness muestreado.\n- Aleatorizar por usuario con un hash estable detrás de un feature flag, para que cada usuario vea una sola variante.\n- Calcular el tamaño de muestra antes, a partir de la tasa base, el efecto mínimo detectable, alfa y potencia.\n- No mirar los resultados y detener antes; usar un horizonte fijo o un test secuencial.\n- Correr al menos uno o dos ciclos semanales para que se diluya la novedad, y revisar el sample ratio mismatch.\n\nSe lanza solo si gana la métrica principal y ningún guardrail empeora."
+    }
+  },
+  {
+    "id": "m3-iv-08",
+    "level": "mid",
+    "tags": ["tracing", "langfuse", "langsmith", "debugging"],
+    "question": {
+      "en": "A user reports a wrong answer from your RAG assistant. Walk me through how you debug it.",
+      "es": "Un usuario reporta una respuesta incorrecta de tu asistente RAG. Explícame cómo lo depuras."
+    },
+    "answer": {
+      "en": "I start from the trace. Every response carries a trace id (for example in an `X-Trace-Id` header), so I open it in Langfuse or LangSmith.\n\nThen I walk the span tree:\n\n- **Query rewrite**: did it change the meaning?\n- **Retrieval**: were the right documents in the top-k? If not, it is a retrieval bug: chunking, filters, hybrid weights.\n- **Re-ranking**: did the right chunk get pushed down?\n- **Generation**: was the right context present but ignored or contradicted? That is a faithfulness problem: prompt or model.\n\nOnce I know the root cause, I add the case to the golden dataset with a tag, fix it, and confirm the regression suite passes. Same as turning a production bug into a regression test.",
+      "es": "Empiezo por el trace. Cada respuesta lleva un trace id (por ejemplo en un header `X-Trace-Id`), así que lo abro en Langfuse o LangSmith.\n\nLuego recorro el árbol de spans:\n\n- **Reescritura de consulta**: ¿cambió el significado?\n- **Retrieval**: ¿estaban los documentos correctos en el top-k? Si no, es un bug de retrieval: chunking, filtros, pesos híbridos.\n- **Re-ranking**: ¿bajó de posición el chunk correcto?\n- **Generación**: ¿el contexto correcto estaba presente pero se ignoró o se contradijo? Eso es un problema de faithfulness: prompt o modelo.\n\nCuando conozco la causa raíz, agrego el caso al golden dataset con un tag, lo corrijo y confirmo que la suite de regresión pasa. Igual que convertir un bug de producción en un test de regresión."
+    }
+  },
+  {
+    "id": "m3-iv-09",
+    "level": "senior",
+    "tags": ["opentelemetry", "observability", "vendor-neutral"],
+    "question": {
+      "en": "Why would you instrument an LLM app with OpenTelemetry instead of only a vendor SDK like LangSmith or Langfuse?",
+      "es": "¿Por qué instrumentarías una app LLM con OpenTelemetry en vez de solo un SDK de proveedor como LangSmith o Langfuse?"
+    },
+    "answer": {
+      "en": "Portability and one trace across the whole system.\n\nWith OpenTelemetry, LLM spans live in the same trace as the FastAPI request, database queries, Redis calls and downstream services. The SRE team already has OTel pipelines, and a Collector lets me fan out to Langfuse for LLM-specific views and to Tempo or Jaeger for infrastructure, or switch vendors without touching app code.\n\nThe GenAI semantic conventions (`gen_ai.request.model`, `gen_ai.usage.input_tokens` and so on) give standard names for model, tokens and operations. The caveat: they are still experimental, so I pin the convention version and wrap attribute names in one module. Vendor SDKs are still great for prompt management, datasets and scoring, so in practice I often combine both.",
+      "es": "Portabilidad y un solo trace a través de todo el sistema.\n\nCon OpenTelemetry, los spans del LLM viven en el mismo trace que la petición FastAPI, las consultas a la base de datos, las llamadas a Redis y los servicios downstream. El equipo de SRE ya tiene pipelines OTel, y un Collector me permite enviar a Langfuse para vistas específicas de LLM y a Tempo o Jaeger para infraestructura, o cambiar de proveedor sin tocar el código de la app.\n\nLas convenciones semánticas GenAI (`gen_ai.request.model`, `gen_ai.usage.input_tokens`, etc.) dan nombres estándar para modelo, tokens y operaciones. La advertencia: siguen siendo experimentales, así que fijo la versión de la convención y centralizo los nombres de atributos en un módulo. Los SDKs de proveedor siguen siendo muy buenos para gestión de prompts, datasets y scoring, así que en la práctica suelo combinar ambos."
+    }
+  },
+  {
+    "id": "m3-iv-10",
+    "level": "mid",
+    "tags": ["monitoring", "latency", "cost", "drift"],
+    "question": {
+      "en": "What would you put on a production dashboard for an LLM application?",
+      "es": "¿Qué pondrías en un dashboard de producción para una aplicación LLM?"
+    },
+    "answer": {
+      "en": "Four groups.\n\n- **Latency**: p50, p95, p99 for total time and time to first token, split by route and model.\n- **Cost**: input and output tokens per request, cost per 1k requests, daily spend against budget, cache hit rate.\n- **Quality**: sampled online judge scores (faithfulness, relevance), thumbs-down rate, escalation rate, refusal rate.\n- **Reliability and drift**: error and retry rates by provider, rate-limit hits, and drift signals such as distance of query embeddings from the baseline centroid or a shift in topic mix.\n\nAlerts go on SLOs and tails, not averages, and each alert links to example traces so on-call can start debugging immediately.",
+      "es": "Cuatro grupos.\n\n- **Latencia**: p50, p95, p99 del tiempo total y del time to first token, por ruta y modelo.\n- **Costo**: tokens de entrada y salida por petición, costo por cada 1k peticiones, gasto diario contra presupuesto, tasa de aciertos de caché.\n- **Calidad**: puntajes muestreados de un juez online (faithfulness, relevancia), tasa de pulgares abajo, tasa de escalamiento, tasa de rechazos.\n- **Confiabilidad y drift**: tasas de error y reintentos por proveedor, límites de tasa alcanzados y señales de drift como la distancia de los embeddings de consultas al centroide base o un cambio en la mezcla de temas.\n\nLas alertas van sobre SLOs y colas, no promedios, y cada alerta enlaza traces de ejemplo para que on-call empiece a depurar de inmediato."
+    }
+  },
+  {
+    "id": "m3-iv-11",
+    "level": "senior",
+    "tags": ["prompt-injection", "guardrails", "owasp", "security"],
+    "question": {
+      "en": "How do you defend a RAG assistant against prompt injection, including injection through retrieved documents?",
+      "es": "¿Cómo defiendes un asistente RAG contra prompt injection, incluyendo injection a través de documentos recuperados?"
+    },
+    "answer": {
+      "en": "Assume injection will sometimes succeed and limit the damage. Defense in depth:\n\n- **Ingestion**: scan and sanitize documents, strip hidden text, track provenance, restrict who can add content.\n- **Prompt structure**: retrieved text is data, wrapped in clear delimiters and never mixed with instructions.\n- **Input guards**: a fast classifier for known jailbreak and injection patterns.\n- **Least privilege**: the model only has read-only tools it needs; risky actions require human approval.\n- **Output guards**: schema validation, groundedness check against retrieved context, PII and policy filters, and output encoding before rendering.\n- **Testing**: a red-team suite with poisoned documents in CI, measuring attack success rate and false refusals.\n\nI map this to the OWASP Top 10 for LLM Applications, mainly LLM01, LLM02, LLM05 and LLM06.",
+      "es": "Asume que el injection a veces tendrá éxito y limita el daño. Defensa en profundidad:\n\n- **Ingesta**: escanear y sanitizar documentos, quitar texto oculto, registrar procedencia, restringir quién puede agregar contenido.\n- **Estructura del prompt**: el texto recuperado es datos, envuelto en delimitadores claros y nunca mezclado con instrucciones.\n- **Guardas de entrada**: un clasificador rápido para patrones conocidos de jailbreak e injection.\n- **Mínimo privilegio**: el modelo solo tiene las herramientas de solo lectura que necesita; las acciones riesgosas requieren aprobación humana.\n- **Guardas de salida**: validación de schema, check de groundedness contra el contexto recuperado, filtros de PII y políticas, y codificación de la salida antes de renderizar.\n- **Testing**: una suite de red-team con documentos envenenados en CI, que mide la tasa de éxito de ataques y los rechazos falsos.\n\nLo mapeo al OWASP Top 10 para aplicaciones LLM, principalmente LLM01, LLM02, LLM05 y LLM06."
+    }
+  },
+  {
+    "id": "m3-iv-12",
+    "level": "senior",
+    "tags": ["red-teaming", "security-testing", "qa-background"],
+    "question": {
+      "en": "How does your SDET background help you in an AI Engineer role focused on quality?",
+      "es": "¿Cómo te ayuda tu experiencia como SDET en un rol de AI Engineer enfocado en calidad?"
+    },
+    "answer": {
+      "en": "Most LLM quality problems are testing problems with a statistical twist.\n\n- The test pyramid becomes the eval pyramid: deterministic checks, model-graded evals, human review.\n- Regression suites become versioned golden datasets, and contract tests become output schemas.\n- Flaky tests taught me to separate noise from signal; with LLMs I use repeated sampling, tolerances and confidence intervals instead of retries.\n- CI gates, test reports and quality dashboards transfer directly to eval gates and eval reports.\n- Negative and security testing map to red-teaming and prompt-injection suites.\n\nConcretely, I built an eval harness that blocks PRs in GitHub Actions when faithfulness drops, and a reusable QA framework with calibrated judges and OpenTelemetry tracing applied to a RAG assistant, with a published quality report.",
+      "es": "La mayoría de los problemas de calidad de LLMs son problemas de testing con un giro estadístico.\n\n- La pirámide de testing se vuelve la pirámide de evals: checks determinísticos, evals calificados por modelo, revisión humana.\n- Las suites de regresión se vuelven golden datasets versionados, y los contract tests se vuelven schemas de salida.\n- Los tests flaky me enseñaron a separar ruido de señal; con LLMs uso muestreo repetido, tolerancias e intervalos de confianza en lugar de reintentos.\n- Los gates de CI, los reportes de pruebas y los dashboards de calidad se trasladan directo a gates y reportes de evals.\n- El testing negativo y de seguridad se mapea a red-teaming y suites de prompt injection.\n\nEn concreto, construí un eval harness que bloquea PRs en GitHub Actions cuando baja el faithfulness, y un framework de QA reutilizable con jueces calibrados y tracing con OpenTelemetry aplicado a un asistente RAG, con un reporte de calidad publicado."
+    }
+  }
+]

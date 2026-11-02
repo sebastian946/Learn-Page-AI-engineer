@@ -1,0 +1,176 @@
+## Goal
+
+Milestone 3 of `llm-provider-client`. Add **provider-neutral tool calling** to your client and use it to build an order-support assistant that completes a full round-trip: the model requests tools, your code validates and executes them (in parallel when possible), results go back, and the model produces a final answer. The same conversation must work on Anthropic and on OpenAI with no feature-code changes.
+
+Time box: 60 minutes. The tools run against an in-memory fake order store, so no real backend is needed.
+
+## The tools
+
+| Tool | Kind | Behavior |
+|---|---|---|
+| `get_order(order_id)` | read | Returns status, items, carrier, tracking number, promised date |
+| `get_tracking(tracking_number)` | read | Returns carrier events (scanned, in transit, delivered) |
+| `create_return_label(order_id, item_skus, confirmed)` | write | Creates a label only if `confirmed` is true and the order is under 30 days old; otherwise returns an error the model must handle |
+
+The write tool is deliberately guarded. The model must ask the customer to confirm before calling it with `confirmed=true`. Your code enforces the business rules regardless of what the model says.
+
+## Extending the normalized types
+
+Your `LLMRequest.messages` held plain text so far. Tool calling needs structured turns. Keep them provider-neutral:
+
+```python
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    schema: dict[str, Any]          # from Pydantic model_json_schema()
+
+@dataclass(frozen=True)
+class ToolResult:
+    call_id: str
+    content: str                    # JSON string
+    is_error: bool = False
+
+@dataclass
+class Turn:
+    role: Literal["user", "assistant"]
+    text: str = ""
+    tool_calls: list["ToolCall"] = field(default_factory=list)     # assistant only
+    tool_results: list[ToolResult] = field(default_factory=list)   # user only
+```
+
+Each adapter translates `Turn` objects into its wire format: Anthropic `tool_use` / `tool_result` blocks, or OpenAI `tool_calls` plus one `role: "tool"` message per result. Feature code only sees `Turn`, `ToolSpec`, `ToolCall` and `ToolResult`.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `ToolSpec`, `ToolResult` and `Turn` added to `types.py`; Anthropic and OpenAI adapters translate them both ways, including multiple tool calls in one assistant turn.
+- [ ] Tool input schemas are generated from Pydantic models; inputs are validated with `model_validate` before execution, and validation errors are returned to the model as error results.
+- [ ] `run_tool_loop()` stops on a final answer, enforces `max_steps` (default 6) and a per-tool timeout, and raises a clear error when the step limit is hit.
+- [ ] Parallel tool calls from one assistant turn are executed concurrently and all results are returned in a single turn, matched by call id.
+- [ ] Tool exceptions never crash the loop: they become `ToolResult(is_error=True)` with a short message.
+- [ ] `create_return_label` refuses unless `confirmed=true` and the order is within 30 days, enforced in Python, not in the prompt.
+- [ ] Every tool call is logged as JSON: request_id, step, tool, validated args, latency_ms, is_error, result size in bytes.
+- [ ] Three scripted scenarios pass with `FakeProvider`: single read tool, two parallel reads, and the guarded write that first fails without confirmation and then succeeds.
+- [ ] `examples/tool_demo.py` runs the same scenario against Anthropic and OpenAI (model ids from `models.toml`) and prints the transcript and total cost for each.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# milestones/m3_tool_calling/loop.py
+import asyncio, json, time, logging
+from collections.abc import Awaitable, Callable
+from pydantic import BaseModel, ValidationError
+
+from llm_client import LLMClient, LLMRequest
+from llm_client.types import StopReason, ToolCall, ToolResult, ToolSpec, Turn
+
+log = logging.getLogger("tools")
+
+class Tool:
+    def __init__(self, name: str, description: str, input_model: type[BaseModel],
+                 fn: Callable[[BaseModel], Awaitable[dict]], timeout_s: float = 5.0) -> None:
+        self.name, self.input_model, self.fn, self.timeout_s = name, input_model, fn, timeout_s
+        self.spec = ToolSpec(name, description, input_model.model_json_schema())
+
+async def execute(tool: Tool, call: ToolCall, request_id: str, step: int) -> ToolResult:
+    start = time.perf_counter()
+    try:
+        args = tool.input_model.model_validate(call.arguments)
+        async with asyncio.timeout(tool.timeout_s):
+            output = await tool.fn(args)
+        result = ToolResult(call.id, json.dumps(output))
+    except ValidationError as exc:
+        result = ToolResult(call.id, json.dumps({"error": "invalid_arguments",
+                                                 "details": exc.errors(include_url=False)},
+                                                default=str), is_error=True)
+    except Exception as exc:
+        result = ToolResult(call.id, json.dumps({"error": type(exc).__name__,
+                                                 "message": str(exc)[:200]}), is_error=True)
+    log.info(json.dumps({"request_id": request_id, "step": step, "tool": tool.name,
+                         "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+                         "is_error": result.is_error, "bytes": len(result.content)}))
+    return result
+
+async def run_tool_loop(client: LLMClient, system: str, history: list[Turn],
+                        tools: dict[str, Tool], request_id: str, max_steps: int = 6) -> str:
+    for step in range(1, max_steps + 1):
+        resp = await client.complete(LLMRequest(
+            model="smart", system=system, messages=history,
+            tools=[t.spec for t in tools.values()], max_tokens=2048,
+            metadata={"feature": "order_support", "request_id": request_id},
+        ))
+        # 1. append the assistant Turn (text + tool_calls)
+        # 2. if stop_reason != TOOL_USE: return resp.text
+        # 3. execute all tool calls concurrently (unknown tool name -> error result)
+        # 4. append ONE user Turn with all tool_results
+        ...
+    raise RuntimeError(f"tool loop exceeded {max_steps} steps")
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Do the adapters first and test them in isolation: build a `list[Turn]` with an assistant turn holding two tool calls and a user turn holding two results, translate it, and assert the exact wire shape for each provider. Most bugs in this exercise are message-shape bugs, and they are cheap to catch without any API call.</Hint>
+  <Hint>For Anthropic, an assistant turn becomes a content list of `text` and `tool_use` blocks (`id`, `name`, `input`); a user turn with results becomes a list of `tool_result` blocks with `tool_use_id`, `content` and `is_error`. For OpenAI, the assistant message carries `tool_calls` with `function.arguments` as a JSON string (`json.dumps`), and each result becomes its own `role: "tool"` message with `tool_call_id`.</Hint>
+  <Hint>Run parallel calls with `asyncio.gather(*(execute(...) for call in resp.tool_calls))`. `execute` already turns exceptions into error results, so gather will not raise. Preserve the call order when building the result turn; ids, not positions, are what providers match on, but stable order makes logs readable.</Hint>
+  <Hint>For the guarded write scenario, script the fake provider: step 1 calls `create_return_label` with `confirmed=false`; your tool returns an error saying confirmation is required; step 2 returns text asking the customer; the test then appends a user turn "yes, confirm" and step 3 calls the tool with `confirmed=true`. Assert the label exists in the fake store only after step 3.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-provider-client">
+
+```text
+llm-provider-client/
+  src/llm_client/
+    types.py                      # + ToolSpec, ToolResult, Turn
+    providers/
+      anthropic_provider.py       # + tool translation both ways
+      openai_provider.py          # + tool translation both ways
+  milestones/
+    m3_tool_calling/
+      __init__.py
+      store.py                    # in-memory orders and tracking fixtures
+      tools.py                    # Pydantic inputs + async tool functions
+      loop.py                     # execute() and run_tool_loop()
+      README.md
+  examples/tool_demo.py
+  tests/
+    test_tool_translation.py
+    test_m3_tool_loop.py
+```
+
+**README section outline (milestone 3)**
+
+1. The three tools, their schemas, and why the write tool is guarded in code.
+2. Sequence diagram (Mermaid) of the parallel-read scenario.
+3. Provider differences table and how `Turn` hides them.
+4. Safety: validation, timeouts, step limit, error results, logging.
+5. Transcripts and cost for Anthropic vs OpenAI on the same scenario.
+
+**Suggested commits**
+
+- `feat(m3): provider-neutral ToolSpec, ToolResult and Turn types`
+- `feat(m3): anthropic and openai tool translation`
+- `test(m3): wire-shape tests for tool turns`
+- `feat(m3): tool loop with parallel execution, timeouts and step limit`
+- `feat(m3): guarded create_return_label tool`
+- `test(m3): scripted scenarios with fake provider`
+- `docs(m3): transcripts and provider comparison`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m1-12-review" title="Self-review before you commit" items={["Feature code never touches tool_use blocks or tool_calls directly", "The full assistant turn (text and tool calls) is appended before results", "All results from one turn are sent back together, matched by id", "Inputs are validated with Pydantic before any tool runs", "Tool errors and unknown tools return error results instead of raising", "The loop has a step limit and every tool has a timeout", "The write tool enforces confirmation and the 30-day rule in Python", "The same scenario runs on Anthropic and OpenAI without code changes"]} />

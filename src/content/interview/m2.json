@@ -1,0 +1,184 @@
+[
+  {
+    "id": "m2-iv-01",
+    "level": "mid",
+    "tags": ["rag", "architecture"],
+    "question": {
+      "en": "Walk me through the components of a production RAG system.",
+      "es": "Explícame los componentes de un sistema RAG en producción."
+    },
+    "answer": {
+      "en": "There is an offline path and an online path.\n\nOffline: load documents, extract and clean text and tables, chunk with structure awareness, attach metadata (source, section, page, effective dates, product), embed, and upsert into a vector store such as pgvector with a full-text index alongside.\n\nOnline: condense or rewrite the query, run hybrid retrieval with metadata filters, fuse with RRF, re-rank with a cross-encoder, send the top few chunks to the LLM with a prompt that requires citations, validate citations, and return the answer with sources.\n\nAround both: caching (embeddings, responses, provider prompt caching), tracing of every stage, and an evaluation suite with a golden dataset that runs in CI.",
+      "es": "Hay una ruta offline y una ruta online.\n\nOffline: cargar documentos, extraer y limpiar texto y tablas, hacer chunking consciente de la estructura, adjuntar metadata (fuente, sección, página, fechas de vigencia, producto), generar embeddings y hacer upsert en un vector store como pgvector con un índice de texto completo al lado.\n\nOnline: condensar o reescribir la consulta, ejecutar retrieval híbrido con filtros de metadata, fusionar con RRF, re-rankear con un cross-encoder, enviar los mejores chunks al LLM con un prompt que exija citas, validar las citas y devolver la respuesta con fuentes.\n\nAlrededor de ambas: caché (embeddings, respuestas, prompt caching del proveedor), tracing de cada etapa y una suite de evaluación con golden dataset que corre en CI."
+    }
+  },
+  {
+    "id": "m2-iv-02",
+    "level": "mid",
+    "tags": ["chunking"],
+    "question": {
+      "en": "How do you choose a chunking strategy and chunk size?",
+      "es": "¿Cómo eliges una estrategia de chunking y un tamaño de chunk?"
+    },
+    "answer": {
+      "en": "I start from the document structure. Policy guides have headings and numbered sections, so structure-aware chunking that keeps a section together usually beats fixed-size splitting. Recursive splitting is a good default for unstructured text. Semantic chunking can help but costs embedding calls at ingestion.\n\nSize is a trade-off: small chunks give precise retrieval but lose context; large chunks keep context but dilute the embedding and cost more tokens. I also match chunk size to the re-ranker's input limit.\n\nThen I measure: build a labeled set and compare strategies on recall@k and context recall. I pick the winner by numbers, not by intuition.",
+      "es": "Empiezo por la estructura del documento. Las guías de políticas tienen encabezados y secciones numeradas, así que el chunking consciente de la estructura que mantiene unida una sección suele superar a la división de tamaño fijo. La división recursiva es un buen default para texto sin estructura. El chunking semántico puede ayudar, pero cuesta llamadas de embeddings en la ingesta.\n\nEl tamaño es un trade-off: chunks pequeños dan retrieval preciso pero pierden contexto; chunks grandes conservan contexto pero diluyen el embedding y cuestan más tokens. También ajusto el tamaño al límite de entrada del re-ranker.\n\nLuego mido: construyo un set etiquetado y comparo estrategias con recall@k y context recall. Elijo la ganadora con números, no por intuición."
+    }
+  },
+  {
+    "id": "m2-iv-03",
+    "level": "mid",
+    "tags": ["embeddings", "cost"],
+    "question": {
+      "en": "What do you consider when choosing an embedding model?",
+      "es": "¿Qué consideras al elegir un modelo de embeddings?"
+    },
+    "answer": {
+      "en": "- **Quality on my data**, measured with recall@k on a labeled set, not only public leaderboards.\n- **Dimensions**: more dimensions mean more storage and slower search; some models support shortened vectors.\n- **Cost and throughput** for ingestion and per query, from the provider's current pricing.\n- **Max input length** relative to my chunk size.\n- **Language support** if documents are multilingual.\n- **Hosting and data policy**: an API vs a self-hosted model, which matters for regulated data.\n\nSwitching models later means re-embedding the whole corpus, so I put the model name in the embedding cache key and keep the choice behind a config value.",
+      "es": "- **Calidad sobre mis datos**, medida con recall@k en un set etiquetado, no solo leaderboards públicos.\n- **Dimensiones**: más dimensiones implican más almacenamiento y búsquedas más lentas; algunos modelos soportan vectores acortados.\n- **Costo y throughput** de la ingesta y por consulta, según los precios actuales del proveedor.\n- **Longitud máxima de entrada** frente a mi tamaño de chunk.\n- **Soporte de idiomas** si los documentos son multilingües.\n- **Hospedaje y política de datos**: API vs modelo autohospedado, lo cual importa con datos regulados.\n\nCambiar de modelo después implica volver a generar los embeddings de todo el corpus, así que pongo el nombre del modelo en la clave del caché de embeddings y mantengo la elección detrás de un valor de configuración."
+    }
+  },
+  {
+    "id": "m2-iv-04",
+    "level": "senior",
+    "tags": ["pgvector", "vector-store"],
+    "question": {
+      "en": "Why would you choose pgvector over a dedicated vector database, and when would you not?",
+      "es": "¿Por qué elegirías pgvector en lugar de una base de datos vectorial dedicada, y cuándo no?"
+    },
+    "answer": {
+      "en": "pgvector keeps vectors next to relational data and metadata in Postgres, which most teams already operate. I get transactions, joins, row-level security, full-text search for hybrid retrieval, backups and familiar tooling. For corpora up to millions of chunks with HNSW indexes, performance is usually fine.\n\nI would consider Qdrant or another dedicated store when the scale grows to many tens of millions of vectors with high QPS, when I need advanced filtered ANN performance, built-in quantization and sharding, or when the vector workload would compete with the transactional database. Either way I keep retrieval behind an interface and decide with a benchmark on my own data and filters.",
+      "es": "pgvector mantiene los vectores junto a los datos relacionales y la metadata en Postgres, que la mayoría de los equipos ya opera. Obtengo transacciones, joins, row-level security, búsqueda de texto completo para retrieval híbrido, backups y herramientas conocidas. Para corpus de hasta millones de chunks con índices HNSW, el rendimiento suele ser suficiente.\n\nConsideraría Qdrant u otro store dedicado cuando la escala crece a decenas de millones de vectores con QPS alto, cuando necesito mejor rendimiento en ANN filtrado, cuantización y sharding integrados, o cuando la carga vectorial competiría con la base transaccional. En cualquier caso, mantengo el retrieval detrás de una interfaz y decido con un benchmark sobre mis propios datos y filtros."
+    }
+  },
+  {
+    "id": "m2-iv-05",
+    "level": "mid",
+    "tags": ["hybrid-search", "bm25", "rrf"],
+    "question": {
+      "en": "What is hybrid search and how does reciprocal rank fusion work?",
+      "es": "¿Qué es la búsqueda híbrida y cómo funciona reciprocal rank fusion?"
+    },
+    "answer": {
+      "en": "Hybrid search runs lexical retrieval (BM25 or Postgres full-text) and dense vector retrieval, then merges the results. Lexical search is strong on exact terms such as form numbers, codes and product names; vectors are strong on paraphrases and lay language.\n\nThe two score scales are not comparable, so instead of adding scores, RRF uses ranks: each document gets the sum of `1 / (k + rank)` across lists, with k around 60. Documents ranked well by both retrievers rise to the top. It needs no score normalization or training, which makes it a robust default. I validate it against vector-only on recall@k.",
+      "es": "La búsqueda híbrida ejecuta retrieval léxico (BM25 o texto completo de Postgres) y retrieval vectorial denso, y luego combina los resultados. La búsqueda léxica es fuerte en términos exactos como números de formulario, códigos y nombres de producto; los vectores son fuertes en paráfrasis y lenguaje coloquial.\n\nLas dos escalas de score no son comparables, así que en lugar de sumar scores, RRF usa posiciones: cada documento recibe la suma de `1 / (k + rank)` entre listas, con k alrededor de 60. Los documentos bien rankeados por ambos retrievers suben al top. No necesita normalizar scores ni entrenamiento, lo que lo hace un default robusto. Lo valido contra solo-vectorial con recall@k."
+    }
+  },
+  {
+    "id": "m2-iv-06",
+    "level": "senior",
+    "tags": ["metadata-filtering", "versioning"],
+    "question": {
+      "en": "How do you prevent a RAG system from answering with outdated policies?",
+      "es": "¿Cómo evitas que un sistema RAG responda con políticas desactualizadas?"
+    },
+    "answer": {
+      "en": "I treat it as a data problem first. Every document and chunk carries `effective_from` and, when replaced, `superseded_by`. Ingestion sets these from document headers or a registry maintained by the policy owners. Retrieval filters to chunks in force on the query date, which also allows historical questions (\"what was the rule in January?\").\n\nOn top: the corpus version is part of cache keys so old answers stop being served after re-ingestion, the answer shows the effective date of each cited source, and the golden dataset contains items that specifically test superseded rules, so a regression fails CI. I would also alert when two in-force chunks conflict.",
+      "es": "Lo trato primero como un problema de datos. Cada documento y chunk lleva `effective_from` y, cuando se reemplaza, `superseded_by`. La ingesta los fija a partir de los encabezados del documento o de un registro mantenido por los dueños de las políticas. El retrieval filtra a los chunks vigentes en la fecha de la consulta, lo que también permite preguntas históricas (\"¿cuál era la regla en enero?\").\n\nAdemás: la versión del corpus forma parte de las claves de caché para que las respuestas viejas dejen de servirse tras re-ingestar, la respuesta muestra la fecha de vigencia de cada fuente citada, y el golden dataset contiene ítems que prueban específicamente reglas reemplazadas, así una regresión hace fallar el CI. También generaría una alerta cuando dos chunks vigentes se contradicen."
+    }
+  },
+  {
+    "id": "m2-iv-07",
+    "level": "mid",
+    "tags": ["reranking", "cross-encoder"],
+    "question": {
+      "en": "When does adding a re-ranker help, and how do you know?",
+      "es": "¿Cuándo ayuda agregar un re-ranker y cómo lo sabes?"
+    },
+    "answer": {
+      "en": "A re-ranker helps when first-stage recall is good at a wide cut (say recall@50) but precision at the top is weak, meaning the right chunk is retrieved but ranks below the top-k you send to the LLM. It cannot help if the chunk is not retrieved at all.\n\nI measure recall@5, MRR and context precision on the golden set with and without the re-ranker, plus the added p95 latency. I tune the number of candidates (often 30–50) and watch for truncation, since small cross-encoders cap input length. A local cross-encoder keeps data in our network; a hosted rerank API removes infra but adds cost and a network hop.",
+      "es": "Un re-ranker ayuda cuando el recall de primera etapa es bueno con un corte amplio (por ejemplo recall@50) pero la precisión en el top es débil, es decir, el chunk correcto se recupera pero queda por debajo del top-k que envías al LLM. No puede ayudar si el chunk ni siquiera se recupera.\n\nMido recall@5, MRR y context precision en el golden set con y sin el re-ranker, más la latencia p95 agregada. Ajusto el número de candidatos (a menudo 30–50) y vigilo el truncamiento, porque los cross-encoders pequeños limitan la longitud de entrada. Un cross-encoder local mantiene los datos en nuestra red; una API de rerank hospedada elimina infraestructura pero agrega costo y un salto de red."
+    }
+  },
+  {
+    "id": "m2-iv-08",
+    "level": "senior",
+    "tags": ["query-rewriting", "hyde", "conversation"],
+    "question": {
+      "en": "Compare multi-query, HyDE, step-back prompting and conversation condensation. Which would you implement first?",
+      "es": "Compara multi-query, HyDE, step-back prompting y condensación de conversación. ¿Cuál implementarías primero?"
+    },
+    "answer": {
+      "en": "- **Condensation** rewrites a follow-up plus history into a standalone query. It fixes a hard failure in any chat product.\n- **Multi-query** generates paraphrases and fuses results with RRF; it raises recall for vague or lay-language questions.\n- **HyDE** embeds a hypothetical answer so the query vector looks like a document; useful for short queries, risky if the hypothetical answer hallucinates, so I fuse it with the original query.\n- **Step-back** adds a more general question to fetch the underlying rule alongside the specific case.\n\nI implement condensation first for any conversational product. The others I add only if the golden set shows a recall gap, because each adds an LLM call to latency and cost. All rewrites are logged as trace spans.",
+      "es": "- **Condensación** reescribe un seguimiento más el historial en una consulta autocontenida. Corrige una falla grave en cualquier producto de chat.\n- **Multi-query** genera paráfrasis y fusiona los resultados con RRF; sube el recall en preguntas vagas o coloquiales.\n- **HyDE** genera el embedding de una respuesta hipotética para que el vector de consulta se parezca a un documento; útil en consultas cortas, riesgoso si la respuesta hipotética alucina, por eso la fusiono con la consulta original.\n- **Step-back** agrega una pregunta más general para traer la regla subyacente junto al caso específico.\n\nImplemento primero la condensación en cualquier producto conversacional. Las demás las agrego solo si el golden set muestra una brecha de recall, porque cada una suma una llamada al LLM a la latencia y al costo. Todas las reescrituras se registran como spans del trace."
+    }
+  },
+  {
+    "id": "m2-iv-09",
+    "level": "mid",
+    "tags": ["citations", "grounding"],
+    "question": {
+      "en": "How do you implement trustworthy citations in a RAG answer?",
+      "es": "¿Cómo implementas citas confiables en una respuesta RAG?"
+    },
+    "answer": {
+      "en": "Each chunk gets a stable ID derived from document, section and content hash, and the prompt delimits chunks with those IDs. I require structured output where each claim lists chunk IDs and a short verbatim quote, and an explicit `answer_found` flag for abstention.\n\nAfter generation I validate: cited IDs must be in the retrieved set and quotes must appear in the cited chunk. On failure I retry once with the problems or refuse. The UI shows document, section, page and a link to the original page. If the provider supports native citations, I use them, but I keep validation tests in CI.",
+      "es": "Cada chunk recibe un ID estable derivado del documento, la sección y un hash del contenido, y el prompt delimita los chunks con esos IDs. Exijo salida estructurada donde cada afirmación lista IDs de chunks y una cita textual corta, y una marca explícita `answer_found` para la abstención.\n\nDespués de la generación valido: los IDs citados deben estar en el conjunto recuperado y las citas deben aparecer en el chunk citado. Si falla, reintento una vez pasando los problemas, o rechazo. La UI muestra documento, sección, página y un enlace a la página original. Si el proveedor soporta citas nativas, las uso, pero mantengo los tests de validación en CI."
+    }
+  },
+  {
+    "id": "m2-iv-10",
+    "level": "senior",
+    "tags": ["failure-modes", "debugging", "observability"],
+    "question": {
+      "en": "What are the main failure modes of RAG, and how do you detect each in production?",
+      "es": "¿Cuáles son los principales modos de falla de RAG y cómo detectas cada uno en producción?"
+    },
+    "answer": {
+      "en": "By stage:\n\n- **Corpus:** missing or stale content. Detected by abstention rates, user feedback and version checks.\n- **Ingestion and chunking:** garbled tables, rules split from exceptions. Detected by spot checks and low context recall on specific topics.\n- **Retrieval:** right chunk ranked too low or filtered out. Detected by recall@k on labeled items and low context precision or recall.\n- **Generation:** ignoring context, hallucinating, incomplete answers. Detected by faithfulness scores and citation validation failure rates.\n\nThe enabler is a trace per request (rewrites, retrieved IDs with scores, prompt version, output, validation). With it I can locate the stage for any bad answer, and I turn every incident into a golden item.",
+      "es": "Por etapa:\n\n- **Corpus:** contenido faltante u obsoleto. Se detecta con tasas de abstención, feedback de usuarios y verificaciones de versión.\n- **Ingesta y chunking:** tablas desordenadas, reglas separadas de sus excepciones. Se detecta con revisiones puntuales y context recall bajo en temas específicos.\n- **Retrieval:** chunk correcto rankeado muy abajo o filtrado. Se detecta con recall@k en ítems etiquetados y context precision o recall bajos.\n- **Generación:** ignorar el contexto, alucinar, respuestas incompletas. Se detecta con scores de faithfulness y tasas de falla en la validación de citas.\n\nLo que lo hace posible es un trace por solicitud (reescrituras, IDs recuperados con scores, versión del prompt, salida, validación). Con eso puedo localizar la etapa de cualquier mala respuesta, y convierto cada incidente en un ítem golden."
+    }
+  },
+  {
+    "id": "m2-iv-11",
+    "level": "mid",
+    "tags": ["evaluation", "ragas", "deepeval"],
+    "question": {
+      "en": "Explain faithfulness, answer relevance, context precision and context recall. Which need a reference answer?",
+      "es": "Explica faithfulness, answer relevance, context precision y context recall. ¿Cuáles necesitan una respuesta de referencia?"
+    },
+    "answer": {
+      "en": "- **Faithfulness:** share of answer claims supported by the retrieved context. No reference needed.\n- **Answer relevance:** whether the answer addresses the question, regardless of correctness. No reference needed.\n- **Context precision:** whether relevant chunks are ranked at the top of the retrieved list. Usually computed with a reference.\n- **Context recall:** whether the retrieved context covers everything in the reference answer. Needs a reference.\n\nRetrieval metrics tell me if the right context arrived; generation metrics tell me what the model did with it. I compute them with Ragas or DeepEval using a pinned judge model, and add deterministic recall@k when I have labeled chunk IDs.",
+      "es": "- **Faithfulness:** proporción de afirmaciones de la respuesta respaldadas por el contexto recuperado. No necesita referencia.\n- **Answer relevance:** si la respuesta atiende la pregunta, sin importar si es correcta. No necesita referencia.\n- **Context precision:** si los chunks relevantes están rankeados arriba en la lista recuperada. Normalmente se calcula con referencia.\n- **Context recall:** si el contexto recuperado cubre todo lo que está en la respuesta de referencia. Necesita referencia.\n\nLas métricas de retrieval me dicen si llegó el contexto correcto; las de generación me dicen qué hizo el modelo con él. Las calculo con Ragas o DeepEval usando un modelo juez fijado, y agrego recall@k determinista cuando tengo IDs de chunks etiquetados."
+    }
+  },
+  {
+    "id": "m2-iv-12",
+    "level": "senior",
+    "tags": ["golden-dataset", "evaluation", "ci"],
+    "question": {
+      "en": "How do you build and maintain a golden dataset for RAG, and how do you use it in CI?",
+      "es": "¿Cómo construyes y mantienes un golden dataset para RAG, y cómo lo usas en CI?"
+    },
+    "answer": {
+      "en": "I write the first 30–50 items with a domain expert, from the source documents, never from system output. Coverage spans topics, difficulty (lookup, multi-hop, numeric), 10–20% unanswerable questions and multi-turn follow-ups. Each item has a reference answer, relevant chunk IDs and tags.\n\nThe dataset lives in git and is reviewed like code. Every production incident becomes a new item before the fix. With traffic, I sample real questions, scrubbed of PII.\n\nIn CI, a PR that touches prompts, retrieval or models runs the suite with a pinned judge, compares against the main-branch baseline and fails if faithfulness or context recall drops beyond a tolerance. Module 3 hardens this with repeated runs and judge calibration.",
+      "es": "Escribo los primeros 30–50 ítems con un experto del dominio, a partir de los documentos fuente, nunca de la salida del sistema. La cobertura abarca temas, dificultad (búsqueda, multi-hop, numérica), 10–20% de preguntas sin respuesta y seguimientos de varios turnos. Cada ítem tiene respuesta de referencia, IDs de chunks relevantes y etiquetas.\n\nEl dataset vive en git y se revisa como código. Cada incidente de producción se vuelve un ítem nuevo antes del arreglo. Con tráfico, tomo muestras de preguntas reales sin PII.\n\nEn CI, un PR que toca prompts, retrieval o modelos ejecuta la suite con un juez fijado, compara contra la línea base de la rama principal y falla si faithfulness o context recall bajan más allá de una tolerancia. El Módulo 3 lo refuerza con ejecuciones repetidas y calibración del juez."
+    }
+  },
+  {
+    "id": "m2-iv-13",
+    "level": "senior",
+    "tags": ["caching", "cost", "latency"],
+    "question": {
+      "en": "Design the caching strategy for a RAG assistant used by 200 loan officers.",
+      "es": "Diseña la estrategia de caché para un asistente RAG usado por 200 oficiales de crédito."
+    },
+    "answer": {
+      "en": "Layered, from safest to riskiest:\n\n- **Embedding cache** keyed by hash of model and text, so re-ingestion only embeds changed chunks.\n- **Rewrite cache** keyed by model, prompt version, history and question.\n- **Exact response cache** in Redis keyed by normalized question, filters, corpus version, prompt version and model, with a TTL as a safety net. Only answers that passed citation validation are cached.\n- **Provider prompt caching** for the stable system prompt and citation rules, placed before the variable context.\n\nI would avoid semantic caching for underwriting rules because near-identical questions can have different answers. I measure hit rate, latency and cost per 1,000 requests, and run the golden set through the cached path to confirm correctness.",
+      "es": "Por capas, de la más segura a la más riesgosa:\n\n- **Caché de embeddings** con clave por hash de modelo y texto, para que la re-ingesta solo procese chunks modificados.\n- **Caché de reescritura** con clave por modelo, versión del prompt, historial y pregunta.\n- **Caché exacto de respuestas** en Redis con clave por pregunta normalizada, filtros, versión del corpus, versión del prompt y modelo, con un TTL como red de seguridad. Solo se cachean respuestas que pasaron la validación de citas.\n- **Prompt caching del proveedor** para el system prompt estable y las reglas de citas, colocados antes del contexto variable.\n\nEvitaría el caché semántico para reglas de underwriting porque preguntas casi idénticas pueden tener respuestas distintas. Mido la tasa de aciertos, la latencia y el costo por cada 1,000 solicitudes, y paso el golden set por la ruta con caché para confirmar la corrección."
+    }
+  },
+  {
+    "id": "m2-iv-14",
+    "level": "senior",
+    "tags": ["frameworks", "langchain", "architecture"],
+    "question": {
+      "en": "Would you build a production RAG system with LangChain or without a framework?",
+      "es": "¿Construirías un sistema RAG en producción con LangChain o sin framework?"
+    },
+    "answer": {
+      "en": "It depends on the team and the path. LangChain speeds up prototyping and gives many integrations, streaming and tracing hooks. But the core path (retrieval SQL, prompt, citation validation) is small and business-critical, and abstractions can hide decisions: chunk size in characters, distance operators, missing filters, retry policies.\n\nMy usual approach: prototype with the framework, then own the core retrieval and generation code directly (httpx or the SDK, psycopg, a prompt in version control), and keep framework pieces at the edges, such as document loaders or LangGraph for agent orchestration. The deciding factor is an eval comparison on the same golden set plus maintainability, not ideology.",
+      "es": "Depende del equipo y de la ruta. LangChain acelera el prototipado y da muchas integraciones, streaming y hooks de tracing. Pero la ruta central (SQL de retrieval, prompt, validación de citas) es pequeña y crítica para el negocio, y las abstracciones pueden esconder decisiones: tamaño de chunk en caracteres, operadores de distancia, filtros faltantes, políticas de reintento.\n\nMi enfoque habitual: prototipar con el framework y luego ser dueño directo del código central de retrieval y generación (httpx o el SDK, psycopg, un prompt bajo control de versiones), manteniendo piezas del framework en los bordes, como loaders de documentos o LangGraph para orquestar agentes. El factor decisivo es una comparación de evals sobre el mismo golden set más la mantenibilidad, no la ideología."
+    }
+  }
+]

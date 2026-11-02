@@ -1,0 +1,127 @@
+## Los reclutadores buscan palabras clave, los ingenieros leen buscando evidencia
+
+Tu CV tiene dos lectores. Primero, un sistema de seguimiento de candidatos (ATS) y un reclutador que buscan palabras clave de la oferta: "RAG", "LangGraph", "evals", "FastAPI", "AWS". Segundo, un ingeniero que lee tus bullets buscando evidencia de que hiciste trabajo real con resultados reales.
+
+Así que cada bullet necesita ambas cosas: la palabra clave que busca el reclutador y un resultado medido que el ingeniero crea. Esta lección mapea cada módulo del curso a habilidades, palabras clave y bullets de ejemplo, y luego te da un plan de búsqueda de empleo.
+
+Nota: si postulas al mercado en inglés (el objetivo principal de este curso), escribe tu CV y tu LinkedIn en inglés. Aquí los ejemplos van traducidos para que los entiendas; la versión en inglés está en la lección en inglés.
+
+## La fórmula del bullet
+
+**Verbo de acción + qué construiste + con qué tecnología + resultado medido.**
+
+- Débil: "Trabajé en un chatbot de RAG."
+- Fuerte: "Construí un asistente RAG con búsqueda híbrida (pgvector + BM25 + re-ranking con cross-encoder) sobre 1.200 PDFs de políticas hipotecarias; subí faithfulness de 0.81 a 0.93 en un golden set de 60 preguntas manteniendo la latencia p95 por debajo de 2 s."
+
+Los números de esta lección son **ejemplos**. Reemplaza cada uno por un número de tus propios reportes de evals, traces y dashboards. Si no puedes respaldar un número con un artefacto, no lo uses.
+
+## Mapeo de módulo a palabras clave
+
+| Módulo | Habilidades demostradas | Palabras clave de las ofertas | Bullet de ejemplo (reemplaza los números por los tuyos) |
+|---|---|---|---|
+| M1 Fundamentos de LLM | Abstracción de proveedores, salidas estructuradas, tool calling, streaming, reintentos, seguimiento de costos | LLM integration, prompt engineering, OpenAI API, Anthropic Claude, Amazon Bedrock, function calling, JSON schema, Pydantic, async Python | Construí un cliente de LLM agnóstico al proveedor (Anthropic, OpenAI, Bedrock) con streaming, backoff exponencial y registro de costo por petición; clasifiqué tickets de soporte con salidas estructuradas con 94% de precisión en un set etiquetado de 300 tickets |
+| M2 RAG | Ingesta, chunking, embeddings, búsqueda híbrida, re-ranking, citas, evaluación de RAG, caché | RAG, retrieval-augmented generation, vector databases, pgvector, Qdrant, embeddings, semantic search, hybrid search, LangChain, re-ranking | Diseñé un pipeline RAG con chunking consciente del documento, retrieval híbrido y re-ranking sobre 1.200 PDFs; mejoré el context recall en 18 puntos y reduje el costo por 1k consultas en 40% con caché semántica |
+| M3 Evals y observabilidad | Golden datasets, LLM-as-judge, gates de evals en CI, tracing, guardrails, red-teaming | LLM evaluation, evals, Ragas, DeepEval, LangSmith, Langfuse, OpenTelemetry, observability, guardrails, prompt injection, A/B testing | Construí un harness de evals de LLM en GitHub Actions que bloquea PRs cuando faithfulness cae más de 2 puntos; detectó 3 regresiones de prompts antes del release |
+| M4 Agentes | Diseño de herramientas, máquinas de estado en LangGraph, HITL, memoria, multi-agente, MCP, evals de trayectoria | AI agents, agentic workflows, LangGraph, tool use, Model Context Protocol, MCP, multi-agent systems, human-in-the-loop | Construí un agente de operaciones en LangGraph con 6 herramientas MCP, aprobación humana para acciones de alto riesgo y loop guards; suite de evals de trayectoria de 30 escenarios con 0.87 de secuencias de herramientas correctas |
+| M5 Serving | Streaming con FastAPI, Docker, caché y rate limiting con Redis, CI/CD, deploy en AWS, pruebas de carga con k6, SLOs | FastAPI, Python, Docker, Kubernetes, CI/CD, GitHub Actions, AWS, ECS, Lambda, Redis, PostgreSQL, load testing, SLOs | Desplegué un servicio de LLM con streaming en FastAPI sobre AWS ECS Fargate con CI/CD en GitHub Actions, rate limiting con Redis y una prueba de carga k6 que sostuvo 50 streams concurrentes con primer token p95 de 1.2 s |
+| M6 Datos y plataforma | SQL, pipelines de ingesta, Databricks Vector Search, evaluación con MLflow, Unity Catalog, trade-offs de fine-tuning | Databricks, MLflow, Unity Catalog, Spark, data pipelines, SQL, Mosaic AI, fine-tuning, LoRA, vLLM | Construí un pipeline de inteligencia documental en Databricks (Unity Catalog, Vector Search, evaluación con MLflow) que procesa 5k documentos con precisión de extracción medida por tipo de documento |
+| M7 Capstone final | Multi-tenancy, aislamiento por tenant, atribución de costos, documentos de arquitectura, system design | Multi-tenant SaaS, system design, scalability, cost optimization, technical leadership, B2B | Construí una plataforma multi-tenant de RAG + agentes con row-level security en PostgreSQL, cuotas por tenant y dashboards de costos; 0 fugas entre tenants en 40 tests de aislamiento en CI, costo por 1k peticiones medido por tenant |
+| Experiencia SDET | Estrategia de pruebas, frameworks de automatización, quality gates de CI, pruebas de rendimiento | Test automation, quality engineering, Playwright, CI/CD, reliability, TypeScript | Replantea: "Diseñé quality gates y la estrategia de evaluación" en lugar de "escribí casos de prueba" |
+
+## Un chequeo de cobertura de palabras clave
+
+Trata la oferta como un documento de requisitos y tu CV como una suite de pruebas. Mide la cobertura.
+
+```python
+import re
+from collections import Counter
+
+KEYWORDS = {
+    "rag": ["rag", "retrieval-augmented", "retrieval augmented"],
+    "vector_db": ["pgvector", "qdrant", "pinecone", "vector database", "vector store", "chroma"],
+    "agents": ["agent", "agentic", "langgraph", "tool use", "function calling"],
+    "mcp": ["mcp", "model context protocol"],
+    "evals": ["eval", "ragas", "deepeval", "llm-as-judge", "golden dataset"],
+    "observability": ["langsmith", "langfuse", "opentelemetry", "tracing", "observability"],
+    "serving": ["fastapi", "docker", "kubernetes", "ecs", "lambda"],
+    "cloud": ["aws", "bedrock", "gcp", "azure"],
+    "cicd": ["ci/cd", "github actions", "pipeline"],
+    "data": ["databricks", "mlflow", "spark", "sql"],
+}
+
+def found(text: str) -> set[str]:
+    t = text.lower()
+    return {k for k, variants in KEYWORDS.items() if any(re.search(rf"\b{re.escape(v)}", t) for v in variants)}
+
+def coverage(posting: str, resume: str) -> dict[str, object]:
+    wanted, have = found(posting), found(resume)
+    return {
+        "coverage_pct": round(100 * len(wanted & have) / max(len(wanted), 1)),
+        "missing": sorted(wanted - have),
+        "extra": sorted(have - wanted),
+    }
+```
+
+Úsalo para adaptar, no para rellenar. Si una oferta pide Pinecone y tú usaste Qdrant, escribe "vector databases (Qdrant, pgvector)" y prepárate para decir que aprenderías la API de Pinecone en un día. Nunca declares una herramienta que no has usado.
+
+## Estructura del CV para esta transición
+
+1. **Titular:** "AI Engineer | RAG, LLM Evaluation, Agents | Ex-Senior SDET".
+2. **Resumen (3 líneas):** la declaración de posicionamiento de la lección anterior, comprimida.
+3. **Habilidades (agrupadas):** LLM y RAG; Agentes; Evaluación y observabilidad; Backend y cloud; Datos. Usa el vocabulario de las ofertas.
+4. **Proyectos (por encima de la experiencia mientras haces la transición):** primero el capstone final, luego 2 o 3 capstones de módulos. Cada uno con enlace al repo y 2 a 3 bullets.
+5. **Experiencia:** tus roles de SDET, reescritos con la columna derecha de la tabla de traducción. Destaca todo lo que tenga LLMs, datos o servicios en Python.
+6. **Certificaciones:** por ejemplo, la Databricks Generative AI Engineer Associate si la presentaste después del Módulo 6.
+
+Una página si tienes menos de unos 10 años de experiencia, dos como máximo.
+
+## LinkedIn
+
+- **Titular (máximo 220 caracteres):** "AI Engineer: RAG, agents and LLM evals | Built a multi-tenant RAG + agent platform with evals in CI | Ex-Senior SDET who makes AI systems reliable".
+- **Acerca de:** 3 párrafos cortos. Qué haces ahora; por qué la experiencia de SDET te hace bueno en eso; qué has construido (con enlaces); qué buscas. Termina con un llamado a la acción.
+- **Destacados:** fija el repo del capstone, su GIF de demo o un video corto, y una publicación técnica.
+- **Aptitudes:** agrega las 10 palabras clave principales de la tabla de mapeo y ordénalas para que las tres más relevantes aparezcan primero.
+- **Open to work:** pon los títulos exactos: AI Engineer, LLM Engineer, Applied AI Engineer, GenAI Engineer, ML Engineer (LLM).
+
+## Plan de búsqueda de empleo (6 semanas)
+
+| Semana | Foco | Entregable |
+|---|---|---|
+| 1 | Pulir el capstone, CV v1, reescribir LinkedIn | Repo en vivo con GIF, CV en PDF, perfil actualizado |
+| 2 | Lista de 40 empresas objetivo en tres niveles (AI-first, AI-support, cercanas a tu dominio), leer 30 ofertas, correr chequeos de cobertura | Hoja de cálculo con empresa, rol, palabras clave, contacto |
+| 3-6 | 10 postulaciones adaptadas por semana, 5 pedidos de referido por semana, 1 publicación técnica por semana | Pipeline medido semanalmente: postulaciones, screenings, entrevistas finales |
+| 3-6 | 2 sesiones de system design simulado por semana (repo `system-design-notes`), 1 ensayo conductual | Puntajes en tendencia al alza |
+| Continuo | Revisión: ¿qué versión del CV consigue screenings? Ajusta | Retro semanal de 30 minutos |
+
+Los referidos convierten mucho mejor que las postulaciones en frío en la mayoría de procesos de contratación, así que dedícales tiempo real. Un mensaje corto funciona: quién eres, el rol específico, una frase sobre tu proyecto más relevante con enlace y un pedido claro.
+
+Trata la búsqueda como una campaña de pruebas: define métricas (tasa de postulación a screening, tasa de screening a entrevista final), corre experimentos (dos variantes de CV) y haz retro semanal.
+
+## Errores comunes
+
+- Rellenar la sección de habilidades con herramientas que nunca usaste. Los ingenieros van a preguntar.
+- Bullets que describen responsabilidades ("encargado de las pruebas") en lugar de resultados.
+- Métricas inventadas o imposibles de verificar.
+- Esconder los proyectos al final, debajo de experiencia antigua.
+- Postular con un CV genérico a todas las ofertas.
+- Esperar a que todo esté perfecto. Empieza a postular en la semana 3 de este plan, no en la 10.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Recórreme tu CV." level="mid">
+
+Mantenlo en 90 segundos y que sea una historia, no una lista. Empieza por los años de SDET y las habilidades de calidad que construyeron; el momento en que empezaste a aplicarlas a funcionalidades con LLM; los proyectos que demuestran la transición, terminando con el capstone multi-tenant; luego por qué quieres este rol específico. Señala un bullet con un número sobre el que puedan preguntar.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Cada número es una pregunta de seguimiento">
+
+Si tu CV dice "subí faithfulness de 0.81 a 0.93", espera "¿cómo mediste faithfulness?", "¿qué tamaño tenía el dataset?" y "¿qué cambiaste?". Prepara esas respuestas para cada número que pongas.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- Certificación Databricks Generative AI Engineer Associate: https://www.databricks.com/learn/certification/genai-engineer-associate
+- Ayuda de LinkedIn, secciones del perfil: https://www.linkedin.com/help/linkedin
+- README de perfil en GitHub: https://docs.github.com/en/account-and-profile/setting-up-and-managing-your-github-profile/customizing-your-profile/managing-your-profile-readme

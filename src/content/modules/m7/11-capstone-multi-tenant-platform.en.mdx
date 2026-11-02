@@ -1,0 +1,182 @@
+<ClientBrief company="Lexora" industry="Legal tech / B2B SaaS" duration="5 days" />
+
+## Company context
+
+Lexora sells a research and matter-management workspace to mid-size law firms. It has 14 client firms today, from a 20-lawyer boutique to a 400-lawyer firm with an office in Frankfurt. Each firm uploads its own precedents, engagement letters, internal memos and court filings. Lexora's contracts promise that a firm's documents are never visible to any other firm, never used to train models, and, for EU firms, never leave the EU.
+
+Lexora shipped a single-tenant RAG prototype last year for one pilot firm. It worked, and every other firm now wants it. The prototype cannot be copied 14 times: the ops team is three people, and margins on the starter plan are thin. You are hired to build the multi-tenant version: one platform, many firms, strict isolation, an agent that can act on matters, and numbers that prove quality and cost.
+
+This is the final capstone. It reuses everything: your LLM client (M1), hybrid RAG with re-ranking and citations (M2), the eval harness and tracing (M3), LangGraph agents with HITL and MCP tools (M4), FastAPI, Docker, CI/CD and AWS (M5), and data pipelines (M6).
+
+## Stakeholders
+
+- **Priya Nair, CTO:** owns the architecture. Cares about isolation guarantees, operational simplicity and a clear path to 100 firms.
+- **Daniel Okafor, Head of Customer Success:** fields complaints. Wants answers with citations lawyers trust, and fewer "it made something up" tickets.
+- **Marta Keller, Data Protection Officer:** EU firms, GDPR, data residency. Will ask where every byte goes, including traces.
+- **Sam Liu, CFO:** wants cost per firm and gross margin per plan, monthly.
+- **Pilot users:** associates at two firms who will try the agent and judge whether it saves time.
+
+## Business goal
+
+Launch the multi-tenant assistant to all 14 firms within one quarter, at a cost per 1k chat requests that keeps the starter plan profitable, with zero cross-tenant data exposure and measurable answer quality that Customer Success can show to firms.
+
+## Functional requirements
+
+1. **Tenant management:** an admin API to create a tenant with plan (starter, pro, enterprise), region (US or EU), isolation mode (pool or dedicated), token budget and rate limit. Tenant users authenticate with a JWT that carries `tenant_id` and role.
+2. **Ingestion per tenant:** upload PDFs and DOCX files; parse, clean, chunk (document-aware), embed and index into the tenant's partition. Deduplicate by content hash. Ingestion jobs are queued with per-tenant concurrency caps. New documents searchable within 10 minutes.
+3. **Research chat:** multi-turn questions over the tenant's documents with hybrid retrieval (BM25 + vector, RRF), re-ranking, and inline citations to document and section. Answers "I can't find this in your documents" when context is insufficient. Responses stream over SSE.
+4. **Matter agent:** a LangGraph agent with tools exposed through at least one MCP server: `search_documents`, `get_matter` (from a seeded matters table), `compute_deadline` (court deadline from a rule and a date), `create_review_task`, and `draft_client_email`. Any tool with side effects (`create_review_task`, sending a drafted email) requires human approval through an interrupt. Max 8 steps and a per-request token cap.
+5. **Quotas and degradation:** per-tenant rate limit (429 with `Retry-After`), monthly token budget with soft alert at 80% and plan-specific behavior at 100% (degrade to a smaller model or block).
+6. **Model routing:** a cheap difficulty classifier routes each request to a fast or balanced tier; enterprise tenants can use the best tier for agent tasks. Model ids come from config.
+7. **Cost attribution:** every LLM, embedding and re-rank call writes a usage event with tenant, feature, model, prompt version, tokens and cost. A dashboard shows cost per tenant per day, cost per 1k requests, and margin per plan against plan prices in config.
+8. **Observability:** OpenTelemetry or Langfuse traces for every request with `tenant_id`, prompt version and model on each span. EU tenant traces are either sent to an EU backend or redacted before export.
+9. **Data residency:** an EU tenant is routed to an EU "cell" (a second stack configuration with its own database and LLM endpoint setting). Locally this can be a second docker compose profile; the routing logic must be real.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Latency, research chat | p95 first token under 1.5 s, p95 full answer under 8 s at 20 concurrent streams |
+| Latency, agent task | p95 under 25 s excluding human approval time |
+| Cost | Under $6 per 1k research chat requests at the measured routing mix (prices from config, dated) |
+| Answer quality | Faithfulness 0.90 or higher, context recall 0.85 or higher, citation accuracy 0.95 or higher on the golden set |
+| Agent quality | Correct tool sequence on 85% or more of trajectory scenarios; 0 side-effect tools executed without approval |
+| Isolation | 0 cross-tenant leaks across retrieval, cache, agent tools and traces in the isolation suite |
+| Availability | Degraded "search only" mode when the LLM provider fails; no 5xx storm |
+| Freshness | New documents searchable within 10 minutes |
+
+## Out of scope
+
+- Fine-tuning or training on client data.
+- A polished end-user UI. A minimal web page or Streamlit app for the demo is enough; the API is the product.
+- Real court-rules databases. Seed 10 deadline rules.
+- Billing integration. Plan prices live in config.
+- SSO with a real identity provider. Issue signed JWTs from a dev endpoint.
+
+## Deliverables
+
+1. Repo `multi-tenant-ai-platform` with source, Docker Compose (two profiles: `us` and `eu`), Makefile, seed data for 3 tenants (one EU).
+2. Eval suites with reports: RAG golden set (100 or more Q&A across 3 tenants, including unanswerable questions), agent trajectory set (25 or more scenarios), isolation suite (30 or more cases), red-team set (20 or more prompt-injection attempts, including documents that try to cross tenants).
+3. GitHub Actions: lint, unit tests, isolation suite, offline evals with thresholds as a merge gate, image build, deploy to AWS (ECS Fargate or Lambda) or the alternative target from Module 5.
+4. k6 load test script and results for the streaming endpoint.
+5. Cost dashboard (Grafana, Metabase, Streamlit or a static report generated from `usage_events`).
+6. README with demo GIF and generated results table, `docs/architecture.md`, at least 5 ADRs, cost analysis, runbook.
+
+## Acceptance criteria
+
+- Creating a tenant through the admin API, uploading documents and asking a question works end to end in under 5 minutes from a clean clone with `LLM_PROVIDER=fake`.
+- PostgreSQL RLS (or a per-tenant collection or namespace) enforces isolation; the app role cannot read another tenant's rows even with a query that has no tenant filter. A test proves it.
+- No tool schema exposes a `tenant_id` argument. Tenant context comes from the runtime.
+- Cache keys include tenant id and prompt version. A test proves a cached answer for Tenant A is never served to Tenant B.
+- The CI eval gate fails a PR that drops faithfulness by more than 2 points or introduces any isolation failure. Demonstrate with a deliberately bad PR (keep it in the history or screenshot it).
+- The cost dashboard shows per-tenant cost and cost per 1k requests from real usage events produced by the eval and load-test runs.
+- Exceeding a starter tenant's budget switches to the documented behavior, with a test.
+- The EU tenant's requests hit the EU cell configuration, verified in traces.
+
+## Suggested architecture
+
+<Diagram caption="Lexora multi-tenant RAG + agent platform" chart={`flowchart TB
+  subgraph Control["Global control plane"]
+    AUTH["Auth (JWT: tenant_id, role)"] --> DIR[("Tenant directory: plan, region, limits")]
+  end
+  U["Firm user"] --> GW["API gateway"]
+  GW --> AUTH
+  GW --> ROUTE{"Region router"}
+  ROUTE -->|US tenants| US
+  ROUTE -->|EU tenants| EU
+  subgraph US["US cell"]
+    API["FastAPI: chat, agent, admin, ingest"] --> RL[("Redis: rate limits, budgets, cache")]
+    API --> RT["Model router"]
+    API --> AG["LangGraph agent + HITL"]
+    AG --> MCP["MCP server: matters, deadlines, tasks, email"]
+    AG --> RET["Hybrid retriever + re-ranker"]
+    API --> RET
+    RET --> PG[("PostgreSQL + pgvector, RLS by tenant")]
+    RT --> LLM["LLM provider (US endpoint)"]
+    AG --> LLM
+    API --> QQ["Ingestion queue"] --> WK["Ingestion workers (per-tenant caps)"] --> PG
+    API --> UE[("usage_events")]
+    API --> TR["Tracing (OTel / Langfuse)"]
+  end
+  subgraph EU["EU cell (same stack, EU endpoints)"]
+    EAPI["FastAPI + agent + retriever"] --> EPG[("PostgreSQL + pgvector")]
+    EAPI --> ELLM["LLM provider (EU endpoint)"]
+  end
+  UE --> DASH["Cost and quality dashboard"]
+  TR --> DASH
+  CI["GitHub Actions: tests, isolation suite, eval gate, deploy"] --> US
+  CI --> EU`} />
+
+Notes on the design:
+
+- **Isolation:** pool model with RLS for starter and pro tenants; the enterprise EU tenant gets its own cell. Write this choice as an ADR with alternatives.
+- **Retrieval:** both the BM25 query and the vector query run inside the tenant-scoped transaction. Measure recall per tenant, since the smallest tenant suffers most from HNSW post-filtering.
+- **Agent:** retrieval is just one tool. The agent's state, including pending approvals, is checkpointed in PostgreSQL so an approval can arrive minutes later.
+- **Cost:** usage events are written asynchronously (queue or background task) so they never add latency to the hot path.
+
+## Evaluation rubric
+
+This rubric is deliberately demanding. A "meets" across the board is a strong portfolio piece. "Exceeds" in three or more rows is senior-level work. Score yourself honestly and put the table in the README.
+
+| Area (weight) | Does not meet | Meets | Exceeds |
+|---|---|---|---|
+| Tenant isolation (20%) | Filter only in app code; no tests | RLS or per-tenant partitions; canary, raw-count and cache tests in CI; no tenant id in tool schemas | Plus prompt-injection cross-tenant tests, trace audit test, per-tenant recall monitoring and a documented blast-radius analysis |
+| Retrieval and answer quality (15%) | Vector-only; no citations | Hybrid + re-rank + citations; meets faithfulness, recall and citation targets | Ablation table (vector vs hybrid vs hybrid + re-rank) with quality, latency and cost per row |
+| Agent and tools (15%) | Free-form tool calls, no approval | MCP tools with typed errors and idempotency; HITL on side effects; loop and token caps | Trajectory evals with argument checks; resumable approvals after restart; failure injection tests on tools |
+| Evals and CI gate (15%) | Manual spot checks | Four suites with versioned datasets; thresholds block merges; demonstrated failing PR | Online sampling with an LLM judge in the deployed app, judge agreement measured against 30 human labels |
+| Observability and cost (10%) | Logs only | Traces with tenant, model and prompt version; per-tenant cost dashboard; cost per 1k computed from real events | Margin per plan, budget alerts, and a cost-reduction experiment with before/after numbers |
+| Serving and operations (10%) | Runs only locally | Docker, CI/CD to a cloud target, rate limits, budgets, degraded mode, k6 results against the latency targets | Two-region cell routing verified in traces; runbook with 3 incident playbooks; load test at 2x target |
+| Documentation (10%) | Setup-only README | README with GIF, generated results table, architecture doc, 5 ADRs, cost analysis, limitations | A reviewer runs it in 5 minutes without help; ADRs include "revisit when" triggers |
+| Code quality (5%) | Untyped scripts | Typed Python, Pydantic models, tests for core logic, clear module boundaries | Provider and vector-store adapters behind interfaces, swapped in a test to prove it |
+
+## Suggested timeline (5 days)
+
+**Day 1: foundations and isolation.** Repo scaffold from your M5 template. Tenant directory, JWT auth, `TenantContext`. PostgreSQL schema with RLS. Ingestion worker with per-tenant caps. Seed 3 tenants. Write the isolation suite first, as failing tests, then make it pass. ADRs 1-3.
+
+**Day 2: retrieval and chat.** Port the hybrid retriever and re-ranker from `mortgage-knowledge-assistant`, now tenant-scoped. Streaming chat with citations. Tenant-aware cache. Build the RAG golden set (start with 30 per tenant, grow to 100+). First eval run and baseline numbers.
+
+**Day 3: agent and tools.** MCP server with the five tools, typed errors, idempotency keys. LangGraph agent with approval interrupts, checkpoints, step and token caps. Trajectory eval set and red-team set. Model router.
+
+**Day 4: production.** Usage events and cost dashboard. Rate limits, budgets and degraded mode. Tracing with tenant attributes; EU cell profile and region routing. GitHub Actions with the eval gate and deploy. k6 test and tuning to hit latency targets.
+
+**Day 5: proof and presentation.** Fill gaps found by evals. Demonstrate the failing PR. Generated README table, demo GIF, architecture doc, cost analysis, runbook, limitations. Rehearse the 5-minute demo twice, timed.
+
+## Definition of Done
+
+<Checklist id="m7-11-dod" title="Definition of Done" items={["A clean clone runs end to end in under 5 minutes with the fake LLM provider", "RLS or per-tenant partitions enforce isolation, proven by tests that run without tenant filters", "Isolation suite passes with 0 leaks across retrieval, cache, agent tools and traces", "No tool schema accepts a tenant id; tenant context comes from the runtime", "Hybrid retrieval with re-ranking and citations meets the faithfulness, recall and citation targets", "Side-effect tools never run without human approval, verified by trajectory tests", "CI blocks merges on eval regressions and isolation failures, demonstrated with a failing PR", "Per-tenant cost dashboard and cost per 1k requests computed from real usage events", "Budget and rate limits trigger the documented behavior, with tests", "EU tenant requests are served by the EU cell, visible in traces", "Deployed to a cloud target through CI/CD with k6 results against the latency targets", "README has the demo GIF, generated results table, architecture doc, 5 or more ADRs, cost analysis and limitations", "Rubric self-score is in the README with honest notes"]} />
+
+## How to present this in an interview
+
+You will present this project in almost every loop. Prepare three assets: a 5-minute demo, a 3-minute architecture walkthrough, and answers to the trade-off questions below.
+
+### The 5-minute demo script
+
+| Time | What you show | What you say |
+|---|---|---|
+| 0:00-0:30 | README top: pitch and results table | "Lexora serves 14 law firms on one platform. The hard constraints were strict isolation, EU residency and a thin margin on the starter plan. Here are the targets and current results, regenerated from the eval report on every merge." |
+| 0:30-1:30 | Chat as Firm A: question, streamed answer, click a citation | "Hybrid retrieval, re-ranking to 5 chunks, citations validated against retrieved ids. When context is insufficient it says so; that is part of the golden set." |
+| 1:30-2:30 | Agent task with approval | "The agent can compute a deadline and create a review task. Anything with side effects pauses for approval; the state is checkpointed, so approval can come later. Tools never receive a tenant id from the model." |
+| 2:30-3:15 | Switch to Firm B, ask for Firm A's canary | "This is the canary test from CI, live. Enforcement is in PostgreSQL RLS, so even a buggy query cannot cross tenants." |
+| 3:15-4:15 | Trace and cost dashboard | "Every span carries tenant, model and prompt version. Costs roll up per tenant and per plan. Routing simple questions to the fast tier cut cost per 1k by the amount in this chart." (Use your measured number.) |
+| 4:15-5:00 | CI run with the failing PR, then limitations | "This PR lowered faithfulness by 4 points and the gate blocked it. Known limitations: small-tenant recall in the pooled index, and one open red-team case. Here's what I'd do next." |
+
+Rehearse with a timer. If you go over, cut the dashboard to one sentence, never the isolation demo.
+
+### The architecture walkthrough
+
+Share the container diagram and follow one request: auth and tenant resolution, region routing, rate limit and budget check, routing decision, agent or chat path, tenant-scoped retrieval, generation, usage event and trace. Then the offline side: ingestion, evals in CI, deploy. Then one decision you would revisit. Stop at 3 minutes and invite questions.
+
+### Trade-off questions to expect
+
+- Why pool with RLS instead of a database per firm? When would you switch a firm to its own cell?
+- How do you know isolation holds? What is not covered by your tests?
+- Why pgvector and not a managed vector database? At what scale does that change?
+- Why LangGraph for the agent but plain Python for retrieval?
+- How did you build the golden set, and how do you know your LLM judge is right?
+- What happens when the LLM provider is down or rate-limits you?
+- How would this scale to 100 firms and 10x documents? What breaks first?
+- How do you attribute shared infrastructure costs to tenants?
+- How do you handle a firm that asks you to delete all its data (GDPR erasure), including embeddings, caches, traces and eval sets?
+- What would you change if you had another week?
+
+Prepare each answer with the three-sentence formula from lesson 03: choice and reasons, cost and mitigation, the trigger to revisit. Back each with a number or an artifact from the repo. That is what separates a portfolio project from a production-minded engineer.

@@ -61,15 +61,15 @@ A canary is only as good as its gates. For LLM apps, use three layers of signals
 
 Layers 1 and 2 can gate every step. Layer 3 needs volume. Use it for the later, larger steps, or as a background analysis that runs during the whole rollout.
 
-Here is a small sketch of how the service exports the signals. Every metric carries `version` so Prometheus can compare canary to stable.
+Here is a small sketch of how the service exports the signals. Every series must end up with a `version` label so Prometheus can compare canary to stable. On Kubernetes, Prometheus attaches it from the pod label (shown below), so the request-path metrics stay version-agnostic. The judge worker runs elsewhere, so it sets `version` itself from the logged request.
 
 ```python
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel, ValidationError
 
-REQUESTS = Counter("llm_requests_total", "LLM requests", ["version", "status"])
-CONTRACT = Counter("llm_contract_checks_total", "Output contract checks", ["version", "result"])
-TTFT = Histogram("llm_ttft_seconds", "Time to first token", ["version"],
+REQUESTS = Counter("llm_requests_total", "LLM requests", ["status"])
+CONTRACT = Counter("llm_contract_checks_total", "Output contract checks", ["result"])
+TTFT = Histogram("llm_ttft_seconds", "Time to first token",
                  buckets=(0.25, 0.5, 1, 2, 4, 8))
 JUDGE = Histogram("llm_judge_score", "Sampled judge score 0..1", ["version"],
                   buckets=(0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0))
@@ -79,13 +79,13 @@ class TriageAnswer(BaseModel):
     confidence: float
     reply: str
 
-def record_contract(version: str, raw_json: str) -> TriageAnswer | None:
+def record_contract(raw_json: str) -> TriageAnswer | None:
     try:
         parsed = TriageAnswer.model_validate_json(raw_json)
     except ValidationError:
-        CONTRACT.labels(version, "invalid").inc()
+        CONTRACT.labels("invalid").inc()
         return None
-    CONTRACT.labels(version, "valid").inc()
+    CONTRACT.labels("valid").inc()
     return parsed
 ```
 
@@ -148,6 +148,8 @@ strategy:
       - pause: { duration: 10m }
       - setWeight: 100
 ```
+
+`canaryMetadata` and `stableMetadata` put a `version` label on the pods. To get it onto your metrics, map pod labels to metric labels in the Prometheus scrape config (the common `labelmap` rule on `__meta_kubernetes_pod_label_(.+)` does this). Do not read it into an env var with the Downward API: Argo relabels pods when it promotes the canary, and env vars are fixed at pod start, so the label would go stale.
 
 Without a traffic router (NGINX, Istio, Gateway API plugin), `setWeight` is approximated by the replica ratio. With 4 replicas, 10% really means "1 of 4 pods". Use a traffic router when you need precise small percentages.
 

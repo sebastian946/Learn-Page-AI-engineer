@@ -1,0 +1,158 @@
+<ClientBrief company="Harborline Home Lending" industry="Fintech / Mortgage lending" duration="5 days" />
+
+## Company context
+
+Harborline Home Lending is a fictional mid-sized US mortgage lender. It originates conventional, FHA and VA loans in 14 states, with about 220 loan officers, 40 underwriters and a 15-person operations team. Harborline sells most of its loans to the secondary market, so every file must follow both its internal policies and the investor guidelines it has adopted.
+
+Today, policy knowledge lives in a mess of places:
+
+- A 200+ page internal **Underwriting Guide** (PDF, updated quarterly, with tables of DTI/LTV limits).
+- About 60 **policy bulletins** (PDF and HTML), each superseding parts of the guide from an effective date.
+- A **product matrix** per loan program (PDF tables).
+- An internal **FAQ wiki** (HTML) maintained by operations, partly outdated.
+
+Loan officers send roughly 300 policy questions a week to an internal Slack channel. Underwriters answer them between files. The median response time is 3 hours, and answers are not always consistent. Two recent post-close audit findings were traced to an officer acting on an outdated bulletin.
+
+## Stakeholders
+
+| Person | Role | What they care about |
+|---|---|---|
+| Dana Whitfield | VP of Operations (sponsor) | Faster answers, fewer escalations to underwriters, measurable ROI |
+| Marcus Oyelaran | Chief Underwriter | Correctness. Every answer must cite the exact policy section; outdated rules are unacceptable |
+| Priya Raman | Compliance Officer | Auditability, no PII leaving approved systems, ability to show how an answer was produced |
+| Leo Castillo | Head of Engineering | Fits the existing stack (Postgres, Python, AWS), maintainable, predictable cost |
+| Loan officers | End users | Quick, clear answers inside their workflow, with a link to the source |
+
+## Business goal
+
+Cut the median time to a correct policy answer from hours to under a minute, while reducing underwriter interruptions by at least 40% within one quarter of launch. The assistant must make audits easier, not riskier: every answer is traceable to specific, current policy text.
+
+## Functional requirements
+
+1. **Ingestion** of the Underwriting Guide, bulletins, product matrices (PDF) and FAQ pages (HTML). Extract text and tables, keep section numbers, page numbers and titles.
+2. **Document versioning:** each document and chunk has `effective_from` and, when applicable, `superseded_by`. Retrieval only returns chunks in force on the query date (default: today).
+3. **Metadata filters:** loan program (conventional, FHA, VA), state, document type. The user can set them, and the assistant can infer them from the question.
+4. **Hybrid retrieval:** pgvector similarity plus Postgres full-text search, fused with RRF.
+5. **Re-ranking** of the fused candidates with a cross-encoder (local by default; a hosted re-ranker can be a configurable option).
+6. **Query rewriting:** conversation condensation for follow-ups; multi-query optional behind a flag.
+7. **Cited answers:** every factual sentence cites at least one chunk, showing document, section and page. Citations are validated before the answer is shown.
+8. **Abstention:** when the corpus does not contain the answer, the assistant says so and links the closest sections. It never answers from general mortgage knowledge.
+9. **API:** a FastAPI service with `POST /ask` (question, optional filters, optional history) returning answer, citations, `answer_found` and a `trace_id`. Streaming is a nice-to-have.
+10. **Minimal UI:** a simple web page or Streamlit app showing the answer, clickable citations and the filters.
+11. **Evaluation suite:** at least **50 golden Q&A pairs** reviewed against the source documents, including at least 8 unanswerable questions and at least 5 multi-turn follow-ups.
+12. **Latency and cost dashboard:** per-request logs aggregated into p50/p95 latency by stage and cost per 1,000 requests.
+
+## Non-functional requirements
+
+| Area | Target |
+|---|---|
+| Latency | p95 under 4 s end-to-end for non-streaming answers; p95 retrieval (rewrite excluded) under 600 ms |
+| Cost | Under a target you define per 1,000 requests, computed from logged token usage and current provider pricing; document the assumption |
+| Faithfulness | ≥ 0.90 average on the golden set (Ragas or DeepEval), no answerable item below 0.5 without an explanation |
+| Context recall | ≥ 0.85 average on answerable items |
+| Retrieval | recall@5 ≥ 0.85 on items with labeled chunk IDs |
+| Abstention | ≥ 90% of unanswerable items correctly answered "not found" |
+| Citation validity | 100% of displayed citations point to retrieved chunks with matching quotes |
+| Security | No borrower PII in the corpus or logs; secrets via environment variables; no data sent to providers without an approved agreement (document which providers you use) |
+| Auditability | Every request has a trace: query, rewrites, filters, retrieved IDs with scores, prompt version, model, output, validation result |
+
+## Out of scope
+
+- Answering questions about specific borrowers or loan files.
+- Making credit decisions or approving exceptions.
+- Authentication and multi-tenant permissions (assume an internal network; Module 7 revisits this).
+- Production deployment, CI/CD and load testing (Module 5 deploys this project).
+- Full LLM-as-judge calibration and online monitoring (Module 3 builds this on top of your suite).
+
+## Deliverables
+
+1. Repository `mortgage-knowledge-assistant` with source code, `docker-compose.yml` (Postgres with pgvector, the API, optional Redis) and a one-command setup.
+2. A **synthetic corpus** you create: an underwriting guide (at least 30 pages), at least 8 bulletins with effective dates (at least 2 superseding earlier rules), 3 product matrices and 15 FAQ pages. Do not use any real lender's documents.
+3. The golden dataset (`evals/golden.jsonl`) and the eval runner with a saved report.
+4. The dashboard (a notebook, Streamlit page or Grafana board reading your request logs).
+5. A README with architecture, design decisions, eval results, cost analysis and a demo GIF.
+6. An `ADR` folder with at least three short architecture decision records (for example: chunking strategy, re-ranker choice, caching policy).
+
+## Acceptance criteria
+
+- `docker compose up` followed by `make ingest` and `make eval` works on a clean machine.
+- Asking about a rule that a bulletin superseded returns the new rule and cites the bulletin, not the old guide section.
+- Filtering by FHA never returns conventional-only chunks.
+- The eval report meets the non-functional targets, or explains each miss with a diagnosis and a plan.
+- The dashboard shows p50/p95 latency per stage (rewrite, retrieval, re-rank, generation) and cost per 1,000 requests for at least 200 logged requests.
+- A reviewer can pick any answer in the logs and reconstruct how it was produced from its trace.
+
+## Suggested architecture
+
+<Diagram caption="Mortgage knowledge assistant: offline ingestion and online answering" chart={`flowchart LR
+  subgraph Offline["Offline ingestion"]
+    D["PDFs, bulletins, FAQ HTML"] --> P["Parse and clean (tables, sections)"]
+    P --> C["Structure-aware chunking"]
+    C --> M["Metadata: program, state, effective_from, superseded_by"]
+    M --> E["Embed (cached by hash)"]
+    E --> PG[("Postgres: pgvector + tsvector")]
+  end
+  subgraph Online["Online answering"]
+    U[Loan officer] --> API["FastAPI /ask"]
+    API --> RW["Condense / rewrite (small model)"]
+    RW --> HY["Hybrid search + filters + RRF"]
+    HY --> PG
+    HY --> RR["Cross-encoder re-rank"]
+    RR --> G["Generate with citations"]
+    G --> V["Validate citations"]
+    V --> U
+  end
+  API --> L[("Request logs and traces")]
+  L --> DB["Latency and cost dashboard"]
+  L --> EV["Eval suite (50+ golden pairs)"]`} />
+
+Notes:
+
+- Reuse the framework-free core from `rag-lab/07-from-scratch/`, or the LangChain pipeline if you prefer. Justify the choice in an ADR.
+- Put an exact-match response cache in front of generation, keyed by question, filters, corpus version and prompt version. Skip semantic caching for underwriting content and explain why.
+- Use a small model (`claude-haiku-5-5`) for rewriting and a larger one (`claude-sonnet-5-5`) for generation. Put stable instructions in a cached prompt prefix.
+
+## Evaluation rubric
+
+| Criterion | Weight | Excellent | Acceptable | Needs work |
+|---|---|---|---|---|
+| Retrieval quality | 20% | Hybrid + filters + versioning + re-rank; recall@5 and context recall meet targets with evidence | Hybrid works, one target missed with a diagnosis | Vector-only or no filtering by effective date |
+| Grounding and citations | 20% | Claim-level citations validated; abstention meets target | Citations shown and mostly valid | Citations not validated or answers from general knowledge |
+| Evaluation suite | 20% | 50+ reviewed pairs, unanswerable and multi-turn items, per-item analysis, pinned judge | 50 pairs with aggregate scores | Fewer pairs, references copied from system output |
+| Observability, latency and cost | 15% | Per-stage traces, dashboard with p50/p95 and cost per 1k, documented assumptions | Dashboard with totals only | No cost or latency data |
+| Engineering quality | 15% | Clean structure, tests for core logic, one-command setup, ADRs | Runs with a few manual steps | Hard to run, no tests |
+| Communication | 10% | README tells a clear story with trade-offs, numbers and a demo GIF | README covers setup and results | Minimal README |
+
+## Suggested timeline (5 days)
+
+**Day 1 — Corpus and ingestion.** Write the synthetic corpus, including superseding bulletins and tables. Build parsing, structure-aware chunking and metadata extraction. Load into pgvector with HNSW and full-text indexes. Start drafting golden questions while you write the documents; that is when you know the answers best.
+
+**Day 2 — Retrieval.** Hybrid search with RRF, metadata and effective-date filters, cross-encoder re-ranking, conversation condensation. Build the retrieval benchmark (recall@5, MRR) on labeled chunk IDs and tune fetch size and top-k.
+
+**Day 3 — Generation and API.** Citation prompt, structured output, citation validation, abstention. FastAPI `POST /ask` with trace IDs and request logging. Response and embedding caches. Minimal UI.
+
+**Day 4 — Evaluation.** Finish and review the 50+ golden pairs. Run Ragas or DeepEval with a pinned judge. Analyze the worst items, fix the top issues, re-run. Write the eval report.
+
+**Day 5 — Dashboard and polish.** Generate at least 200 logged requests (golden set plus paraphrases), build the latency/cost dashboard, write ADRs, README, record the demo GIF. Do a clean-machine setup test.
+
+## Definition of Done
+
+<Checklist id="m2-20-dod" title="Definition of Done" items={["Synthetic corpus committed, including superseding bulletins and product matrix tables", "Ingestion keeps section, page, program, state and effective dates for every chunk", "Hybrid retrieval with RRF, metadata filters and effective-date filtering", "Cross-encoder re-ranking with a measured before/after comparison", "Follow-up questions are condensed before retrieval", "Every displayed citation is validated against retrieved chunks", "Unanswerable questions return 'not found' with links to the closest sections", "Golden dataset has 50+ reviewed pairs, 8+ unanswerable and 5+ multi-turn items", "Eval report with pinned judge, per-item analysis and targets met or explained", "Dashboard shows p50/p95 latency per stage and cost per 1,000 requests", "Every request has a reconstructable trace", "docker compose setup works on a clean machine", "README with architecture diagram, decisions, eval results, cost analysis and demo GIF", "At least three ADRs committed"]} />
+
+## How to present this in an interview
+
+Use a two-minute story, then let the interviewer dig in.
+
+1. **Problem (20 s).** "A mortgage lender's loan officers waited hours for policy answers, and outdated bulletins caused audit findings."
+2. **Approach (40 s).** "I built a cited RAG assistant: structure-aware chunking with effective-date metadata, hybrid pgvector plus full-text search fused with RRF, a cross-encoder re-ranker, and claim-level citations validated before display."
+3. **Proof (40 s).** "I wrote 50+ golden questions with a domain-style review, including unanswerable and follow-up questions. Faithfulness, context recall and abstention are tracked per item." Quote your actual numbers.
+4. **Operations (20 s).** "Every request is traced; the dashboard shows p95 by stage and cost per 1,000 requests. Prompt caching and fewer, re-ranked chunks cut input tokens." Again, your own measured numbers.
+
+Be ready for follow-ups:
+
+- *How do you handle superseded policies?* Effective-date metadata and filters, plus golden items that specifically test superseded rules.
+- *Why not just use a bigger context window?* Cost, latency, "lost in the middle", and weaker citations. Show your measurements.
+- *What failed first and how did you find it?* Pick a real worst-item from your report and walk through the stage-by-stage diagnosis.
+- *What would you do next?* CI gate on faithfulness (Module 3), deployment with SLOs (Module 5), multi-tenant permissions (Module 7).
+
+Open the repo during the interview. Show the trace of one answer, the eval report and one ADR. Concrete artifacts beat adjectives.

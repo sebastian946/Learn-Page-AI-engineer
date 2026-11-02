@@ -1,0 +1,221 @@
+## What is different about LLM workloads on Kubernetes
+
+You know Deployments, Services, Ingress and HPA. This lesson is about the parts that behave differently when every request is a 5–60 second stream that mostly waits on a provider or a GPU.
+
+Three facts drive every decision:
+
+1. **CPU is a bad scaling signal.** An API-calling LLM service is I/O-bound. Pods can be saturated at 15% CPU because every worker slot is waiting on a stream.
+2. **Connections are long-lived.** A rolling update or a scale-down that kills a pod cuts every stream on it. Users see answers stop mid-sentence.
+3. **Concurrency, not RPS, is the capacity unit.** By Little's law, in-flight requests equal arrival rate times duration. At 20 req/s and 15 s average duration, you hold about 300 open streams. Plan for that number.
+
+In Module 5 you scaled ECS on request count per target. Here you get finer tools.
+
+## Scale on in-flight requests with the HPA
+
+Expose a gauge of active requests from each pod. Then let the HPA target an average per pod.
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from prometheus_client import Gauge, make_asgi_app
+
+IN_FLIGHT = Gauge("llm_inflight_requests", "Requests currently being served")
+app = FastAPI()
+app.mount("/metrics", make_asgi_app())
+
+@app.middleware("http")
+async def track_inflight(request: Request, call_next):
+    if request.url.path.startswith(("/metrics", "/healthz", "/readyz")):
+        return await call_next(request)
+    IN_FLIGHT.inc()
+    try:
+        response = await call_next(request)
+    except Exception:
+        IN_FLIGHT.dec()
+        raise
+    # For streaming responses, decrement when the body finishes, not here.
+    original = response.body_iterator
+
+    async def wrapped():
+        try:
+            async for chunk in original:
+                yield chunk
+        finally:
+            IN_FLIGHT.dec()
+
+    response.body_iterator = wrapped()
+    return response
+```
+
+The `finally` in the wrapped iterator matters. If you decrement when the handler returns, a streaming response counts as finished before it sends a single token.
+
+With the Prometheus Adapter installed, the metric becomes available to the HPA as a `Pods` metric:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chat-api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: chat-api }
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Pods
+      pods:
+        metric: { name: llm_inflight_requests }
+        target: { type: AverageValue, averageValue: "40" }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies: [{ type: Pods, value: 2, periodSeconds: 120 }]
+```
+
+How to pick `40`: load test one pod (Module 5's k6 skills apply) and find the concurrency where p95 time to first token starts to climb. Target 60–70% of that. Scale up fast, scale down slowly. A long `scaleDown` window avoids killing pods (and streams) on every traffic dip.
+
+Remember the upstream limit. Thirty pods times 40 streams is 1,200 concurrent provider calls. If your provider quota allows 400, more pods only produce more 429s. Cap `maxReplicas` from the quota, not from hope.
+
+## KEDA: event-driven scaling and scale to zero
+
+KEDA wraps the HPA and adds scalers for queues, Prometheus queries, cron and more. It is a natural fit for two LLM patterns:
+
+- **Async workers** (batch summarization, document ingestion, eval jobs): scale on queue depth, including down to zero when the queue is empty.
+- **Prometheus-driven scaling without the adapter**: one `ScaledObject` with a PromQL query.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: summarizer-worker
+spec:
+  scaleTargetRef: { name: summarizer-worker }
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  cooldownPeriod: 300
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.default.svc:6379
+        listName: summarize-jobs
+        listLength: "10"   # target jobs per replica
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring:80
+        query: sum(rate(summarize_jobs_enqueued_total[2m]))
+        threshold: "2"     # target enqueue rate (jobs/s) per replica
+```
+
+With several triggers, KEDA scales to the highest replica count any trigger asks for.
+
+Scale to zero is great for GPU workers that cost real money per hour. The price is a cold start: pulling a large image and loading model weights can take minutes. Lesson 3 covers that trade-off.
+
+## Long-lived streams and load balancing
+
+Kubernetes Services balance **connections**, not requests. With HTTP/1.1 and SSE, one connection carries one stream, so balance is fine. Two traps remain:
+
+- **HTTP/2 or gRPC clients** multiplex many requests on one connection. A kube-proxy Service pins all of them to one pod. Use a request-aware proxy (Envoy, Istio, a gRPC-aware ingress) or client-side load balancing.
+- **New pods get no traffic from existing connections.** After a scale-up, old pods stay hot until their streams end. That is normal. Do not panic and add more replicas.
+
+Ingress settings matter as much as the ALB idle timeout did in Module 5. For ingress-nginx, raise `proxy-read-timeout` and `proxy-send-timeout` (for example to 300 seconds) and disable `proxy-buffering` for streaming routes. Otherwise NGINX buffers tokens and the user sees nothing, then everything at once.
+
+## Graceful shutdown of streams
+
+When Kubernetes deletes a pod, two things happen **in parallel**: the kubelet sends `SIGTERM`, and the endpoint is removed from Services and ingress controllers. The removal propagates in a few seconds. If your app stops accepting connections immediately on `SIGTERM`, new requests still routed to it fail.
+
+The safe sequence:
+
+1. `preStop` hook sleeps 5–10 seconds, so endpoint removal propagates while the pod still serves.
+2. The app receives `SIGTERM`, flips readiness to failing, stops accepting new requests and lets in-flight streams finish.
+3. Streams that would exceed the deadline get a clean final event telling the client to retry.
+4. `terminationGracePeriodSeconds` is longer than preStop plus your longest expected stream.
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 120
+  containers:
+    - name: api
+      image: ghcr.io/acme/chat-api:1.8.0
+      lifecycle:
+        preStop:
+          sleep: { seconds: 10 }   # native sleep action, Kubernetes 1.30+
+      readinessProbe:
+        httpGet: { path: /readyz, port: 8000 }
+        periodSeconds: 5
+      args: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000",
+             "--timeout-graceful-shutdown", "100"]
+```
+
+On older clusters use `exec: { command: ["sleep", "10"] }`, which needs a `sleep` binary in the image.
+
+Inside a stream, check a shutdown flag and end politely instead of being cut:
+
+```python
+import time
+
+shutting_down = asyncio.Event()
+shutdown_deadline: float | None = None  # set by the SIGTERM handler: now + 90 s
+
+async def token_stream(prompt: str):
+    async for token in generate(prompt):  # your provider stream
+        if shutting_down.is_set() and shutdown_deadline is not None \
+                and time.monotonic() > shutdown_deadline - 5:
+            yield 'event: retry\ndata: {"reason": "server_restart"}\n\n'
+            return
+        yield f"data: {token}\n\n"
+```
+
+Most streams finish normally inside the grace period. Only the few that would be killed get the retry event.
+
+The client treats `event: retry` as "reconnect and resend". Pair it with an idempotency key from Module 5 so the retry does not double-charge or double-act.
+
+## PodDisruptionBudgets and placement
+
+Rollouts are not the only thing that kills pods. Node drains for upgrades and cluster-autoscaler consolidation do too.
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chat-api
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: chat-api }
+```
+
+A PDB limits **voluntary** disruptions. With `maxUnavailable: 1`, a drain evicts one pod at a time and waits for a replacement to be ready. Combine it with `topologySpreadConstraints` across zones so one zone outage does not take every replica. For GPU pods, also tell the cluster autoscaler not to consolidate them casually (`cluster-autoscaler.kubernetes.io/safe-to-evict: "false"` or Karpenter's `karpenter.sh/do-not-disrupt` annotation) because a restart costs a slow model load.
+
+## Common mistakes
+
+- **HPA on CPU for an API-calling service.** It scales after users already feel it.
+- **Decrementing the in-flight gauge too early** for streaming responses, so every pod looks idle.
+- **No preStop delay.** You get a burst of 502s on every deploy, then blame the ingress.
+- **Grace period shorter than the longest stream.** `SIGKILL` cuts answers mid-sentence.
+- **`maxReplicas` above the provider quota.** Scaling turns throttling into more throttling.
+- **PDB with `minAvailable` equal to replicas.** Node drains hang forever and block cluster upgrades.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your LLM chat service on Kubernetes shows cut-off answers during every deploy. How do you fix it?" level="senior">
+
+Cut-offs during deploys mean pods die while streams are open. I check four things. First, a `preStop` sleep so endpoint removal propagates before the app stops accepting traffic. Second, the app handles `SIGTERM` by failing readiness, refusing new requests and draining in-flight streams, with uvicorn's graceful-shutdown timeout set. Third, `terminationGracePeriodSeconds` exceeds preStop plus the p99 stream duration. Fourth, streams that cannot finish in time end with an explicit retry event, and the client resends with an idempotency key. I would also verify ingress timeouts and buffering, and add a PDB plus a slow scale-down policy so autoscaling and node drains do not cause the same symptom.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Show you know the capacity math">
+
+Interviewers like Little's law here. "At 20 requests per second and 15 seconds per streamed answer, I need about 300 concurrent slots. Load tests showed one pod handles 40 before time to first token degrades, so I target about 28 per pod and need 11 pods, capped by the provider's concurrency quota."
+
+</Callout>
+
+## Further reading
+
+- Horizontal Pod Autoscaling: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
+- Pod lifecycle and termination: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/
+- Disruptions and PodDisruptionBudgets: https://kubernetes.io/docs/concepts/workloads/pods/disruptions/
+- KEDA scalers: https://keda.sh/docs/latest/scalers/
+- Prometheus Adapter: https://github.com/kubernetes-sigs/prometheus-adapter

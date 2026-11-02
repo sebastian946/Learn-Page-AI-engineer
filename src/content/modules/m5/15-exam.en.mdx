@@ -1,0 +1,26 @@
+## Module 5 exam
+
+This exam checks whether you can run an LLM service in production, not just build one. It has 20 questions and a 30-minute limit. You need **70%** to pass and unlock Module 6.
+
+**What it covers**
+
+- FastAPI streaming with SSE, client disconnects, idempotency keys and timeouts
+- Multi-stage Docker builds for Python AI apps and secrets handling
+- Redis exact and semantic caching, per-tenant token-bucket rate limiting
+- pgvector indexes (HNSW vs IVFFlat), migrations and connection pooling
+- GitHub Actions CI/CD with an eval gate, OIDC and environments
+- ECS Fargate, Lambda trade-offs for streaming, and Fly.io
+- k6 load testing: TTFT, tokens/sec, thresholds, mocking the provider
+- Cost per 1k requests, capacity planning, circuit breakers and prompt feature flags
+
+**Question types**
+
+Single choice, multi-select, "order the steps", and code reading. The code questions show short FastAPI, Dockerfile, k6 and GitHub Actions snippets. Read them carefully. Most traps are one line.
+
+**How to prepare**
+
+1. Re-read the "Common mistakes" sections of each lesson. Many questions come from them.
+2. Open your `mortgage-knowledge-assistant` repo. Make sure you can explain every line of your Dockerfile, workflow and k6 script.
+3. Redo the cost math from lesson 13 by hand for a different `top_k`.
+
+Options are shuffled on every attempt. Each answer has an explanation, so review them even when you pass.

@@ -1,0 +1,212 @@
+# Mosaic AI Agent Framework: author, log, review and deploy agents
+
+You have the pieces: governed data (lesson 3), retrieval (lesson 4), models behind endpoints (lesson 5) and evaluation (lesson 6). The **Mosaic AI Agent Framework** is how Databricks assembles them into a deployed application with a lifecycle: author → log → evaluate → register → deploy → review → monitor. The exam's "assembling and deploying applications" domain lives here.
+
+<Callout type="warning" title="Fast-moving APIs">
+
+The agent interface moved from `ChatModel` to `ChatAgent` to `ResponsesAgent` (recommended with MLflow 3), and `log_model` arguments changed (`artifact_path` became `name`). The lifecycle below is stable; method names may not be. Check docs.databricks.com and mlflow.org/docs before copying code.
+
+</Callout>
+
+## The lifecycle
+
+<Diagram caption="Agent lifecycle on Databricks" chart={`flowchart LR
+  A["Author agent.py (LangGraph or plain Python)"] --> B["Log with MLflow (models from code + resources)"]
+  B --> C["Evaluate (mlflow.genai.evaluate)"]
+  C --> D["Register in Unity Catalog"]
+  D --> E["agents.deploy"]
+  E --> F["Serving endpoint"]
+  E --> G["Review App (SME feedback)"]
+  F --> H["Inference tables and traces"]
+  G --> H
+  H --> I["New eval examples"]
+  I --> C`} />
+
+The loop at the end is the point: production traffic and expert feedback flow back into evaluation datasets. That is the same "every bug becomes a regression test" habit you have as an SDET.
+
+## 1. Author the agent
+
+You can write the agent in any framework — LangGraph, LangChain, OpenAI Agents SDK, or plain Python — as long as you wrap it in an MLflow interface the serving layer understands. With MLflow 3 the recommended one is `ResponsesAgent`, which speaks an OpenAI Responses-compatible schema (messages in, output items out, with tool calls and streaming).
+
+```python
+# agent.py
+from uuid import uuid4
+
+import mlflow
+from mlflow.entities import SpanType
+from mlflow.pyfunc import ResponsesAgent
+from mlflow.types.responses import ResponsesAgentRequest, ResponsesAgentResponse
+from databricks.vector_search.client import VectorSearchClient
+from openai import OpenAI
+from databricks.sdk import WorkspaceClient
+
+LLM_ENDPOINT = "claude-sonnet-gateway"
+INDEX_NAME = "main.claims.chunks_index"
+
+mlflow.openai.autolog()
+mlflow.models.set_retriever_schema(primary_key="chunk_id", text_column="content", doc_uri="doc_id")
+
+class ClaimsAgent(ResponsesAgent):
+    def __init__(self) -> None:
+        self.llm: OpenAI = WorkspaceClient().serving_endpoints.get_open_ai_client()
+        self.index = VectorSearchClient().get_index(index_name=INDEX_NAME)
+
+    @mlflow.trace(span_type=SpanType.RETRIEVER)
+    def retrieve(self, query: str) -> list[dict]:
+        res = self.index.similarity_search(query_text=query, num_results=5,
+                                           columns=["chunk_id", "doc_id", "content"])
+        return [{"chunk_id": r[0], "doc_id": r[1], "content": r[2]}
+                for r in res["result"]["data_array"]]
+
+    def predict(self, request: ResponsesAgentRequest) -> ResponsesAgentResponse:
+        question = request.input[-1].content
+        docs = self.retrieve(question)
+        context = "\n\n".join(f"[{d['doc_id']}] {d['content']}" for d in docs)
+        out = self.llm.chat.completions.create(
+            model=LLM_ENDPOINT,
+            messages=[
+                {"role": "system", "content": "Answer from the context only. Cite [doc_id]. "
+                                              "If the context is insufficient, say so."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+            ],
+        )
+        text = out.choices[0].message.content
+        return ResponsesAgentResponse(output=[self.create_text_output_item(text=text, id=str(uuid4()))])
+
+mlflow.models.set_model(ClaimsAgent())
+```
+
+Key details:
+
+- **`set_retriever_schema`** tells MLflow which fields of your retriever output are the id, text and document URI. Evaluation judges and the Review App use it to display and score retrieved context.
+- **`set_model`** marks the object to serve. This is the **models-from-code** pattern: MLflow logs the source file, not a pickle, which avoids serialization problems with clients and connections.
+- Tracing is on, so every request produces a trace in the endpoint's experiment.
+
+### Tools from Unity Catalog
+
+Business logic can live as **UC functions** (SQL or Python), governed with `EXECUTE` grants and reusable by any agent:
+
+```sql
+CREATE OR REPLACE FUNCTION main.claims.lookup_policy(policy_number STRING)
+RETURNS TABLE (policy_number STRING, product STRING, status STRING, wind_deductible_pct DOUBLE)
+COMMENT 'Look up policy status and deductibles by policy number.'
+RETURN SELECT policy_number, product, status, wind_deductible_pct
+       FROM main.claims.policies WHERE policy_number = lookup_policy.policy_number;
+```
+
+In LangChain or LangGraph, `databricks_langchain.UCFunctionToolkit(function_names=["main.claims.lookup_policy"])` turns these into tools. The function's `COMMENT` becomes the tool description, so write it like a tool contract (Module 4).
+
+## 2. Log the agent with its resources
+
+```python
+import mlflow
+from mlflow.models.resources import (
+    DatabricksFunction, DatabricksServingEndpoint, DatabricksVectorSearchIndex,
+)
+
+input_example = {"input": [{"role": "user", "content": "What is the wind deductible on POL-12345678?"}]}
+
+with mlflow.start_run(run_name="claims-agent-v3"):
+    logged = mlflow.pyfunc.log_model(
+        name="agent",
+        python_model="agent.py",
+        input_example=input_example,
+        resources=[
+            DatabricksServingEndpoint(endpoint_name="claude-sonnet-gateway"),
+            DatabricksVectorSearchIndex(index_name="main.claims.chunks_index"),
+            DatabricksFunction(function_name="main.claims.lookup_policy"),
+        ],
+        pip_requirements=["mlflow", "databricks-vectorsearch", "databricks-sdk", "openai"],
+    )
+```
+
+**Resources** are a frequent exam topic. Declaring the endpoints, indexes and functions the agent uses lets Databricks provision **automatic authentication passthrough**: the deployed endpoint gets short-lived credentials scoped to exactly those resources. No personal tokens in the container, no secrets to rotate by hand.
+
+## 3. Evaluate before registering
+
+Run `mlflow.genai.evaluate` (lesson 6) against the logged model or the in-process agent on your evaluation dataset. Store the results in the same run. Only register versions that pass your thresholds — the same CI-gate idea from Module 3.
+
+## 4. Register in Unity Catalog
+
+```python
+mlflow.set_registry_uri("databricks-uc")
+uc_model = "main.claims.claims_agent"
+version = mlflow.register_model(logged.model_uri, uc_model)
+```
+
+The agent is now a governed UC object with versions, lineage to the run, and grants. Use aliases (for example `champion`, `challenger`) to mark which version is live.
+
+## 5. Deploy with `agents.deploy`
+
+```python
+from databricks import agents
+
+deployment = agents.deploy(uc_model, version.version)
+print(deployment.query_endpoint)    # REST endpoint for apps
+print(deployment.review_app_url)    # Review App for stakeholders
+```
+
+One call does a lot:
+
+- Creates or updates a **Model Serving endpoint** for that UC model version.
+- Sets up authentication for the declared resources.
+- Enables **tracing and payload logging** (inference tables / MLflow traces) so production requests are recorded.
+- Creates the **Review App**, a chat UI where stakeholders can try the agent and give feedback.
+
+Deploying a new version to the same UC model updates the endpoint, so the URL stays stable for your app.
+
+## 6. Review App: subject-matter experts in the loop
+
+In regulated domains, engineers cannot judge answer quality alone. A claims adjuster knows whether "mold is excluded unless caused by a covered water loss" is correct; you probably do not. The Review App lets SMEs:
+
+- **Chat with the agent** and rate responses (thumbs up/down, free-text comments, corrected answers).
+- **Label existing traces** in **labeling sessions**: you choose traces (for example from production or an eval run) and assign them to reviewers with specific questions.
+
+Their feedback is stored with traces and can become `expectations` in your evaluation dataset. This closes the loop: the rows SMEs correct this week are regression tests next week.
+
+## 7. Monitor
+
+After deployment, watch:
+
+- **Operational metrics**: latency, error rate, token usage per endpoint (AI Gateway usage tracking, endpoint metrics).
+- **Quality**: scheduled scorers on sampled production traces (groundedness, safety, guidelines).
+- **Feedback**: thumbs-down rate by topic, using SQL over the inference tables (lesson 1).
+
+## Exam-style reasoning
+
+- "Stakeholders without Databricks expertise need to test the agent and leave feedback" → **Review App**.
+- "The deployed agent fails with permission errors calling the vector index" → declare the index as a **resource** when logging (or grant the endpoint's identity access).
+- "The team wants versioned, governed agents with access control" → **register in Unity Catalog**.
+- "Serialization errors when logging an agent with clients" → use **models from code** (`python_model="agent.py"` + `set_model`).
+- "They need to capture production requests for later evaluation" → payload logging / inference tables enabled by `agents.deploy`.
+
+## Common mistakes
+
+- Logging an agent object with live clients via pickle instead of models-from-code.
+- Forgetting to declare resources, then debugging 403s in production.
+- Skipping `set_retriever_schema`, so judges and the Review App cannot see retrieved docs.
+- Deploying without an evaluation gate.
+- Collecting SME feedback and never turning it into eval data.
+- Hard-coding endpoint names in many places instead of one config.
+
+## How this shows up in interviews and on the exam
+
+<InterviewQuestion question="Walk me through taking a LangGraph agent from a notebook to a governed production endpoint on Databricks." level="mid">
+
+Move the agent into `agent.py`, wrap it in MLflow's `ResponsesAgent` interface, enable autolog tracing and call `set_model`. Log it with `mlflow.pyfunc.log_model` using models from code, an input example, pinned requirements and `resources` listing the LLM endpoint, vector index and UC functions so auth passthrough works. Evaluate with `mlflow.genai.evaluate` and gate on thresholds. Register to Unity Catalog, then `agents.deploy` to get a serving endpoint, payload logging and a Review App. Monitor with scheduled scorers and feed SME labels back into the eval dataset.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Why does Databricks have you declare resources when logging an agent?" level="senior">
+
+So the platform knows exactly which dependencies the agent needs and can provision least-privilege, short-lived credentials for them at deploy time. It removes long-lived personal tokens from serving containers, makes permissions auditable through Unity Catalog, and gives lineage from the model to the indexes, functions and endpoints it uses. It also fails fast: a missing grant shows up at deploy time rather than as a 403 in front of a user.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Agent Framework overview: https://docs.databricks.com/en/generative-ai/agent-framework/build-genai-apps.html
+- Author agents in code: https://docs.databricks.com/en/generative-ai/agent-framework/author-agent.html
+- Log and register agents: https://docs.databricks.com/en/generative-ai/agent-framework/log-agent.html
+- Deploy agents: https://docs.databricks.com/en/generative-ai/agent-framework/deploy-agent.html
+- MLflow ResponsesAgent: https://mlflow.org/docs/latest/genai/serving/responses-agent/

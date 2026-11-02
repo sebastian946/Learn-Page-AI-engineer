@@ -1,0 +1,169 @@
+## El problema que resuelve un gateway
+
+Imagina una empresa seis meses después de "IA en todas partes". Cinco equipos llaman a LLMs. Cada uno tiene sus propias keys de proveedor en su propio almacén de secretos. Dos usan el SDK de Anthropic, dos el de OpenAI, uno llama a Bedrock. Nadie puede responder tres preguntas simples:
+
+- ¿Cuánto gastó cada equipo la semana pasada?
+- Si nuestro proveedor principal tiene una caída, ¿qué pasa?
+- ¿Qué apps envían PII de clientes a qué proveedor?
+
+El Módulo 5 resolvió esto dentro de **un** servicio: rate limits por tenant, caché, modelos de fallback. Un **AI gateway** saca esas responsabilidades de cada app y las pone en una capa compartida. Es para las llamadas a LLMs lo que un API gateway es para las APIs HTTP.
+
+## Qué hace un AI gateway
+
+| Capacidad | Qué significa en la práctica |
+|---|---|
+| **API unificada** | Las apps hablan un solo formato (normalmente compatible con OpenAI). El gateway traduce a Anthropic, Bedrock, Azure, Vertex, vLLM... |
+| **Keys virtuales** | Cada equipo o app recibe su propia key del gateway. Las keys reales del proveedor viven solo en el gateway. Revocar a un equipo es una llamada a la API. |
+| **Alias de modelos** | Las apps piden `chat-default`, no un id de modelo concreto. Cambias el modelo detrás del alias de forma centralizada. |
+| **Ruteo y balanceo de carga** | Varios deployments detrás de un alias (dos regiones, dos proveedores, autoalojado más API). Repartes la carga, prefieres el más barato o el más rápido. |
+| **Reintentos y fallbacks** | Ante 429/5xx o timeout, reintenta y luego cae a otro alias. Fallbacks especiales para desborde de ventana de contexto o rechazos por política de contenido. |
+| **Presupuestos y límites** | Topes de gasto, requests por minuto y tokens por minuto por equipo o key, con períodos de reinicio. |
+| **Logging central** | Cada llamada con equipo, modelo, tokens, costo y latencia. Exportación a Langfuse, OpenTelemetry o tu data warehouse. |
+| **Caché y guardrails** | Caché de respuestas compartida, enmascarado o bloqueo de PII antes de que un request salga de la red. |
+
+Las opciones incluyen LiteLLM (proxy open source, el que se usa en este módulo), Portkey, Kong AI Gateway, Envoy AI Gateway y servicios gestionados como Cloudflare AI Gateway. Los conceptos se transfieren. Elige según el modelo de hosting, los proveedores que necesitas y dónde deben vivir tus logs.
+
+## Proxy LiteLLM: una configuración que funciona
+
+El proxy lee un archivo YAML. `model_name` es el alias que ven las apps. Varias entradas con el mismo `model_name` forman un grupo con balanceo de carga.
+
+```yaml
+model_list:
+  - model_name: chat-default
+    litellm_params:
+      model: anthropic/claude-sonnet-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      rpm: 500                       # used for routing decisions
+  - model_name: chat-default
+    litellm_params:
+      model: bedrock/us.anthropic.claude-sonnet-5-5-v1:0   # example ID; copy the exact one from the Bedrock console
+      aws_region_name: us-east-1
+  - model_name: chat-cheap
+    litellm_params:
+      model: anthropic/claude-haiku-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: chat-private          # self-hosted, PII-safe
+    litellm_params:
+      model: hosted_vllm/llama-8b
+      api_base: http://vllm-llama8b.models.svc:8000/v1
+      input_cost_per_token: 0.0000002   # your internal GPU cost estimate
+      output_cost_per_token: 0.0000004
+
+router_settings:
+  routing_strategy: simple-shuffle    # weighted by rpm/tpm when set
+  num_retries: 2
+  timeout: 60
+  allowed_fails: 3                    # failures before a deployment cools down
+  cooldown_time: 30
+  fallbacks: [{ "chat-default": ["chat-cheap"] }]
+  context_window_fallbacks: [{ "chat-cheap": ["chat-default"] }]
+  redis_host: os.environ/REDIS_HOST   # shared state across proxy replicas
+  redis_port: 6379
+
+litellm_settings:
+  cache: true
+  cache_params: { type: redis, host: os.environ/REDIS_HOST, port: 6379, ttl: 600 }
+  success_callback: ["langfuse"]
+  drop_params: true                   # ignore params a provider does not support
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL   # Postgres: keys, teams, spend
+```
+
+Léelo de arriba abajo como una política. `chat-default` se reparte entre la API de Anthropic y Bedrock. Si ambos fallan después de los reintentos, los requests caen a `chat-cheap`. Un request demasiado largo para `chat-cheap` sube a `chat-default`. `chat-private` nunca sale del cluster.
+
+Fíjate en lo que **ya no** está en las apps: keys de proveedores, bucles de reintento, lógica de fallback y tablas de costos.
+
+## Equipos, keys y presupuestos
+
+Con una base de datos configurada, el proxy gestiona tenants. Un admin con la master key crea un equipo con presupuesto y una lista de modelos permitidos, y luego emite keys para ese equipo.
+
+```bash
+# Team with a monthly budget and allowed aliases
+curl -s http://gateway:4000/team/new \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{"team_alias": "claims-ops", "max_budget": 500, "budget_duration": "30d",
+       "models": ["chat-private", "chat-cheap"], "tpm_limit": 200000, "rpm_limit": 300}'
+
+# Key for one service in that team (team_id from the previous response)
+curl -s http://gateway:4000/key/generate \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
+  -d '{"team_id": "<team-id>", "key_alias": "claims-summarizer-prod", "max_budget": 200}'
+```
+
+Cuando un equipo supera su presupuesto, el gateway rechaza sus requests con un error de presupuesto excedido hasta que el período se reinicia. Es una decisión de política: algunas empresas prefieren alertas al 80% y un límite blando. Decídelo con finanzas, no solo en el YAML.
+
+Ahora las apps usan cualquier cliente compatible con OpenAI:
+
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url="http://gateway:4000", api_key=settings.gateway_key)
+
+async def summarize(text: str) -> str:
+    resp = await client.chat.completions.create(
+        model="chat-private",            # alias, not a vendor model id
+        messages=[{"role": "user", "content": f"Summarize:\n{text}"}],
+        max_tokens=400,
+        extra_body={"metadata": {"feature": "claim-summary"}},  # tags for spend reports
+    )
+    return resp.choices[0].message.content or ""
+```
+
+## Guardrails en el gateway
+
+Como todas las llamadas pasan por él, el gateway es un lugar natural para controles que deben aplicarse a todos los equipos. LiteLLM soporta integraciones de guardrails (por ejemplo Presidio para enmascarar PII, Bedrock Guardrails y otras) configuradas por fase de la llamada:
+
+```yaml
+guardrails:
+  - guardrail_name: pii-mask
+    litellm_params:
+      guardrail: presidio
+      mode: pre_call          # mask before the request leaves the network
+```
+
+Luego se puede exigir a equipos o keys que usen guardrails específicos. Los guardrails del gateway no reemplazan los controles a nivel de app del Módulo 3. Son un piso que todos los equipos reciben gratis.
+
+## Operar el gateway
+
+El gateway ahora está en el camino crítico de cada funcionalidad de IA. Trátalo como infraestructura central:
+
+- **Alta disponibilidad.** Corre al menos 3 réplicas sin estado distribuidas en zonas. El estado vive en Postgres (keys, gasto) y Redis (contadores de rate limit, cooldowns, caché). Sin Redis compartido, cada réplica aplica los límites por separado y un límite de 300 RPM se convierte en 900.
+- **Presupuesto de latencia.** Un proxy bien operado agrega unos pocos milisegundos. Mídelo: registra el overhead del gateway por separado de la latencia del proveedor.
+- **Streaming de punta a punta.** Prueba que los streams SSE pasen por el gateway y tu ingress sin buffering (lección 2).
+- **Secretos.** La master key y las keys de proveedores vienen de Secrets Manager o de un secret de Kubernetes sincronizado desde ahí. Nunca del archivo YAML.
+- **Configuración como código.** El YAML vive en git y se publica con el mismo proceso canary que cualquier servicio. Un cambio de ruteo malo es un release.
+- **Radio de impacto.** Un solo gateway para todo es un único punto de falla. Las empresas grandes corren deployments de gateway separados por entorno o por nivel de criticidad.
+
+## Errores comunes
+
+- **Apps que siguen guardando keys del proveedor "por las dudas".** Entonces la vista de costos y auditoría del gateway queda incompleta.
+- **Ids de modelo del proveedor hardcodeados en las apps.** Pierdes el beneficio principal: cambiar modelos de forma centralizada.
+- **Fallbacks que cruzan una frontera de cumplimiento.** Caer desde el modelo autoalojado para PII a una API pública filtra justo los datos que estabas protegiendo. Las cadenas de fallback deben respetar la clasificación de datos.
+- **Sin Redis compartido entre réplicas.** Los límites y cooldowns quedan por réplica.
+- **Tratar los presupuestos como exactos.** Los costos de modelos autoalojados son tus estimaciones; los cambios de precio de los proveedores requieren actualizar la configuración.
+- **Sin control de versiones de la configuración.** Una edición del YAML sin registro es un cambio de producción sin revisión.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Por qué pondrías un AI gateway delante de los proveedores de LLM, y cuáles son los riesgos?" level="mid">
+
+Un gateway centraliza responsabilidades que de otro modo cada equipo reimplementa: una API compatible con OpenAI sobre muchos proveedores, keys virtuales para que las keys de proveedores vivan en un solo lugar, alias de modelos para cambiar modelos de forma centralizada, reintentos y fallbacks, presupuestos y rate limits por equipo, caché, logging para costos y auditoría, y guardrails compartidos como el enmascarado de PII.
+
+Los riesgos son que se vuelve un único punto de falla y un salto extra de latencia, y que su configuración se vuelve una palanca poderosa de producción. Lo mitigo con varias réplicas entre zonas, Redis y Postgres compartidos para el estado, métricas de overhead del gateway, configuración en git con revisión y releases canary, y cadenas de fallback que respetan la clasificación de datos.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="El fallback consciente del cumplimiento">
+
+Una señal fuerte de seniority: "Los fallbacks son política de ruteo, y la política de ruteo debe respetar la clasificación de datos. El fallback de la carga con PII es una segunda réplica autoalojada o un reintento encolado, nunca una API pública."
+
+</Callout>
+
+## Lecturas adicionales
+
+- Documentación del proxy LiteLLM: https://docs.litellm.ai/docs/simple_proxy
+- Ruteo, reintentos y fallbacks en LiteLLM: https://docs.litellm.ai/docs/routing
+- Keys virtuales y presupuestos en LiteLLM: https://docs.litellm.ai/docs/proxy/virtual_keys
+- OWASP Top 10 para aplicaciones LLM: https://owasp.org/www-project-top-10-for-large-language-model-applications/

@@ -1,0 +1,162 @@
+## LLM workloads are waiting workloads
+
+A single LLM call spends almost all its time **waiting**: on the network, on the provider's queue, on token generation. Typical calls take 1–20 seconds. Your CPU is idle the whole time.
+
+If you classify 2,000 tickets sequentially at 2 seconds each, that is over an hour. With 20 calls in flight, it is under 4 minutes. That is what `asyncio` buys you: many concurrent waits on one thread, without the overhead and locking issues of threads.
+
+You already know `async/await` from TypeScript and Playwright. Python's model is similar, with a few sharp edges this lesson focuses on: **concurrency limits, timeouts, cancellation and blocking calls**.
+
+## The building blocks (Python 3.11+)
+
+- `async def` / `await` – coroutines that yield control while waiting.
+- `asyncio.TaskGroup` – structured concurrency: start tasks, wait for all, and if one fails, cancel the rest. Prefer it over bare `create_task`.
+- `asyncio.gather(..., return_exceptions=True)` – collect results and exceptions without cancelling siblings. Useful for batch jobs where one failure must not stop the others.
+- `asyncio.Semaphore(n)` – at most `n` coroutines inside a block at once. Your concurrency limit.
+- `asyncio.timeout(seconds)` – deadline for a block; raises `TimeoutError`.
+- `asyncio.to_thread(fn, ...)` – run blocking code (boto3, heavy parsing) in a worker thread so the event loop keeps running.
+
+## A batch classifier with bounded concurrency
+
+```python
+import asyncio
+from dataclasses import dataclass
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic(max_retries=0, timeout=30.0)  # one client, reused
+SEM = asyncio.Semaphore(10)                          # max 10 calls in flight
+
+@dataclass
+class Result:
+    ticket_id: str
+    label: str | None
+    error: str | None = None
+
+async def classify(ticket_id: str, text: str) -> Result:
+    async with SEM:                       # wait for a slot
+        try:
+            async with asyncio.timeout(25):   # end-to-end deadline per call
+                r = await client.messages.create(
+                    model="claude-haiku-5-5", max_tokens=64,
+                    output_config={"effort": "low"},
+                    system="Return only one label: order_status, shipping_delay, "
+                           "return_refund, damaged_item, billing, account_access, other.",
+                    messages=[{"role": "user", "content": text}],
+                )
+            label = "".join(b.text for b in r.content if b.type == "text").strip()
+            return Result(ticket_id, label)
+        except TimeoutError:
+            return Result(ticket_id, None, "timeout")
+
+async def classify_all(tickets: dict[str, str]) -> list[Result]:
+    results = await asyncio.gather(
+        *(classify(tid, text) for tid, text in tickets.items()),
+        return_exceptions=True,
+    )
+    return [r if isinstance(r, Result) else Result("?", None, repr(r)) for r in results]
+```
+
+Why each piece is there:
+
+- **One client, reused.** Each client holds an HTTP connection pool. Creating a client per request throws away keep-alive connections and TLS sessions, adding latency and sometimes exhausting sockets.
+- **Semaphore.** Without it, `gather` over 2,000 tickets fires 2,000 requests at once. You hit rate limits immediately, and your retries make it worse. Pick `n` from your rate limit (next lesson) and measure.
+- **Timeout per call.** A hung request must not hold a semaphore slot forever.
+- **`return_exceptions=True`.** In a batch job, one bad ticket should not cancel the other 1,999.
+
+### gather vs. TaskGroup
+
+Use `TaskGroup` when the tasks are **parts of one operation** and a failure means the whole result is invalid (e.g. fetching an order and the customer profile to build one prompt). It cancels the remaining tasks on the first exception and raises an `ExceptionGroup`.
+
+```python
+async def build_context(order_id: str, customer_id: str) -> dict:
+    async with asyncio.TaskGroup() as tg:
+        order_t = tg.create_task(fetch_order(order_id))
+        customer_t = tg.create_task(fetch_customer(customer_id))
+    return {"order": order_t.result(), "customer": customer_t.result()}
+```
+
+Use `gather(return_exceptions=True)` when tasks are **independent items** in a batch.
+
+## httpx for your own HTTP calls
+
+The Anthropic and OpenAI Python SDKs are built on `httpx`. For your own services (order API, CRM, internal tools called by the model), use `httpx.AsyncClient` with explicit timeouts and pool limits:
+
+```python
+import httpx
+
+ORDERS = httpx.AsyncClient(
+    base_url="https://orders.internal.example",
+    timeout=httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0),
+    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+    headers={"User-Agent": "support-router/1.0"},
+)
+
+async def fetch_order(order_id: str) -> dict:
+    resp = await ORDERS.get(f"/orders/{order_id}")
+    resp.raise_for_status()
+    return resp.json()
+
+# On shutdown (e.g. FastAPI lifespan): await ORDERS.aclose()
+```
+
+httpx timeouts are **per phase**, not total. A `read=5.0` timeout resets on every chunk received, so a slow trickle can run far longer than 5 seconds. For a hard end-to-end deadline, wrap the call in `asyncio.timeout(...)` as well. This distinction is exactly why streaming needs an idle timeout and a total deadline (lesson 4).
+
+`pool` is how long to wait for a free connection when `max_connections` are all busy. If you see `PoolTimeout`, your concurrency is higher than your pool, or connections are not being released (a response body not read or closed).
+
+## Cancellation: the part people get wrong
+
+When a task is cancelled (client disconnected, sibling failed in a TaskGroup, deadline reached), Python raises `asyncio.CancelledError` **inside** the coroutine at its current `await`. Rules:
+
+1. **Never swallow it.** `except Exception` does not catch `CancelledError` (it inherits from `BaseException`), which is good. A bare `except:` or `except BaseException:` that doesn't re-raise breaks cancellation.
+2. **Clean up in `finally` or context managers.** `async with client.messages.stream(...)` closes the HTTP connection when cancelled, which stops generation and billing.
+3. **Record partial work.** If a stream is cancelled after 300 output tokens, those tokens are billed. Log them in `finally`.
+
+```python
+async def tracked_stream(req) -> None:
+    usage_out = 0
+    try:
+        async with client.messages.stream(**req) as stream:
+            async for event in stream:
+                if event.type == "message_delta" and event.usage:
+                    usage_out = event.usage.output_tokens
+                ...
+    finally:
+        record_usage(req["model"], output_tokens=usage_out)  # runs on cancel too
+```
+
+## Blocking the event loop
+
+One synchronous call inside a coroutine freezes **every** concurrent task: `boto3`, `requests`, `time.sleep`, a big `json.loads` of a 50 MB file, a CPU-heavy tokenizer. Symptoms: concurrency "doesn't help", latencies spike together, timeouts fire in unrelated tasks.
+
+Fixes: use async libraries (`httpx`, async DB drivers), `await asyncio.sleep(...)` instead of `time.sleep`, and `await asyncio.to_thread(fn, ...)` for unavoidable blocking calls. Turn on asyncio debug mode in development (`PYTHONASYNCIODEBUG=1`); it logs callbacks that block the loop for more than 100 ms.
+
+## Common mistakes
+
+- Creating a new SDK or httpx client per request.
+- `gather` over thousands of coroutines with no semaphore.
+- Relying on httpx `read` timeouts as a total deadline.
+- Swallowing `CancelledError` or forgetting to close streams on cancel.
+- Calling `boto3` or `requests` directly inside `async def`.
+- Using `asyncio.run()` inside code that already runs in an event loop (FastAPI, Jupyter). Await the coroutine instead.
+- Fire-and-forget `create_task` without keeping a reference: the task can be garbage-collected and its exceptions are lost.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="You need to classify 50,000 tickets overnight with an LLM. How do you structure the job?" level="mid">
+
+Async Python with a single reused SDK client and a semaphore sized from my rate limits (requests and tokens per minute), measured with a small pilot. Each call has an end-to-end timeout and goes through my retry layer with jittered backoff that respects retry-after. I process in chunks with `gather(return_exceptions=True)` so one failure doesn't stop the batch, and write results incrementally so the job is resumable. I log usage and cost per call and track throughput and error rates. If latency doesn't matter, I'd also consider the provider's batch API, which is typically much cheaper for offline workloads.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explain how cancellation propagates through an async LLM streaming endpoint." level="senior">
+
+When the HTTP client disconnects, the ASGI server cancels the request task. `CancelledError` is raised at the current await point, typically inside the loop reading the provider stream. Because the provider stream is an async context manager, its exit closes the upstream HTTP connection, which stops generation and billing. `finally` blocks record partial usage and release resources such as semaphore slots. Nothing in the chain may catch and swallow `CancelledError`. With TaskGroups, a failure in one child cancels siblings the same way. I test this with a fake provider and by cancelling the task explicitly in a unit test, asserting the stream was closed and usage was recorded.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Python docs, coroutines and tasks (TaskGroup, timeout, gather): https://docs.python.org/3/library/asyncio-task.html
+- Python docs, asyncio synchronization primitives (Semaphore): https://docs.python.org/3/library/asyncio-sync.html
+- Python docs, developing with asyncio (debug mode, blocking calls): https://docs.python.org/3/library/asyncio-dev.html
+- HTTPX, async support: https://www.python-httpx.org/async/
+- HTTPX, timeouts and resource limits: https://www.python-httpx.org/advanced/timeouts/

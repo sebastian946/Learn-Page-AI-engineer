@@ -1,0 +1,164 @@
+## De "¿está bien?" a "¿qué estamos midiendo exactamente?"
+
+En el módulo 3 construiste un eval harness: un golden dataset, un juez LLM, un gate en CI. En el módulo 2 mediste RAG con Ragas y DeepEval. En el módulo 4 evaluaste trayectorias de agentes. Esas herramientas responden "¿bajó la calidad?". Este módulo responde preguntas más difíciles. ¿El modelo B es *realmente* mejor que el modelo A? ¿Podemos confiar en estas etiquetas? ¿Esta métrica se moverá cuando se mueva la métrica de negocio?
+
+Todo empieza con el diseño del eval. Como SDET nunca escribiste "probar la app". Escribiste una estrategia de pruebas: qué riesgos, qué niveles, qué oráculos, qué cobertura. El diseño de evals es la misma disciplina. Antes de elegir una métrica, escribe cuatro cosas:
+
+1. **La decisión que el eval respalda.** "Publicar el prompt v7", "migrar a un modelo más barato", "liberar a tenants enterprise". Un eval sin decisión se convierte en un dashboard que nadie lee.
+2. **La unidad de análisis.** Una respuesta, una conversación completa, un documento, una sesión de usuario. Tu tamaño de muestra cuenta estas unidades, no tokens ni turnos.
+3. **El oráculo.** Referencia exacta, conjunto de respuestas aceptables, rúbrica, juicio humano o una señal posterior como "ticket reabierto".
+4. **El costo del fallo.** Un tope de responsabilidad omitido en un contrato cuesta más que una frase torpe. Pondera tus métricas o, al menos, reporta los errores caros por separado.
+
+## Una taxonomía de métricas
+
+La mayoría de las funcionalidades con LLM caen en unas pocas formas de tarea. Cada forma tiene métricas que le encajan. Usar un "puntaje de calidad 1–5" genérico para todas es el error de diseño más común.
+
+| Forma de tarea | Ejemplo | Métricas principales | Oráculo |
+|---|---|---|---|
+| Clasificación / ruteo | Router de tickets, detección de intención | Precision, recall, F1 por clase, macro-F1, matriz de confusión | Etiqueta gold |
+| Extracción | Campos de contratos, parsing de facturas | Precision/recall/F1 por campo, exact match tras normalizar | Registro gold |
+| QA de respuesta corta | "¿Cuál es el plazo de preaviso?" | Exact match (normalizado), F1 de tokens, equivalencia semántica | Respuesta(s) de referencia |
+| Generación larga | Resúmenes, correos, explicaciones | Puntajes de rúbrica (cobertura, exactitud, concisión), preferencia pareada | Rúbrica + referencia opcional |
+| Generación fundamentada (RAG) | Asistente de conocimiento | Faithfulness, answer relevance, exactitud de citas (módulo 2) | Contexto recuperado |
+| Multi-paso / agéntica | Agente de operaciones | Éxito de la tarea, corrección de tool calls, pasos, costo (módulo 4 y la lección 10 de este) | Estado final + trayectoria |
+
+### Clasificación: deja de reportar solo accuracy
+
+Un router que manda el 90% de los tickets a "general" saca 90% de accuracy en un dataset donde el 90% de los tickets son generales. Es inútil. Reporta precision y recall por clase y mira la matriz de confusión. Precision responde "cuando el modelo dice *reembolso*, ¿qué tan seguido acierta?". Recall responde "de todos los tickets reales de reembolso, ¿cuántos atrapamos?".
+
+Elige el promedio a propósito. **Micro-F1** junta todas las decisiones y lo dominan las clases frecuentes. **Macro-F1** promedia el F1 de cada clase y trata a una clase rara como igual de importante. Si la clase rara es "fraude" o "amenaza legal", quieres macro-F1, más un objetivo de recall dedicado para esa clase.
+
+### Extracción: por campo, no por documento
+
+"Documento totalmente correcto" es demasiado estricto. Una fecha incorrecta marca como fallo un registro de 20 campos y esconde qué campos fallan. Evalúa cada campo:
+
+- **TP**: el gold tiene un valor y la predicción coincide tras normalizar.
+- **FP**: la predicción tiene un valor incorrecto, o el gold no tiene valor (campo alucinado).
+- **FN**: el gold tiene un valor y la predicción está vacía o es incorrecta.
+
+Un valor incorrecto cuenta como FP y como FN a la vez. Es la convención estándar y castiga más los errores confiados que las abstenciones. Eso coincide con la mayoría de los costos de negocio: un campo vacío va a un humano, un campo incorrecto va al cliente.
+
+La normalización es parte de la métrica. "30 días", "treinta (30) días" y "30 días naturales" pueden ser la misma respuesta. Escribe los normalizadores como código, pruébalos como cualquier otro código y versiónalos junto con el dataset.
+
+### Exact match vs similitud semántica
+
+El exact match es barato, determinista y frágil. La similitud coseno de embeddings es flexible y peligrosamente permisiva: "El tope es $1M" y "El tope es $10M" tienen embeddings muy parecidos y significan cosas opuestas. Usa esta escalera:
+
+1. Normaliza y aplica exact match cuando el espacio de respuestas es pequeño (números, fechas, enums, IDs).
+2. Acepta un conjunto de referencias cuando unas pocas redacciones son válidas.
+3. Usa un juez LLM con referencia ("¿el candidato es equivalente a la referencia para esta pregunta?") cuando la redacción varía mucho.
+4. Usa similitud de embeddings solo como pre-filtro barato o señal de drift, nunca como oráculo de aprobado/reprobado para hechos.
+
+### Resúmenes y textos largos
+
+ROUGE y BLEU miden solapamiento de n-gramas con una referencia. Correlacionan débilmente con el juicio humano para salidas de LLM modernas y premian copiar. Mejor descompón: **cobertura** (¿incluyó los puntos clave de una lista?), **exactitud** (¿todas las afirmaciones están respaldadas por la fuente?), **concisión** (longitud dentro del presupuesto) y **formato**. La cobertura y la exactitud se pueden verificar afirmación por afirmación. Eso hace que la métrica sea explicable, lo cual importa cuando un stakeholder pregunta "¿por qué esto sacó 3?".
+
+## Con referencia vs sin referencia
+
+Las métricas **con referencia** comparan contra una respuesta gold: exact match, F1 por campo, jueces de "equivalente a la referencia". Son precisas y estables, pero las referencias cuestan dinero y envejecen cuando cambian las políticas.
+
+Las métricas **sin referencia** juzgan la salida por sí sola o contra la entrada: faithfulness al contexto, apego a la rúbrica, toxicidad, validez del JSON, longitud. Escalan al tráfico de producción, donde no tienes respuestas gold. Son más ruidosas y necesitan calibración (lección 5).
+
+Una suite madura usa ambas. Con referencia en un set offline curado para decisiones de release. Sin referencia en tráfico de producción muestreado para monitoreo. Piénsalo como la diferencia entre aserciones contra un fixture y verificaciones de invariantes en producción.
+
+## Métricas que siguen los resultados de negocio
+
+Una métrica solo es útil si moverla mueve algo que le importa al negocio. Valida ese vínculo de forma explícita:
+
+- **Mapea métrica a resultado.** El macro-F1 del router se mapea a tickets mal ruteados, que se mapean a tiempo de atención. El recall de extracción en "renovación automática" se mapea a plazos de renovación perdidos.
+- **Verifica la correlación una vez.** Toma 100–200 casos históricos con un resultado conocido (ticket reabierto, el usuario editó el borrador, un abogado corrigió el campo). ¿Tu métrica separa los buenos de los malos resultados? Si no, es una métrica de vanidad.
+- **Prefiere un conjunto pequeño.** Una o dos métricas principales que deciden, unas cuantas secundarias que observas y métricas de guardrail que no deben retroceder (seguridad, latencia, costo). Más que eso y cada release tiene "resultados mixtos".
+
+<Callout type="tip" title="Lente SDET">
+
+Este es el problema del oráculo de pruebas que ya conoces. Una prueba con un oráculo débil (status code 200) pasa mientras la funcionalidad está rota. Una métrica con un oráculo débil (similitud de embeddings) pasa mientras los hechos están mal. Elige el oráculo más fuerte que puedas pagar para cada forma de tarea.
+
+</Callout>
+
+## Código: métricas de clasificación y de extracción por campo
+
+```python
+from collections import Counter
+from datetime import date
+import re
+
+from sklearn.metrics import classification_report, confusion_matrix
+
+def classification_metrics(gold: list[str], pred: list[str], labels: list[str]) -> None:
+    print(classification_report(gold, pred, labels=labels, digits=3, zero_division=0))
+    print(confusion_matrix(gold, pred, labels=labels))  # rows = gold, cols = pred
+
+def normalize(field: str, value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    v = value.strip().lower()
+    if field == "notice_days":
+        m = re.search(r"\d+", v)
+        return m.group() if m else v
+    if field == "governing_law":
+        return re.sub(r"^(the )?(state of |laws of )", "", v)
+    if field == "effective_date":
+        try:
+            return date.fromisoformat(v).isoformat()
+        except ValueError:
+            return v
+    return re.sub(r"\s+", " ", v)
+
+def field_f1(gold: list[dict], pred: list[dict], fields: list[str]) -> dict[str, dict[str, float]]:
+    counts: dict[str, Counter] = {f: Counter() for f in fields}
+    for g, p in zip(gold, pred, strict=True):
+        for f in fields:
+            gv, pv = normalize(f, g.get(f)), normalize(f, p.get(f))
+            if gv is not None and pv == gv:
+                counts[f]["tp"] += 1
+                continue
+            if pv is not None:
+                counts[f]["fp"] += 1  # wrong value or hallucinated field
+            if gv is not None:
+                counts[f]["fn"] += 1  # missed or wrong value
+    out = {}
+    for f, c in counts.items():
+        prec = c["tp"] / (c["tp"] + c["fp"]) if c["tp"] + c["fp"] else 0.0
+        rec = c["tp"] / (c["tp"] + c["fn"]) if c["tp"] + c["fn"] else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if prec + rec else 0.0
+        out[f] = {"precision": prec, "recall": rec, "f1": f1, "support": c["tp"] + c["fn"]}
+    return out
+```
+
+Reporta `support` junto a cada número. Un F1 de 1.0 en un campo con 3 valores gold no es evidencia de nada.
+
+## Errores comunes
+
+- **Un solo puntaje genérico de "calidad" 1–5 para todas las tareas.** Esconde qué dimensión falló y es difícil de calibrar. Descompón por forma de tarea.
+- **Accuracy con clases desbalanceadas.** Muestra siempre el recall por clase y la matriz de confusión.
+- **Similitud de embeddings como oráculo de hechos.** Los números y las negaciones apenas mueven los embeddings.
+- **Normalizadores que viven en un notebook.** Son parte de la métrica. Versiónalos y hazles pruebas unitarias.
+- **Contar turnos o tokens como muestras.** Tu muestra es la unidad de análisis. Diez turnos de una conversación no son diez muestras independientes.
+- **Sin vínculo con resultados.** Si nadie puede decir qué número de negocio protege una métrica, no debería bloquear un release.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Te piden evaluar una funcionalidad de extracción de contratos. ¿Qué métricas eliges y por qué?" level="mid">
+
+Evalúo por campo, no por documento. Para cada campo calculo precision, recall y F1 tras normalizar, con conteos de support. Un valor incorrecto cuenta como falso positivo y falso negativo, porque un valor incorrecto confiado es peor que un campo vacío que va a revisión. Agrego exact match por campo para enums y fechas. Reporto por separado los campos críticos como el tope de responsabilidad y la renovación automática, con su propio objetivo de recall, porque su costo de error es mucho mayor. Los normalizadores son código versionado con pruebas unitarias. Por último, verifico que la métrica correlacione con las correcciones reales que hicieron abogados en documentos históricos.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cuándo usarías una métrica sin referencia en lugar de una con referencia?" level="senior">
+
+Las métricas con referencia son mi elección para decisiones de release en un set offline curado: son estables y explicables. Pero las referencias son caras y no existen para el tráfico de producción. Así que para monitoreo uso verificaciones sin referencia sobre tráfico muestreado: faithfulness al contexto recuperado, apego a la rúbrica, validez de formato, seguridad. Son más ruidosas, así que las calibro contra etiquetas humanas y alerto sobre tendencias sostenidas, no sobre puntos aislados. También uso métricas sin referencia cuando el espacio de respuestas es abierto, como en resúmenes, pero las descompongo en afirmaciones verificables para que sigan siendo explicables.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Señal de seniority">
+
+Empieza tu respuesta con la decisión que respalda el eval y el costo de cada tipo de error. Después nombra métricas. Los candidatos que empiezan con "usaría Ragas" suenan a usuarios de herramientas. Los que empiezan con "la decisión es X, el error caro es Y" suenan a dueños.
+
+</Callout>
+
+## Lecturas recomendadas
+
+- scikit-learn, guía de evaluación de modelos: https://scikit-learn.org/stable/modules/model_evaluation.html
+- Ribeiro et al., "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList" (ACL 2020): https://arxiv.org/abs/2005.04118
+- Resumen de métricas de Ragas: https://docs.ragas.io
+- Métricas de DeepEval: https://docs.confident-ai.com

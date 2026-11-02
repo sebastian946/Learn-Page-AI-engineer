@@ -1,0 +1,163 @@
+## Objetivo
+
+Reconstruye tu pipeline RAG sin framework: `httpx` (o el SDK del proveedor) para embeddings, `psycopg` + `pgvector` para almacenamiento y retrieval híbrido, `numpy` donde necesites matemática vectorial, y el SDK de Anthropic para la generación. Todo el núcleo debe caber en **menos de 300 líneas** de código de aplicación (sin contar tests).
+
+Luego demuestra que no es un juguete: ejecútalo contra el golden dataset de `06-evals/` y compara sus scores con tu pipeline de LangChain. Mismos datos, mismo juez, dos implementaciones. Si la versión sin framework queda a pocos puntos y tiene menos piezas móviles, tienes una historia de portafolio sólida.
+
+Carpeta: `rag-lab/07-from-scratch/`.
+
+**Time box:** 90 minutos. Reutiliza tu SQL de la lección 17 y tu validador de citas de la lección 13. No reimplementes el re-ranker; importa el `CrossEncoderReranker` de `05-reranking/` o hazlo opcional.
+
+## Requisitos
+
+El paquete expone un CLI con dos comandos:
+
+```bash
+uv run python -m ragcore ingest data/chunks.jsonl     # embeds and upserts chunks
+uv run python -m ragcore ask "Can gift funds be used for an investment property?" --product conventional
+```
+
+La salida de `ask` imprime la respuesta, las citas (ID de chunk, documento, sección, página) y un resumen de trace en una línea: latencia de retrieval, latencia de generación, tokens de entrada y salida, y costo estimado.
+
+<AcceptanceCriteria>
+
+- [ ] No hay imports de `langchain*`, `llama_index*` ni frameworks similares en ningún lugar de `07-from-scratch/ragcore/`. Un test lo verifica escaneando los imports.
+- [ ] `ragcore/` suma menos de 300 líneas (un test o script cuenta las líneas que no están en blanco ni son comentarios).
+- [ ] Embeddings: en lotes, ordenados por `index`, normalizados, con backoff exponencial ante 429 y 5xx; un caché de embeddings con clave `sha256(model + text)` evita reprocesar chunks sin cambios al re-ingestar.
+- [ ] La ingesta es idempotente: ejecutar `ingest` dos veces deja el mismo número de filas (upsert sobre `chunk_id`).
+- [ ] El retrieval ejecuta consultas vectoriales y de texto completo en SQL, las fusiona con RRF (k = 60), soporta un filtro `product` y devuelve como máximo 5 chunks (tras el re-ranking opcional).
+- [ ] La salida de `EXPLAIN ANALYZE` en el README muestra que se usa el índice HNSW en la consulta vectorial.
+- [ ] La generación usa un system prompt que tú controlas, exige citas con IDs de chunk, las valida y maneja `NOT_FOUND` cuando el contexto es insuficiente.
+- [ ] `eval_compare.py` ejecuta este pipeline y el de LangChain sobre `06-evals/data/golden.jsonl` e imprime faithfulness, context recall, recall@5, latencia p95 y costo promedio por solicitud de cada uno.
+- [ ] El README tiene una sección "Lo que LangChain escondía" con al menos cinco decisiones concretas que tuviste que tomar tú.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 07-from-scratch/ragcore/pipeline.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+from .embed import embed
+from .generate import generate
+from .store import KEYWORD_SQL, VECTOR_SQL, rrf, search
+from .validate import validate_citations
+
+
+@dataclass
+class Trace:
+    question: str
+    retrieved_ids: list[str] = field(default_factory=list)
+    retrieval_ms: float = 0.0
+    generation_ms: float = 0.0
+    usage: dict = field(default_factory=dict)
+    citation_problems: list[str] = field(default_factory=list)
+
+
+async def ask(conn, question: str, product: str | None = None, reranker=None, top_k: int = 5) -> tuple[dict, Trace]:
+    trace = Trace(question=question)
+    t0 = time.perf_counter()
+
+    qvec = (await embed([question]))[0]
+    # TODO: run VECTOR_SQL and KEYWORD_SQL with k=40 and the product filter
+    # TODO: fuse with rrf(...), optionally rerank, keep top_k
+    chunks: list[dict] = []
+    trace.retrieved_ids = [c["chunk_id"] for c in chunks]
+    trace.retrieval_ms = (time.perf_counter() - t0) * 1000
+
+    t1 = time.perf_counter()
+    result = await generate(question, chunks)
+    trace.generation_ms = (time.perf_counter() - t1) * 1000
+    trace.usage = result["usage"]
+    # TODO: validate citations when result["found"]; store problems on the trace
+    return result, trace
+```
+
+```python
+# 07-from-scratch/tests/test_constraints.py
+import ast
+from pathlib import Path
+
+PKG = Path(__file__).parent.parent / "ragcore"
+BANNED = ("langchain", "llama_index", "haystack")
+
+
+def test_no_framework_imports() -> None:
+    for path in PKG.rglob("*.py"):
+        tree = ast.parse(path.read_text("utf-8"))
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            assert not any(n.startswith(BANNED) for n in names), f"{path}: framework import {names}"
+
+
+def test_under_300_lines() -> None:
+    total = 0
+    for path in PKG.rglob("*.py"):
+        lines = [l.strip() for l in path.read_text("utf-8").splitlines()]
+        total += sum(1 for l in lines if l and not l.startswith("#"))
+    assert total < 300, f"ragcore has {total} lines"
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Divide `ragcore/` en módulos pequeños: `embed.py`, `store.py`, `generate.py`, `validate.py`, `pipeline.py`, `cli.py`. Cada uno debería leerse en una sola pantalla. Si un archivo pasa de 80 líneas, probablemente estás construyendo un framework.</Hint>
+  <Hint>Para una ingesta idempotente usa `INSERT ... ON CONFLICT (chunk_id) DO UPDATE SET text = EXCLUDED.text, embedding = EXCLUDED.embedding`. Para el caché de embeddings, una tabla pequeña `embedding_cache(hash text primary key, embedding vector(N))` funciona y mantiene todo en Postgres.</Hint>
+  <Hint>Al pasar el vector de la consulta a psycopg, el adaptador `pgvector` acepta un arreglo de numpy una vez que llamas a `register_vector(conn)`. Si el planner ignora tu índice HNSW, verifica que la consulta use el operador que corresponde a la clase del índice (`<#>` para `vector_ip_ops`) y ejecuta `ANALYZE chunks;` después de una carga masiva.</Hint>
+  <Hint>Para `eval_compare.py`, escribe un pequeño adaptador para que ambos pipelines devuelvan la misma forma `RunRecord` de `06-evals/golden.py`. Así reutilizas tu código de puntuación sin cambios. Mismo modelo juez, mismo dataset, mismo top-k, o la comparación no tiene sentido.</Hint>
+</Hints>
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  07-from-scratch/
+    README.md
+    pyproject.toml           # httpx, psycopg[binary], pgvector, numpy, anthropic
+    ragcore/
+      __init__.py
+      __main__.py
+      cli.py
+      embed.py
+      store.py
+      generate.py
+      validate.py
+      pipeline.py
+    eval_compare.py
+    sql/
+      001_schema.sql
+    tests/
+      test_constraints.py
+      test_rrf.py
+      test_validate.py
+```
+
+**Estructura del README**
+
+1. Qué y por qué: el núcleo RAG en menos de 300 líneas, sin framework
+2. Arquitectura: embeber, almacenar, recuperar (vectorial + texto completo + RRF), generar, validar
+3. Cómo ejecutarlo: `ingest` y `ask`, con salida de ejemplo
+4. Fragmento de `EXPLAIN ANALYZE` que muestra el índice en uso
+5. Tabla comparativa contra el pipeline de LangChain (tus números medidos)
+6. Lo que LangChain escondía: cinco o más decisiones concretas
+7. Cuándo seguiría usando un framework
+
+**Commits sugeridos**
+
+- `feat(07-from-scratch): add batched embedding client with backoff and cache`
+- `feat(07-from-scratch): add pgvector schema and hybrid SQL retrieval with RRF`
+- `feat(07-from-scratch): add generation with chunk-id citations and validation`
+- `test(07-from-scratch): enforce no-framework imports and 300-line budget`
+- `docs(07-from-scratch): compare against LangChain pipeline on golden set`
+
+</CommitBox>
+
+<Checklist id="m2-18-review" title="Autoevaluación" items={["No hay imports de frameworks, y un test lo verifica", "El núcleo tiene menos de 300 líneas y cada archivo cabe en una pantalla", "Los resultados de embeddings se ordenan por índice y se normalizan", "El backoff maneja 429 y 5xx; la ingesta es idempotente", "El SQL usa parámetros, nunca f-strings", "EXPLAIN ANALYZE confirma que se usa el índice vectorial", "Las citas se validan antes de devolver la respuesta", "Ambos pipelines se evaluaron con el mismo dataset, juez y top-k", "El README explica al menos cinco decisiones que antes tomaba el framework por mí"]} />

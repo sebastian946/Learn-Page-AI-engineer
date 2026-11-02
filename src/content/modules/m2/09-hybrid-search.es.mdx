@@ -1,0 +1,209 @@
+## Por qué la búsqueda vectorial sola no basta
+
+Corre tu golden set del ejercicio de chunking y mira las fallas. Aparece un patrón rápido: las preguntas con **identificadores exactos** fallan más que las conceptuales.
+
+- "What does Form 4506-C authorize?"
+- "Rules for Section 50(a)(6) loans"
+- "Is LTV 97% allowed for HomeReady?"
+- "What is reason code DU-1234?"
+
+Los embeddings densos capturan significado, pero comprimen tokens raros como números de formulario, referencias a leyes y códigos de producto en una región general de "esto trata de formularios hipotecarios". El chunk que contiene literalmente "4506-C" puede quedar por debajo de un chunk sobre otro formulario fiscal con redacción similar.
+
+La búsqueda por palabras clave tiene el perfil opuesto. Acierta los términos exactos y falla con las paráfrasis ("highest debt ratio we'll accept" nunca coincide con "maximum DTI"). **La búsqueda híbrida ejecuta ambas y fusiona los resultados.** En corpus llenos de identificadores, como las políticas de préstamo, es una de las mejoras más confiables que puedes hacer, y es barata.
+
+## BM25 en dos minutos
+
+BM25 es la función clásica de ranking por palabras clave detrás de Lucene, Elasticsearch y OpenSearch. Para cada término de la consulta premia:
+
+- **La frecuencia del término** en el chunk, con rendimientos decrecientes (parámetro `k1`, típicamente alrededor de 1.2–2.0).
+- **La rareza** en el corpus (frecuencia inversa de documento, IDF): "4506-C" es raro, así que una coincidencia vale mucho; "loan" está en todas partes, así que vale poco.
+- **Los chunks cortos** sobre los largos con las mismas coincidencias (normalización por longitud, parámetro `b`, típicamente 0.75).
+
+Opciones para una rama estilo BM25:
+
+| Opción | Notas |
+|---|---|
+| Búsqueda full-text de Postgres (`tsvector`, `ts_rank_cd`) | integrada, índice GIN, misma base de datos y transacción que tus vectores. El ranking no es BM25 real (no satura el IDF de la misma forma), pero en la práctica funciona bien para este propósito |
+| Extensión `pg_search` de ParadeDB | BM25 real dentro de Postgres; una extensión más que operar |
+| `rank_bm25` (Python) | ideal para experimentos y corpus pequeños; en memoria, se reconstruye ante cambios |
+| Elasticsearch / OpenSearch | BM25 real, analizadores, sinónimos; un segundo sistema que operar |
+| Vectores sparse (SPLADE, BM25 sparse) en Qdrant | híbrido dentro de un solo motor vectorial |
+
+Para `rag-lab` y el proyecto final usamos la búsqueda full-text de Postgres, porque mantiene todo en una sola base de datos y una sola consulta.
+
+### Búsqueda full-text en Postgres
+
+```sql
+ALTER TABLE chunks
+  ADD COLUMN tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(section, '') || ' ' || content)) STORED;
+
+CREATE INDEX chunks_tsv_gin ON chunks USING gin (tsv);
+
+-- keyword leg: top 20 by text rank
+SELECT chunk_id, ts_rank_cd(tsv, q) AS kw_score
+FROM chunks, websearch_to_tsquery('english', 'Form 4506-C authorization') AS q
+WHERE tsv @@ q
+ORDER BY kw_score DESC
+LIMIT 20;
+```
+
+`websearch_to_tsquery` acepta entradas estilo usuario (comillas para frases, `or`, `-` para excluir) y nunca lanza un error de sintaxis, lo que la hace segura para preguntas crudas de usuarios. Cuidado con el tokenizer: la configuración `english` aplica stemming y puede partir identificadores como "4506-C". Prueba explícitamente tus identificadores importantes; si se rompen, agrega una segunda columna con la configuración `simple` para los códigos, o normalízalos en la ingesta ("4506-C" a "4506C").
+
+## Fusionar las dos listas de resultados
+
+Ahora tienes dos listas rankeadas con puntajes incompatibles: similitud coseno entre 0 y 1, y rank de texto en una escala arbitraria. No puedes simplemente sumarlos.
+
+### Reciprocal rank fusion (RRF)
+
+RRF ignora los puntajes y usa solo las posiciones. Cada documento obtiene `score = sum over lists of 1 / (k + rank)`, con `k = 60` como la constante convencional del paper original.
+
+```python
+from collections import defaultdict
+
+
+def rrf(result_lists: list[list[str]], k: int = 60, weights: list[float] | None = None,
+        top_n: int = 10) -> list[tuple[str, float]]:
+    """Fuse ranked lists of IDs. Rank is 1-based. Higher fused score = better."""
+    weights = weights or [1.0] * len(result_lists)
+    scores: dict[str, float] = defaultdict(float)
+    for w, ids in zip(weights, result_lists):
+        for rank, doc_id in enumerate(ids, start=1):
+            scores[doc_id] += w / (k + rank)
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+
+
+vector_ids = ["c12", "c07", "c33", "c02"]
+keyword_ids = ["c33", "c91", "c12"]
+print(rrf([vector_ids, keyword_ids]))
+# c12 and c33 appear in both lists, so they rise to the top
+```
+
+Por qué RRF es el valor por defecto:
+
+- **Sin calibración de puntajes.** Funciona con cualquier retriever, incluidos los futuros (un re-ranker, un segundo modelo de embeddings).
+- **Robusto.** Un documento bien rankeado por ambas ramas gana; uno rankeado primero por una sola rama sigue puntuando bien.
+- **Una sola perilla.** `k` controla cuánto dominan las primeras posiciones. Un `k` más chico premia más la posición 1. Los pesos por rama te permiten favorecer vectores o palabras clave; ajusta ambos con el golden set.
+
+### Fusión ponderada de puntajes
+
+La alternativa es normalizar los puntajes de cada lista (min-max dentro de la lista de resultados) y combinarlos con `alpha * vector + (1 - alpha) * keyword`. Puede sacar un poco más de calidad si se ajusta bien, pero la normalización min-max es sensible a valores atípicos y a cuántos resultados devuelve cada rama. Empieza con RRF; prueba la fusión ponderada solo si el golden set muestra una ganancia.
+
+### Híbrido en una sola consulta SQL
+
+```sql
+WITH params AS (
+  SELECT %(qvec)s::vector AS qvec, websearch_to_tsquery('english', %(qtext)s) AS qts
+),
+filtered AS (
+  SELECT c.* FROM chunks c JOIN documents d USING (doc_id)
+  WHERE d.is_current
+    AND d.jurisdiction = ANY(%(jur)s)
+    AND (%(doc_type)s::text IS NULL OR d.doc_type = %(doc_type)s)
+),
+vec AS (
+  SELECT chunk_id, row_number() OVER (ORDER BY embedding <=> (SELECT qvec FROM params)) AS r
+  FROM filtered ORDER BY embedding <=> (SELECT qvec FROM params) LIMIT 40
+),
+kw AS (
+  SELECT chunk_id, row_number() OVER (ORDER BY ts_rank_cd(tsv, (SELECT qts FROM params)) DESC) AS r
+  FROM filtered WHERE tsv @@ (SELECT qts FROM params)
+  ORDER BY ts_rank_cd(tsv, (SELECT qts FROM params)) DESC LIMIT 40
+)
+SELECT chunk_id,
+       coalesce(1.0 / (60 + vec.r), 0) + coalesce(1.0 / (60 + kw.r), 0) AS rrf
+FROM vec FULL OUTER JOIN kw USING (chunk_id)
+ORDER BY rrf DESC
+LIMIT %(k)s;
+```
+
+Cada rama recupera más candidatos (40) de los que finalmente devuelves (5–10). La fusión necesita profundidad: un chunk en la posición 15 por vectores y 2 por palabras clave debería poder ganar. Fíjate en que el CTE aplica los filtros antes de rankear; en tablas grandes verifica con `EXPLAIN` que el índice HNSW se siga usando, o aplica los filtros dentro de cada rama.
+
+## Filtrado por metadata
+
+El ranking híbrido decide el *orden*. Los filtros de metadata deciden la *elegibilidad*. En un corpus hipotecario, los tres filtros que evitan las peores respuestas son:
+
+- **Fecha de vigencia / is_current.** Nunca respondas con una política reemplazada a menos que el usuario pregunte por una fecha pasada.
+- **Jurisdicción.** Las reglas de home equity de Texas difieren de las de California. Un oficial de crédito en Texas debe recibir documentos `US` y `US-TX`, no `US-CA`.
+- **Tipo de documento.** Algunas preguntas solo deben usar guías de underwriting, no FAQs de marketing.
+
+¿De dónde salen los valores de los filtros?
+
+1. **Del contexto del request (preferido).** El perfil del usuario o la UI: estado de la sucursal, línea de producto, rol. Determinista y auditable.
+2. **Extraídos de la pregunta.** "What was the gift fund rule in Texas in 2024?" contiene una jurisdicción y una fecha. Un modelo barato con salida estructurada puede extraerlas (el patrón "self-query"):
+
+```python
+from datetime import date
+from typing import Literal
+import anthropic
+from pydantic import BaseModel
+
+class SearchFilters(BaseModel):
+    jurisdiction: str | None = None          # "US-TX"
+    as_of: date | None = None
+    doc_type: Literal["policy", "underwriting_guideline", "faq"] | None = None
+
+client = anthropic.AsyncAnthropic()
+
+async def extract_filters(question: str) -> SearchFilters:
+    msg = await client.messages.create(
+        model="claude-haiku-5-5", max_tokens=200,
+        system="Extract search filters. Use US state codes like US-TX. Omit unknown fields.",
+        tools=[{"name": "set_filters", "description": "Search filters",
+                "input_schema": SearchFilters.model_json_schema()}],
+        tool_choice={"type": "tool", "name": "set_filters"},
+        messages=[{"role": "user", "content": question}],
+    )
+    return SearchFilters.model_validate(msg.content[0].input)
+```
+
+Valida los valores extraídos contra una lista permitida (jurisdicciones conocidas, tipos de documento conocidos). Trata la extracción como una pista: si un filtro estricto no devuelve nada, reintenta sin él y dilo, en lugar de responder "no lo sé".
+
+**Nota de seguridad:** el control de acceso también es un filtro, pero nunca debe venir de la pregunta. Los permisos vienen del usuario autenticado, se aplican en la consulta en cada rama y se prueban. Lo verás de nuevo en el Módulo 7 (multi-tenancy).
+
+## Híbrido con LangChain
+
+El `EnsembleRetriever` de LangChain fusiona retrievers con RRF ponderado:
+
+```python
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+
+bm25 = BM25Retriever.from_documents(chunks, k=20)          # uses rank_bm25 in memory
+dense = pg_store.as_retriever(search_kwargs={"k": 20})
+hybrid = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.4, 0.6])
+docs = hybrid.invoke("Form 4506-C authorization period")
+```
+
+Bueno para prototipar. En producción prefiere la versión de una sola consulta SQL: un solo viaje de ida y vuelta, filtros aplicados de forma consistente a ambas ramas y ningún índice BM25 en memoria que reconstruir con cada cambio.
+
+## Errores comunes
+
+- **Sumar puntajes crudos de distintos retrievers.** El coseno y el rank de texto están en escalas diferentes. Usa RRF o normaliza.
+- **Muy pocos candidatos por rama.** Fusionar dos listas top-5 no le deja nada con qué trabajar a la fusión. Recupera 20–50 por rama.
+- **Filtros en una sola rama.** La rama de palabras clave devuelve feliz una política reemplazada de California que la rama vectorial había filtrado.
+- **No probar los identificadores a través del tokenizer.** El stemming y la separación por guiones pueden volver imposible de buscar "4506-C".
+- **Confiar ciegamente en los filtros extraídos por el LLM.** Valídalos contra listas permitidas y ten un respaldo elegante.
+- **Evaluar el híbrido con un golden set fácil.** Si el set no tiene preguntas de términos exactos, el híbrido parecerá inútil. Inclúyelas.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="Explica la búsqueda híbrida y reciprocal rank fusion. ¿Por qué no simplemente sumar los puntajes?" level="mid">
+
+La búsqueda híbrida ejecuta un retriever por palabras clave (BM25 o full-text de Postgres) y un retriever vectorial denso sobre el mismo corpus, y combina los resultados. La búsqueda por palabras clave atrapa identificadores exactos como números de formulario y referencias a leyes; los vectores atrapan las paráfrasis. Sus puntajes están en escalas diferentes y no calibradas, así que sumarlos deja que un retriever domine de forma arbitraria. Reciprocal rank fusion usa posiciones: cada documento suma 1 sobre (k más la posición) en cada lista, con k alrededor de 60. Los documentos bien rankeados en ambas suben al tope, y no requiere calibración. Recupero 20–50 candidatos por rama, fusiono y paso los 5–10 mejores a un re-ranker o al LLM, ajustando los pesos con un golden set.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="¿Cómo te aseguras de que un asistente RAG nunca responda con una política reemplazada o de otra jurisdicción?" level="senior">
+
+Lo convierto en una garantía de datos y de consulta, no en una instrucción del prompt. En la ingesta, cada documento recibe `effective_date`, `is_current` y `jurisdiction` como columnas tipadas. En la consulta, los filtros vienen principalmente del contexto autenticado del request (el estado del oficial, el producto), refinados opcionalmente con una extracción validada desde la pregunta, y se aplican dentro de cada rama de retrieval, antes de la fusión. Las versiones reemplazadas se quedan en la base de datos para auditoría pero se excluyen por defecto; las preguntas con fecha específica cambian a un filtro `as_of`. Luego lo pruebo: preguntas doradas cuya respuesta correcta solo existe en el documento vigente o en el de un solo estado, más un test de propiedades que verifica que ningún chunk recuperado viole los filtros.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- [Cormack, Clarke y Büttcher, Reciprocal Rank Fusion (SIGIR 2009)](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)
+- [PostgreSQL — Búsqueda full-text](https://www.postgresql.org/docs/current/textsearch.html)
+- [pgvector — Ejemplos de búsqueda híbrida](https://github.com/pgvector/pgvector)
+- [LangChain — Ensemble retriever](https://python.langchain.com/docs/how_to/ensemble_retriever/)
+- [Qdrant — Consultas híbridas](https://qdrant.tech/documentation/concepts/hybrid-queries/)

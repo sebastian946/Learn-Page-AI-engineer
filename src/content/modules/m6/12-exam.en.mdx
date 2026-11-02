@@ -1,0 +1,22 @@
+# Module 6 exam
+
+This exam is styled like the **Databricks Certified Generative AI Engineer Associate**: most questions describe a team, a constraint and a goal, then ask which approach fits best. A few test SQL and pipeline skills from the first two lessons, and a few cover fine-tuning and self-hosting decisions.
+
+**What it covers**
+
+- SQL over LLM logs: percentiles, window functions, building eval datasets
+- Pipelines: incremental loads, idempotency, dedup, PII scrubbing, lineage
+- Unity Catalog, Volumes, Delta (CDF, time travel) and governance
+- Vector Search: endpoints, Delta Sync vs Direct Access, sync modes, managed embeddings
+- Model Serving: pay-per-token, provisioned throughput, external models, AI Gateway, `ai_query`
+- MLflow tracing and GenAI evaluation, LLM judges and custom scorers
+- Agent Framework: models from code, resources, Unity Catalog registration, `agents.deploy`, Review App
+- Prompting → RAG → fine-tuning, LoRA/QLoRA, vLLM
+
+**How to prepare**
+
+Re-read the "exam pattern" callouts and the common-mistakes sections. For each scenario question, look for the answer that keeps data governed in Unity Catalog, uses the managed option with the least custom code, and matches the stated constraint (freshness, SLA, cost, compliance). Read every option: several will be plausible, only one fits all constraints.
+
+**Format:** 18 questions, 35 minutes, passing score **70%**. Single choice, multi-select, ordering and code-reading questions. You can retake it.
+
+This is practice, not the official exam. Check the current official exam guide for domains and weights before booking.

@@ -1,0 +1,173 @@
+## Las fallas son tráfico normal
+
+Las APIs de LLM fallan más seguido que las bases de datos y servicios internos a los que estás acostumbrado. A escala, espera:
+
+- **429 Too Many Requests** – excediste un rate limit.
+- **529 Overloaded** (Anthropic) o **503** – el proveedor está al límite de capacidad.
+- **500 / 502** – errores transitorios del servidor.
+- **Timeouts y conexiones reiniciadas** – red o generaciones largas.
+- **400 / 401 / 403 / 404** – tu bug, tu key, tu id de modelo. **Nunca los reintentes.**
+
+Una API inestable es para un AI engineer lo que un ambiente inestable es para un SDET: no deseas que desaparezca, diseñas para ella. Las herramientas son **reintentos con backoff y jitter**, **rate limiting del lado del cliente**, **fechas límite** y **fallbacks**.
+
+## Backoff exponencial con jitter
+
+Reintentar de inmediato empeora la sobrecarga. Reintentar con un horario fijo hace que todos los clientes reintenten **en el mismo momento** (thundering herd, la estampida). La solución estándar es backoff exponencial con *full jitter*:
+
+```text
+sleep = random_uniform(0, min(cap, base * 2 ** attempt))
+```
+
+Con `base = 1s` y `cap = 30s`, el intento 0 duerme 0–1 s, el intento 1 duerme 0–2 s, el intento 2 duerme 0–4 s, y así sucesivamente. La aleatoriedad dispersa los reintentos, así el proveedor ve una carga suave en lugar de picos sincronizados. El análisis de AWS sobre estrategias de jitter es la referencia clásica.
+
+### Respeta `retry-after`
+
+Cuando un proveedor envía un header `retry-after` (en segundos) con un 429 o 529, te está diciendo exactamente cuándo vuelve la capacidad. Úsalo como espera **mínima** (con un poco de jitter encima). Ignorarlo te trae más 429.
+
+Anthropic también devuelve headers como `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-input-tokens-remaining` y `anthropic-ratelimit-output-tokens-remaining` con tiempos de reinicio. Regístralos; hacen concreta la planificación de capacidad.
+
+## Un wrapper de reintentos que respeta fechas límite
+
+```python
+import asyncio, random, time, logging
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
+
+T = TypeVar("T")
+log = logging.getLogger("llm.retry")
+
+async def with_retries(
+    call: Callable[[], Awaitable[T]],
+    *,
+    max_attempts: int = 4,
+    base: float = 1.0,
+    cap: float = 30.0,
+    deadline_s: float = 60.0,
+) -> T:
+    start = time.monotonic()
+    for attempt in range(max_attempts):
+        try:
+            return await call()
+        except LLMError as exc:                     # normalized errors (lesson 6)
+            last_try = attempt == max_attempts - 1
+            if not exc.retryable or last_try:
+                raise
+            delay = random.uniform(0, min(cap, base * 2 ** attempt))
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after:
+                delay = max(delay, retry_after + random.uniform(0, 1))
+            if time.monotonic() - start + delay > deadline_s:
+                raise                               # retrying would blow the deadline
+            log.warning("retry", extra={"attempt": attempt + 1, "delay_s": round(delay, 2),
+                                        "provider": exc.provider, "status": exc.status})
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+```
+
+Decisiones de diseño:
+
+- **Intentos acotados y una fecha límite total.** Un request de cara al usuario con un SLO de 10 segundos no puede dormir 30 segundos. Los jobs batch toleran más.
+- **Solo errores reintentables** (lo decide el adaptador, no una comparación de strings).
+- **Registra cada reintento.** La tasa de reintentos es un indicador adelantado de problemas del proveedor y de un rate limit subdimensionado.
+- **Una sola capa de reintentos.** Desactiva los reintentos del SDK (`max_retries=0`) cuando tú te encargas de ellos, o mantén los del SDK y no agregues los tuyos. Los reintentos apilados se multiplican.
+
+`tenacity` es una librería sólida para esto si prefieres decoradores declarativos (`wait_random_exponential`, `stop_after_attempt`, `retry_if_exception`). Los conceptos son idénticos.
+
+### ¿Es seguro reintentar?
+
+Una llamada de generación simple no tiene efectos secundarios, así que reintentar es seguro — pero **no gratis**: si el primer intento sí se completó y la respuesta se perdió, pagas dos veces. Las tool calls con efectos secundarios (reembolso, enviar email) son distintas: haz la tool idempotente con una idempotency key, o no la reintentes a ciegas.
+
+## Rate limits: conoce tus tres presupuestos
+
+Los proveedores te limitan en varios ejes a la vez, por modelo o familia de modelos, por organización:
+
+- **Requests por minuto (RPM)**
+- **Tokens de entrada por minuto (ITPM)**
+- **Tokens de salida por minuto (OTPM)**
+
+Cualquiera de ellos puede disparar un 429. Un job que envía pocos prompts pero enormes choca primero con ITPM. Un agente conversador con muchas llamadas pequeñas choca primero con RPM. Las respuestas largas chocan con OTPM. Los límites también varían según el tier de uso y cambian con el tiempo, así que léelos de la consola y los headers, no de un blog.
+
+## Rate limiting del lado del cliente con un token bucket
+
+En lugar de disparar requests y reaccionar a los 429, **da forma a tu tráfico** antes de que salga. Un **token bucket** (cubeta de tokens) contiene hasta `capacity` tokens y se rellena a `rate` por segundo. Cada request toma tokens; si no hay suficientes, espera.
+
+```python
+import asyncio, time
+
+class TokenBucket:
+    def __init__(self, rate_per_s: float, capacity: float) -> None:
+        self.rate, self.capacity = rate_per_s, capacity
+        self.tokens = capacity
+        self.updated = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, amount: float = 1.0) -> None:
+        if amount > self.capacity:
+            raise ValueError("request larger than bucket capacity")
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                wait = (amount - self.tokens) / self.rate
+            await asyncio.sleep(wait)
+
+# Example: 50 RPM and 40k input tokens/minute (use YOUR real limits, with ~10-20% headroom)
+requests_bucket = TokenBucket(rate_per_s=50 / 60, capacity=10)
+itpm_bucket = TokenBucket(rate_per_s=40_000 / 60, capacity=40_000)
+
+async def limited_call(estimated_input_tokens: int, call):
+    await requests_bucket.acquire(1)
+    await itpm_bucket.acquire(estimated_input_tokens)
+    return await with_retries(call)
+```
+
+Notas:
+
+- Estima los tokens de entrada antes de la llamada (endpoint de conteo, o una heurística calibrada por velocidad). Después de la llamada, puedes corregir con el usage real.
+- Deja un margen de 10–20% por debajo del límite real: otros servicios pueden compartir tu key.
+- El **semáforo** (lección 7) limita la concurrencia; el **bucket** limita el throughput. Normalmente quieres ambos.
+- Un bucket en un proceso no se coordina entre réplicas. Con varios pods, usa un limitador compartido (basado en Redis, módulo 5) o divide el presupuesto por réplica.
+
+## Fallbacks y circuit breakers
+
+Los reintentos manejan interrupciones cortas. Para incidentes más largos:
+
+- **Fallback**: cuando se agotan los reintentos (o de inmediato ante un 529), envía el request a un modelo o proveedor de respaldo. Solo a modelos que pasaron tus evals para esta feature.
+- **Circuit breaker**: si el 50% de las llamadas a un proveedor fallan en los últimos 30 segundos, deja de llamarlo durante un periodo de enfriamiento y ve directo al fallback. Así evitas quemar latencia en reintentos que van a fallar.
+- **Degradación elegante**: si todo falla, devuelve un valor seguro por defecto (enrutar el ticket a la cola humana general) en lugar de un 500.
+
+## Errores comunes
+
+- Reintentar 400 y 401.
+- Esperas fijas sin jitter, que crean olas de reintentos sincronizadas.
+- Ignorar `retry-after`.
+- Reintentos sin límite que superan el timeout del usuario.
+- Apilar reintentos: reintentos del SDK × tus reintentos × un reintento del job externo.
+- Solo reaccionar a los 429 en lugar de dar forma al tráfico con un semáforo y un token bucket.
+- Limitadores por proceso en un despliegue con varias réplicas, cada uno asumiendo que tiene toda la cuota.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cuál es tu estrategia de reintentos para llamadas a APIs de LLM?" level="mid">
+
+Primero clasifico los errores: reintento 429, 5xx, proveedor sobrecargado, timeouts y errores de conexión; nunca reintento 400, 401, 403 o 404. Uso backoff exponencial con full jitter, con tope, y uso retry-after como espera mínima cuando está presente. Acoto los intentos y aplico una fecha límite total acorde al SLO de quien llama. Reintento en exactamente una capa y registro cada reintento con proveedor, status y espera. Cuando se agotan los reintentos, hago fallback a un modelo alternativo evaluado, o degrado elegantemente. Las tool calls con efectos secundarios necesitan idempotency keys antes de poder reintentarse.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Tu job batch sigue recibiendo 429 aunque estás por debajo del límite de requests por minuto. ¿Por qué?" level="senior">
+
+Porque RPM es solo uno de los límites. Probablemente el job excede los tokens de entrada por minuto (prompts grandes) o los tokens de salida por minuto (respuestas largas), u otro servicio comparte la misma cuota de la organización. Leería los headers de rate limit para ver qué presupuesto se agotó, y luego daría forma al tráfico con token buckets para requests y tokens de entrada, estimando tokens por llamada, más un semáforo de concurrencia. Agregaría margen, respetaría retry-after y, si el job corre en varios workers, usaría un limitador compartido para que cada uno no asuma la cuota completa. Si la latencia no es crítica, la batch API evita el problema y es más barata.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Anthropic, rate limits: https://docs.anthropic.com/en/api/rate-limits
+- Anthropic, errores (incluido 529 overloaded): https://docs.anthropic.com/en/api/errors
+- OpenAI, rate limits: https://platform.openai.com/docs/guides/rate-limits
+- AWS Architecture Blog, "Exponential Backoff And Jitter": https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+- Documentación de Tenacity: https://tenacity.readthedocs.io/

@@ -1,0 +1,172 @@
+## Beyond a single judge with a rubric
+
+Module 3 gave you the basics: write a rubric, ask a strong model for a verdict, watch for position and verbosity bias, and check Cohen's kappa against human labels before you gate CI on it. That judge is a good test oracle for one metric on one dataset.
+
+At scale, new problems appear. One judge model has blind spots and favors outputs that look like its own. Open-ended criteria produce unstable scores. The judge's own vendor upgrades it and your historical trend line shifts overnight. And a judge that is 85% accurate still gives you a **biased estimate** of the true pass rate. This lesson covers the techniques that address each problem.
+
+## Reference-guided judging
+
+A judge asked "is this answer correct?" must solve the task itself. If the task is hard (a tax calculation, a legal edge case), the judge fails exactly where you need it. Give it a **reference answer** and change the question to "is the candidate equivalent to the reference for this question?". That is a much easier task. The MT-Bench paper showed that reference-guided grading clearly improves judge accuracy on math and reasoning questions.
+
+Rules for reference-guided judges:
+
+- Tell the judge what equivalence means: same facts and numbers, wording can differ, extra correct detail is fine, extra unsupported detail is not.
+- Put the reference in its own tagged block so the judge never confuses it with the candidate.
+- Keep references short and factual. A long reference invites "how similar is the style?" judging.
+- When there are several valid answers, give a list of acceptable references or key facts, not one exemplar.
+
+## G-Eval-style chain-of-thought rubrics
+
+G-Eval (Liu et al., 2023) has two ideas worth keeping:
+
+1. **Evaluation steps.** Turn a vague criterion ("coherence") into explicit steps the judge executes before scoring. You can have an LLM draft the steps from the criterion once, then review and freeze them as part of the rubric.
+2. **Probability-weighted scores.** The original method reads token probabilities for each score value and takes the expected value, which gives finer-grained, less tied scores. When your provider does not expose log-probabilities, the practical substitute is sampling the judge a few times and averaging.
+
+A related pattern is **decomposition**: instead of one holistic score, the judge extracts claims and verifies each one (this is how faithfulness metrics in Ragas and DeepEval work under the hood). Decomposed judgments are easier to audit, because you can point at the exact unsupported claim.
+
+```python
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.AsyncAnthropic()
+
+class JudgeOut(BaseModel):
+    steps: list[str]
+    score: int = Field(ge=1, le=4)
+
+RUBRIC_V3 = """You grade the ACCURACY of a contract clause summary.
+Follow these evaluation steps in order and write one line per step:
+1. List every factual claim in the candidate summary.
+2. Check each claim against the clause text: supported, contradicted, or not in the clause.
+3. Compare with the reference: list key points the candidate omits.
+4. Score with this scale:
+   4 = all claims supported, no key point missing
+   3 = all claims supported, one minor omission
+   2 = one unsupported claim, or a key point missing
+   1 = any contradicted claim (amounts, parties, dates, obligations)
+Return only JSON: {"steps": ["..."], "score": 1-4}"""
+
+async def judge_accuracy(model: str, clause: str, reference: str, candidate: str, samples: int = 3) -> float:
+    scores: list[int] = []
+    for _ in range(samples):
+        msg = await client.messages.create(
+            model=model,
+            max_tokens=800,
+            system=RUBRIC_V3,
+            messages=[{"role": "user", "content": (
+                f"<clause>\n{clause}\n</clause>\n<reference>\n{reference}\n</reference>\n"
+                f"<candidate>\n{candidate}\n</candidate>"
+            )}],
+        )
+        scores.append(JudgeOut.model_validate_json(msg.content[0].text).score)
+    return sum(scores) / len(scores)  # sampling average as a stand-in for probability weighting
+```
+
+In production, use tool use or structured outputs instead of parsing free text, and cache by `(judge model, rubric hash, item id, sample index)`.
+
+## Judge ensembles (juries)
+
+A single judge model has idiosyncratic errors and a known **self-preference bias**: it tends to rate outputs from its own model family higher. The "Replacing Judges with Juries" paper (Verga et al., 2024) showed that a panel of smaller models from different families can match or beat a single large judge in agreement with humans, at lower cost.
+
+Design choices:
+
+- **Diversity over size.** Three judges from different providers beat three samples of the same model.
+- **Aggregation policy follows risk.** Mean or majority for quality metrics. "Any judge fails means fail" for safety and compliance checks.
+- **Disagreement is a routing signal.** When the judges' scores spread by 2 or more points on a 4-point scale, send the item to a human. You get a cheap uncertainty estimate for free.
+- **Never let the candidate's family judge alone.** This matters a lot in a model migration (capstone): if you compare model X vs model Y, a judge from X's family is a conflict of interest.
+
+```python
+import asyncio
+import os
+from statistics import mean
+
+from llm_client import judge_call  # your provider-agnostic client from Module 1
+
+JURY = ["claude-sonnet-5-5", os.environ["JUDGE_MODEL_B"], os.environ["JUDGE_MODEL_C"]]  # different providers
+
+async def jury_score(item: dict, policy: str = "mean") -> dict:
+    scores = await asyncio.gather(*(judge_call(m, item) for m in JURY))
+    value = min(scores) if policy == "strict" else mean(scores)
+    return {
+        "scores": dict(zip(JURY, scores)),
+        "value": value,
+        "needs_human": max(scores) - min(scores) >= 2,
+    }
+```
+
+## Calibrating judges against humans
+
+Kappa is the headline, but calibration needs more detail:
+
+- **Confusion matrix by segment.** A judge with kappa 0.75 overall may have 0.4 on long documents or Spanish inputs. Report kappa per segment that matters for the decision.
+- **Threshold tuning.** For continuous scores, choose the pass threshold on a dev split to hit a target false-pass rate (the dangerous error), then confirm on a held-out split.
+- **Judge-vs-human compared to human-vs-human.** If two humans reach kappa 0.70 and the judge reaches 0.68 with each of them, the judge is as good as another annotator. Asking for 0.90 when humans agree at 0.70 is asking for the impossible.
+- **Bias correction for estimates.** Even a good judge is wrong on some items, and its errors are rarely symmetric. If the judge says 82% pass on 5,000 items, the true rate may be 78%.
+
+### Correcting the judge's bias with a small human sample
+
+**Prediction-powered inference** (Angelopoulos et al., 2023) gives a principled fix. Run the judge on everything (`N` items). Have humans label a random subset (`n` items) that the judge also scored. The average human-minus-judge difference on that subset estimates the judge's bias, and you subtract it.
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+def ppi_mean(judge_all: np.ndarray, judge_lab: np.ndarray, human_lab: np.ndarray, conf: float = 0.95):
+    """judge_all: judge scores on N unlabeled items; judge_lab/human_lab: same n labeled items."""
+    rectifier = human_lab - judge_lab                 # judge bias on the labeled subset
+    estimate = judge_all.mean() + rectifier.mean()
+    se = np.sqrt(judge_all.var(ddof=1) / len(judge_all) + rectifier.var(ddof=1) / len(rectifier))
+    z = norm.ppf(1 - (1 - conf) / 2)
+    return estimate, estimate - z * se, estimate + z * se
+```
+
+The labeled subset must be a **random** sample of the same population, not hand-picked hard cases. The better the judge, the smaller the rectifier variance and the narrower the interval. With a decent judge, 200 human labels plus 5,000 judge scores can give a tighter, unbiased interval than 200 human labels alone.
+
+## Judge drift
+
+Your judge is a dependency. Providers release new versions and retire old ones. If your judge silently changes, every metric that depends on it changes too, and you will chase a "regression" that is really a new grader.
+
+Treat the judge like any versioned dependency with a contract test:
+
+1. **Pin an exact model id** and store it, the rubric hash and sampling parameters with every result.
+2. Keep a frozen **judge calibration set** (100–300 human-labeled items across segments).
+3. When the judge model must change, run old and new judges on the calibration set. Report kappa of each against humans and kappa between the two judges.
+4. If the new judge is acceptable, **re-score the baseline** with it before comparing any new run. Never compare scores produced by different judges.
+5. Mark the change on dashboards so trend lines show a discontinuity, not a fake drop.
+
+<Callout type="tip" title="SDET lens">
+
+This is the same discipline as upgrading Playwright or a browser version in CI. You run the old and new versions on a known suite, investigate differences, then update the baseline in one deliberate commit. You never upgrade the oracle and the system under test in the same change.
+
+</Callout>
+
+## Common mistakes
+
+- **Judging hard tasks without a reference.** The judge fails exactly on the hard items.
+- **A judge from the candidate's model family.** Self-preference bias inflates the candidate.
+- **Averaging an ensemble for safety checks.** Use a strict policy: one failure fails.
+- **Reporting the judge's raw pass rate as the truth.** Correct it with a random human subset, or at least report the judge's measured false-pass and false-fail rates.
+- **Upgrading the judge and the prompt in the same PR.** You cannot attribute the change.
+- **Calibration only on the aggregate.** Check segments where the judge may be weak.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you make an LLM judge trustworthy enough to support a model migration decision?" level="senior">
+
+I use a reference-guided rubric with explicit evaluation steps and a decomposed claim check, so verdicts are auditable. I use a jury of judges from at least two providers, and none from the candidate's model family alone, because of self-preference bias. I calibrate against adjudicated human labels on a held-out split, per segment, and compare judge-human kappa to human-human kappa. Items where jurors disagree go to humans. For the headline pass rate I correct the judge's bias with a random human-labeled subset using prediction-powered inference, so the interval is both narrow and unbiased. The judge id and rubric hash are pinned and stored with every score.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Your judge provider deprecates the model you use. What do you do?" level="mid">
+
+I treat it as a dependency upgrade. I run the old and new judge models on my frozen calibration set, compute kappa of each against human labels and kappa between them, and inspect disagreements. If the new judge meets the same bar, I re-score the stored baseline outputs with it, commit the new baseline in a dedicated change, and annotate dashboards with the switch date. I never compare a new run scored by the new judge with a baseline scored by the old one.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena": https://arxiv.org/abs/2306.05685
+- Liu et al., "G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment": https://arxiv.org/abs/2303.16634
+- Verga et al., "Replacing Judges with Juries: Evaluating LLM Generations with a Panel of Diverse Models": https://arxiv.org/abs/2404.18796
+- Angelopoulos et al., "Prediction-Powered Inference": https://arxiv.org/abs/2301.09633
+- DeepEval G-Eval metric: https://docs.confident-ai.com

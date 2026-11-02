@@ -1,0 +1,182 @@
+<ClientBrief company="Lexora" industry="Legal tech / SaaS B2B" duration="5 días" />
+
+## Contexto de la empresa
+
+Lexora vende un espacio de trabajo de investigación y gestión de asuntos (matters) a bufetes medianos. Hoy tiene 14 bufetes clientes, desde una boutique de 20 abogados hasta un bufete de 400 abogados con oficina en Frankfurt. Cada bufete sube sus propios precedentes, cartas de encargo, memos internos y escritos judiciales. Los contratos de Lexora prometen que los documentos de un bufete nunca serán visibles para otro bufete, nunca se usarán para entrenar modelos y, en el caso de bufetes de la UE, nunca saldrán de la UE.
+
+El año pasado Lexora lanzó un prototipo RAG single-tenant para un bufete piloto. Funcionó, y ahora todos los demás bufetes lo quieren. El prototipo no se puede copiar 14 veces: el equipo de operaciones son tres personas y los márgenes del plan starter son estrechos. Te contratan para construir la versión multi-tenant: una plataforma, muchos bufetes, aislamiento estricto, un agente que puede actuar sobre los asuntos y números que demuestren calidad y costo.
+
+Este es el capstone final. Reutiliza todo: tu cliente de LLM (M1), RAG híbrido con re-ranking y citas (M2), el harness de evals y el tracing (M3), agentes de LangGraph con HITL y herramientas MCP (M4), FastAPI, Docker, CI/CD y AWS (M5) y pipelines de datos (M6).
+
+## Stakeholders
+
+- **Priya Nair, CTO:** dueña de la arquitectura. Le importan las garantías de aislamiento, la simplicidad operativa y un camino claro hacia 100 bufetes.
+- **Daniel Okafor, Head of Customer Success:** recibe las quejas. Quiere respuestas con citas en las que los abogados confíen, y menos tickets de "se inventó algo".
+- **Marta Keller, Data Protection Officer:** bufetes de la UE, GDPR, residencia de datos. Preguntará a dónde va cada byte, incluidos los traces.
+- **Sam Liu, CFO:** quiere el costo por bufete y el margen bruto por plan, cada mes.
+- **Usuarios piloto:** asociados de dos bufetes que probarán el agente y juzgarán si les ahorra tiempo.
+
+## Objetivo de negocio
+
+Lanzar el asistente multi-tenant a los 14 bufetes en un trimestre, con un costo por 1k peticiones de chat que mantenga rentable el plan starter, con cero exposición de datos entre tenants y una calidad de respuesta medible que Customer Success pueda mostrar a los bufetes.
+
+## Requisitos funcionales
+
+1. **Gestión de tenants:** una API de administración para crear un tenant con plan (starter, pro, enterprise), región (US o EU), modo de aislamiento (pool o dedicado), presupuesto de tokens y rate limit. Los usuarios del tenant se autentican con un JWT que lleva `tenant_id` y rol.
+2. **Ingesta por tenant:** subir PDFs y DOCX; parsear, limpiar, hacer chunking (consciente del documento), generar embeddings e indexar en la partición del tenant. Deduplicar por hash de contenido. Los jobs de ingesta van a una cola con topes de concurrencia por tenant. Documentos nuevos buscables en menos de 10 minutos.
+3. **Chat de investigación:** preguntas de varios turnos sobre los documentos del tenant con retrieval híbrido (BM25 + vectorial, RRF), re-ranking y citas en línea a documento y sección. Responde "No encuentro esto en tus documentos" cuando el contexto no alcanza. Las respuestas se transmiten por SSE.
+4. **Agente de asuntos:** un agente de LangGraph con herramientas expuestas mediante al menos un servidor MCP: `search_documents`, `get_matter` (desde una tabla de asuntos sembrada), `compute_deadline` (plazo judicial a partir de una regla y una fecha), `create_review_task` y `draft_client_email`. Toda herramienta con efectos secundarios (`create_review_task`, enviar un correo redactado) requiere aprobación humana mediante un interrupt. Máximo 8 pasos y un tope de tokens por petición.
+5. **Cuotas y degradación:** rate limit por tenant (429 con `Retry-After`), presupuesto mensual de tokens con alerta suave al 80% y comportamiento según el plan al 100% (degradar a un modelo más pequeño o bloquear).
+6. **Enrutamiento de modelos:** un clasificador de dificultad barato enruta cada petición a un nivel rápido o equilibrado; los tenants enterprise pueden usar el mejor nivel para tareas del agente. Los ids de modelo vienen de configuración.
+7. **Atribución de costos:** cada llamada al LLM, a embeddings y al re-ranker escribe un evento de uso con tenant, funcionalidad, modelo, versión de prompt, tokens y costo. Un dashboard muestra el costo por tenant por día, el costo por 1k peticiones y el margen por plan contra los precios de los planes en configuración.
+8. **Observabilidad:** traces de OpenTelemetry o Langfuse para cada petición con `tenant_id`, versión de prompt y modelo en cada span. Los traces de tenants de la UE se envían a un backend en la UE o se redactan antes de exportarse.
+9. **Residencia de datos:** un tenant de la UE se enruta a una "celda" de la UE (una segunda configuración del stack con su propia base de datos y su propio endpoint de LLM). En local puede ser un segundo perfil de docker compose; la lógica de enrutamiento debe ser real.
+
+## Requisitos no funcionales
+
+| Área | Objetivo |
+|---|---|
+| Latencia, chat de investigación | Primer token p95 por debajo de 1.5 s, respuesta completa p95 por debajo de 8 s con 20 streams concurrentes |
+| Latencia, tarea del agente | p95 por debajo de 25 s sin contar el tiempo de aprobación humana |
+| Costo | Menos de $6 por 1k peticiones de chat de investigación con la mezcla de enrutamiento medida (precios de configuración, con fecha) |
+| Calidad de respuesta | Faithfulness de 0.90 o más, context recall de 0.85 o más, precisión de citas de 0.95 o más en el golden set |
+| Calidad del agente | Secuencia de herramientas correcta en el 85% o más de los escenarios de trayectoria; 0 herramientas con efectos secundarios ejecutadas sin aprobación |
+| Aislamiento | 0 fugas entre tenants en retrieval, caché, herramientas del agente y traces en la suite de aislamiento |
+| Disponibilidad | Modo degradado "solo búsqueda" cuando falla el proveedor de LLM; sin tormenta de 5xx |
+| Frescura | Documentos nuevos buscables en menos de 10 minutos |
+
+## Fuera de alcance
+
+- Fine-tuning o entrenamiento con datos de clientes.
+- Una UI pulida para usuarios finales. Basta una página web mínima o una app de Streamlit para la demo; la API es el producto.
+- Bases de datos reales de reglas judiciales. Siembra 10 reglas de plazos.
+- Integración de facturación. Los precios de los planes viven en configuración.
+- SSO con un proveedor de identidad real. Emite JWTs firmados desde un endpoint de desarrollo.
+
+## Entregables
+
+1. Repo `multi-tenant-ai-platform` con código, Docker Compose (dos perfiles: `us` y `eu`), Makefile y datos sembrados para 3 tenants (uno de la UE).
+2. Suites de evals con reportes: golden set de RAG (100 o más Q&A entre 3 tenants, incluidas preguntas sin respuesta), set de trayectorias del agente (25 o más escenarios), suite de aislamiento (30 o más casos), set de red team (20 o más intentos de prompt injection, incluidos documentos que intentan cruzar tenants).
+3. GitHub Actions: lint, tests unitarios, suite de aislamiento, evals offline con umbrales como gate de merge, build de imagen, deploy a AWS (ECS Fargate o Lambda) o al destino alternativo del Módulo 5.
+4. Script de prueba de carga con k6 y resultados para el endpoint de streaming.
+5. Dashboard de costos (Grafana, Metabase, Streamlit o un reporte estático generado desde `usage_events`).
+6. README con GIF de demo y tabla de resultados generada, `docs/architecture.md`, al menos 5 ADRs, análisis de costos y runbook.
+
+## Criterios de aceptación
+
+- Crear un tenant con la API de administración, subir documentos y hacer una pregunta funciona de punta a punta en menos de 5 minutos desde un clon limpio con `LLM_PROVIDER=fake`.
+- RLS de PostgreSQL (o una colección o namespace por tenant) aplica el aislamiento; el rol de la app no puede leer filas de otro tenant ni siquiera con una consulta sin filtro de tenant. Un test lo demuestra.
+- Ningún schema de herramienta expone un argumento `tenant_id`. El contexto de tenant viene del runtime.
+- Las claves de caché incluyen el tenant id y la versión de prompt. Un test demuestra que una respuesta cacheada del Tenant A nunca se sirve al Tenant B.
+- El gate de evals en CI hace fallar un PR que baja faithfulness más de 2 puntos o introduce cualquier falla de aislamiento. Demuéstralo con un PR deliberadamente malo (déjalo en el historial o toma una captura).
+- El dashboard de costos muestra el costo por tenant y el costo por 1k peticiones a partir de eventos de uso reales producidos por las corridas de evals y de la prueba de carga.
+- Superar el presupuesto de un tenant starter activa el comportamiento documentado, con un test.
+- Las peticiones del tenant de la UE llegan a la configuración de la celda de la UE, verificado en los traces.
+
+## Arquitectura sugerida
+
+<Diagram caption="Plataforma multi-tenant de RAG + agentes de Lexora" chart={`flowchart TB
+  subgraph Control["Control plane global"]
+    AUTH["Auth (JWT: tenant_id, rol)"] --> DIR[("Directorio de tenants: plan, región, límites")]
+  end
+  U["Usuario del bufete"] --> GW["API gateway"]
+  GW --> AUTH
+  GW --> ROUTE{"Router por región"}
+  ROUTE -->|Tenants US| US
+  ROUTE -->|Tenants EU| EU
+  subgraph US["Celda US"]
+    API["FastAPI: chat, agente, admin, ingesta"] --> RL[("Redis: rate limits, presupuestos, caché")]
+    API --> RT["Router de modelos"]
+    API --> AG["Agente LangGraph + HITL"]
+    AG --> MCP["Servidor MCP: asuntos, plazos, tareas, correo"]
+    AG --> RET["Retriever híbrido + re-ranker"]
+    API --> RET
+    RET --> PG[("PostgreSQL + pgvector, RLS por tenant")]
+    RT --> LLM["Proveedor de LLM (endpoint US)"]
+    AG --> LLM
+    API --> QQ["Cola de ingesta"] --> WK["Workers de ingesta (topes por tenant)"] --> PG
+    API --> UE[("usage_events")]
+    API --> TR["Tracing (OTel / Langfuse)"]
+  end
+  subgraph EU["Celda EU (mismo stack, endpoints EU)"]
+    EAPI["FastAPI + agente + retriever"] --> EPG[("PostgreSQL + pgvector")]
+    EAPI --> ELLM["Proveedor de LLM (endpoint EU)"]
+  end
+  UE --> DASH["Dashboard de costos y calidad"]
+  TR --> DASH
+  CI["GitHub Actions: tests, suite de aislamiento, gate de evals, deploy"] --> US
+  CI --> EU`} />
+
+Notas sobre el diseño:
+
+- **Aislamiento:** modelo pool con RLS para tenants starter y pro; el tenant enterprise de la UE recibe su propia celda. Escribe esta elección como un ADR con alternativas.
+- **Retrieval:** tanto la consulta BM25 como la vectorial corren dentro de la transacción con alcance de tenant. Mide el recall por tenant, porque el tenant más pequeño es el que más sufre el post-filtrado de HNSW.
+- **Agente:** el retrieval es solo una herramienta más. El estado del agente, incluidas las aprobaciones pendientes, se guarda con checkpoints en PostgreSQL para que una aprobación pueda llegar minutos después.
+- **Costo:** los eventos de uso se escriben de forma asíncrona (cola o tarea en segundo plano) para que nunca agreguen latencia al hot path.
+
+## Rúbrica de evaluación
+
+Esta rúbrica es exigente a propósito. "Cumple" en todas las filas es una pieza de portafolio sólida. "Supera" en tres o más filas es trabajo de nivel senior. Califícate con honestidad y pon la tabla en el README.
+
+| Área (peso) | No cumple | Cumple | Supera |
+|---|---|---|---|
+| Aislamiento por tenant (20%) | Filtro solo en el código de la app; sin tests | RLS o particiones por tenant; tests canario, de conteo crudo y de caché en CI; sin tenant id en los schemas de herramientas | Además tests de prompt injection entre tenants, test de auditoría de traces, monitoreo de recall por tenant y un análisis de blast radius documentado |
+| Calidad de retrieval y respuestas (15%) | Solo vectorial; sin citas | Híbrido + re-rank + citas; cumple los objetivos de faithfulness, recall y citas | Tabla de ablación (vectorial vs híbrido vs híbrido + re-rank) con calidad, latencia y costo por fila |
+| Agente y herramientas (15%) | Llamadas a herramientas libres, sin aprobación | Herramientas MCP con errores tipados e idempotencia; HITL en efectos secundarios; topes de pasos y tokens | Evals de trayectoria con chequeo de argumentos; aprobaciones reanudables tras un reinicio; tests de inyección de fallas en las herramientas |
+| Evals y gate de CI (15%) | Revisiones manuales puntuales | Cuatro suites con datasets versionados; los umbrales bloquean merges; PR fallido demostrado | Muestreo online con juez LLM en la app desplegada, concordancia del juez medida contra 30 etiquetas humanas |
+| Observabilidad y costo (10%) | Solo logs | Traces con tenant, modelo y versión de prompt; dashboard de costos por tenant; costo por 1k calculado desde eventos reales | Margen por plan, alertas de presupuesto y un experimento de reducción de costos con números antes/después |
+| Serving y operación (10%) | Solo corre en local | Docker, CI/CD a un destino cloud, rate limits, presupuestos, modo degradado, resultados de k6 contra los objetivos de latencia | Enrutamiento de celdas en dos regiones verificado en traces; runbook con 3 playbooks de incidentes; prueba de carga al doble del objetivo |
+| Documentación (10%) | README solo de instalación | README con GIF, tabla de resultados generada, documento de arquitectura, 5 ADRs, análisis de costos, limitaciones | Un revisor lo corre en 5 minutos sin ayuda; los ADRs incluyen disparadores de "revisar cuando" |
+| Calidad de código (5%) | Scripts sin tipos | Python tipado, modelos Pydantic, tests de la lógica central, fronteras de módulos claras | Adaptadores de proveedor y de vector store detrás de interfaces, intercambiados en un test para demostrarlo |
+
+## Cronograma sugerido (5 días)
+
+**Día 1: cimientos y aislamiento.** Estructura del repo a partir de tu plantilla del M5. Directorio de tenants, auth con JWT, `TenantContext`. Schema de PostgreSQL con RLS. Worker de ingesta con topes por tenant. Siembra 3 tenants. Escribe primero la suite de aislamiento, como tests que fallan, y luego hazla pasar. ADRs 1-3.
+
+**Día 2: retrieval y chat.** Porta el retriever híbrido y el re-ranker de `mortgage-knowledge-assistant`, ahora con alcance de tenant. Chat en streaming con citas. Caché consciente del tenant. Construye el golden set de RAG (empieza con 30 por tenant, crece a más de 100). Primera corrida de evals y números base.
+
+**Día 3: agente y herramientas.** Servidor MCP con las cinco herramientas, errores tipados, idempotency keys. Agente de LangGraph con interrupts de aprobación, checkpoints, topes de pasos y tokens. Set de evals de trayectoria y set de red team. Router de modelos.
+
+**Día 4: producción.** Eventos de uso y dashboard de costos. Rate limits, presupuestos y modo degradado. Tracing con atributos de tenant; perfil de la celda EU y enrutamiento por región. GitHub Actions con el gate de evals y el deploy. Prueba k6 y ajustes para alcanzar los objetivos de latencia.
+
+**Día 5: pruebas y presentación.** Cierra las brechas que encontraron los evals. Demuestra el PR fallido. Tabla generada en el README, GIF de demo, documento de arquitectura, análisis de costos, runbook, limitaciones. Ensaya la demo de 5 minutos dos veces, con cronómetro.
+
+## Definition of Done
+
+<Checklist id="m7-11-dod" title="Definition of Done" items={["Un clon limpio corre de punta a punta en menos de 5 minutos con el proveedor de LLM fake", "RLS o particiones por tenant aplican el aislamiento, demostrado con tests que corren sin filtros de tenant", "La suite de aislamiento pasa con 0 fugas en retrieval, caché, herramientas del agente y traces", "Ningún schema de herramienta acepta un tenant id; el contexto de tenant viene del runtime", "El retrieval híbrido con re-ranking y citas cumple los objetivos de faithfulness, recall y citas", "Las herramientas con efectos secundarios nunca corren sin aprobación humana, verificado con tests de trayectoria", "CI bloquea merges ante regresiones de evals y fallas de aislamiento, demostrado con un PR fallido", "Dashboard de costos por tenant y costo por 1k peticiones calculados desde eventos de uso reales", "Los límites de presupuesto y rate limit activan el comportamiento documentado, con tests", "Las peticiones del tenant de la UE las atiende la celda EU, visible en los traces", "Desplegado a un destino cloud mediante CI/CD con resultados de k6 contra los objetivos de latencia", "El README tiene el GIF de demo, la tabla de resultados generada, documento de arquitectura, 5 o más ADRs, análisis de costos y limitaciones", "La autoevaluación con la rúbrica está en el README con notas honestas"]} />
+
+## Cómo presentar esto en una entrevista
+
+Presentarás este proyecto en casi todos los procesos. Prepara tres recursos: una demo de 5 minutos, un recorrido de arquitectura de 3 minutos y respuestas a las preguntas de trade-offs de abajo.
+
+### El guion de la demo de 5 minutos
+
+| Tiempo | Qué muestras | Qué dices |
+|---|---|---|
+| 0:00-0:30 | Parte superior del README: pitch y tabla de resultados | "Lexora atiende a 14 bufetes en una sola plataforma. Las restricciones duras eran aislamiento estricto, residencia en la UE y un margen estrecho en el plan starter. Aquí están los objetivos y los resultados actuales, regenerados desde el reporte de evals en cada merge." |
+| 0:30-1:30 | Chat como Bufete A: pregunta, respuesta en streaming, clic en una cita | "Retrieval híbrido, re-ranking a 5 chunks, citas validadas contra los ids recuperados. Cuando el contexto no alcanza, lo dice; eso es parte del golden set." |
+| 1:30-2:30 | Tarea del agente con aprobación | "El agente puede calcular un plazo y crear una tarea de revisión. Todo lo que tiene efectos secundarios se pausa para aprobación; el estado queda en un checkpoint, así que la aprobación puede llegar después. Las herramientas nunca reciben un tenant id del modelo." |
+| 2:30-3:15 | Cambio al Bufete B, pregunta por el canario del Bufete A | "Este es el test canario de CI, en vivo. El aislamiento se aplica en RLS de PostgreSQL, así que ni una consulta con bugs puede cruzar tenants." |
+| 3:15-4:15 | Trace y dashboard de costos | "Cada span lleva tenant, modelo y versión de prompt. Los costos se agregan por tenant y por plan. Enrutar las preguntas simples al nivel rápido redujo el costo por 1k en la cantidad de este gráfico." (Usa tu número medido.) |
+| 4:15-5:00 | Corrida de CI con el PR fallido, luego limitaciones | "Este PR bajó faithfulness 4 puntos y el gate lo bloqueó. Limitaciones conocidas: recall de tenants pequeños en el índice compartido y un caso de red team abierto. Esto es lo que haría después." |
+
+Ensaya con cronómetro. Si te pasas, reduce el dashboard a una frase, nunca la demo de aislamiento.
+
+### El recorrido de arquitectura
+
+Comparte el diagrama de contenedores y sigue una petición: auth y resolución del tenant, enrutamiento por región, chequeo de rate limit y presupuesto, decisión de enrutamiento, camino del agente o del chat, retrieval con alcance de tenant, generación, evento de uso y trace. Luego el lado offline: ingesta, evals en CI, deploy. Luego una decisión que revisarías. Detente a los 3 minutos e invita a preguntar.
+
+### Preguntas de trade-offs que debes esperar
+
+- ¿Por qué pool con RLS en lugar de una base de datos por bufete? ¿Cuándo pasarías un bufete a su propia celda?
+- ¿Cómo sabes que el aislamiento se sostiene? ¿Qué no cubren tus tests?
+- ¿Por qué pgvector y no una vector database administrada? ¿A qué escala cambia eso?
+- ¿Por qué LangGraph para el agente pero Python puro para el retrieval?
+- ¿Cómo construiste el golden set y cómo sabes que tu juez LLM acierta?
+- ¿Qué pasa cuando el proveedor de LLM se cae o te aplica rate limits?
+- ¿Cómo escalaría esto a 100 bufetes y 10 veces más documentos? ¿Qué se rompe primero?
+- ¿Cómo atribuyes los costos de infraestructura compartida a los tenants?
+- ¿Cómo manejas a un bufete que te pide borrar todos sus datos (derecho de supresión del GDPR), incluidos embeddings, cachés, traces y sets de evals?
+- ¿Qué cambiarías si tuvieras otra semana?
+
+Prepara cada respuesta con la fórmula de tres frases de la lección 03: elección y razones, costo y mitigación, el disparador para revisarla. Respalda cada una con un número o un artefacto del repo. Eso es lo que separa un proyecto de portafolio de un ingeniero con mentalidad de producción.

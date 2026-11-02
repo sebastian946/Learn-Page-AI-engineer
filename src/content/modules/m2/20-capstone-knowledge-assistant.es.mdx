@@ -1,0 +1,158 @@
+<ClientBrief company="Harborline Home Lending" industry="Fintech / Préstamos hipotecarios" duration="5 días" />
+
+## Contexto de la empresa
+
+Harborline Home Lending es un prestamista hipotecario ficticio de tamaño medio en Estados Unidos. Origina préstamos convencionales, FHA y VA en 14 estados, con unos 220 oficiales de crédito, 40 underwriters y un equipo de operaciones de 15 personas. Harborline vende la mayoría de sus préstamos en el mercado secundario, así que cada expediente debe cumplir tanto sus políticas internas como las guías de inversionistas que ha adoptado.
+
+Hoy, el conocimiento de políticas está disperso en muchos lugares:
+
+- Una **Guía de Underwriting** interna de más de 200 páginas (PDF, actualizada cada trimestre, con tablas de límites de DTI/LTV).
+- Unos 60 **boletines de políticas** (PDF y HTML), cada uno reemplaza partes de la guía a partir de una fecha de vigencia.
+- Una **matriz de productos** por programa de préstamo (tablas en PDF).
+- Una **wiki interna de FAQ** (HTML) mantenida por operaciones, parcialmente desactualizada.
+
+Los oficiales de crédito envían unas 300 preguntas de políticas por semana a un canal interno de Slack. Los underwriters las responden entre expedientes. El tiempo mediano de respuesta es de 3 horas, y las respuestas no siempre son consistentes. Dos hallazgos recientes de auditoría post-cierre se rastrearon hasta un oficial que actuó con base en un boletín desactualizado.
+
+## Stakeholders
+
+| Persona | Rol | Qué le importa |
+|---|---|---|
+| Dana Whitfield | VP de Operaciones (sponsor) | Respuestas más rápidas, menos escalamientos a underwriters, ROI medible |
+| Marcus Oyelaran | Underwriter en jefe | Corrección. Cada respuesta debe citar la sección exacta de la política; las reglas obsoletas son inaceptables |
+| Priya Raman | Oficial de Cumplimiento | Auditabilidad, que ninguna PII salga de sistemas aprobados, poder mostrar cómo se produjo una respuesta |
+| Leo Castillo | Head of Engineering | Que encaje con el stack actual (Postgres, Python, AWS), mantenible, con costo predecible |
+| Oficiales de crédito | Usuarios finales | Respuestas rápidas y claras dentro de su flujo de trabajo, con enlace a la fuente |
+
+## Objetivo de negocio
+
+Reducir el tiempo mediano para obtener una respuesta correcta sobre políticas de horas a menos de un minuto, y disminuir las interrupciones a underwriters al menos un 40% durante el primer trimestre tras el lanzamiento. El asistente debe hacer las auditorías más fáciles, no más riesgosas: cada respuesta debe poder rastrearse hasta texto de política específico y vigente.
+
+## Requisitos funcionales
+
+1. **Ingesta** de la Guía de Underwriting, los boletines, las matrices de productos (PDF) y las páginas de FAQ (HTML). Extraer texto y tablas, conservando números de sección, números de página y títulos.
+2. **Versionado de documentos:** cada documento y chunk tiene `effective_from` y, cuando aplica, `superseded_by`. El retrieval solo devuelve chunks vigentes en la fecha de la consulta (por defecto: hoy).
+3. **Filtros por metadata:** programa de préstamo (convencional, FHA, VA), estado, tipo de documento. El usuario puede definirlos y el asistente puede inferirlos de la pregunta.
+4. **Retrieval híbrido:** similitud con pgvector más búsqueda de texto completo de Postgres, fusionados con RRF.
+5. **Re-ranking** de los candidatos fusionados con un cross-encoder (local por defecto; un re-ranker hospedado puede ser una opción configurable).
+6. **Reescritura de consultas:** condensación de conversación para preguntas de seguimiento; multi-query opcional detrás de un flag.
+7. **Respuestas con citas:** cada oración factual cita al menos un chunk, mostrando documento, sección y página. Las citas se validan antes de mostrar la respuesta.
+8. **Abstención:** cuando el corpus no contiene la respuesta, el asistente lo dice y enlaza las secciones más cercanas. Nunca responde con conocimiento hipotecario general.
+9. **API:** un servicio FastAPI con `POST /ask` (pregunta, filtros opcionales, historial opcional) que devuelve respuesta, citas, `answer_found` y un `trace_id`. El streaming es deseable pero opcional.
+10. **UI mínima:** una página web simple o app de Streamlit que muestre la respuesta, citas clicables y los filtros.
+11. **Suite de evaluación:** al menos **50 pares golden de pregunta y respuesta** revisados contra los documentos fuente, incluyendo al menos 8 preguntas sin respuesta y al menos 5 seguimientos de varios turnos.
+12. **Dashboard de latencia y costo:** logs por solicitud agregados en latencia p50/p95 por etapa y costo por cada 1,000 solicitudes.
+
+## Requisitos no funcionales
+
+| Área | Meta |
+|---|---|
+| Latencia | p95 por debajo de 4 s de punta a punta para respuestas sin streaming; p95 de retrieval (sin contar la reescritura) por debajo de 600 ms |
+| Costo | Por debajo de una meta que tú defines por cada 1,000 solicitudes, calculada con el uso de tokens registrado y los precios actuales del proveedor; documenta el supuesto |
+| Faithfulness | ≥ 0.90 en promedio sobre el golden set (Ragas o DeepEval), ningún ítem con respuesta por debajo de 0.5 sin explicación |
+| Context recall | ≥ 0.85 en promedio sobre ítems con respuesta |
+| Retrieval | recall@5 ≥ 0.85 en ítems con IDs de chunks etiquetados |
+| Abstención | ≥ 90% de los ítems sin respuesta respondidos correctamente con "no encontrado" |
+| Validez de citas | 100% de las citas mostradas apuntan a chunks recuperados con citas textuales que coinciden |
+| Seguridad | Sin PII de solicitantes en el corpus ni en los logs; secretos por variables de entorno; ningún dato enviado a proveedores sin un acuerdo aprobado (documenta qué proveedores usas) |
+| Auditabilidad | Cada solicitud tiene un trace: consulta, reescrituras, filtros, IDs recuperados con scores, versión del prompt, modelo, salida y resultado de validación |
+
+## Fuera de alcance
+
+- Responder preguntas sobre solicitantes o expedientes específicos.
+- Tomar decisiones de crédito o aprobar excepciones.
+- Autenticación y permisos multi-tenant (asume una red interna; el Módulo 7 retoma esto).
+- Deploy a producción, CI/CD y pruebas de carga (el Módulo 5 despliega este proyecto).
+- Calibración completa de LLM-as-judge y monitoreo online (el Módulo 3 lo construye sobre tu suite).
+
+## Entregables
+
+1. Repositorio `mortgage-knowledge-assistant` con el código fuente, `docker-compose.yml` (Postgres con pgvector, la API, Redis opcional) y un setup de un solo comando.
+2. Un **corpus sintético** creado por ti: una guía de underwriting (al menos 30 páginas), al menos 8 boletines con fechas de vigencia (al menos 2 que reemplacen reglas anteriores), 3 matrices de productos y 15 páginas de FAQ. No uses documentos de ningún prestamista real.
+3. El golden dataset (`evals/golden.jsonl`) y el runner de evaluación con un reporte guardado.
+4. El dashboard (un notebook, una página de Streamlit o un tablero de Grafana que lea tus logs de solicitudes).
+5. Un README con arquitectura, decisiones de diseño, resultados de evals, análisis de costos y un GIF de demo.
+6. Una carpeta `ADR` con al menos tres registros breves de decisiones de arquitectura (por ejemplo: estrategia de chunking, elección de re-ranker, política de caché).
+
+## Criterios de aceptación
+
+- `docker compose up` seguido de `make ingest` y `make eval` funciona en una máquina limpia.
+- Preguntar por una regla que un boletín reemplazó devuelve la regla nueva y cita el boletín, no la sección vieja de la guía.
+- Filtrar por FHA nunca devuelve chunks exclusivos de préstamos convencionales.
+- El reporte de evaluación cumple las metas no funcionales, o explica cada incumplimiento con un diagnóstico y un plan.
+- El dashboard muestra la latencia p50/p95 por etapa (reescritura, retrieval, re-rank, generación) y el costo por cada 1,000 solicitudes para al menos 200 solicitudes registradas.
+- Un revisor puede elegir cualquier respuesta en los logs y reconstruir cómo se produjo a partir de su trace.
+
+## Arquitectura sugerida
+
+<Diagram caption="Asistente de conocimiento hipotecario: ingesta offline y respuesta online" chart={`flowchart LR
+  subgraph Offline["Ingesta offline"]
+    D["PDFs, boletines, FAQ HTML"] --> P["Parseo y limpieza (tablas, secciones)"]
+    P --> C["Chunking consciente de la estructura"]
+    C --> M["Metadata: programa, estado, effective_from, superseded_by"]
+    M --> E["Embeddings (caché por hash)"]
+    E --> PG[("Postgres: pgvector + tsvector")]
+  end
+  subgraph Online["Respuesta online"]
+    U[Oficial de crédito] --> API["FastAPI /ask"]
+    API --> RW["Condensar / reescribir (modelo pequeño)"]
+    RW --> HY["Búsqueda híbrida + filtros + RRF"]
+    HY --> PG
+    HY --> RR["Re-rank con cross-encoder"]
+    RR --> G["Generar con citas"]
+    G --> V["Validar citas"]
+    V --> U
+  end
+  API --> L[("Logs de solicitudes y traces")]
+  L --> DB["Dashboard de latencia y costo"]
+  L --> EV["Suite de evals (50+ pares golden)"]`} />
+
+Notas:
+
+- Reutiliza el núcleo sin framework de `rag-lab/07-from-scratch/`, o el pipeline de LangChain si lo prefieres. Justifica la elección en un ADR.
+- Pon un caché exacto de respuestas antes de la generación, con clave por pregunta, filtros, versión de corpus y versión de prompt. Omite el caché semántico para contenido de underwriting y explica por qué.
+- Usa un modelo pequeño (`claude-haiku-5-5`) para la reescritura y uno más grande (`claude-sonnet-5-5`) para la generación. Pon las instrucciones estables en un prefijo de prompt cacheado.
+
+## Rúbrica de evaluación
+
+| Criterio | Peso | Excelente | Aceptable | Necesita trabajo |
+|---|---|---|---|---|
+| Calidad de retrieval | 20% | Híbrido + filtros + versionado + re-rank; recall@5 y context recall cumplen las metas con evidencia | El híbrido funciona, una meta incumplida con diagnóstico | Solo vectorial o sin filtro por fecha de vigencia |
+| Grounding y citas | 20% | Citas por afirmación validadas; la abstención cumple la meta | Se muestran citas y en su mayoría son válidas | Citas sin validar o respuestas con conocimiento general |
+| Suite de evaluación | 20% | 50+ pares revisados, ítems sin respuesta y de varios turnos, análisis por ítem, juez fijado | 50 pares con scores agregados | Menos pares, referencias copiadas de la salida del sistema |
+| Observabilidad, latencia y costo | 15% | Traces por etapa, dashboard con p50/p95 y costo por 1k, supuestos documentados | Dashboard solo con totales | Sin datos de costo ni de latencia |
+| Calidad de ingeniería | 15% | Estructura limpia, tests de la lógica central, setup de un comando, ADRs | Corre con algunos pasos manuales | Difícil de ejecutar, sin tests |
+| Comunicación | 10% | El README cuenta una historia clara con trade-offs, números y GIF de demo | El README cubre setup y resultados | README mínimo |
+
+## Cronograma sugerido (5 días)
+
+**Día 1 — Corpus e ingesta.** Escribe el corpus sintético, incluyendo boletines que reemplazan reglas y tablas. Construye el parseo, el chunking consciente de la estructura y la extracción de metadata. Carga en pgvector con índices HNSW y de texto completo. Empieza a redactar preguntas golden mientras escribes los documentos; es cuando mejor conoces las respuestas.
+
+**Día 2 — Retrieval.** Búsqueda híbrida con RRF, filtros de metadata y de fecha de vigencia, re-ranking con cross-encoder y condensación de conversación. Construye el benchmark de retrieval (recall@5, MRR) sobre IDs de chunks etiquetados y ajusta el tamaño de búsqueda y el top-k.
+
+**Día 3 — Generación y API.** Prompt de citas, salida estructurada, validación de citas, abstención. FastAPI `POST /ask` con trace IDs y registro de solicitudes. Cachés de respuestas y de embeddings. UI mínima.
+
+**Día 4 — Evaluación.** Termina y revisa los 50+ pares golden. Ejecuta Ragas o DeepEval con un juez fijado. Analiza los peores ítems, corrige los problemas principales y vuelve a ejecutar. Escribe el reporte de evaluación.
+
+**Día 5 — Dashboard y pulido.** Genera al menos 200 solicitudes registradas (golden set más paráfrasis), construye el dashboard de latencia/costo, escribe los ADRs y el README, y graba el GIF de demo. Haz una prueba de setup en una máquina limpia.
+
+## Definition of Done
+
+<Checklist id="m2-20-dod" title="Definition of Done" items={["Corpus sintético en el repo, incluyendo boletines que reemplazan reglas y tablas de matrices de productos", "La ingesta conserva sección, página, programa, estado y fechas de vigencia en cada chunk", "Retrieval híbrido con RRF, filtros de metadata y filtrado por fecha de vigencia", "Re-ranking con cross-encoder y una comparación medida de antes y después", "Las preguntas de seguimiento se condensan antes del retrieval", "Cada cita mostrada se valida contra los chunks recuperados", "Las preguntas sin respuesta devuelven 'no encontrado' con enlaces a las secciones más cercanas", "El golden dataset tiene 50+ pares revisados, 8+ sin respuesta y 5+ de varios turnos", "Reporte de evals con juez fijado, análisis por ítem y metas cumplidas o explicadas", "El dashboard muestra latencia p50/p95 por etapa y costo por cada 1,000 solicitudes", "Cada solicitud tiene un trace reconstruible", "El setup con docker compose funciona en una máquina limpia", "README con diagrama de arquitectura, decisiones, resultados de evals, análisis de costos y GIF de demo", "Al menos tres ADRs en el repo"]} />
+
+## Cómo presentarlo en una entrevista
+
+Usa una historia de dos minutos y luego deja que el entrevistador profundice.
+
+1. **Problema (20 s).** "Los oficiales de crédito de un prestamista hipotecario esperaban horas por respuestas sobre políticas, y los boletines desactualizados causaban hallazgos de auditoría."
+2. **Enfoque (40 s).** "Construí un asistente RAG con citas: chunking consciente de la estructura con metadata de fecha de vigencia, búsqueda híbrida con pgvector más texto completo fusionada con RRF, un re-ranker cross-encoder y citas por afirmación validadas antes de mostrarse."
+3. **Prueba (40 s).** "Escribí más de 50 preguntas golden con una revisión al estilo de un experto del dominio, incluyendo preguntas sin respuesta y de seguimiento. Faithfulness, context recall y abstención se monitorean por ítem." Cita tus números reales.
+4. **Operación (20 s).** "Cada solicitud queda trazada; el dashboard muestra el p95 por etapa y el costo por cada 1,000 solicitudes. El prompt caching y enviar menos chunks re-rankeados redujeron los tokens de entrada." De nuevo, tus propios números medidos.
+
+Prepárate para las preguntas de seguimiento:
+
+- *¿Cómo manejas las políticas reemplazadas?* Metadata y filtros de fecha de vigencia, más ítems golden que prueban específicamente reglas reemplazadas.
+- *¿Por qué no usar simplemente una ventana de contexto más grande?* Costo, latencia, "lost in the middle" y citas más débiles. Muestra tus mediciones.
+- *¿Qué falló primero y cómo lo encontraste?* Elige un peor ítem real de tu reporte y recorre el diagnóstico etapa por etapa.
+- *¿Qué harías después?* Gate de CI sobre faithfulness (Módulo 3), deploy con SLOs (Módulo 5), permisos multi-tenant (Módulo 7).
+
+Abre el repo durante la entrevista. Muestra el trace de una respuesta, el reporte de evals y un ADR. Los artefactos concretos le ganan a los adjetivos.

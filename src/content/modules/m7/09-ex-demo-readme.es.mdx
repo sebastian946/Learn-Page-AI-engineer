@@ -1,0 +1,132 @@
+## Objetivo
+
+Convierte el repo del capstone final, `multi-tenant-ai-platform`, en algo que un revisor entienda en 90 segundos. Grabarás un GIF de demo con guion, escribirás el README final, agregarás un documento de arquitectura con ADRs y harás que la tabla de resultados se regenere a partir de la salida real de los evals para que nunca quede desactualizada.
+
+Haz este ejercicio cuando el capstone funcione de punta a punta (o cerca del final del día 5 del capstone). Un README escrito antes de que el sistema funcione termina describiendo intenciones, no resultados.
+
+La idea de ingeniería clave: **los números del README son artefactos de build.** Como SDET nunca editarías a mano un reporte de pruebas. Aquí igual. `make eval` escribe `reports/latest.json`; un script genera la tabla de resultados del README a partir de él, entre dos comentarios marcadores. CI falla si el README está desactualizado.
+
+El guion de la demo (apunta a 20 a 25 segundos, sin narración):
+
+1. Inicia sesión como usuario del Bufete A. Haz una pregunta real. Muestra la respuesta en streaming con citas.
+2. Haz clic en una cita; se abre el pasaje fuente.
+3. Pídele al agente que haga algo con una herramienta (por ejemplo, "crea una tarea de revisión para esta cláusula"); muestra el pedido de aprobación y apruébalo.
+4. Cambia al Bufete B. Pregunta por el documento canario del Bufete A. Muestra "No tengo información sobre eso".
+5. Abre el trace de la última petición: spans de retrieval, re-rank y LLM, con el `tenant_id` visible.
+6. Termina en el dashboard de costos filtrado por tenant.
+
+<AcceptanceCriteria>
+
+- [ ] Existe `docs/demo.gif`, dura 30 segundos o menos, pesa menos de 5 MB y muestra los seis pasos del guion.
+- [ ] El README sigue el orden: pitch, GIF, resultados de un vistazo, arquitectura, cómo correrlo en 5 minutos, evaluación, análisis de costos, observabilidad, decisiones de diseño, limitaciones.
+- [ ] La tabla de resultados la genera `scripts/render_readme.py` a partir de `reports/latest.json` entre los marcadores `<!-- results:start -->` y `<!-- results:end -->`, y un paso de CI falla si el README difiere de la salida generada.
+- [ ] "How to run in 5 minutes" se cronometró en un clon limpio (o Codespace) y funciona con `LLM_PROVIDER=fake` y sin API key.
+- [ ] `docs/architecture.md` tiene un diagrama C4 de contexto y de contenedores, un diagrama de secuencia de una petición que muestre dónde se aplica el contexto de tenant y un párrafo por contenedor.
+- [ ] `docs/adr/` tiene al menos 4 ADRs con contexto, decisión, alternativas y consecuencias.
+- [ ] El análisis de costos muestra la fórmula, los tokens medidos por petición, la tasa de aciertos de caché, el costo por 1k peticiones por nivel de modelo y el costo mensual en 3 niveles de tráfico, con precios leídos de configuración y etiquetados con la fecha en que se revisaron.
+- [ ] Una sección de Limitaciones lista al menos 3 limitaciones reales con issues enlazados.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# scripts/render_readme.py - regenerate the results table from the latest eval report
+import json
+import sys
+from pathlib import Path
+
+START, END = "<!-- results:start -->", "<!-- results:end -->"
+
+ROWS = [  # (label, report key, target, format, higher_is_better)
+    ("Faithfulness", "rag.faithfulness", 0.90, "{:.2f}", True),
+    ("Context recall", "rag.context_recall", 0.85, "{:.2f}", True),
+    ("Agent tool-sequence accuracy", "agent.trajectory_exact", 0.80, "{:.2f}", True),
+    ("Cross-tenant leaks", "isolation.leaks", 0, "{:d}", False),
+    ("p95 first token (s)", "perf.p95_ttft_s", 1.5, "{:.2f}", False),
+    ("Cost per 1k requests (USD)", "cost.per_1k_usd", 4.00, "{:.2f}", False),
+]
+
+def get(report: dict, dotted: str):
+    node = report
+    for part in dotted.split("."):
+        node = node[part]
+    return node
+
+def table(report: dict) -> str:
+    meta = report["meta"]
+    lines = [f"_Eval set {meta['dataset_version']} ({meta['n_questions']} questions), run {meta['date']}, commit {meta['commit'][:7]}_", "",
+             "| Metric | Target | Current | Status |", "|---|---|---|---|"]
+    for label, key, target, fmt, higher in ROWS:
+        value = get(report, key)
+        ok = value >= target if higher else value <= target
+        lines.append(f"| {label} | {fmt.format(target)} | {fmt.format(value)} | {'pass' if ok else 'FAIL'} |")
+    return "\n".join(lines)
+
+def render(readme: str, report: dict) -> str:
+    head, rest = readme.split(START, 1)
+    _, tail = rest.split(END, 1)
+    return f"{head}{START}\n{table(report)}\n{END}{tail}"
+
+if __name__ == "__main__":
+    readme_path, report = Path("README.md"), json.loads(Path("reports/latest.json").read_text())
+    new = render(readme_path.read_text(encoding="utf-8"), report)
+    if "--check" in sys.argv:
+        sys.exit(0 if new == readme_path.read_text(encoding="utf-8") else "README results are stale: run make readme")
+    readme_path.write_text(new, encoding="utf-8")
+```
+
+```yaml
+# .github/workflows/ci.yml (excerpt)
+      - name: Offline evals
+        run: make eval            # writes reports/latest.json, fails on threshold breach
+      - name: README results are up to date
+        run: python scripts/render_readme.py --check
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Graba la demo con datos sembrados, no con tu base de desarrollo. Un target `make seed-demo` con dos bufetes, documentos fijos y una cadena canaria conocida hace que la grabación sea repetible, así puedes rehacerla en 2 minutos tras un cambio de UI.</Hint>
+  <Hint>Graba primero un video (OBS o el grabador de tu sistema operativo) a 1280x720, recórtalo y luego conviértelo con ffmpeg usando una paleta generada. Si el GIF pesa demasiado, baja a 10 fps, escala a 1000 px de ancho y corta los frames inactivos mientras el modelo hace streaming.</Hint>
+  <Hint>Para que el chequeo del README en CI sea determinista, el job de evals de CI no debe commitear nada y la tabla generada debe depender solo de `reports/latest.json`. Commitea el reporte que produce `make eval` en main y haz que CI compare contra él. No pongas marcas de tiempo que cambien en cada render fuera de los metadatos del propio reporte.</Hint>
+  <Hint>Escribe la sección de Limitaciones leyendo tus propias fallas de evals y tus traces: "los tenants pequeños muestran menor recall en el índice compartido", "no hay streaming en el flujo de aprobación del agente", "la suite de red team tiene 1 caso de inyección abierto (#42)". Cada una debe corresponder a un issue con una solución propuesta.</Hint>
+</Hints>
+
+<CommitBox repo="multi-tenant-ai-platform">
+
+```text
+multi-tenant-ai-platform/
+  README.md
+  docs/
+    demo.gif
+    architecture.md
+    cost-analysis.md
+    runbook.md
+    adr/
+      0001-record-architecture-decisions.md
+      0002-postgres-pgvector-as-vector-store.md
+      0003-pool-isolation-with-rls.md
+      0004-langgraph-for-agent-plain-python-for-retrieval.md
+      0005-model-routing-by-difficulty-and-budget.md
+      0006-eval-gate-thresholds.md
+  reports/
+    latest.json
+  scripts/
+    render_readme.py
+  Makefile               # seed, seed-demo, demo, eval, readme
+```
+
+Estructura del README: pitch, GIF de demo, resultados de un vistazo (generados), arquitectura (diagrama + camino de la petición en 5 puntos), cómo correrlo en 5 minutos, evaluación (suites, tamaños, umbrales, cómo re-ejecutar), análisis de costos (fórmula + tabla), observabilidad (captura de un trace y del dashboard), decisiones de diseño (enlaces a ADRs), limitaciones y siguientes pasos.
+
+Commits sugeridos:
+
+- `docs: architecture doc with C4 diagrams and request sequence`
+- `docs(adr): record isolation, vector store, framework and routing decisions`
+- `feat(scripts): render README results table from eval report`
+- `ci: fail when README results are stale`
+- `docs: demo GIF and final README`
+
+</CommitBox>
+
+<Checklist id="m7-09-review" title="Autorrevisión" items={["El GIF muestra los seis pasos y dura menos de 30 segundos y pesa menos de 5 MB", "Un desconocido puede correr el proyecto en 5 minutos sin API key", "La tabla de resultados se genera a partir de un reporte de evals real, nunca se edita a mano", "CI falla cuando los resultados del README están desactualizados", "El documento de arquitectura muestra dónde se resuelve y se aplica el contexto de tenant", "Cada ADR nombra al menos dos alternativas y sus consecuencias", "Cada precio del análisis de costos viene de configuración y muestra la fecha en que se revisó", "La sección de Limitaciones es honesta y cada punto enlaza a un issue"]} />

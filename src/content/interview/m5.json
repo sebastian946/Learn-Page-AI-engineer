@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m5-iv-01",
+    "level": "mid",
+    "tags": ["fastapi", "streaming", "sse"],
+    "question": {
+      "en": "How would you implement token streaming from an LLM to a browser with FastAPI?",
+      "es": "¿Cómo implementarías el streaming de tokens desde un LLM hacia un navegador con FastAPI?"
+    },
+    "answer": {
+      "en": "I would use Server-Sent Events: a `StreamingResponse` with `media_type=\"text/event-stream\"` wrapping an async generator that yields `event:` and `data:` lines.\n\nThe order matters:\n- Validate input, authenticate, rate-limit and retrieve **before** the first byte, so failures still get a proper HTTP status.\n- Stream typed events: `token`, `citations`, `done` (with `ttft_ms` and token counts) and `error`, because once streaming starts the status is already 200.\n- Check `request.is_disconnected()` and stop the provider stream when the client leaves, so you do not pay for unread tokens.\n- Set `Cache-Control: no-cache` and disable proxy buffering (`X-Accel-Buffering: no`).\n\nI test it with `httpx.AsyncClient.stream` against the ASGI app and a mock provider, asserting event order.",
+      "es": "Usaría Server-Sent Events: un `StreamingResponse` con `media_type=\"text/event-stream\"` que envuelve un generador async que emite líneas `event:` y `data:`.\n\nEl orden importa:\n- Validar el input, autenticar, aplicar rate limit y hacer retrieval **antes** del primer byte, para que las fallas aún reciban un status HTTP correcto.\n- Emitir eventos tipados: `token`, `citations`, `done` (con `ttft_ms` y conteos de tokens) y `error`, porque una vez que empieza el streaming el status ya es 200.\n- Revisar `request.is_disconnected()` y detener el stream del proveedor cuando el cliente se va, para no pagar tokens que nadie lee.\n- Poner `Cache-Control: no-cache` y desactivar el buffering de proxies (`X-Accel-Buffering: no`).\n\nLo pruebo con `httpx.AsyncClient.stream` contra la app ASGI y un proveedor mock, verificando el orden de los eventos."
+    }
+  },
+  {
+    "id": "m5-iv-02",
+    "level": "senior",
+    "tags": ["idempotency", "api-design"],
+    "question": {
+      "en": "Where do idempotency keys matter in an LLM application, and how do you implement them?",
+      "es": "¿Dónde importan las idempotency keys en una aplicación LLM y cómo las implementas?"
+    },
+    "answer": {
+      "en": "They matter on any endpoint with a side effect that clients may retry: creating a support ticket, sending an email from an agent tool, starting a costly batch job. LLM calls are slow, so client timeouts and retries are common.\n\nImplementation: the client sends an `Idempotency-Key` header. The server does `SET key pending NX EX 86400` in Redis before the side effect. If the key exists and is complete, return the stored response. If it is pending, return 409 or wait. After success, store the response under the key. I also hash the request body with the key and reject a reused key with a different body.\n\nThe same idea applies to agent tools: give each tool call a deterministic id so a retried step does not repeat the action.",
+      "es": "Importan en cualquier endpoint con un efecto secundario que los clientes puedan reintentar: crear un ticket de soporte, enviar un email desde una tool de un agente, lanzar un batch job costoso. Las llamadas a LLM son lentas, así que los timeouts y reintentos del cliente son comunes.\n\nImplementación: el cliente envía un header `Idempotency-Key`. El servidor hace `SET key pending NX EX 86400` en Redis antes del efecto secundario. Si la key existe y está completa, devuelve la respuesta guardada. Si está pendiente, devuelve 409 o espera. Tras el éxito, guarda la respuesta bajo la key. También hago hash del body junto con la key y rechazo una key reutilizada con un body distinto.\n\nLa misma idea aplica a las tools de agentes: dale a cada llamada de tool un id determinista para que un paso reintentado no repita la acción."
+    }
+  },
+  {
+    "id": "m5-iv-03",
+    "level": "mid",
+    "tags": ["docker", "security", "secrets"],
+    "question": {
+      "en": "Walk me through a production Dockerfile for a Python RAG service.",
+      "es": "Explícame un Dockerfile de producción para un servicio RAG en Python."
+    },
+    "answer": {
+      "en": "Two stages. The builder stage starts from a Python slim image, copies only `pyproject.toml` and `uv.lock`, and runs `uv sync --frozen --no-dev` with a BuildKit cache mount, so dependency layers are cached until the lockfile changes. Then it copies the app code.\n\nThe runtime stage copies only the virtualenv and the app, runs as a non-root user, sets `PYTHONUNBUFFERED=1`, exposes 8000 and starts uvicorn. I add a `.dockerignore` for `.git`, `.env`, tests data and notebooks.\n\nNo secrets in the image: no `ENV` with API keys, no copied `.env`. Secrets come from Secrets Manager at runtime. Large model weights are not baked in unless they are small and versioned; otherwise they are downloaded to a volume or served by a separate service. I check image size and run a scanner in CI.",
+      "es": "Dos etapas. La etapa builder parte de una imagen Python slim, copia solo `pyproject.toml` y `uv.lock`, y corre `uv sync --frozen --no-dev` con un cache mount de BuildKit, así las capas de dependencias se cachean hasta que cambia el lockfile. Luego copia el código de la app.\n\nLa etapa runtime copia solo el virtualenv y la app, corre como usuario no root, define `PYTHONUNBUFFERED=1`, expone el 8000 y arranca uvicorn. Agrego un `.dockerignore` para `.git`, `.env`, datos de pruebas y notebooks.\n\nNada de secretos en la imagen: ningún `ENV` con API keys, ningún `.env` copiado. Los secretos vienen de Secrets Manager en runtime. Los pesos de modelos grandes no se hornean en la imagen salvo que sean pequeños y versionados; si no, se descargan a un volumen o los sirve otro servicio. Reviso el tamaño de la imagen y corro un scanner en CI."
+    }
+  },
+  {
+    "id": "m5-iv-04",
+    "level": "senior",
+    "tags": ["caching", "redis", "semantic-cache"],
+    "question": {
+      "en": "Would you add a semantic cache to a RAG assistant for a regulated business? How?",
+      "es": "¿Agregarías una caché semántica a un asistente RAG para un negocio regulado? ¿Cómo?"
+    },
+    "answer": {
+      "en": "Exact cache first, always: it has no quality risk when the key includes tenant, normalized question, model, prompt version and corpus version.\n\nA semantic cache I would add only with guardrails, because a wrong hit is a confident wrong answer. Similar embeddings do not mean the same question: \"rate for a 15-year loan\" and \"rate for a 30-year loan\" are close.\n\nGuardrails: a strict similarity threshold tuned on a labeled set of paraphrase and near-miss pairs; scoping by tenant and corpus version; skipping questions that contain numbers, dates or named entities; a short TTL; and logging every semantic hit so we can sample and evaluate them. I would launch it behind a flag, measure hit rate and the wrong-hit rate from sampled evals, and keep it only if the wrong-hit rate is near zero. During outages it also serves as a labeled fallback.",
+      "es": "Primero caché exacta, siempre: no tiene riesgo de calidad cuando la key incluye tenant, pregunta normalizada, modelo, versión del prompt y versión del corpus.\n\nUna caché semántica la agregaría solo con guardrails, porque un hit equivocado es una respuesta equivocada con total confianza. Embeddings similares no significan la misma pregunta: \"tasa para un préstamo a 15 años\" y \"tasa para un préstamo a 30 años\" están cerca.\n\nGuardrails: un umbral de similitud estricto ajustado con un set etiquetado de paráfrasis y casi-coincidencias; aislamiento por tenant y versión del corpus; omitir preguntas con números, fechas o entidades; un TTL corto; y registrar cada hit semántico para muestrearlos y evaluarlos. La lanzaría detrás de un flag, mediría el hit rate y la tasa de hits equivocados con evals muestreados, y la mantendría solo si esa tasa es casi cero. Durante caídas también sirve como fallback etiquetado."
+    }
+  },
+  {
+    "id": "m5-iv-05",
+    "level": "senior",
+    "tags": ["rate-limiting", "multi-tenant", "redis"],
+    "question": {
+      "en": "Design rate limiting for a multi-tenant LLM API.",
+      "es": "Diseña el rate limiting de una API LLM multi-tenant."
+    },
+    "answer": {
+      "en": "Two dimensions per tenant: requests per minute and tokens per minute, because tokens are what cost money and what the provider limits.\n\nI use token buckets in Redis implemented as a Lua script, so refill and decrement are atomic across all API tasks. Before the LLM call, I estimate input tokens (tokenizer or a chars-per-token heuristic) plus a reserve for output, and charge the bucket. After the call, I reconcile with the real `usage`: refund or charge the difference.\n\nWhen a bucket is empty I return 429 with `Retry-After` computed from the refill rate. Limits come from the tenant's plan. On top of tenant limits I keep a global bucket sized below the provider account limit, so one tenant cannot exhaust it for everyone. If Redis is down, I fail open with a conservative local in-memory limiter rather than taking the API down, and I alert.",
+      "es": "Dos dimensiones por tenant: peticiones por minuto y tokens por minuto, porque los tokens son lo que cuesta dinero y lo que el proveedor limita.\n\nUso token buckets en Redis implementados como un script Lua, para que la recarga y el descuento sean atómicos entre todas las tasks de la API. Antes de la llamada al LLM, estimo los tokens de entrada (tokenizer o una heurística de caracteres por token) más una reserva para la salida, y los cobro al bucket. Después de la llamada, concilio con el `usage` real: devuelvo o cobro la diferencia.\n\nCuando un bucket está vacío devuelvo 429 con `Retry-After` calculado a partir de la tasa de recarga. Los límites vienen del plan del tenant. Encima de los límites por tenant mantengo un bucket global por debajo del límite de la cuenta del proveedor, para que un tenant no lo agote para todos. Si Redis se cae, fallo abierto con un limitador local en memoria conservador en lugar de tumbar la API, y disparo una alerta."
+    }
+  },
+  {
+    "id": "m5-iv-06",
+    "level": "mid",
+    "tags": ["pgvector", "postgres", "indexes"],
+    "question": {
+      "en": "HNSW or IVFFlat in pgvector? How do you choose?",
+      "es": "¿HNSW o IVFFlat en pgvector? ¿Cómo eliges?"
+    },
+    "answer": {
+      "en": "HNSW is my default. It gives a better recall-latency trade-off, has no training step, and handles incremental inserts well. The costs are more memory and slower index builds. Tuning knobs: `m` and `ef_construction` at build time, `hnsw.ef_search` at query time for recall.\n\nIVFFlat builds faster and uses less memory, but it clusters the existing data into `lists`, so you must build it after loading data and rebuild when the distribution shifts a lot. At query time `ivfflat.probes` trades recall for speed.\n\nEither way I measure recall@k against exact search on a sample, build with `CREATE INDEX CONCURRENTLY` in a migration outside a transaction, and watch filtered queries: a selective `WHERE tenant_id = ...` can return too few results after the approximate scan, so I check iterative scans or partial indexes per large tenant.",
+      "es": "HNSW es mi default. Da un mejor trade-off entre recall y latencia, no tiene paso de entrenamiento y maneja bien los inserts incrementales. Los costos son más memoria y builds de índice más lentos. Parámetros: `m` y `ef_construction` al construir, `hnsw.ef_search` al consultar para el recall.\n\nIVFFlat construye más rápido y usa menos memoria, pero agrupa los datos existentes en `lists`, así que debes construirlo después de cargar los datos y reconstruirlo cuando la distribución cambia mucho. Al consultar, `ivfflat.probes` intercambia recall por velocidad.\n\nEn ambos casos mido el recall@k contra búsqueda exacta en una muestra, construyo con `CREATE INDEX CONCURRENTLY` en una migración fuera de transacción y vigilo las consultas filtradas: un `WHERE tenant_id = ...` selectivo puede devolver muy pocos resultados después del escaneo aproximado, así que reviso los iterative scans o índices parciales por tenant grande."
+    }
+  },
+  {
+    "id": "m5-iv-07",
+    "level": "senior",
+    "tags": ["ci-cd", "github-actions", "evals"],
+    "question": {
+      "en": "What does a CI/CD pipeline for an LLM service need beyond a normal web service pipeline?",
+      "es": "¿Qué necesita un pipeline de CI/CD para un servicio LLM además de lo que tiene un pipeline web normal?"
+    },
+    "answer": {
+      "en": "Three additions.\n\n- **An eval gate.** Prompts and retrieval config are code. A job runs the golden dataset and blocks the merge if faithfulness or answer relevance drops below threshold. It runs on a paths filter (prompts, retrieval, model config) to control cost, with a hard budget cap and a cached baseline.\n- **Deterministic tests without the provider.** Unit and contract tests run against a mock LLM so CI is fast, free and not flaky. Only the eval job calls the real model.\n- **Safer releases for behavior changes.** Images are tagged with the git SHA and promoted from staging to production through GitHub environments with approval. Prompt changes can also ship behind feature flags with a canary.\n\nThe rest is standard but important: OIDC to AWS instead of stored keys, buildx layer caching, concurrency groups so two deploys never race, and a post-deploy smoke test that actually streams an answer.",
+      "es": "Tres agregados.\n\n- **Un eval gate.** Los prompts y la configuración de retrieval son código. Un job corre el golden dataset y bloquea el merge si el faithfulness o la relevancia de respuesta caen bajo el umbral. Corre con un filtro de paths (prompts, retrieval, config del modelo) para controlar el costo, con un tope de presupuesto y una baseline cacheada.\n- **Pruebas deterministas sin el proveedor.** Las pruebas unitarias y de contrato corren contra un LLM mock para que CI sea rápido, gratis y no flaky. Solo el job de evals llama al modelo real.\n- **Releases más seguros para cambios de comportamiento.** Las imágenes llevan el SHA de git como tag y se promueven de staging a producción con environments de GitHub y aprobación. Los cambios de prompt también pueden salir detrás de feature flags con canary.\n\nEl resto es estándar pero importante: OIDC hacia AWS en lugar de llaves guardadas, caché de capas con buildx, concurrency groups para que dos deploys nunca compitan, y un smoke test post-deploy que realmente haga streaming de una respuesta."
+    }
+  },
+  {
+    "id": "m5-iv-08",
+    "level": "mid",
+    "tags": ["aws", "ecs", "lambda", "deploy"],
+    "question": {
+      "en": "ECS Fargate or Lambda for a streaming chat API?",
+      "es": "¿ECS Fargate o Lambda para una API de chat con streaming?"
+    },
+    "answer": {
+      "en": "For steady chat traffic with streaming, I default to ECS Fargate behind an ALB. Containers hold many concurrent streams with async FastAPI, there is no per-invocation duration cap, no cold start on each scale event once tasks are warm, and connection pools to Postgres and Redis are reused. I raise the ALB idle timeout and send SSE heartbeats.\n\nLambda can stream responses through function URLs or the Lambda Web Adapter, and it is great for spiky, low-volume or background work like ingestion. The trade-offs are cold starts, a maximum duration, one request per execution environment (so concurrency and connection counts scale together), and buffering when you put API Gateway in front. I would check the current limits before choosing. For many teams the answer is both: Fargate for the API, Lambda or scheduled tasks for jobs.",
+      "es": "Para tráfico de chat estable con streaming, mi default es ECS Fargate detrás de un ALB. Los contenedores mantienen muchos streams concurrentes con FastAPI async, no hay tope de duración por invocación, no hay cold start en cada evento de escalado una vez que las tasks están calientes, y los connection pools a Postgres y Redis se reutilizan. Subo el idle timeout del ALB y envío heartbeats SSE.\n\nLambda puede hacer streaming de respuestas con function URLs o con Lambda Web Adapter, y es excelente para trabajo con picos, bajo volumen o en segundo plano, como la ingesta. Los trade-offs son cold starts, una duración máxima, una petición por entorno de ejecución (así que la concurrencia y las conexiones escalan juntas) y buffering cuando pones API Gateway delante. Revisaría los límites actuales antes de elegir. Para muchos equipos la respuesta es ambos: Fargate para la API, Lambda o scheduled tasks para los jobs."
+    }
+  },
+  {
+    "id": "m5-iv-09",
+    "level": "senior",
+    "tags": ["load-testing", "k6", "ttft"],
+    "question": {
+      "en": "How do you load test an LLM endpoint, and which metrics matter?",
+      "es": "¿Cómo haces pruebas de carga de un endpoint LLM y qué métricas importan?"
+    },
+    "answer": {
+      "en": "First, separate my service from the provider. Most runs use a mock provider that simulates realistic TTFT and tokens per second, so I find my own bottlenecks (connection pools, CPU, Redis, Postgres) cheaply and reproducibly. Then one small, budgeted run against the real provider measures real TTFT and validates the cost model and the provider rate limits.\n\nIn k6 I use an arrival-rate executor (open model), because real users do not wait for each other. Metrics: p95 and p99 end-to-end latency, p95 TTFT (I emit `ttft_ms` from the server in the `done` event, since plain k6 HTTP waits for the full body), tokens per second, error rate, 429 rate and cache hit rate. Thresholds make the run pass or fail in CI.\n\nI interpret results with Little's law: if concurrency grows while throughput stays flat, something is saturated, and I find it with traces.",
+      "es": "Primero, separo mi servicio del proveedor. La mayoría de las corridas usan un proveedor mock que simula TTFT y tokens por segundo realistas, así encuentro mis propios cuellos de botella (connection pools, CPU, Redis, Postgres) de forma barata y reproducible. Luego una corrida pequeña y presupuestada contra el proveedor real mide el TTFT real y valida el modelo de costos y los rate limits del proveedor.\n\nEn k6 uso un executor de arrival rate (modelo abierto), porque los usuarios reales no se esperan entre sí. Métricas: latencia de punta a punta p95 y p99, TTFT p95 (emito `ttft_ms` desde el servidor en el evento `done`, ya que el HTTP simple de k6 espera el body completo), tokens por segundo, tasa de errores, tasa de 429 y cache hit rate. Los thresholds hacen que la corrida pase o falle en CI.\n\nInterpreto los resultados con la ley de Little: si la concurrencia crece mientras el throughput se mantiene plano, algo está saturado, y lo encuentro con traces."
+    }
+  },
+  {
+    "id": "m5-iv-10",
+    "level": "mid",
+    "tags": ["cost", "capacity-planning"],
+    "question": {
+      "en": "How do you calculate cost per 1k requests for a RAG service?",
+      "es": "¿Cómo calculas el costo por 1k peticiones de un servicio RAG?"
+    },
+    "answer": {
+      "en": "Per request: input tokens (system prompt + retrieved context + history + question) times the input price, plus output tokens times the output price, plus embeddings, re-ranking and any extra calls like query rewriting or guardrails. Multiply by 1,000, then by the share of requests that miss the cache, and add infrastructure cost per 1k.\n\nPrices come from config, not constants, because they change. I validate the model with logged `usage` data, and I look at p95 input tokens per tenant, because long pasted inputs drive the bill.\n\nThe biggest levers are usually `max_tokens`, the exact cache, and trimming retrieved context, and I run the eval gate before and after any lever that touches quality.",
+      "es": "Por petición: tokens de entrada (system prompt + contexto recuperado + historial + pregunta) por el precio de entrada, más tokens de salida por el precio de salida, más embeddings, re-ranking y llamadas extra como reescritura de consultas o guardrails. Multiplica por 1,000, luego por la fracción de peticiones que no pegan en caché, y suma el costo de infraestructura por 1k.\n\nLos precios vienen de configuración, no de constantes, porque cambian. Valido el modelo con los datos de `usage` registrados y miro el p95 de tokens de entrada por tenant, porque los inputs largos pegados mueven la factura.\n\nLas palancas más grandes suelen ser `max_tokens`, la caché exacta y recortar el contexto recuperado, y corro el eval gate antes y después de cualquier palanca que toque la calidad."
+    }
+  },
+  {
+    "id": "m5-iv-11",
+    "level": "senior",
+    "tags": ["reliability", "circuit-breaker", "fallback"],
+    "question": {
+      "en": "What is your fallback strategy when the LLM provider degrades?",
+      "es": "¿Cuál es tu estrategia de fallback cuando el proveedor LLM se degrada?"
+    },
+    "answer": {
+      "en": "A degradation ladder agreed with product: primary model, fallback model, labeled cached answer, retrieved passages with links, then a 503 with a status link.\n\nMechanics: connect timeout and a TTFT budget; SDK retries turned down so they do not eat the latency budget; a circuit breaker per model that counts only health failures (timeouts, 5xx, overloaded, connection errors), opens after a threshold and half-opens after a cooldown. Fallback happens only before the first token, never mid-stream. The fallback model has its own eval score, so we know what quality we degrade to.\n\nEvery response reports its degradation level in the payload, logs and metrics, so dashboards show the share of degraded traffic and support can explain it. I test the whole path with fault injection in the mock provider and with a game day in staging.",
+      "es": "Una escalera de degradación acordada con producto: modelo primario, modelo de fallback, respuesta cacheada etiquetada, pasajes recuperados con links y luego un 503 con link de estado.\n\nMecánica: connect timeout y un presupuesto de TTFT; reintentos del SDK reducidos para que no consuman el presupuesto de latencia; un circuit breaker por modelo que cuenta solo fallas de salud (timeouts, 5xx, overloaded, errores de conexión), se abre tras un umbral y pasa a half-open tras un enfriamiento. El fallback ocurre solo antes del primer token, nunca a mitad del stream. El modelo de fallback tiene su propio score de evals, así sabemos a qué calidad degradamos.\n\nCada respuesta reporta su nivel de degradación en el payload, logs y métricas, para que los dashboards muestren la fracción de tráfico degradado y soporte pueda explicarlo. Pruebo todo el camino con inyección de fallas en el proveedor mock y con un game day en staging."
+    }
+  },
+  {
+    "id": "m5-iv-12",
+    "level": "senior",
+    "tags": ["slo", "observability", "operations"],
+    "question": {
+      "en": "Which SLOs would you define for a production LLM assistant, and how do you alert on them?",
+      "es": "¿Qué SLOs definirías para un asistente LLM en producción y cómo alertas sobre ellos?"
+    },
+    "answer": {
+      "en": "Four that the business understands:\n- **Availability**: share of requests without a 5xx; degraded but useful answers count as success, and I track the degraded share separately.\n- **Latency**: p95 end-to-end for JSON, and p95 time to first token for streaming, because TTFT is what users feel.\n- **Cost**: cost per 1k requests against a budget, plus a daily spend alert.\n- **Quality**: an offline faithfulness threshold gated in CI, and an online signal like sampled groundedness or thumbs-down rate.\n\nFor alerting I use multi-window burn-rate alerts on the error budget (a fast window that pages, a slow window that opens a ticket) instead of static thresholds, which page too often or too late. Each alert links to a runbook entry with triage steps and mitigations such as forcing the fallback model via a flag.",
+      "es": "Cuatro que el negocio entiende:\n- **Disponibilidad**: fracción de peticiones sin 5xx; las respuestas degradadas pero útiles cuentan como éxito, y sigo la fracción degradada por separado.\n- **Latencia**: p95 de punta a punta para JSON, y p95 del time to first token para streaming, porque el TTFT es lo que sienten los usuarios.\n- **Costo**: costo por 1k peticiones contra un presupuesto, más una alerta de gasto diario.\n- **Calidad**: un umbral offline de faithfulness como gate en CI, y una señal online como groundedness muestreada o tasa de thumbs-down.\n\nPara alertar uso alertas de burn rate multi-ventana sobre el error budget (una ventana rápida que hace page, una lenta que abre un ticket) en lugar de umbrales estáticos, que alertan demasiado seguido o demasiado tarde. Cada alerta enlaza a una entrada del runbook con pasos de triage y mitigaciones como forzar el modelo de fallback con un flag."
+    }
+  }
+]

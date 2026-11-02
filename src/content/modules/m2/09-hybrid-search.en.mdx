@@ -1,0 +1,209 @@
+## Why vector search alone is not enough
+
+Run your golden set from the chunking exercise and look at the misses. A pattern shows up quickly: questions with **exact identifiers** fail more than conceptual ones.
+
+- "What does Form 4506-C authorize?"
+- "Rules for Section 50(a)(6) loans"
+- "Is LTV 97% allowed for HomeReady?"
+- "What is reason code DU-1234?"
+
+Dense embeddings capture meaning, but they compress rare tokens like form numbers, statute references and product codes into a general "this is about mortgage forms" region. The chunk that literally contains "4506-C" may rank below a chunk about a different tax form with similar wording.
+
+Keyword search has the opposite profile. It nails exact terms and fails on paraphrase ("highest debt ratio we'll accept" never matches "maximum DTI"). **Hybrid search runs both and fuses the results.** On corpora full of identifiers, like lending policies, it is one of the most reliable improvements you can make, and it is cheap.
+
+## BM25 in two minutes
+
+BM25 is the classic keyword ranking function behind Lucene, Elasticsearch and OpenSearch. For each query term it rewards:
+
+- **Term frequency** in the chunk, with diminishing returns (parameter `k1`, typically about 1.2–2.0).
+- **Rarity** across the corpus (inverse document frequency): "4506-C" is rare, so a match is worth a lot; "loan" is everywhere, so it is worth little.
+- **Short chunks** over long ones for the same matches (length normalization, parameter `b`, typically 0.75).
+
+Options for a BM25-style leg:
+
+| Option | Notes |
+|---|---|
+| Postgres full-text search (`tsvector`, `ts_rank_cd`) | built in, GIN index, same database and transaction as your vectors. Ranking is not true BM25 (no IDF saturation the same way) but works well in practice for this purpose |
+| ParadeDB `pg_search` extension | real BM25 inside Postgres; an extra extension to operate |
+| `rank_bm25` (Python) | great for experiments and small corpora; in-memory, rebuild on change |
+| Elasticsearch / OpenSearch | real BM25, analyzers, synonyms; a second system to run |
+| Sparse vectors (SPLADE, BM25 sparse) in Qdrant | hybrid inside one vector engine |
+
+For `rag-lab` and the capstone we use Postgres full-text search, because it keeps everything in one database and one query.
+
+### Full-text search in Postgres
+
+```sql
+ALTER TABLE chunks
+  ADD COLUMN tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('english', coalesce(section, '') || ' ' || content)) STORED;
+
+CREATE INDEX chunks_tsv_gin ON chunks USING gin (tsv);
+
+-- keyword leg: top 20 by text rank
+SELECT chunk_id, ts_rank_cd(tsv, q) AS kw_score
+FROM chunks, websearch_to_tsquery('english', 'Form 4506-C authorization') AS q
+WHERE tsv @@ q
+ORDER BY kw_score DESC
+LIMIT 20;
+```
+
+`websearch_to_tsquery` accepts user-style input (quotes for phrases, `or`, `-` to exclude) and never throws a syntax error, which makes it safe for raw user questions. Watch the tokenizer: the `english` configuration stems words and may split identifiers like "4506-C". Test your important identifiers explicitly; if they break, add a second `simple` configuration column for codes, or normalize them at ingestion ("4506-C" to "4506C").
+
+## Fusing the two result lists
+
+You now have two ranked lists with incompatible scores: cosine similarity in 0–1, text rank on an arbitrary scale. You cannot just add them.
+
+### Reciprocal rank fusion (RRF)
+
+RRF ignores scores and uses ranks only. Each document gets `score = sum over lists of 1 / (k + rank)`, with `k = 60` as the conventional constant from the original paper.
+
+```python
+from collections import defaultdict
+
+
+def rrf(result_lists: list[list[str]], k: int = 60, weights: list[float] | None = None,
+        top_n: int = 10) -> list[tuple[str, float]]:
+    """Fuse ranked lists of IDs. Rank is 1-based. Higher fused score = better."""
+    weights = weights or [1.0] * len(result_lists)
+    scores: dict[str, float] = defaultdict(float)
+    for w, ids in zip(weights, result_lists):
+        for rank, doc_id in enumerate(ids, start=1):
+            scores[doc_id] += w / (k + rank)
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+
+
+vector_ids = ["c12", "c07", "c33", "c02"]
+keyword_ids = ["c33", "c91", "c12"]
+print(rrf([vector_ids, keyword_ids]))
+# c12 and c33 appear in both lists, so they rise to the top
+```
+
+Why RRF is the default:
+
+- **No score calibration.** Works across any retrievers, including future ones (a re-ranker, a second embedding model).
+- **Robust.** A document ranked well by both legs wins; one ranked first by only one leg still scores well.
+- **One knob.** `k` controls how much the top ranks dominate. A smaller `k` rewards rank 1 more. Per-leg weights let you favour vectors or keywords; tune both on the golden set.
+
+### Weighted score fusion
+
+The alternative is to normalize each list's scores (min-max within the result list) and combine with `alpha * vector + (1 - alpha) * keyword`. It can squeeze out a bit more quality when tuned, but min-max normalization is sensitive to outliers and to how many results each leg returns. Start with RRF; try weighted fusion only if the golden set shows a gain.
+
+### Hybrid in one SQL query
+
+```sql
+WITH params AS (
+  SELECT %(qvec)s::vector AS qvec, websearch_to_tsquery('english', %(qtext)s) AS qts
+),
+filtered AS (
+  SELECT c.* FROM chunks c JOIN documents d USING (doc_id)
+  WHERE d.is_current
+    AND d.jurisdiction = ANY(%(jur)s)
+    AND (%(doc_type)s::text IS NULL OR d.doc_type = %(doc_type)s)
+),
+vec AS (
+  SELECT chunk_id, row_number() OVER (ORDER BY embedding <=> (SELECT qvec FROM params)) AS r
+  FROM filtered ORDER BY embedding <=> (SELECT qvec FROM params) LIMIT 40
+),
+kw AS (
+  SELECT chunk_id, row_number() OVER (ORDER BY ts_rank_cd(tsv, (SELECT qts FROM params)) DESC) AS r
+  FROM filtered WHERE tsv @@ (SELECT qts FROM params)
+  ORDER BY ts_rank_cd(tsv, (SELECT qts FROM params)) DESC LIMIT 40
+)
+SELECT chunk_id,
+       coalesce(1.0 / (60 + vec.r), 0) + coalesce(1.0 / (60 + kw.r), 0) AS rrf
+FROM vec FULL OUTER JOIN kw USING (chunk_id)
+ORDER BY rrf DESC
+LIMIT %(k)s;
+```
+
+Each leg retrieves more candidates (40) than you finally return (5–10). Fusion needs depth: a chunk ranked 15th by vectors and 2nd by keywords should be able to win. Note that the CTE applies filters before ranking; on large tables check with `EXPLAIN` that the HNSW index is still used, or apply the filters inside each leg instead.
+
+## Metadata filtering
+
+Hybrid ranking decides *order*. Metadata filters decide *eligibility*. In a mortgage corpus the three filters that prevent the worst answers are:
+
+- **Effective date / is_current.** Never answer from a superseded policy unless the user asks about a past date.
+- **Jurisdiction.** Texas home-equity rules differ from California's. A loan officer in Texas should get `US` and `US-TX` documents, not `US-CA`.
+- **Doc type.** Some questions should only use underwriting guidelines, not marketing FAQs.
+
+Where do filter values come from?
+
+1. **Request context (preferred).** The user's profile or the UI: branch state, product line, role. Deterministic and auditable.
+2. **Extracted from the question.** "What was the gift fund rule in Texas in 2024?" contains a jurisdiction and a date. A cheap model with structured output can extract them (the "self-query" pattern):
+
+```python
+from datetime import date
+from typing import Literal
+import anthropic
+from pydantic import BaseModel
+
+class SearchFilters(BaseModel):
+    jurisdiction: str | None = None          # "US-TX"
+    as_of: date | None = None
+    doc_type: Literal["policy", "underwriting_guideline", "faq"] | None = None
+
+client = anthropic.AsyncAnthropic()
+
+async def extract_filters(question: str) -> SearchFilters:
+    msg = await client.messages.create(
+        model="claude-haiku-5-5", max_tokens=200,
+        system="Extract search filters. Use US state codes like US-TX. Omit unknown fields.",
+        tools=[{"name": "set_filters", "description": "Search filters",
+                "input_schema": SearchFilters.model_json_schema()}],
+        tool_choice={"type": "tool", "name": "set_filters"},
+        messages=[{"role": "user", "content": question}],
+    )
+    return SearchFilters.model_validate(msg.content[0].input)
+```
+
+Validate extracted values against an allow-list (known jurisdictions, known doc types). Treat extraction as a hint: if a strict filter returns nothing, retry without it and say so, rather than answering "I don't know".
+
+**Security note:** access control is also a filter, but it must never come from the question. Permissions come from the authenticated user, are applied in the query on every leg, and are tested. You will see this again in Module 7 (multi-tenancy).
+
+## Hybrid with LangChain
+
+LangChain's `EnsembleRetriever` fuses retrievers with weighted RRF:
+
+```python
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
+
+bm25 = BM25Retriever.from_documents(chunks, k=20)          # uses rank_bm25 in memory
+dense = pg_store.as_retriever(search_kwargs={"k": 20})
+hybrid = EnsembleRetriever(retrievers=[bm25, dense], weights=[0.4, 0.6])
+docs = hybrid.invoke("Form 4506-C authorization period")
+```
+
+Good for prototyping. In production prefer the single-SQL version: one round-trip, filters applied consistently to both legs, and no in-memory BM25 index to rebuild on every change.
+
+## Common mistakes
+
+- **Adding raw scores from different retrievers.** Cosine and text rank are on different scales. Use RRF or normalize.
+- **Too few candidates per leg.** Fusing two top-5 lists gives fusion nothing to work with. Retrieve 20–50 per leg.
+- **Filters on one leg only.** The keyword leg happily returns a superseded California policy that the vector leg had filtered out.
+- **Not testing identifiers through the tokenizer.** Stemming and hyphen splitting can make "4506-C" unsearchable.
+- **Trusting LLM-extracted filters blindly.** Validate against allow-lists and fall back gracefully.
+- **Evaluating hybrid on an easy golden set.** If the set has no exact-term questions, hybrid will look useless. Include them.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Explain hybrid search and reciprocal rank fusion. Why not just add the scores?" level="mid">
+
+Hybrid search runs a keyword retriever (BM25 or Postgres full-text) and a dense vector retriever over the same corpus and merges the results. Keyword search catches exact identifiers like form numbers and statute references; vectors catch paraphrases. Their scores are on different, uncalibrated scales, so adding them lets one retriever dominate arbitrarily. Reciprocal rank fusion uses ranks instead: each document scores the sum of 1 over (k plus rank) across lists, with k around 60. Documents ranked well by both rise to the top, and it needs no calibration. I retrieve 20–50 candidates per leg, fuse, and pass the top 5–10 to a re-ranker or the LLM, tuning weights on a golden set.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="How do you make sure a RAG assistant never answers from a superseded or out-of-jurisdiction policy?" level="senior">
+
+Make it a data and query guarantee, not a prompt instruction. At ingestion, every document gets `effective_date`, `is_current` and `jurisdiction` as typed columns. At query time, filters come primarily from authenticated request context (the officer's state, the product), optionally refined by validated extraction from the question, and are applied inside every retrieval leg, before fusion. Superseded versions stay in the database for audit but are excluded by default; date-specific questions switch to an `as_of` filter. Then I test it: golden questions whose correct answer exists only in the current or only in one state's document, plus a property test that no retrieved chunk ever violates the filters.
+
+</InterviewQuestion>
+
+## Further reading
+
+- [Cormack, Clarke and Büttcher, Reciprocal Rank Fusion (SIGIR 2009)](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)
+- [PostgreSQL — Full text search](https://www.postgresql.org/docs/current/textsearch.html)
+- [pgvector — Hybrid search examples](https://github.com/pgvector/pgvector)
+- [LangChain — Ensemble retriever](https://python.langchain.com/docs/how_to/ensemble_retriever/)
+- [Qdrant — Hybrid queries](https://qdrant.tech/documentation/concepts/hybrid-queries/)

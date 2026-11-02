@@ -1,0 +1,221 @@
+## El costo es un requisito de la feature
+
+En un servicio web clásico, el costo marginal de un request se redondea a cero. En un servicio LLM no. Una sola feature puede costar silenciosamente miles de dólares al mes, y un cambio de prompt puede duplicar la factura de la noche a la mañana. Los hiring managers lo saben: el "costo por 1k requests" aparece en briefs de clientes, entrevistas de diseño de sistemas y ofertas de empleo.
+
+No puedes optimizar lo que no mides. El objetivo de esta lección: **cada llamada al LLM produce un registro de costo**, atribuido a una feature, una versión de prompt y (si aplica) un tenant, para que puedas responder "¿cuánto cuesta esta feature y por qué cambió?" con una consulta.
+
+## La fórmula del costo
+
+Los proveedores cobran por token, con precios distintos por categoría y por modelo:
+
+```text
+cost = input_tokens        * input_price
+     + output_tokens       * output_price
+     + cache_write_tokens  * cache_write_price
+     + cache_read_tokens   * cache_read_price
+```
+
+Los precios suelen expresarse por **millón de tokens (MTok)**. Cosas que sorprenden:
+
+- **La salida es varias veces más cara que la entrada.** Las respuestas verbosas son respuestas caras.
+- **Los tokens de razonamiento ("thinking") se cobran como tokens de salida**, incluso cuando el texto del razonamiento no se te muestra. Con Anthropic están incluidos en `usage.output_tokens`. La configuración de effort cambia directamente este número.
+- **El prompt caching** tiene sus propios precios: escribir en el caché cuesta un poco más que la entrada normal; leer de él cuesta mucho menos. Anthropic los reporta como `cache_creation_input_tokens` y `cache_read_input_tokens`.
+- **Las batch APIs** tienen descuento para cargas no urgentes.
+- **Algunos precios son escalonados** según el largo del prompt, y los **marketplaces cloud** (Bedrock, Vertex) tienen precios separados de las APIs de primera parte.
+
+Ejemplo de precios de Anthropic de primera parte al momento de escribir esto (verifica siempre en la página de precios antes de usar números en un reporte):
+
+| Modelo | Entrada $/MTok | Salida $/MTok |
+|---|---|---|
+| `claude-haiku-5-5` | 0.10 | 0.50 |
+| `claude-sonnet-5-5` | 2.00 | 10.00 |
+| `claude-opus-5-5` | 4.00 | 20.00 |
+
+Para OpenAI, Bedrock y otros, lee los precios de sus páginas de precios y mantenlos en el mismo archivo de configuración.
+
+## Los precios son configuración, con fechas
+
+Los precios cambian. Guárdalos en configuración versionada con una fecha de vigencia, nunca como constantes dispersas en el código. Usa `Decimal` para dinero.
+
+```toml
+# pricing.toml — USD per million tokens. Verify against provider pricing pages.
+[meta]
+effective_date = "2026-11-01"
+source = "provider pricing pages"
+
+[models."claude-haiku-5-5"]
+input = "0.10"
+output = "0.50"
+# no cache prices filled in: code falls back to the input price (conservative)
+
+[models."claude-sonnet-5-5"]
+input = "2.00"
+output = "10.00"
+cache_read = "0.20"
+
+[models."claude-opus-5-5"]
+input = "4.00"
+output = "20.00"
+cache_read = "0.20"
+```
+
+```python
+import tomllib
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+
+MTOK = Decimal(1_000_000)
+
+@dataclass(frozen=True)
+class Price:
+    input: Decimal
+    output: Decimal
+    cache_read: Decimal
+    cache_write: Decimal
+
+def load_prices(path: Path = Path("pricing.toml")) -> dict[str, Price]:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    prices = {}
+    for model, p in data["models"].items():
+        inp = Decimal(p["input"])
+        prices[model] = Price(
+            input=inp, output=Decimal(p["output"]),
+            cache_read=Decimal(p.get("cache_read", p["input"])),
+            cache_write=Decimal(p.get("cache_write", p["input"])),
+        )
+    return prices
+
+def cost_usd(usage: "Usage", price: Price) -> Decimal:
+    return (
+        usage.input_tokens * price.input
+        + usage.output_tokens * price.output
+        + usage.cache_read_tokens * price.cache_read
+        + usage.cache_write_tokens * price.cache_write
+    ) / MTOK
+```
+
+Un modelo desconocido debe **fallar ruidosamente** (o emitir una métrica de alerta), no costar $0 en silencio. Una línea de $0 en un reporte de costos es un bug que oculta gasto real.
+
+## Un registro de costo por llamada
+
+Tu cliente (lección 6) ya devuelve un `Usage` normalizado. Envuelve cada llamada para que emita un registro estructurado:
+
+```python
+import json, logging, time, uuid
+from decimal import Decimal
+
+cost_log = logging.getLogger("llm.cost")
+
+def emit_cost_record(resp: "LLMResponse", req: "LLMRequest", attempt: int,
+                     prices: dict[str, Price]) -> Decimal:
+    price = prices.get(resp.model)
+    if price is None:
+        cost_log.error("unknown_model_price", extra={"model": resp.model})
+        raise KeyError(f"no price for {resp.model}")
+    usd = cost_usd(resp.usage, price)
+    record = {
+        "ts": time.time(),
+        "request_id": req.metadata.get("request_id", str(uuid.uuid4())),
+        "feature": req.metadata.get("feature", "unknown"),
+        "prompt_id": req.metadata.get("prompt_id"),
+        "prompt_version": req.metadata.get("prompt_version"),
+        "tenant": req.metadata.get("tenant"),
+        "provider": resp.provider,
+        "model": resp.model,
+        "attempt": attempt,
+        "input_tokens": resp.usage.input_tokens,
+        "output_tokens": resp.usage.output_tokens,
+        "cache_read_tokens": resp.usage.cache_read_tokens,
+        "cache_write_tokens": resp.usage.cache_write_tokens,
+        "latency_ms": round(resp.latency_ms, 1),
+        "stop_reason": resp.stop_reason,
+        "cost_usd": str(usd),
+    }
+    cost_log.info(json.dumps(record))
+    return usd
+```
+
+Envía estos registros a donde agregues datos: un archivo JSONL para los ejercicios, PostgreSQL o un data warehouse en producción, o una herramienta de observabilidad LLM (Langfuse, LangSmith — módulo 3).
+
+### Atribución: qué dimensiones importan
+
+- **feature** – "ticket_triage", "reply_draft". La unidad con la que razonan los product managers.
+- **prompt_version** – responde "¿1.4.0 costó más que 1.3.0?"
+- **model** y **provider** – muestran el efecto del enrutamiento y los fallbacks.
+- **tenant / cliente** – necesario para precios, cuotas y detección de abuso en productos B2B.
+- **attempt** – separa los primeros intentos de los reintentos y reparaciones, que son overhead puro.
+
+Pasa estas dimensiones a través de `LLMRequest.metadata`. Haz `feature` obligatorio en tu cliente: un request sin él se rechaza en los tests.
+
+## De registros a decisiones
+
+Con registros, el análisis es una consulta:
+
+```sql
+SELECT feature,
+       prompt_version,
+       model,
+       COUNT(*)                                     AS calls,
+       SUM(cost_usd::numeric)                       AS total_usd,
+       1000 * SUM(cost_usd::numeric) / COUNT(DISTINCT request_id) AS usd_per_1k_requests,
+       AVG(output_tokens)                           AS avg_out,
+       SUM(CASE WHEN attempt > 1 THEN cost_usd::numeric ELSE 0 END) AS retry_usd
+FROM llm_cost_records
+WHERE ts >= now() - interval '7 days'
+GROUP BY 1, 2, 3
+ORDER BY total_usd DESC;
+```
+
+Métricas que vale la pena monitorear:
+
+- **Costo por 1k requests** por feature (el número que piden clientes y entrevistadores).
+- **Costo por tarea exitosa**: un modelo barato que necesita reparaciones y escalamientos puede costar más por ticket *resuelto* que un modelo más fuerte.
+- **Proporción de overhead**: reintentos + reparaciones + escalamientos como porcentaje del gasto.
+- **Tokens por request** p50/p95: una regresión en el tamaño del prompt aparece aquí primero.
+
+Luego agrega barandas: un presupuesto diario por feature con alerta al 80%, un tope duro por request en `max_tokens` y una cuota por tenant donde aplique.
+
+### Estimación rápida antes de construir
+
+Para un brief de cliente, estima por adelantado. Ejemplo: 1,000 tickets, unos 700 tokens de entrada y 150 de salida cada uno, en `claude-haiku-5-5` con los precios de ejemplo de arriba:
+
+```text
+input:  1,000 * 700 = 700,000 tokens  -> 0.7 MTok * $0.10 = $0.07
+output: 1,000 * 150 = 150,000 tokens  -> 0.15 MTok * $0.50 = $0.075
+total ~ $0.15 per 1k tickets (before retries, escalations and thinking overhead)
+```
+
+Luego mide el número real con tus registros. La diferencia entre la estimación y la realidad suele ser el largo de la salida y los escalamientos.
+
+## Errores comunes
+
+- Precios codificados en el código, sin fechas.
+- Usar floats para dinero y obtener desviaciones de redondeo en los reportes.
+- Registrar el costo solo de las llamadas exitosas. Los intentos fallidos que completaron la generación también se cobran.
+- Olvidar los tokens de caché y de thinking, de modo que el costo parece menor que la factura.
+- Sin atribución por feature, así la única respuesta a "¿por qué se duplicó el gasto?" es "los LLMs son caros".
+- Modelos desconocidos con precio $0 en lugar de levantar una alerta.
+
+## Cómo aparece esto en entrevistas
+
+<InterviewQuestion question="¿Cómo sabrías el costo por request de cada feature LLM en producción?" level="mid">
+
+Cada llamada pasa por un único cliente que devuelve usage normalizado: tokens de entrada, salida, lectura y escritura de caché. El cliente calcula el costo con una configuración de precios fechada, usando Decimal, y emite un registro estructurado con id del request, feature, versión de prompt, tenant, proveedor, modelo, número de intento, tokens, latencia y costo. Los registros van a un almacén que puedo consultar. A partir de ahí calculo el costo por 1k requests por feature, el costo por tarea exitosa y el overhead de reintentos y escalamientos, con presupuestos y alertas por feature. Concilio mensualmente contra la factura del proveedor para detectar categorías de tokens faltantes.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Un modelo más barato redujo el costo por llamada en 70%, pero finanzas dice que la feature salió más cara. ¿Cómo?" level="senior">
+
+El costo por llamada es la unidad equivocada. El modelo más barato probablemente produjo más fallas de validación, reparaciones y escalamientos al modelo más fuerte, o más derivaciones a humanos, además de salidas más largas o más tokens de thinking. Mide el costo por tarea exitosa: gasto total, incluyendo reintentos, reparaciones, llamadas de escalamiento y una estimación del costo de revisión humana, dividido entre los tickets resueltos correctamente. Luego compara configuraciones sobre el mismo set de evals. A menudo la respuesta es una cascada con un umbral de confianza calibrado, o el modelo más fuerte con menor effort, en lugar del modelo más barato en todas partes.
+
+</InterviewQuestion>
+
+## Lecturas recomendadas
+
+- Anthropic, precios: https://docs.anthropic.com/en/docs/about-claude/pricing
+- Anthropic, prompt caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- Anthropic, Message Batches API: https://docs.anthropic.com/en/docs/build-with-claude/batch-processing
+- OpenAI, precios: https://platform.openai.com/docs/pricing
+- AWS, precios de Amazon Bedrock: https://aws.amazon.com/bedrock/pricing/
+- Langfuse, seguimiento de uso y costo de modelos: https://langfuse.com/docs/model-usage-and-cost

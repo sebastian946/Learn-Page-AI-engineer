@@ -1,0 +1,125 @@
+## Objetivo
+
+Reescribe tus bullets del CV, tu titular de LinkedIn y tu sección "Acerca de" usando el mapeo de módulo a palabras clave de la lección anterior. Luego mide el resultado contra tres ofertas reales, como medirías la cobertura de pruebas.
+
+Producirás una carpeta `career/` versionada en el repo central de tu portafolio (`ai-engineer-portfolio`, del Módulo 0). El contenido del CV vive como markdown y YAML para que puedas comparar versiones, adaptarlo por oferta y generar un PDF.
+
+Contexto: la lección anterior te dio una fórmula (acción + qué + tecnología + resultado medido) y un chequeador de cobertura. Aquí aplicas ambos a tu propia historia. Espera que el primer borrador sea débil. La segunda pasada, donde cada número se verifica contra un artefacto, es donde está el valor.
+
+Nota: si postulas al mercado en inglés, escribe el contenido final en inglés. Las plantillas de abajo ya están en inglés.
+
+Pasos:
+
+1. **Reúne evidencia (15 min).** Para cada capstone, abre la tabla de resultados de su README, el reporte de evals y el análisis de costos. Anota cada número medido con un enlace a su origen. Este es tu archivo de evidencia.
+2. **Elige tres ofertas objetivo (10 min).** Ofertas reales y vigentes para roles que aceptarías. Guarda el texto en archivos (las ofertas cambian o desaparecen).
+3. **Redacta los bullets (20 min).** 2 a 3 bullets por capstone, 3 a 5 por rol de SDET. Usa la fórmula. Cada número debe aparecer en tu archivo de evidencia.
+4. **Corre la cobertura (10 min).** Usa el chequeador contra cada oferta. Corrige las brechas honestas (usaste la habilidad pero no la mencionaste). Anota las brechas deshonestas (te falta la habilidad) como temas de aprendizaje, no como líneas del CV.
+5. **LinkedIn (15 min).** Titular, "Acerca de", plan de la sección Destacados, orden de las aptitudes principales.
+6. **Lectura en voz alta (5 min).** Lee el resultado en voz alta. Todo lo que suene a responsabilidad en lugar de resultado se reescribe.
+
+<AcceptanceCriteria>
+
+- [ ] `career/evidence.md` lista cada número usado en el CV, cada uno con un enlace al artefacto del repo que lo prueba.
+- [ ] `career/resume.yaml` tiene titular, resumen de 3 líneas, habilidades agrupadas, proyectos (el capstone final primero) y experiencia reescrita.
+- [ ] Cada bullet sigue acción + qué + tecnología + resultado medido, y ocupa menos de 2 líneas.
+- [ ] No aparece en el CV ninguna herramienta que no hayas usado en un proyecto o trabajo.
+- [ ] `career/postings/` contiene 3 ofertas guardadas y `career/coverage.md` muestra la cobertura por oferta antes y después de la reescritura, con las brechas restantes listadas.
+- [ ] `career/linkedin.md` tiene un titular de menos de 220 caracteres, un "Acerca de" de 3 párrafos que termina con un llamado a la acción, un plan de Destacados y las 10 aptitudes principales ordenadas.
+- [ ] El script de cobertura corre con `python career/check.py` e imprime una tabla.
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```yaml
+# career/resume.yaml
+headline: "AI Engineer | RAG, LLM Evaluation, Agents | Ex-Senior SDET"
+summary: >
+  Senior SDET turned AI engineer. I build RAG and agent systems end to end and make
+  them reliable with evals in CI, tracing and cost tracking. Recent: multi-tenant
+  RAG + agent platform with tenant isolation and per-tenant cost dashboards.
+skills:
+  llm_and_rag: [RAG, hybrid search, re-ranking, pgvector, Qdrant, embeddings, Anthropic Claude, OpenAI API, Amazon Bedrock]
+  agents: [LangGraph, tool calling, MCP, human-in-the-loop]
+  evals_observability: [Ragas, DeepEval, LLM-as-judge, Langfuse, LangSmith, OpenTelemetry]
+  backend_cloud: [Python, FastAPI, Docker, GitHub Actions, AWS ECS, Redis, PostgreSQL]
+  data: [SQL, Databricks, MLflow]
+projects:
+  - name: multi-tenant-ai-platform
+    url: https://github.com/<you>/multi-tenant-ai-platform
+    bullets:
+      - "TODO: action + what + technology + measured result (number from evidence.md)"
+experience:
+  - company: "TODO"
+    title: "Senior SDET"
+    dates: "TODO"
+    bullets:
+      - "TODO: reframe with the translation table"
+```
+
+```python
+# career/check.py - coverage of each saved posting vs the resume
+from pathlib import Path
+import yaml
+from keywords import found  # the KEYWORDS + found() function from lesson 07
+
+def resume_text(path: Path) -> str:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    parts = [data["headline"], data["summary"]]
+    parts += [s for group in data["skills"].values() for s in group]
+    for section in ("projects", "experience"):
+        parts += [b for item in data[section] for b in item["bullets"]]
+    return "\n".join(parts)
+
+def main() -> None:
+    resume = found(resume_text(Path("career/resume.yaml")))
+    print(f"{'posting':40} {'coverage':>8}  missing")
+    for p in sorted(Path("career/postings").glob("*.txt")):
+        wanted = found(p.read_text(encoding="utf-8"))
+        pct = round(100 * len(wanted & resume) / max(len(wanted), 1))
+        print(f"{p.stem:40} {pct:>7}%  {', '.join(sorted(wanted - resume))}")
+
+if __name__ == "__main__":
+    main()
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Empieza por la evidencia, no por el bullet. Abre el reporte de evals de cada capstone y escribe primero los números. Un bullet construido alrededor de un número real se escribe solo; un bullet construido alrededor de un adjetivo nunca consigue un número.</Hint>
+  <Hint>Para los bullets de SDET, pregúntate "¿qué cambió gracias a mi trabajo?". Menos defectos escapados, menos tiempo de CI, un framework que otros equipos adoptaron, un release desbloqueado. Luego usa vocabulario cercano a IA de la tabla de traducción: "diseñé quality gates", "construí infraestructura de evaluación", "reduje el no determinismo en las señales de prueba".</Hint>
+  <Hint>Arma el titular de LinkedIn en tres partes separadas por barras verticales: rol y habilidades centrales, prueba (el capstone en pocas palabras), diferenciador (ex-SDET que hace confiable la IA). Revisa su largo con `len(headline)`; LinkedIn corta en 220 caracteres.</Hint>
+  <Hint>Si la cobertura sigue baja para una oferta después de las correcciones honestas, esa oferta es un rol aspiracional o necesita una habilidad que no tienes. Registra la brecha en `coverage.md` con un plan (por ejemplo "Pinecone: portar el retriever de rag-lab a Pinecone, 2 horas") en lugar de agregar la palabra clave.</Hint>
+</Hints>
+
+<CommitBox repo="ai-engineer-portfolio">
+
+```text
+ai-engineer-portfolio/
+  career/
+    evidence.md          # every number, with a link to its source artifact
+    resume.yaml          # source of truth for the resume
+    resume.md            # rendered version (or generate a PDF from it)
+    linkedin.md          # headline, about, featured plan, skills order
+    stories.yaml         # STAR story bank from lesson 06
+    keywords.py
+    check.py
+    coverage.md          # before/after coverage per posting, gaps and plans
+    postings/
+      2026-11-acme-ai-engineer.txt
+      2026-11-globex-llm-engineer.txt
+      2026-11-initech-applied-ai.txt
+```
+
+Sección del README a agregar al repo central: "Career materials: resume source, evidence links for every metric, coverage against target postings."
+
+Commits sugeridos:
+
+- `docs(career): evidence file linking every resume metric to an artifact`
+- `docs(career): resume v2 with outcome-based bullets`
+- `feat(career): keyword coverage checker for saved postings`
+- `docs(career): LinkedIn headline, about and featured plan`
+
+</CommitBox>
+
+<Checklist id="m7-08-review" title="Autorrevisión" items={["Cada número de mi CV está en evidence.md con un enlace a su origen", "Cada bullet tiene un verbo de acción, una tecnología y un resultado medido", "El capstone final aparece primero en la sección de proyectos", "La experiencia de SDET está reescrita con vocabulario de ingeniería de IA sin exagerar", "No aparece ninguna herramienta que no haya usado de verdad", "La cobertura mejoró en las tres ofertas y las brechas restantes tienen un plan de aprendizaje", "Mi titular de LinkedIn tiene menos de 220 caracteres e indica rol, prueba y diferenciador", "Leí el CV en voz alta y eliminé cada bullet con estilo de responsabilidad"]} />

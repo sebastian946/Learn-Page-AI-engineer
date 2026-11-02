@@ -1,0 +1,546 @@
+{
+  "moduleId": "m4",
+  "title": { "en": "Module 4 exam: Agents & tool use", "es": "Examen del módulo 4: Agentes y uso de herramientas" },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "A client wants to process inbound invoices: extract fields, validate them against the PO in the ERP, then post them. The steps never change. What should you build?",
+        "es": "Un cliente quiere procesar facturas entrantes: extraer campos, validarlos contra la orden de compra en el ERP y luego registrarlas. Los pasos nunca cambian. ¿Qué deberías construir?"
+      },
+      "options": {
+        "en": [
+          "A fixed workflow (prompt chain) with LLM calls only where judgment is needed",
+          "A ReAct agent with extract, validate and post tools so it can choose the order",
+          "A supervisor multi-agent system with one agent per step",
+          "A swarm of agents that hand off to each other"
+        ],
+        "es": [
+          "Un workflow fijo (cadena de prompts) con llamadas al LLM solo donde se necesita criterio",
+          "Un agente ReAct con tools de extraer, validar y registrar para que elija el orden",
+          "Un sistema multi-agente con supervisor y un agente por paso",
+          "Un swarm de agentes que se pasan el control entre sí"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "When the control flow is known in advance, a workflow is cheaper, faster, easier to test and easier to debug. Agents earn their cost only when the path depends on what the model discovers at runtime. Multi-agent setups add even more overhead for no gain here.",
+        "es": "Cuando el flujo de control se conoce de antemano, un workflow es más barato, más rápido, más fácil de testear y de depurar. Un agente solo justifica su costo cuando el camino depende de lo que el modelo descubre en tiempo de ejecución. Un sistema multi-agente agrega todavía más overhead sin ninguna ganancia aquí."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "Why does `reschedule_delivery(order_id, new_date, idempotency_key)` take an idempotency key?",
+        "es": "¿Por qué `reschedule_delivery(order_id, new_date, idempotency_key)` recibe una idempotency key?"
+      },
+      "options": {
+        "en": [
+          "So a retried or duplicated call (timeout, resume after interrupt, model repeating itself) applies the change only once",
+          "So the model can authenticate against the carrier API",
+          "So LangGraph can cache the tool output between threads",
+          "So the tool can be called in parallel with other tools"
+        ],
+        "es": [
+          "Para que una llamada reintentada o duplicada (timeout, reanudación tras un interrupt, el modelo repitiéndose) aplique el cambio una sola vez",
+          "Para que el modelo se autentique contra la API del transportista",
+          "Para que LangGraph cachee la salida de la tool entre hilos",
+          "Para que la tool pueda llamarse en paralelo con otras tools"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Agents retry. Networks time out. Nodes re-run after a resume. Any write tool must make duplicates harmless. The server stores the key with the result and returns the stored result on a repeat instead of applying the change twice.",
+        "es": "Los agentes reintentan. Las redes hacen timeout. Los nodos se vuelven a ejecutar tras una reanudación. Toda tool de escritura debe volver inofensivos los duplicados. El servidor guarda la key junto con el resultado y, ante una repetición, devuelve el resultado guardado en lugar de aplicar el cambio dos veces."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "Which tool error response gives the model the best chance to recover on its own?",
+        "es": "¿Qué respuesta de error de una tool le da al modelo la mejor oportunidad de recuperarse por sí solo?"
+      },
+      "options": {
+        "en": [
+          "{\"error\": {\"code\": \"ORDER_NOT_FOUND\", \"message\": \"No order ORD-99\", \"retryable\": false, \"hint\": \"Order ids look like ORD-1234. Ask the customer to confirm.\"}}",
+          "A raised Python exception with the full stack trace",
+          "An empty string",
+          "{\"status\": 500}"
+        ],
+        "es": [
+          "{\"error\": {\"code\": \"ORDER_NOT_FOUND\", \"message\": \"No order ORD-99\", \"retryable\": false, \"hint\": \"Order ids look like ORD-1234. Ask the customer to confirm.\"}}",
+          "Una excepción de Python lanzada con el stack trace completo",
+          "Un string vacío",
+          "{\"status\": 500}"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "An error contract the model can act on has a stable code, a human-readable message, a retryable flag and a hint about the next step. Stack traces waste tokens and leak internals. Empty strings and bare status codes leave the model guessing, which leads to loops.",
+        "es": "Un contrato de error sobre el que el modelo puede actuar tiene un código estable, un mensaje legible, un flag de retryable y una pista sobre el siguiente paso. Los stack traces gastan tokens y exponen detalles internos. Los strings vacíos y los códigos de estado sueltos dejan al modelo adivinando, y eso lleva a bucles."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "You are deploying one MCP server that many remote clients will reach over the network. Which transport fits?",
+        "es": "Vas a desplegar un servidor MCP al que muchos clientes remotos accederán por la red. ¿Qué transporte encaja?"
+      },
+      "options": {
+        "en": [
+          "Streamable HTTP",
+          "stdio",
+          "A Unix pipe opened by each client",
+          "WebRTC data channels"
+        ],
+        "es": [
+          "Streamable HTTP",
+          "stdio",
+          "Un pipe de Unix abierto por cada cliente",
+          "Canales de datos WebRTC"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "stdio is for local servers launched as a subprocess by one client (for example a desktop app or an IDE). Streamable HTTP is the MCP transport for remote servers that serve many clients, and it is where you add auth, TLS and load balancing.",
+        "es": "stdio es para servidores locales que un solo cliente lanza como subproceso (por ejemplo una app de escritorio o un IDE). Streamable HTTP es el transporte de MCP para servidores remotos que atienden a muchos clientes, y es donde agregas autenticación, TLS y balanceo de carga."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "single",
+      "prompt": {
+        "en": "What does compiling a LangGraph graph with a checkpointer (for example `MemorySaver` or `PostgresSaver`) give you?",
+        "es": "¿Qué obtienes al compilar un grafo de LangGraph con un checkpointer (por ejemplo `MemorySaver` o `PostgresSaver`)?"
+      },
+      "options": {
+        "en": [
+          "State is saved after each step per thread_id, which enables multi-turn threads, interrupts, resuming and time travel",
+          "Faster model calls because responses are cached",
+          "Automatic retries of failed tool calls",
+          "Long-term memory shared across all users"
+        ],
+        "es": [
+          "El estado se guarda después de cada paso por thread_id, lo que permite hilos multi-turno, interrupciones, reanudación y time travel",
+          "Llamadas al modelo más rápidas porque las respuestas se cachean",
+          "Reintentos automáticos de tool calls fallidas",
+          "Memoria de largo plazo compartida entre todos los usuarios"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A checkpointer persists the graph state at every super-step, keyed by thread_id. Without it, `interrupt()` cannot pause and resume, and a thread forgets everything between invocations. Cross-thread long-term memory is a separate concept: the store.",
+        "es": "Un checkpointer persiste el estado del grafo en cada super-step, indexado por thread_id. Sin él, `interrupt()` no puede pausar y reanudar, y un hilo olvida todo entre invocaciones. La memoria de largo plazo entre hilos es un concepto distinto: el store."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "A support agent has 6 tools, all about orders and deliveries, and handles one customer request at a time. A teammate proposes splitting it into a supervisor plus three specialist agents. What is the best response?",
+        "es": "Un agente de soporte tiene 6 tools, todas sobre pedidos y entregas, y atiende una solicitud de cliente a la vez. Un compañero propone dividirlo en un supervisor y tres agentes especialistas. ¿Cuál es la mejor respuesta?"
+      },
+      "options": {
+        "en": [
+          "Keep a single agent; multi-agent adds latency, cost and handoff failures without a clear benefit at this size",
+          "Split it; multi-agent systems are always more accurate",
+          "Split it into a swarm so agents can talk freely",
+          "Replace the tools with one tool that accepts free-form SQL"
+        ],
+        "es": [
+          "Mantener un solo agente; el multi-agente agrega latencia, costo y fallas de handoff sin un beneficio claro a este tamaño",
+          "Dividirlo; los sistemas multi-agente siempre son más precisos",
+          "Dividirlo en un swarm para que los agentes hablen libremente",
+          "Reemplazar las tools por una sola tool que acepte SQL libre"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Multi-agent pays off when there are many tools across distinct domains, conflicting instructions, or separate context needs. Six related tools fit comfortably in one agent. Start with one agent and split only when evals show tool confusion or context bloat.",
+        "es": "El multi-agente vale la pena cuando hay muchas tools en dominios distintos, instrucciones que chocan o necesidades de contexto separadas. Seis tools relacionadas caben bien en un solo agente. Empieza con un agente y divide solo cuando los evals muestren confusión entre tools o contexto inflado."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "single",
+      "prompt": {
+        "en": "Your trajectory eval must pass if the agent calls every expected tool, even if it also calls extra read-only lookups. Which match mode do you use?",
+        "es": "Tu eval de trayectoria debe pasar si el agente llama todas las tools esperadas, aunque también haga consultas extra de solo lectura. ¿Qué modo de comparación usas?"
+      },
+      "options": {
+        "en": [
+          "superset: the actual trajectory must contain all reference calls",
+          "strict: same calls in the same order",
+          "subset: the actual trajectory may only use calls from the reference",
+          "exact string match on the final answer"
+        ],
+        "es": [
+          "superset: la trayectoria real debe contener todas las llamadas de referencia",
+          "strict: las mismas llamadas en el mismo orden",
+          "subset: la trayectoria real solo puede usar llamadas de la referencia",
+          "comparación exacta de strings sobre la respuesta final"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "superset allows extra calls as long as every reference call appears. subset is the opposite: no calls outside the reference. strict is too brittle for this case. Pair superset with a forbidden-tools list so extra calls cannot include refunds or cancellations.",
+        "es": "superset permite llamadas extra siempre que aparezcan todas las de referencia. subset es lo contrario: ninguna llamada fuera de la referencia. strict es demasiado frágil para este caso. Combina superset con una lista de tools prohibidas para que las llamadas extra no incluyan reembolsos ni cancelaciones."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "multi",
+      "prompt": {
+        "en": "Which practices make a tool easier for a model to use correctly? Select all that apply.",
+        "es": "¿Qué prácticas hacen que una tool sea más fácil de usar correctamente para un modelo? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "A description that says when to use the tool, when not to, and the format of each argument",
+          "Enums and constrained types in the JSON schema instead of free-form strings",
+          "Paginated list results with a cursor and a small default limit",
+          "One generic `do_action(action: str, payload: str)` tool for everything",
+          "Returning the full raw API payload so the model has all the data"
+        ],
+        "es": [
+          "Una descripción que diga cuándo usar la tool, cuándo no, y el formato de cada argumento",
+          "Enums y tipos restringidos en el JSON schema en lugar de strings libres",
+          "Resultados de listas paginados con un cursor y un límite por defecto pequeño",
+          "Una tool genérica `do_action(action: str, payload: str)` para todo",
+          "Devolver el payload crudo completo de la API para que el modelo tenga todos los datos"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Clear descriptions, constrained schemas and pagination all reduce wrong calls and context bloat. A generic do-everything tool hides the contract from the model and from your evals. Raw payloads waste tokens and bury the fields that matter; return a trimmed, stable shape.",
+        "es": "Las descripciones claras, los schemas restringidos y la paginación reducen las llamadas equivocadas y el contexto inflado. Una tool genérica que lo hace todo esconde el contrato al modelo y a tus evals. Los payloads crudos gastan tokens y entierran los campos importantes; devuelve una forma recortada y estable."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "multi",
+      "prompt": {
+        "en": "Which items are good candidates for long-term memory (a cross-thread store) in a logistics support agent? Select all that apply.",
+        "es": "¿Qué elementos son buenos candidatos para memoria de largo plazo (un store entre hilos) en un agente de soporte logístico? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "The customer's preferred delivery window",
+          "The customer's preferred language for replies",
+          "A standing instruction such as 'always leave parcels at the loading dock'",
+          "A one-time verification code the customer typed",
+          "The full raw transcript of every past conversation"
+        ],
+        "es": [
+          "La ventana de entrega preferida del cliente",
+          "El idioma preferido del cliente para las respuestas",
+          "Una instrucción permanente como 'siempre deja los paquetes en el muelle de carga'",
+          "Un código de verificación de un solo uso que el cliente escribió",
+          "La transcripción cruda completa de todas las conversaciones pasadas"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Long-term memory should hold durable, useful facts and preferences. One-time secrets must never be stored. Full raw transcripts are expensive to retrieve, noisy, and a privacy risk; store distilled facts or summaries with a retention policy instead.",
+        "es": "La memoria de largo plazo debe guardar hechos y preferencias duraderos y útiles. Los secretos de un solo uso nunca se deben guardar. Las transcripciones crudas completas son caras de recuperar, ruidosas y un riesgo de privacidad; guarda hechos destilados o resúmenes con una política de retención."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "multi",
+      "prompt": {
+        "en": "Which mechanisms actually cap the cost of a single agent run? Select all that apply.",
+        "es": "¿Qué mecanismos realmente limitan el costo de una sola ejecución de un agente? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "A per-run USD budget checked before every model call, using usage_metadata and configured prices",
+          "A maximum step count (or recursion_limit) that stops the loop",
+          "Repeated-action detection that stops when the same tool and args repeat N times",
+          "Raising the temperature so the model finishes faster",
+          "Removing the system prompt to save tokens"
+        ],
+        "es": [
+          "Un presupuesto por ejecución en USD que se revisa antes de cada llamada al modelo, usando usage_metadata y precios configurados",
+          "Un número máximo de pasos (o recursion_limit) que detiene el bucle",
+          "Detección de acciones repetidas que se detiene cuando la misma tool con los mismos args se repite N veces",
+          "Subir la temperatura para que el modelo termine más rápido",
+          "Quitar el system prompt para ahorrar tokens"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "A budget check, a step cap and repeated-action detection are hard guards: they stop the run no matter what the model does. Temperature does not bound anything and usually adds variance. Removing the system prompt saves little and breaks behavior.",
+        "es": "Un chequeo de presupuesto, un tope de pasos y la detección de acciones repetidas son guardas duras: detienen la ejecución sin importar lo que haga el modelo. La temperatura no acota nada y suele agregar varianza. Quitar el system prompt ahorra poco y rompe el comportamiento."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "multi",
+      "prompt": {
+        "en": "A scenario says: 'Customer reports a damaged box on ORD-1042 and asks for a refund.' Which checks belong in a solid agent eval for it? Select all that apply.",
+        "es": "Un escenario dice: 'El cliente reporta una caja dañada en ORD-1042 y pide un reembolso.' ¿Qué chequeos pertenecen a un buen eval de agente para este caso? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "Trajectory check: get_order is called before issue_refund",
+          "Tool-arg accuracy: issue_refund uses order_id ORD-1042 and an amount not above the order total",
+          "Final-state check: the fake backend recorded exactly one refund after approval",
+          "BLEU score of the final reply against a reference reply",
+          "The final reply is longer than 50 words"
+        ],
+        "es": [
+          "Chequeo de trayectoria: get_order se llama antes de issue_refund",
+          "Precisión de argumentos: issue_refund usa order_id ORD-1042 y un monto no mayor al total del pedido",
+          "Chequeo de estado final: el backend falso registró exactamente un reembolso tras la aprobación",
+          "Puntaje BLEU de la respuesta final contra una respuesta de referencia",
+          "La respuesta final tiene más de 50 palabras"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Agent evals assert on behavior and side effects: the path, the arguments and what actually changed in the system. That is the SDET instinct: check the database, not only the UI text. BLEU and length say nothing about whether the right action happened.",
+        "es": "Los evals de agentes verifican comportamiento y efectos secundarios: el camino, los argumentos y lo que realmente cambió en el sistema. Es el instinto de SDET: revisar la base de datos, no solo el texto de la UI. BLEU y la longitud no dicen nada sobre si ocurrió la acción correcta."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of one ReAct turn that uses a single tool with the Anthropic Messages API.",
+        "es": "Ordena los pasos de un turno ReAct que usa una sola tool con la Messages API de Anthropic."
+      },
+      "items": {
+        "en": [
+          "Send the messages plus the tool definitions to the model",
+          "The model responds with stop_reason \"tool_use\" and a tool_use block",
+          "Your code executes the tool with the given input",
+          "Append a user message with a tool_result block that references the tool_use_id",
+          "Call the model again with the extended history",
+          "The model responds with stop_reason \"end_turn\" and a final text answer"
+        ],
+        "es": [
+          "Enviar los mensajes junto con las definiciones de tools al modelo",
+          "El modelo responde con stop_reason \"tool_use\" y un bloque tool_use",
+          "Tu código ejecuta la tool con el input recibido",
+          "Agregar un mensaje de usuario con un bloque tool_result que referencia el tool_use_id",
+          "Llamar al modelo otra vez con el historial extendido",
+          "El modelo responde con stop_reason \"end_turn\" y una respuesta final de texto"
+        ]
+      },
+      "explanation": {
+        "en": "The model never runs tools itself. It asks for a call, your code runs it, and you feed the result back as a tool_result tied to the tool_use_id. The loop repeats until the model stops asking for tools.",
+        "es": "El modelo nunca ejecuta tools por sí mismo. Pide una llamada, tu código la ejecuta y le devuelves el resultado como tool_result asociado al tool_use_id. El bucle se repite hasta que el modelo deja de pedir tools."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "order",
+      "prompt": {
+        "en": "Order the human-in-the-loop approval flow for a refund in LangGraph.",
+        "es": "Ordena el flujo de aprobación human-in-the-loop para un reembolso en LangGraph."
+      },
+      "items": {
+        "en": [
+          "The approval node calls interrupt() with the proposed issue_refund call",
+          "The checkpointer saves the state and invoke returns a result with __interrupt__",
+          "A human reviews the payload and approves, rejects or edits the arguments",
+          "The caller invokes the graph with Command(resume=...) on the same thread_id",
+          "The approval node re-runs from the top and interrupt() returns the resume value",
+          "The approved (or edited) refund tool call executes"
+        ],
+        "es": [
+          "El nodo de aprobación llama a interrupt() con la llamada propuesta a issue_refund",
+          "El checkpointer guarda el estado e invoke devuelve un resultado con __interrupt__",
+          "Una persona revisa el payload y aprueba, rechaza o edita los argumentos",
+          "El llamador invoca el grafo con Command(resume=...) sobre el mismo thread_id",
+          "El nodo de aprobación se vuelve a ejecutar desde el inicio e interrupt() devuelve el valor de reanudación",
+          "Se ejecuta la tool call de reembolso aprobada (o editada)"
+        ]
+      },
+      "explanation": {
+        "en": "interrupt() pauses the graph and persists state through the checkpointer. Resuming with Command(resume=...) on the same thread re-executes the paused node from its first line, and this time interrupt() returns the human's decision.",
+        "es": "interrupt() pausa el grafo y persiste el estado mediante el checkpointer. Reanudar con Command(resume=...) en el mismo hilo vuelve a ejecutar el nodo pausado desde su primera línea, y esta vez interrupt() devuelve la decisión de la persona."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps to build and run a LangGraph agent.",
+        "es": "Ordena los pasos para construir y ejecutar un agente en LangGraph."
+      },
+      "items": {
+        "en": [
+          "Define the state as a TypedDict with reducers (for example add_messages)",
+          "Create StateGraph(AgentState) and add the nodes",
+          "Add the START edge and the conditional edges",
+          "Compile with a checkpointer",
+          "Invoke with a config that contains a thread_id"
+        ],
+        "es": [
+          "Definir el estado como un TypedDict con reducers (por ejemplo add_messages)",
+          "Crear StateGraph(AgentState) y agregar los nodos",
+          "Agregar el edge desde START y los edges condicionales",
+          "Compilar con un checkpointer",
+          "Invocar con una config que contenga un thread_id"
+        ]
+      },
+      "explanation": {
+        "en": "The state schema comes first because nodes and reducers depend on it. Edges reference nodes, so nodes come before edges. compile() freezes the graph and attaches persistence. The thread_id is supplied at invoke time.",
+        "es": "El schema de estado va primero porque los nodos y los reducers dependen de él. Los edges referencian nodos, así que los nodos van antes que los edges. compile() congela el grafo y le conecta la persistencia. El thread_id se pasa al momento de invocar."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "code",
+      "prompt": {
+        "en": "The state has messages = [HumanMessage('Where is ORD-1042?')] and step_count = 2. What is the state after this node runs?",
+        "es": "El estado tiene messages = [HumanMessage('Where is ORD-1042?')] y step_count = 2. ¿Cuál es el estado después de que corre este nodo?"
+      },
+      "code": "class AgentState(TypedDict):\n    messages: Annotated[list[AnyMessage], add_messages]\n    step_count: int\n\ndef agent(state: AgentState) -> dict:\n    reply = AIMessage(content=\"It is in transit.\")\n    return {\"messages\": [reply], \"step_count\": state[\"step_count\"] + 1}",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "messages has 2 items (the human message, then the AI reply) and step_count is 3",
+          "messages has 1 item (only the AI reply) and step_count is 3",
+          "messages has 2 items and step_count is 1, because ints are added by default",
+          "The node raises because it did not return the full state"
+        ],
+        "es": [
+          "messages tiene 2 elementos (el mensaje humano y luego la respuesta de la IA) y step_count es 3",
+          "messages tiene 1 elemento (solo la respuesta de la IA) y step_count es 3",
+          "messages tiene 2 elementos y step_count es 1, porque los ints se suman por defecto",
+          "El nodo lanza un error porque no devolvió el estado completo"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Nodes return partial updates. messages uses the add_messages reducer, so the reply is appended. step_count has no reducer, so the returned value (2 + 1 = 3) overwrites the old one. Returning only some keys is normal.",
+        "es": "Los nodos devuelven actualizaciones parciales. messages usa el reducer add_messages, así que la respuesta se agrega al final. step_count no tiene reducer, así que el valor devuelto (2 + 1 = 3) reemplaza al anterior. Devolver solo algunas keys es lo normal."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "code",
+      "prompt": {
+        "en": "Before the node runs, notes = [\"looked up order\"] and errors = [\"timeout\"]. What are notes and errors afterwards?",
+        "es": "Antes de que corra el nodo, notes = [\"looked up order\"] y errors = [\"timeout\"]. ¿Cuánto valen notes y errors después?"
+      },
+      "code": "import operator\n\nclass State(TypedDict):\n    notes: Annotated[list[str], operator.add]\n    errors: list[str]\n\ndef audit(state: State) -> dict:\n    return {\"notes\": [\"checked rates\"], \"errors\": []}",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "notes = [\"looked up order\", \"checked rates\"] and errors = []",
+          "notes = [\"checked rates\"] and errors = [\"timeout\"]",
+          "notes = [\"looked up order\", \"checked rates\"] and errors = [\"timeout\"]",
+          "notes = [\"checked rates\"] and errors = []"
+        ],
+        "es": [
+          "notes = [\"looked up order\", \"checked rates\"] y errors = []",
+          "notes = [\"checked rates\"] y errors = [\"timeout\"]",
+          "notes = [\"looked up order\", \"checked rates\"] y errors = [\"timeout\"]",
+          "notes = [\"checked rates\"] y errors = []"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "notes has the operator.add reducer, so the new list is concatenated to the old one. errors has no reducer, so the returned empty list replaces the old value. This is a common bug source: forgetting a reducer silently drops history.",
+        "es": "notes tiene el reducer operator.add, así que la lista nueva se concatena con la anterior. errors no tiene reducer, así que la lista vacía devuelta reemplaza el valor anterior. Esta es una fuente común de bugs: olvidar un reducer borra el historial sin avisar."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "code",
+      "prompt": {
+        "en": "The operator approves the refund and the graph is resumed with Command(resume={\"action\": \"approve\"}). How many times does log_audit run for this approval in total?",
+        "es": "El operador aprueba el reembolso y el grafo se reanuda con Command(resume={\"action\": \"approve\"}). ¿Cuántas veces en total corre log_audit para esta aprobación?"
+      },
+      "code": "def approval(state: AgentState) -> dict:\n    call = state[\"messages\"][-1].tool_calls[0]\n    log_audit(\"approval_requested\", call)  # inserts a DB row\n    decision = interrupt({\"tool\": call[\"name\"], \"args\": call[\"args\"]})\n    if decision[\"action\"] == \"approve\":\n        return {}\n    return {\"messages\": [rejection_message(call)]}",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "Twice: once before the pause and again when the node re-runs from the top on resume",
+          "Once: execution continues from the line after interrupt()",
+          "Zero times: interrupt() skips side effects",
+          "Once per checkpoint saved, so it depends on the checkpointer"
+        ],
+        "es": [
+          "Dos veces: una antes de la pausa y otra cuando el nodo se vuelve a ejecutar desde el inicio al reanudar",
+          "Una vez: la ejecución continúa desde la línea después de interrupt()",
+          "Cero veces: interrupt() omite los efectos secundarios",
+          "Una vez por cada checkpoint guardado, así que depende del checkpointer"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "On resume, LangGraph re-executes the interrupted node from its first line; interrupt() then returns the resume value instead of pausing. Any side effect before interrupt() runs again. Make it idempotent (upsert keyed by tool_call id) or move it to a separate node.",
+        "es": "Al reanudar, LangGraph vuelve a ejecutar el nodo interrumpido desde su primera línea; esta vez interrupt() devuelve el valor de reanudación en lugar de pausar. Cualquier efecto secundario antes de interrupt() corre otra vez. Hazlo idempotente (upsert indexado por el id de la tool call) o muévelo a un nodo aparte."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "code",
+      "prompt": {
+        "en": "What does this node do when the last AI message requests issue_refund?",
+        "es": "¿Qué hace este nodo cuando el último mensaje de la IA pide issue_refund?"
+      },
+      "code": "RISKY = {\"issue_refund\", \"cancel_order\"}\n\ndef router(state: AgentState) -> Command[Literal[\"approval\", \"tools\", \"__end__\"]]:\n    calls = state[\"messages\"][-1].tool_calls\n    if not calls:\n        return Command(goto=END)\n    if any(c[\"name\"] in RISKY for c in calls):\n        return Command(goto=\"approval\", update={\"pending_risky\": True})\n    return Command(goto=\"tools\")",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "It sets pending_risky to True in the state and routes to the approval node",
+          "It routes to tools and runs the refund immediately",
+          "It ends the graph because Command cannot carry an update",
+          "It raises because nodes must return a dict"
+        ],
+        "es": [
+          "Pone pending_risky en True en el estado y enruta al nodo de aprobación",
+          "Enruta a tools y ejecuta el reembolso de inmediato",
+          "Termina el grafo porque Command no puede llevar un update",
+          "Lanza un error porque los nodos deben devolver un dict"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A node can return Command(goto=..., update=...) to update state and choose the next node in one step. The return type annotation tells LangGraph which destinations are possible, so the graph can be rendered and validated.",
+        "es": "Un nodo puede devolver Command(goto=..., update=...) para actualizar el estado y elegir el siguiente nodo en un solo paso. La anotación del tipo de retorno le dice a LangGraph qué destinos son posibles, para poder dibujar y validar el grafo."
+      }
+    },
+    {
+      "id": "q19",
+      "type": "code",
+      "prompt": {
+        "en": "An MCP client lists the tools of this FastMCP server. What does it see for get_order?",
+        "es": "Un cliente MCP lista las tools de este servidor FastMCP. ¿Qué ve para get_order?"
+      },
+      "code": "from mcp.server.fastmcp import FastMCP\n\nmcp = FastMCP(\"northstar-orders\")\n\n@mcp.tool()\ndef get_order(order_id: str) -> dict:\n    \"\"\"Look up an order by id (format ORD-1234). Returns status, carrier and delivery date.\"\"\"\n    return ORDERS[order_id]",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "A tool named get_order whose description is the docstring and whose input schema requires a string order_id",
+          "A resource at the URI get_order://order_id",
+          "A prompt template named get_order",
+          "Nothing, because tools must be registered with a JSON schema by hand"
+        ],
+        "es": [
+          "Una tool llamada get_order cuya descripción es el docstring y cuyo input schema requiere un order_id de tipo string",
+          "Un resource en la URI get_order://order_id",
+          "Un prompt template llamado get_order",
+          "Nada, porque las tools deben registrarse con un JSON schema escrito a mano"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "FastMCP derives the tool name from the function, the description from the docstring, and the JSON input schema from the type hints. That is why the docstring is part of your API: the model reads it to decide when and how to call the tool. Note also that ORDERS[order_id] raises on an unknown id; a production tool should return a structured error instead.",
+        "es": "FastMCP toma el nombre de la tool desde la función, la descripción desde el docstring y el JSON input schema desde los type hints. Por eso el docstring es parte de tu API: el modelo lo lee para decidir cuándo y cómo llamar la tool. Nota también que ORDERS[order_id] lanza un error con un id desconocido; una tool de producción debería devolver un error estructurado."
+      }
+    }
+  ]
+}

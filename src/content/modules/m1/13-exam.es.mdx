@@ -1,0 +1,18 @@
+## Examen del módulo 1
+
+Este examen verifica que puedes razonar sobre la integración con LLMs como lo hace un ingeniero de producción, no que memorizaste nombres de APIs.
+
+**Qué cubre**
+
+- Tokens, ventanas de contexto, `max_tokens`, stop reasons, y por qué las perillas de sampling ahora son una capacidad opcional.
+- Salidas estructuradas: JSON Schema, validación con Pydantic v2 y bucles de reparación acotados.
+- Flujo de mensajes del tool calling en Anthropic y OpenAI, incluyendo llamadas paralelas y resultados de error.
+- Streaming: orden de eventos SSE, JSON parcial, timeouts de inactividad, cancelación y backpressure.
+- System prompts como contratos versionados y versionado semántico de prompts.
+- Abstracción de proveedores, normalización de errores, reintentos con jitter, rate limits y token buckets.
+- Python asíncrono: semáforos, `TaskGroup` vs `gather`, timeouts y cancelación.
+- Fórmulas de costo y atribución por feature.
+
+**Formato.** 18 preguntas: opción única, selección múltiple, ordenar los pasos y preguntas de lectura de código sobre fragmentos cortos de Python (SDK de Anthropic, Pydantic, asyncio). Tiempo límite: 30 minutos. Puntaje para aprobar: **70%**. Las opciones se mezclan en cada intento.
+
+**Cómo prepararte.** Relee las secciones de "Errores comunes" de las lecciones 1–9. Luego abre tu repo `llm-provider-client` y explícate en voz alta por qué existe cada reintento, timeout y validación. Si puedes hacerlo, estás listo. Cada pregunta tiene una explicación, así que un intento fallido sigue siendo tiempo de estudio.

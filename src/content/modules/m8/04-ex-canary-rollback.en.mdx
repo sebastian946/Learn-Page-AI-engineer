@@ -1,0 +1,193 @@
+## Goal
+
+Prove, on your laptop, that a bad prompt change rolls itself back before most users see it.
+
+You will run a small "triage" service on a local Kubernetes cluster (kind or minikube), manage it with **Argo Rollouts**, and gate the canary on two Prometheus signals from lesson 1: error rate and output-contract validity. Then you ship two releases:
+
+1. `v2-bad`: a prompt change that breaks the JSON contract for about 30% of requests. It must abort automatically.
+2. `v3`: a good change. It must promote all the way to 100% without a human.
+
+The service fakes the LLM call by default, so you need no API key and the run is reproducible. A `REAL_LLM=1` switch lets you call `claude-haiku-5-5` instead if you want to try it with real outputs.
+
+This is the progressive-delivery version of the eval gate you built in Module 3: CI checks the change before merge, the canary checks it again on live traffic.
+
+<AcceptanceCriteria>
+
+- [ ] A kind (or minikube) cluster runs the Argo Rollouts controller and Prometheus (the `prometheus-community/prometheus` chart is enough)
+- [ ] The service exposes `llm_requests_total{status}` and `llm_contract_checks_total{result}` on `/metrics`, and Prometheus adds a `version` label (`canary` or `stable`) from the pod labels
+- [ ] A `Rollout` with 4 replicas uses canary steps: 25% → analysis → 50% → pause 2 minutes → 100%
+- [ ] An `AnalysisTemplate` checks error rate under 2% and contract validity at or above 98%, and treats "no data yet" as not-yet-failed rather than as a pass
+- [ ] A load generator sends steady traffic (about 10 requests per second) through the Service during every rollout
+- [ ] Deploying `v2-bad` ends with the Rollout `Degraded`, canary pods scaled to 0 and 100% of traffic on stable, with no manual command
+- [ ] Deploying `v3` reaches `Healthy` at 100% with no manual promote
+- [ ] The README records, for the bad release, the time from deploy to automatic abort and the approximate number of requests the bad version served
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# app/main.py — fake LLM triage service (pip install fastapi uvicorn prometheus-client)
+import json
+import os
+import random
+
+from fastapi import FastAPI
+from prometheus_client import Counter, make_asgi_app
+from pydantic import BaseModel, ValidationError
+
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1")
+FAULT_RATE = float(os.getenv("FAULT_RATE", "0.0"))      # share of broken outputs
+ERROR_RATE = float(os.getenv("ERROR_RATE", "0.0"))      # share of upstream failures
+
+REQUESTS = Counter("llm_requests_total", "LLM requests", ["status"])
+CONTRACT = Counter("llm_contract_checks_total", "Output contract checks", ["result"])
+
+app = FastAPI()
+app.mount("/metrics", make_asgi_app())
+
+class Ticket(BaseModel):
+    text: str
+
+class Triage(BaseModel):
+    category: str
+    priority: int
+    reply: str
+
+def fake_llm(ticket: Ticket) -> str:
+    if random.random() < FAULT_RATE:
+        return "Sure! Here is the triage: category billing, priority 2"  # not JSON
+    return json.dumps({"category": "billing", "priority": 2,
+                       "reply": f"[{PROMPT_VERSION}] We are looking into it."})
+
+@app.post("/triage")
+async def triage(ticket: Ticket) -> dict:
+    if random.random() < ERROR_RATE:
+        REQUESTS.labels("error").inc()
+        return {"error": "upstream_unavailable"}
+    raw = fake_llm(ticket)  # TODO: if REAL_LLM=1, call claude-haiku-5-5 instead
+    try:
+        result = Triage.model_validate_json(raw)
+    except ValidationError:
+        CONTRACT.labels("invalid").inc()
+        REQUESTS.labels("ok").inc()
+        return {"fallback": True}
+    CONTRACT.labels("valid").inc()
+    REQUESTS.labels("ok").inc()
+    return result.model_dump()
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    return {"ok": True}
+```
+
+```yaml
+# k8s/rollout.yaml — fill in the TODOs
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: triage
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { app: triage }
+  template:
+    metadata:
+      labels: { app: triage }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      containers:
+        - name: api
+          image: triage:v1          # kind load docker-image triage:v1
+          env:
+            - { name: PROMPT_VERSION, value: v1 }
+            - { name: FAULT_RATE, value: "0.0" }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /healthz, port: 8000 } }
+  strategy:
+    canary:
+      canaryMetadata: { labels: { version: canary } }
+      stableMetadata: { labels: { version: stable } }
+      steps:
+        # TODO: 25% -> analysis (template llm-canary-health) -> 50% -> pause 2m -> 100%
+```
+
+```python
+# scripts/loadgen.py — steady traffic through a port-forwarded Service
+import asyncio
+import httpx
+
+async def main(rps: int = 10, url: str = "http://localhost:8080/triage") -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            tasks = [client.post(url, json={"text": "I was charged twice"}) for _ in range(rps)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Install order: `kind create cluster`, then the Argo Rollouts controller (`kubectl create namespace argo-rollouts` and apply the `install.yaml` from the project's releases), then the kubectl plugin, then `helm install prometheus prometheus-community/prometheus -n monitoring --create-namespace`. Build the image and load it into kind with `kind load docker-image triage:v1` so no registry is needed.</Hint>
+  <Hint>The chart's default `kubernetes-pods` scrape job honors the `prometheus.io/*` annotations and has a `labelmap` rule for pod labels, so `version` shows up on your series for free. Check it in the Prometheus UI (`kubectl port-forward svc/prometheus-server -n monitoring 9090:80`) with `sum by (version) (rate(llm_requests_total[1m]))` before you write the analysis.</Hint>
+  <Hint>Right after a step starts, the canary may have zero samples and the ratio is empty or NaN. Use `count` and `interval` so the analysis takes several measurements, set `failureLimit: 1`, and write the condition defensively, for example `successCondition: len(result) == 0 || isNaN(result[0]) || result[0] >= 0.98`, combined with a separate metric that fails if the canary served fewer than a minimum number of requests over the window. Then "no data" cannot silently pass the whole step.</Hint>
+  <Hint>To ship a release, change the pod template: `kubectl argo rollouts set image triage api=triage:v2` plus the env change, or edit `rollout.yaml` (`PROMPT_VERSION: v2-bad`, `FAULT_RATE: "0.3"`) and `kubectl apply`. Watch with `kubectl argo rollouts get rollout triage --watch`. After an abort, the Rollout stays `Degraded` until you apply a new revision or run `kubectl argo rollouts undo triage`; that is expected and is your signal to investigate.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-deploy-lab">
+
+```text
+llm-deploy-lab/
+  01-canary-rollouts/
+    app/
+      main.py
+      requirements.txt
+    Dockerfile
+    k8s/
+      rollout.yaml
+      service.yaml
+      analysis-template.yaml
+    scripts/
+      loadgen.py
+      setup-cluster.sh       # kind + Argo Rollouts + Prometheus
+      release.sh             # ./release.sh v2-bad 0.3
+    results/
+      bad-release.txt        # kubectl argo rollouts get rollout output after abort
+      good-release.txt
+    README.md
+  README.md                  # index of all exercises in the lab
+```
+
+README outline for `01-canary-rollouts`:
+
+1. What this proves (one paragraph) and a Mermaid diagram: loadgen → Service → stable and canary pods → Prometheus → AnalysisRun → Rollout.
+2. How to run it in under 10 commands.
+3. The gates: each PromQL query, its threshold and why.
+4. Results: time to abort, requests served by the bad version, screenshots or text output.
+5. What I would add in production: a traffic router for exact percentages, sticky routing by user id, a sampled judge-score metric as background analysis.
+
+Suggested commits:
+
+- `feat(canary): fake LLM triage service with contract metrics`
+- `infra(canary): kind cluster with Argo Rollouts and Prometheus`
+- `feat(canary): rollout with analysis-gated canary steps`
+- `test(canary): bad prompt release aborts automatically`
+- `docs(canary): results and production notes`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m8-04-review" title="Self-review" items={["The app emits no version label itself; Prometheus attaches canary/stable from pod labels", "I verified the queries in the Prometheus UI before writing the AnalysisTemplate", "An empty or NaN result cannot make a step pass on its own", "The bad release aborted with no manual command and canary pods went to 0", "The good release promoted to 100% with no manual promote", "I measured time to abort and estimated how many requests the bad version served", "The README explains why replica-ratio weights are approximate without a traffic router", "setup-cluster.sh rebuilds the whole lab from scratch"]} />

@@ -1,0 +1,163 @@
+## Goal
+
+Move your retrieval from in-memory numpy arrays to PostgreSQL with pgvector, the way you would run it in production. You will write the schema, an idempotent indexer that only re-embeds changed documents, a query function with metadata filters, and a small benchmark that checks ANN recall against exact search and measures latency.
+
+Folder: `rag-lab/03-pgvector/`. Inputs: `01-ingestion/out/documents.jsonl`, the chunking strategy you chose in `02-chunking/`, and its golden set.
+
+At the end of this exercise you have the storage layer the capstone (`mortgage-knowledge-assistant`) will reuse almost unchanged.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `docker compose up -d` at the root of `rag-lab` starts Postgres from the `pgvector/pgvector` image with a healthcheck and a named volume.
+- [ ] `migrations/001_init.sql` creates the `vector` extension, a `documents` table (typed metadata columns: `doc_type`, `jurisdiction`, `effective_date`, `is_current`, `content_hash`) and a `chunks` table with `embedding_model` and a `vector(N)` column, plus an HNSW index using the operator class that matches your distance.
+- [ ] `python -m pgrag index` loads documents, chunks them with your chosen strategy, embeds in batches, and upserts in a transaction per document. Re-running with no changes performs zero embedding calls and zero writes; changing one document re-embeds only that document's chunks.
+- [ ] `search(query, k, filters)` supports filters on `doc_type`, `jurisdiction` (list), `is_current` and an `effective_on` date, using SQL parameters (no string formatting of user input).
+- [ ] The query asserts that `embedding_model` in the table matches the configured model and fails loudly if not.
+- [ ] `EXPLAIN ANALYZE` output in the README shows the HNSW index being used for an unfiltered query.
+- [ ] A pytest integration test (running against the compose database) proves a selective filter still returns `k` results when at least `k` matching chunks exist.
+- [ ] `python -m pgrag bench` reports, for the golden set: hit@5 and MRR@10, ANN recall@10 versus exact search, and p50/p95 query latency (excluding the query embedding call) at `hnsw.ef_search` 40 and 100.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```yaml
+# rag-lab/docker-compose.yml
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./03-pgvector/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 2s
+      retries: 20
+volumes:
+  pgdata:
+```
+
+```python
+# 03-pgvector/pgrag/db.py
+import os
+from datetime import date
+
+import numpy as np
+from pgvector.psycopg import register_vector_async
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
+
+DSN = os.getenv("DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag")
+EMBED_MODEL = os.environ["EMBEDDING_MODEL"]
+
+
+async def connect() -> AsyncConnection:
+    conn = await AsyncConnection.connect(DSN, row_factory=dict_row, autocommit=False)
+    await register_vector_async(conn)
+    return conn
+
+
+async def search(conn: AsyncConnection, qvec: np.ndarray, k: int = 5, *,
+                 doc_type: str | None = None, jurisdictions: list[str] | None = None,
+                 current_only: bool = True, effective_on: date | None = None,
+                 ef_search: int = 40) -> list[dict]:
+    await conn.execute(f"SET LOCAL hnsw.ef_search = {int(ef_search)}")
+    await conn.execute("SET LOCAL hnsw.iterative_scan = relaxed_order")
+    where, params = ["c.embedding_model = %(model)s"], {"model": EMBED_MODEL, "q": qvec, "k": k}
+    if doc_type:
+        where.append("d.doc_type = %(doc_type)s"); params["doc_type"] = doc_type
+    if jurisdictions:
+        where.append("d.jurisdiction = ANY(%(jur)s)"); params["jur"] = jurisdictions
+    if current_only:
+        where.append("d.is_current")
+    if effective_on:
+        where.append("d.effective_date <= %(eff)s"); params["eff"] = effective_on
+    sql = f"""
+        SELECT c.chunk_id, c.doc_id, c.section, c.page, c.content, d.title,
+               1 - (c.embedding <=> %(q)s) AS similarity
+        FROM chunks c JOIN documents d USING (doc_id)
+        WHERE {' AND '.join(where)}
+        ORDER BY c.embedding <=> %(q)s
+        LIMIT %(k)s"""
+    cur = await conn.execute(sql, params)
+    return await cur.fetchall()
+```
+
+```python
+# 03-pgvector/pgrag/index.py  (skeleton)
+async def index_document(conn, doc: dict, embedder) -> int:
+    """Return number of chunks written; 0 if unchanged."""
+    cur = await conn.execute(
+        "SELECT content_hash FROM documents WHERE doc_id = %s", (doc["doc_id"],))
+    row = await cur.fetchone()
+    if row and row["content_hash"] == doc["content_hash"]:
+        return 0
+    # TODO: chunk the doc, embed chunk texts (input_type="document"),
+    #       then in ONE transaction: upsert documents row, delete old chunks,
+    #       insert new chunks with executemany / COPY.
+    raise NotImplementedError
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Only fixed SQL fragments are joined into the `WHERE` clause; every user-provided value goes through a `%(name)s` parameter. The `ef_search` value is cast with `int()` before formatting because `SET` does not accept bind parameters.</Hint>
+  <Hint>For idempotency, compare `content_hash` before embedding, not after. Wrap "upsert document, delete its chunks, insert new chunks" in `async with conn.transaction():` so a crash never leaves a document half-indexed.</Hint>
+  <Hint>For ANN recall, compute ground truth with an exact search: run the same query with `SET LOCAL enable_indexscan = off` (or compute cosine in numpy over all vectors from the table) and measure the overlap of the top-10 IDs with the HNSW result. On a small corpus recall will be close to 1.0; that is a valid finding, write it down.</Hint>
+  <Hint>For the selective-filter test, insert a fixture set where only 12 chunks have `jurisdiction = 'US-NV'` among a few thousand random vectors, query with `k = 10` and that filter, and assert 10 rows come back. Then try it with `hnsw.iterative_scan` turned off and observe the difference; mention it in the README.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  docker-compose.yml
+  03-pgvector/
+    README.md
+    pyproject.toml
+    migrations/
+      001_init.sql
+    pgrag/
+      __init__.py
+      __main__.py       # index | search | bench
+      db.py
+      index.py
+      embedder.py       # provider-agnostic, from lesson 6
+      chunking.py       # imported strategy from 02-chunking
+      bench.py
+    tests/
+      conftest.py       # connects to compose DB, truncates tables per test
+      test_index_idempotent.py
+      test_filtered_search.py
+    results/
+      bench.md
+```
+
+**README outline for `03-pgvector/`:** architecture sketch (documents and chunks tables), how to run (compose, migrate, index, search), schema and index choices with reasons (HNSW, operator class, `m`, `ef_construction`), idempotent indexing explained, filtering approach and the selective-filter finding, `EXPLAIN ANALYZE` snippet, benchmark table (hit@5, MRR@10, ANN recall@10, p50/p95 at two `ef_search` values), next steps (hybrid search).
+
+**Suggested commits:**
+
+- `chore(pgvector): docker compose with pgvector image and init migration`
+- `feat(pgvector): idempotent indexer with content-hash skip and per-document transactions`
+- `feat(pgvector): filtered search with model guard and iterative scan`
+- `test(pgvector): integration tests for idempotency and selective filters`
+- `feat(pgvector): benchmark for ANN recall and latency; docs with results`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m2-08-review" title="Self-review" items={["docker compose up starts a healthy pgvector database with migrations applied", "The HNSW operator class matches the distance operator used in queries (verified with EXPLAIN)", "A second index run makes zero embedding calls and zero writes", "All user-supplied filter values go through SQL parameters", "Search fails loudly if the stored embedding_model differs from the configured one", "The selective-filter integration test passes and the README explains why it could fail", "The benchmark reports ANN recall and p50/p95 latency at two ef_search values"]} />

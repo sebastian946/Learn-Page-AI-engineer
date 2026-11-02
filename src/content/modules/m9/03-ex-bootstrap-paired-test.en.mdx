@@ -1,0 +1,175 @@
+## Goal
+
+Your team has two prompts for the support ticket router from Module 1: `v1` (in production) and `v2` (a rewrite with clearer category definitions). Someone ran both once and posted "v2 is 3 points better!" in Slack. Your job is to produce an answer that would survive a skeptical staff engineer:
+
+1. Run both prompts on the **same** labeled tickets, 3 times each, with caching.
+2. Measure the A/A noise floor (v1 vs v1).
+3. Report accuracy and macro-F1 for each prompt with 95% bootstrap confidence intervals.
+4. Report the **paired** difference with a CI, an exact McNemar test and a paired permutation test.
+5. Estimate how many items you would need to detect a 3-point difference with 80% power.
+6. Write a one-page `REPORT.md` that ends with a clear recommendation.
+
+This is the first folder of a new repo, `llm-eval-lab`, which collects all Module 9 exercises.
+
+## Context
+
+Use at least 200 labeled tickets. Reuse the dataset from `support-ticket-router` if you have it. Otherwise, generate a seed set with an LLM, then **relabel every item yourself** so the gold labels are human labels. Keep at least 5 categories, and make sure one category is rare (5–8% of items), for example `legal_threat`. Rare classes are where macro-F1 and accuracy disagree.
+
+Row format for `data/tickets.jsonl`:
+
+```json
+{"id": "t-0042", "text": "I was charged twice for order 88123 and want my money back today.", "label": "billing_refund"}
+```
+
+Prediction cache format for `runs/<prompt>-run<k>.jsonl`:
+
+```json
+{"id": "t-0042", "pred": "billing_refund", "latency_ms": 812, "input_tokens": 412, "output_tokens": 9}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `data/tickets.jsonl` has at least 200 human-labeled rows, validated by a Pydantic model, with one rare class at 5–8%
+- [ ] `run_prompts.py` runs each prompt 3 times per item, caches results to `runs/` and never re-calls the API for a cached `(prompt hash, model, run, id)`
+- [ ] Unparseable model outputs are mapped to an explicit `__invalid__` label and counted, not dropped
+- [ ] `analyze.py` reports, per prompt: accuracy with a Wilson CI, macro-F1 with a bootstrap CI (resampling items, not runs), and per-class recall
+- [ ] The paired analysis uses per-item majority vote (or mean) across runs, then reports the mean difference in accuracy and in macro-F1 with paired bootstrap CIs
+- [ ] Exact McNemar (via `scipy.stats.binomtest`) and a paired permutation test are reported with the discordant counts
+- [ ] An A/A comparison (v1 run 1 vs v1 run 2) is reported as the noise floor
+- [ ] A sample-size estimate for detecting a 3-point accuracy difference at alpha 0.05 and 80% power uses the observed discordant rate
+- [ ] `REPORT.md` leads with effect size and CI, then p-values, then a recommendation (ship, do not ship, or collect more data) with the reasoning
+- [ ] All random operations use a fixed seed; rerunning `analyze.py` gives identical numbers
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 01-stats/analyze.py
+import json
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+from scipy import stats
+from sklearn.metrics import f1_score, recall_score
+
+SEED = 7
+LABELS = ["billing_refund", "shipping", "account", "product_question", "legal_threat", "__invalid__"]
+
+
+def load_preds(prompt: str, runs: int = 3) -> dict[str, list[str]]:
+    """Returns {item_id: [pred_run1, pred_run2, pred_run3]}."""
+    out: dict[str, list[str]] = {}
+    for k in range(1, runs + 1):
+        for line in Path(f"runs/{prompt}-run{k}.jsonl").read_text("utf-8").splitlines():
+            row = json.loads(line)
+            out.setdefault(row["id"], []).append(row["pred"])
+    return out
+
+
+def majority(preds: list[str]) -> str:
+    return Counter(preds).most_common(1)[0][0]
+
+
+def macro_f1(gold: np.ndarray, pred: np.ndarray) -> float:
+    real = [l for l in LABELS if l != "__invalid__"]
+    return f1_score(gold, pred, labels=real, average="macro", zero_division=0)
+
+
+def paired_bootstrap_metric(gold, pred_a, pred_b, metric, iters: int = 5_000):
+    """Resample ITEM indices once per iteration; compute metric(b) - metric(a) on the same sample."""
+    rng = np.random.default_rng(SEED)
+    n = len(gold)
+    # TODO(you): loop iters times, draw idx = rng.integers(0, n, n),
+    #            diffs.append(metric(gold[idx], pred_b[idx]) - metric(gold[idx], pred_a[idx]))
+    # TODO(you): return observed diff, 2.5th and 97.5th percentiles
+    raise NotImplementedError
+
+
+def mcnemar_exact(correct_a: np.ndarray, correct_b: np.ndarray) -> dict:
+    # TODO(you): count a_only, b_only; binomtest(b_only, a_only + b_only, 0.5)
+    raise NotImplementedError
+
+
+def n_mcnemar(p_disc: float, delta: float, alpha: float = 0.05, power: float = 0.8) -> int:
+    # TODO(you): implement the formula from lesson 02
+    raise NotImplementedError
+
+
+def main() -> None:
+    gold_rows = [json.loads(l) for l in Path("data/tickets.jsonl").read_text("utf-8").splitlines()]
+    ids = [r["id"] for r in gold_rows]
+    gold = np.array([r["label"] for r in gold_rows])
+    a_runs, b_runs = load_preds("v1"), load_preds("v2")
+    pred_a = np.array([majority(a_runs[i]) for i in ids])
+    pred_b = np.array([majority(b_runs[i]) for i in ids])
+    # TODO(you): per-prompt accuracy + Wilson CI, macro-F1 + bootstrap CI, per-class recall
+    # TODO(you): paired accuracy and macro-F1 differences with CIs
+    # TODO(you): McNemar + permutation test on correctness vectors
+    # TODO(you): A/A noise floor using a_runs run 1 vs run 2
+    # TODO(you): sample-size estimate for delta = 0.03 using the observed discordant rate
+    # TODO(you): write results to results.json for REPORT.md
+
+
+if __name__ == "__main__":
+    main()
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Separate generation from analysis. `run_prompts.py` is the only file that calls the API. `analyze.py` reads only cached files, so you can iterate on statistics for free. Use the prompt file's SHA-256 in the cache key so editing `v2.md` invalidates its runs automatically.</Hint>
+  <Hint>Macro-F1 is not an average of per-item scores, so you cannot bootstrap a vector of per-item numbers. Resample indices and recompute the whole metric on each resample, for both prompts on the same indices. That is what makes it paired.</Hint>
+  <Hint>For McNemar, build boolean vectors `correct_a = pred_a == gold` and `correct_b = pred_b == gold`. `a_only = (correct_a & ~correct_b).sum()`. The discordant rate for the sample-size formula is `(a_only + b_only) / n`. If your A/A test already shows 5% discordance, your items are noisy and majority voting across runs matters.</Hint>
+  <Hint>A good report structure: one table with accuracy and macro-F1 per prompt and CIs; one table with paired differences, CIs and p-values; one line with the A/A floor; one line with the required n; then the recommendation. If the CI on the difference includes 0, the honest answer is "no evidence that v2 is better at n = 200; we need about N items", not "v2 is slightly better".</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  README.md
+  pyproject.toml
+  01-stats/
+    README.md
+    data/
+      tickets.jsonl
+    prompts/
+      v1.md
+      v2.md
+    run_prompts.py
+    analyze.py
+    stats_utils.py
+    runs/                 # cached predictions, committed (small) for reproducibility
+    results.json
+    REPORT.md
+    tests/
+      test_stats_utils.py # wilson, mcnemar and n_mcnemar against hand-computed values
+```
+
+README outline (repo root):
+
+- What this lab is: Module 9 advanced evaluation exercises, one folder per exercise
+- How to install (`uv sync` or `pip install -e .`) and set `ANTHROPIC_API_KEY`
+- Folder index with one-line summaries and links to each REPORT.md
+
+`01-stats/README.md` outline:
+
+- Question being answered and the decision it supports
+- Dataset: size, class distribution, how labels were produced
+- How to run: `python run_prompts.py --prompt v1 --runs 3`, then `python analyze.py`
+- Results table and the recommendation (copied from REPORT.md)
+- Limitations: dataset size, single domain, judge-free metrics only
+
+Suggested commits:
+
+- `feat(stats): add 200 human-labeled tickets with a rare legal_threat class`
+- `feat(stats): cached multi-run prompt runner`
+- `feat(stats): paired bootstrap, McNemar and permutation tests`
+- `test(stats): unit tests for interval and sample-size helpers`
+- `docs(stats): v1 vs v2 report with CIs and recommendation`
+
+</CommitBox>
+
+<Checklist id="m9-03-review" title="Self-review" items={["Both prompts ran on exactly the same items, and the analysis is paired", "I resample items, never runs, when bootstrapping", "Invalid outputs are counted as wrong, not silently dropped", "I report effect sizes with CIs before p-values", "I measured the A/A noise floor and compared the observed difference to it", "The sample-size estimate uses the discordant rate I actually observed", "The recommendation follows from the numbers, including the option to collect more data", "Rerunning analyze.py reproduces the same numbers"]} />

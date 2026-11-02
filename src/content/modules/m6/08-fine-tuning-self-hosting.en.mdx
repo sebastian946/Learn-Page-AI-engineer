@@ -1,0 +1,177 @@
+# Fine-tuning (and when not to), LoRA/QLoRA and self-hosting with vLLM
+
+Job postings mention fine-tuning far less often than RAG, evals and LLM integration. When interviewers bring it up, they usually want to know whether you can **decide** — not whether you can run a training loop. This lesson gives you that decision framework, the mental model of LoRA and QLoRA, and the core ideas behind self-hosting models with vLLM.
+
+## The decision ladder: prompting → RAG → fine-tuning
+
+Climb one step at a time. Each step costs more to build and much more to maintain.
+
+<Diagram caption="Escalate only when the cheaper step has been measured and failed" chart={`flowchart TD
+  A["Problem with LLM output"] --> B{"Missing knowledge or facts?"}
+  B -- Yes --> C["RAG: retrieve the facts at query time"]
+  B -- No --> D{"Wrong format, style or behavior?"}
+  D -- Yes --> E["Prompting: instructions, few-shot, structured outputs"]
+  E --> F{"Still failing on a measured eval set?"}
+  F -- No --> G["Ship it"]
+  F -- Yes --> H{"Narrow, stable task with 1k+ quality examples?"}
+  H -- Yes --> I["Consider fine-tuning (LoRA / QLoRA)"]
+  H -- No --> J["Improve data, prompts, model choice or task decomposition"]
+  C --> F`} />
+
+Rules of thumb:
+
+- **Knowledge problems → RAG.** Fine-tuning is a poor way to teach facts. Facts change; a fine-tuned model is frozen at training time, cannot cite sources and may still hallucinate. RAG updates by re-indexing a document.
+- **Behavior problems → prompting first.** Format, tone, refusal policy and output schema are usually fixed by a better system prompt, a few examples and structured outputs (Module 1).
+- **Fine-tuning fits when:**
+  - The task is **narrow and stable** (classify claims into 40 internal codes, extract fields from one form family, write in a strict house style).
+  - You have **hundreds to thousands of high-quality labeled examples** — and the eval set to prove improvement.
+  - You need **lower cost or latency**: a small fine-tuned model can replace a large general model on a narrow task.
+  - You need a model that **runs on your own infrastructure** for data-residency reasons and must close a quality gap.
+
+### The hidden cost: maintenance
+
+A fine-tuned model is a product you own:
+
+- **Data pipeline** to collect, clean, label and version training data (lesson 2).
+- **Training runs** that must be reproducible: data version, base model version, hyperparameters, seed.
+- **Evaluation** on every retrain, against the base model and the previous version.
+- **Serving**: often provisioned capacity or your own GPUs (lesson 5 and below).
+- **Re-basing**: when a better base model ships, your fine-tune does not upgrade itself. You retrain or fall behind. Meanwhile, a prompted frontier model gets better for free.
+
+Put this in the README of any fine-tuning project. Interviewers notice candidates who count maintenance.
+
+## LoRA and QLoRA conceptually
+
+Full fine-tuning updates every weight. For a 7B-parameter model that means storing the weights, gradients and optimizer states for all parameters — with Adam in mixed precision this is roughly 16 bytes per parameter, so over 100 GB of GPU memory before activations. That is multi-GPU territory.
+
+**LoRA (Low-Rank Adaptation)** freezes the base weights and learns a small update for selected weight matrices. Instead of learning a full update matrix ΔW of size d × d, it learns two thin matrices B (d × r) and A (r × d) with a small rank r (often 8–64), so ΔW = B·A. For d = 4096 and r = 16, that is about 131k parameters instead of 16.7M for that matrix — under 1%.
+
+Consequences:
+
+- **Much less memory** for gradients and optimizer states.
+- **Small artifacts**: an adapter is megabytes, not gigabytes. You can keep one base model and many adapters (one per task or per tenant).
+- **Swappable**: servers like vLLM can load several LoRA adapters on one base model and choose per request.
+- Quality is usually close to full fine-tuning for narrow tasks; not always for large domain shifts.
+
+**QLoRA** goes further: it loads the frozen base model in **4-bit** precision (NF4 quantization) and trains LoRA adapters on top in higher precision. A 7B model's weights drop from about 14 GB in 16-bit to roughly 4 GB, making fine-tuning possible on a single consumer or mid-range GPU. The cost is slower training and a small quality risk from quantization.
+
+```python
+import torch
+from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+BASE = "meta-llama/Llama-3.1-8B-Instruct"   # example base model
+
+bnb = BitsAndBytesConfig(                    # QLoRA: 4-bit frozen base
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+model = AutoModelForCausalLM.from_pretrained(BASE, quantization_config=bnb, device_map="auto")
+
+lora = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora)
+model.print_trainable_parameters()   # typically well under 1% trainable
+```
+
+From here you would use a trainer (for example TRL's `SFTTrainer`) on a chat-formatted dataset. Databricks also offers managed fine-tuning for supported foundation models, with the result registered in Unity Catalog and served with provisioned throughput — check the docs for the currently supported models.
+
+### What good fine-tuning data looks like
+
+- Formatted exactly like production inputs, with the same system prompt.
+- Deduplicated, PII-scrubbed and split so that no near-duplicates leak from train into eval.
+- Covering edge cases on purpose, not just the happy path.
+- Ideally built from reviewed production traces and SME corrections — the same assets that feed your eval set.
+
+## Self-hosting with vLLM
+
+Calling an API is the default. Self-hosting means running open-weight models on GPUs you control. **vLLM** is the most common open-source inference server for this. Two ideas make it fast.
+
+### PagedAttention
+
+During generation, the model stores keys and values for every previous token: the **KV cache**. It is big. For Llama 3.1 8B (32 layers, 8 KV heads, head dimension 128, 16-bit), each token costs 2 × 32 × 8 × 128 × 2 bytes = 128 KiB. An 8k-token sequence needs about 1 GiB of KV cache.
+
+Naive servers reserve one contiguous block per request sized for the maximum length, wasting most of it. **PagedAttention** splits the KV cache into fixed-size blocks, like virtual memory pages in an OS, and allocates them on demand. Less fragmentation means more concurrent sequences fit on the same GPU, and identical prefixes (a shared system prompt) can share blocks.
+
+### Continuous batching
+
+Static batching waits for a batch to fill and for its slowest sequence to finish. **Continuous batching** inserts new requests into the running batch at each decoding step and removes finished ones immediately. The GPU stays busy, throughput rises sharply under concurrent load, and short requests are not stuck behind long ones.
+
+### Running it
+
+vLLM exposes an **OpenAI-compatible API**, so your Module 1 client works unchanged:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --enable-lora \
+  --lora-modules claims-coder=./adapters/claims-coder
+```
+
+```python
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="unused-locally")
+
+async def classify(text: str) -> str:
+    resp = await client.chat.completions.create(
+        model="claims-coder",          # the LoRA adapter name, or the base model id
+        messages=[{"role": "user", "content": text}],
+        max_tokens=16, temperature=0,
+    )
+    return resp.choices[0].message.content
+```
+
+### When self-hosting beats APIs
+
+Self-hosting wins when several of these are true:
+
+- **Data residency or compliance** forbids sending data to a third-party API, and no approved managed option exists.
+- **High, steady volume** keeps GPUs busy. Idle GPUs cost the same as busy ones; per-token APIs do not.
+- **A small open or fine-tuned model is good enough** for a narrow task, so a cheap GPU handles it.
+- **Latency control**: co-located inference without internet round-trips.
+
+APIs win when volume is low or spiky, when you need frontier-level quality, or when you do not have the team to run GPU infrastructure (drivers, autoscaling, upgrades, on-call). Compare **total cost**: GPU hours at realistic utilization plus engineering time, against per-token prices at your measured volume. Use current prices from providers and cloud vendors; the crossover moves every few months.
+
+## Common mistakes
+
+- Fine-tuning to add knowledge that belongs in RAG.
+- Fine-tuning before building an eval set, so you cannot prove it helped.
+- Ignoring re-basing cost when the next base model ships.
+- Training on unreviewed model outputs and amplifying their errors.
+- Self-hosting for a prototype with 100 requests a day.
+- Sizing GPUs from model weights only and forgetting the KV cache.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="A stakeholder asks you to fine-tune a model on the company's policy documents so it 'knows' them. What do you say?" level="mid">
+
+I'd recommend RAG instead. Policy knowledge changes, needs citations and must be auditable; a fine-tuned model is frozen at training time, can't cite and still hallucinates. RAG updates by re-indexing and shows its sources. If after RAG and prompt work we still see a measured gap — for example, a strict output style or a narrow classification task — I'd consider LoRA fine-tuning on reviewed examples, with an eval set to prove the gain and a plan for retraining when the base model changes.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Explain PagedAttention and continuous batching, and why they matter for cost." level="senior">
+
+The KV cache grows with every generated token and dominates GPU memory under load. PagedAttention stores it in fixed-size blocks allocated on demand, like OS virtual memory, so there's little fragmentation and shared prefixes can reuse blocks; more sequences fit per GPU. Continuous batching adds and removes sequences at every decoding step instead of waiting for whole batches, keeping the GPU busy and preventing short requests from waiting behind long ones. Together they raise throughput per GPU, which lowers cost per token — the main lever when deciding whether self-hosting beats an API.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Show the ladder">
+
+When asked "would you fine-tune?", answer with the ladder: what you would try first, what metric would tell you it failed, and what fine-tuning would cost to maintain. That structure signals seniority more than any LoRA detail.
+
+</Callout>
+
+## Further reading
+
+- LoRA paper (Hu et al., 2021): https://arxiv.org/abs/2106.09685
+- QLoRA paper (Dettmers et al., 2023): https://arxiv.org/abs/2305.14314
+- PagedAttention / vLLM paper (Kwon et al., 2023): https://arxiv.org/abs/2309.06180
+- vLLM documentation: https://docs.vllm.ai
+- Hugging Face PEFT: https://huggingface.co/docs/peft
+- Databricks foundation model fine-tuning: https://docs.databricks.com/en/large-language-models/foundation-model-training/index.html

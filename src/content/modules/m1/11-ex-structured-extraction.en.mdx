@@ -1,0 +1,174 @@
+## Goal
+
+Milestone 2 of `llm-provider-client`. Use your client to turn messy customer **return-request emails** into validated Pydantic objects, with a bounded **repair loop**, field-level accuracy measurement and a repair-rate metric.
+
+The scenario: an e-commerce returns team receives free-text emails ("hi, the boots A-20931 are too small and the jacket arrived torn, can I get store credit?"). They want each email turned into a structured return request that their warehouse system can consume. Wrong data creates real cost: a wrong SKU means the wrong refund.
+
+Time box: 60 minutes.
+
+## The target schema
+
+```python
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+class ReturnItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str = Field(description="Item as the customer describes it")
+    quantity: int = Field(ge=1, le=20)
+    reason: Literal["wrong_size", "damaged", "not_as_described", "changed_mind", "other"]
+
+class ReturnRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order_id: str | None = Field(description="Format A-12345, null if not mentioned")
+    items: list[ReturnItem] = Field(min_length=1)
+    preferred_resolution: Literal["refund", "store_credit", "exchange", "unspecified"]
+    customer_sentiment: Literal["positive", "neutral", "negative"]
+    needs_human: bool = Field(description="True if threats, legal language or safety issues")
+
+    @field_validator("order_id")
+    @classmethod
+    def check_order_id(cls, v: str | None) -> str | None:
+        if v is not None and (not v.startswith("A-") or not v[2:].isdigit() or len(v) != 7):
+            raise ValueError("order_id must match A-12345")
+        return v
+
+    @model_validator(mode="after")
+    def damaged_items_need_human_if_many(self) -> "ReturnRequest":
+        damaged = sum(i.quantity for i in self.items if i.reason == "damaged")
+        if damaged >= 3 and not self.needs_human:
+            raise ValueError("3+ damaged units must set needs_human=true")
+        return self
+```
+
+The `model_validator` encodes a business rule the schema alone cannot express. It is exactly the kind of rule a repair loop can fix.
+
+## Acceptance criteria
+
+<AcceptanceCriteria>
+
+- [ ] `milestones/m2_structured_extraction/` contains `schema.py`, `extract.py`, `evaluate.py`, a versioned prompt file and `data/emails.jsonl`.
+- [ ] `data/emails.jsonl` has at least 20 hand-labeled examples (input email + expected `ReturnRequest`), including: no order id, multiple items, Spanish text, a vague "other" reason, an angry email with legal language, and one with 3+ damaged items.
+- [ ] `extract_return(email)` calls `LLMClient.complete()` with the JSON Schema from `ReturnRequest.model_json_schema()`, logical model `"fast"` and metadata `feature="return_extraction"` plus the prompt version.
+- [ ] Validation uses `ReturnRequest.model_validate_json`; on `ValidationError` it sends the previous output and `exc.errors()` back to the model, at most 2 repairs.
+- [ ] After the repair budget, it raises `ExtractionFailed` carrying the raw output and errors; it never returns an invalid object.
+- [ ] Responses with `stop_reason` `max_tokens` or `refusal` are treated as failures, not repaired blindly.
+- [ ] `evaluate.py` prints per-field accuracy (order_id, resolution, sentiment, needs_human, item count), overall exact-match rate, repair rate and total cost from the cost log.
+- [ ] Unit tests with `FakeProvider` cover: valid first try, invalid JSON then valid, business-rule violation then valid, and repair budget exhausted.
+- [ ] README section for milestone 2 reports your measured numbers and one example of a repair that worked.
+
+</AcceptanceCriteria>
+
+## Starter code
+
+<StarterCode>
+
+```python
+# milestones/m2_structured_extraction/extract.py
+import json
+from dataclasses import dataclass, field
+from pydantic import ValidationError
+
+from llm_client import LLMClient, LLMRequest
+from llm_client.prompts import load_prompt
+from llm_client.types import StopReason
+from .schema import ReturnRequest
+
+PROMPT = load_prompt("return-extraction", "1.0.0")
+
+@dataclass
+class ExtractionStats:
+    calls: int = 0
+    repairs: int = 0
+    failures: int = 0
+    errors_by_type: dict[str, int] = field(default_factory=dict)
+
+class ExtractionFailed(Exception):
+    def __init__(self, raw: str, errors: list[dict]) -> None:
+        super().__init__(f"extraction failed: {errors[:2]}")
+        self.raw, self.errors = raw, errors
+
+async def extract_return(
+    client: LLMClient, email: str, stats: ExtractionStats, max_repairs: int = 2
+) -> ReturnRequest:
+    messages = [{"role": "user", "content": f"<email>\n{email}\n</email>"}]
+    schema = ReturnRequest.model_json_schema()
+    for attempt in range(max_repairs + 1):
+        resp = await client.complete(LLMRequest(
+            model="fast",
+            system=PROMPT.text,
+            messages=messages,
+            json_schema=schema,
+            max_tokens=1024,
+            metadata={"feature": "return_extraction",
+                      "prompt_id": PROMPT.id, "prompt_version": PROMPT.version},
+        ))
+        stats.calls += 1
+        # 1. reject MAX_TOKENS / REFUSAL stop reasons
+        # 2. try ReturnRequest.model_validate_json(resp.text) -> return on success
+        # 3. on ValidationError: count error types, append assistant output and
+        #    a user message with json.dumps(exc.errors(include_url=False)), stats.repairs += 1
+        ...
+    stats.failures += 1
+    raise ExtractionFailed(raw=resp.text, errors=[])
+```
+
+```json
+{"id": "e07", "email": "Hola, pedido A-31877. Las botas llegaron rotas (2 pares) y quiero mi dinero.", "expected": {"order_id": "A-31877", "items": [{"description": "boots", "quantity": 2, "reason": "damaged"}], "preferred_resolution": "refund", "customer_sentiment": "negative", "needs_human": false}}
+```
+
+</StarterCode>
+
+## Hints
+
+<Hints>
+  <Hint>Write the prompt file first (`prompts/return-extraction/1.0.0.md`). Define each `reason` and `preferred_resolution` value in one line, and state explicitly: "If no order id is mentioned, use null. Never invent one." Most accuracy problems in this task are label-definition problems.</Hint>
+  <Hint>To test the repair path offline, script the `FakeProvider` with two responses: first `'{"order_id": "12345", ...}'` (fails the A-12345 validator), then a valid one. Assert that the second request's messages contain the validation error text and that `stats.repairs == 1`.</Hint>
+  <Hint>Compare `description` loosely (it is free text) and every other field exactly. For items, compare the multiset of `(quantity, reason)` pairs. Keep the evaluation deterministic and print a confusion table for `preferred_resolution`, since `refund` vs `store_credit` is the most common confusion.</Hint>
+  <Hint>If your repair rate is near zero because the provider enforces the schema, temporarily set `supports_json_schema = false` for the `"fast"` model in `models.toml`. Your adapter will then send no schema, and you will see syntax and shape repairs happen. Report both numbers in the README: that comparison is a great interview talking point.</Hint>
+</Hints>
+
+## Commit it
+
+<CommitBox repo="llm-provider-client">
+
+```text
+llm-provider-client/
+  prompts/
+    return-extraction/
+      1.0.0.md
+      CHANGELOG.md
+  milestones/
+    m2_structured_extraction/
+      __init__.py
+      schema.py
+      extract.py
+      evaluate.py
+      data/emails.jsonl
+      README.md
+  tests/
+    test_m2_extraction.py
+```
+
+**README section outline (milestone 2)**
+
+1. Problem and schema (link to `schema.py`), including the business-rule validator.
+2. How the repair loop works, with a sequence of one real repair.
+3. Results table: per-field accuracy, exact match, repair rate, failures, cost per 100 emails.
+4. With vs without provider-enforced schema: repair rate comparison.
+5. Known failure cases and what you would change in prompt 1.1.0.
+
+**Suggested commits**
+
+- `feat(m2): ReturnRequest schema with business-rule validation`
+- `feat(m2): return-extraction prompt v1.0.0`
+- `feat(m2): extraction with bounded repair loop`
+- `test(m2): repair loop paths with fake provider`
+- `feat(m2): labeled dataset and field-level evaluation`
+- `docs(m2): results and repair-rate comparison`
+
+</CommitBox>
+
+## Self-review
+
+<Checklist id="m1-11-review" title="Self-review before you commit" items={["Schema is defined once in Pydantic and the JSON Schema is generated from it", "Nullable fields exist wherever the email may not contain the data", "Repair messages include the model's previous output and structured validation errors", "Repair loop is bounded and failures raise with raw output attached", "max_tokens and refusal stop reasons are handled before validation", "Dataset covers Spanish, multi-item, missing order id and legal-language cases", "Evaluation reports per-field accuracy, repair rate and cost", "Tests run offline with the fake provider"]} />

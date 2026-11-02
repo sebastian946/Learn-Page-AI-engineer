@@ -1,8 +1,8 @@
 ## Goal
 
-Your hybrid retriever from `04-hybrid/` returns the right chunks somewhere in the top 50, but not always in the top 5. In this exercise you add a second stage: a cross-encoder re-ranker plus a query-rewriting step (conversation condensation and multi-query). Then you prove, with numbers, whether each piece helps.
+Your hybrid retriever from `04-hybrid/` (40 candidates per leg, filters inside each leg, RRF with k = 60) returns the right section somewhere in the fused list, but not always in the top 5. In this exercise you add a second stage: a cross-encoder re-ranker plus a query-rewriting step (conversation condensation and multi-query). Then you prove, with numbers, whether each piece helps.
 
-You will work in a new folder: `rag-lab/05-reranking/`. It reuses the pgvector database and the mortgage corpus you indexed in `03-pgvector/`, and the hybrid search function from `04-hybrid/`.
+You will work in a new folder: `rag-lab/05-reranking/`. It reuses the same compose stack (`pgvector/pgvector:pg17`), the `documents` and `chunks` tables you indexed in `03-pgvector/`, and the `hybrid_search`, `Filters` and `rrf` code from `04-hybrid/`.
 
 Think of it like adding a new layer to a test pipeline: you do not merge it until you have a before/after report.
 
@@ -13,18 +13,19 @@ Think of it like adding a new layer to a test pipeline: you do not merge it unti
 1. `reranker.py` — a `Reranker` protocol with two implementations: `CrossEncoderReranker` (local, `cross-encoder/ms-marco-MiniLM-L-6-v2`) and `CohereReranker` (optional, only if you have an API key).
 2. `rewrite.py` — `condense(history, question)` and `multi_query(question, n=3)` using `claude-haiku-5-5` with JSON output validated by Pydantic.
 3. `pipeline.py` — `retrieve(question, history)` that runs: condense → multi-query → hybrid search per query → RRF merge → re-rank → top-k.
-4. `bench.py` — compares four configurations on a small labeled set and prints a table.
+4. `bench.py` — compares four configurations on the extended golden set and prints a table.
 
-The labeled set is a JSONL file of 20 questions, each with the `chunk_id`s that contain the answer. Write the questions yourself from the mortgage corpus: DTI limits, gift funds, reserve requirements, FHA waiting periods, condo eligibility, rate-lock policy. Include at least 5 follow-up questions with a short chat history, because that is where condensation earns its keep.
+Do not start a new labeled set from zero. Copy `04-hybrid/data/golden_hybrid.jsonl` (rows with `question`, `expected_doc_id`, `expected_section`, `category` and optional `filters`) to `05-reranking/data/golden_rerank.jsonl` and extend it with a new category, `follow_up`: at least 6 questions with a short `history` array that only make sense with that history. Example: history about FHA gift funds, then "and what changed in the 2026 version?". That is where condensation earns its keep. Relevance stays judged by `doc_id` + `section`, exactly as in `02-chunking/`.
 
 <AcceptanceCriteria>
 
-- [ ] `05-reranking/data/labeled.jsonl` has at least 20 questions; at least 5 include a `history` array and depend on it.
+- [ ] `05-reranking/data/golden_rerank.jsonl` contains every row from `golden_hybrid.jsonl` plus at least 6 `follow_up` rows with a `history` array that they depend on.
 - [ ] `CrossEncoderReranker.rerank(query, candidates, top_k)` returns candidates sorted by score with the score attached.
 - [ ] Re-ranking runs off the event loop (`asyncio.to_thread`) and handles an empty candidate list.
 - [ ] `condense` returns a standalone question; `multi_query` returns 3 paraphrases. Both are validated with Pydantic and fall back to the original question on parse errors.
 - [ ] Multi-query results are merged with the RRF function from `04-hybrid/` (k = 60), not concatenated.
-- [ ] `bench.py` prints recall@5, MRR@10 and p95 latency for: baseline hybrid, hybrid + re-rank, hybrid + rewrite, hybrid + rewrite + re-rank.
+- [ ] Re-ranking starts from the fused hybrid candidate set (top 40 after RRF) with the row's `filters` applied, never from an unfiltered search.
+- [ ] `bench.py` prints hit@5, MRR@10 and p95 latency for: baseline hybrid, hybrid + re-rank, hybrid + rewrite, hybrid + rewrite + re-rank, overall and per `category` (exact_term, filtered, paraphrase, follow_up).
 - [ ] The README records your measured table and a two-sentence conclusion about which configuration you would ship and why.
 - [ ] Rewritten queries are logged (stdout or a JSONL trace file) for every benchmark question.
 
@@ -47,8 +48,9 @@ from sentence_transformers import CrossEncoder
 @dataclass
 class Candidate:
     chunk_id: str
-    text: str
-    source: str
+    doc_id: str
+    section: str
+    content: str
     score: float = 0.0
 
 
@@ -61,7 +63,7 @@ class CrossEncoderReranker:
         self.model = CrossEncoder(model_name, max_length=512)
 
     def _rerank_sync(self, query: str, candidates: list[Candidate], top_k: int) -> list[Candidate]:
-        # TODO: build (query, text) pairs, call self.model.predict, attach scores, sort, slice
+        # TODO: build (query, c.content) pairs, call self.model.predict, attach scores, sort, slice
         raise NotImplementedError
 
     async def rerank(self, query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
@@ -88,14 +90,18 @@ class CohereReranker:
 # 05-reranking/pipeline.py
 from __future__ import annotations
 
-from hybrid.search import hybrid_search, rrf_merge  # adapt to your 04-hybrid module
+from hybrid.fusion import rrf               # from 04-hybrid
+from hybrid.search import Filters, hybrid_search
 from reranker import Candidate, Reranker
 from rewrite import condense, multi_query
 
 
 async def retrieve(
+    conn,
+    embed,                      # async fn: list[str] -> np.ndarray (from 03-pgvector)
     question: str,
     history: list[dict],
+    filters: Filters,
     reranker: Reranker | None,
     use_rewrite: bool,
     fetch_k: int = 40,
@@ -108,8 +114,10 @@ async def retrieve(
         variants = await multi_query(standalone, n=3)
         queries = [standalone, *variants]
         trace |= {"standalone": standalone, "variants": variants}
-    # TODO: run hybrid_search for each query (asyncio.gather), merge with rrf_merge,
-    # convert rows to Candidate, re-rank if reranker is set, else slice top_k
+    # TODO: for each query: embed it, call hybrid_search(conn, qvec, q, filters, k=fetch_k)
+    # TODO: if several queries, fuse their id lists with rrf(..., k=60, top_n=fetch_k)
+    # TODO: load chunk_id, doc_id, section, content for the ids (one SELECT ... WHERE chunk_id = ANY(%s))
+    # TODO: re-rank with queries[0] if reranker is set, else slice top_k
     raise NotImplementedError
 ```
 
@@ -118,13 +126,21 @@ async def retrieve(
 import statistics
 
 
-def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
-    return len(set(retrieved[:k]) & relevant) / len(relevant) if relevant else 0.0
+from reranker import Candidate
 
 
-def mrr_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
-    for rank, cid in enumerate(retrieved[:k], start=1):
-        if cid in relevant:
+def is_hit(c: Candidate, row: dict) -> bool:
+    # same relevance rule as 02-chunking: judged by metadata, not text
+    return c.doc_id == row["expected_doc_id"] and c.section == row["expected_section"]
+
+
+def hit_at_k(results: list[Candidate], row: dict, k: int) -> float:
+    return 1.0 if any(is_hit(c, row) for c in results[:k]) else 0.0
+
+
+def mrr_at_k(results: list[Candidate], row: dict, k: int) -> float:
+    for rank, c in enumerate(results[:k], start=1):
+        if is_hit(c, row):
             return 1.0 / rank
     return 0.0
 
@@ -137,7 +153,7 @@ def p95(values: list[float]) -> float:
 
 <Hints>
   <Hint>Start with the benchmark and the baseline row. If you cannot measure the baseline, you cannot tell whether anything else helps. Load the model once at startup; loading `CrossEncoder` per query will dominate your latency numbers.</Hint>
-  <Hint>Re-rank a wide list. If you fetch 5 and re-rank 5, recall@5 cannot change by definition. Fetch 30–50 from hybrid search, then keep 5 after re-ranking.</Hint>
+  <Hint>Re-rank a wide list. If you fetch 5 and re-rank 5, hit@5 cannot change by definition. Pass the 40 fused candidates from `hybrid_search` to the re-ranker, then keep 5.</Hint>
   <Hint>For rewriting, ask for JSON only and validate it: `Rewrite.model_validate(json.loads(text))`. Wrap it in `try/except (json.JSONDecodeError, ValidationError)` and return the original question on failure. A rewrite step that can crash the request is worse than no rewrite step.</Hint>
   <Hint>Merge with RRF using each query's ranked list of `chunk_id`s: score each chunk with the sum of `1 / (60 + rank)` across lists. Then pass the top `fetch_k` merged candidates to the re-ranker with the *standalone* question (not each variant). Measure latency with `time.perf_counter()` around the whole `retrieve` call.</Hint>
 </Hints>
@@ -153,7 +169,7 @@ rag-lab/
     pipeline.py
     bench.py
     data/
-      labeled.jsonl
+      golden_rerank.jsonl
     traces/
       rewrites.jsonl        # gitignored or a small sample committed
     tests/
@@ -165,7 +181,7 @@ rag-lab/
 
 1. What this folder demonstrates (two-stage retrieval + query rewriting)
 2. How to run: `uv run python bench.py --config all`
-3. Results table: config, recall@5, MRR@10, p95 latency (your measured numbers)
+3. Results table: config, hit@5, MRR@10, p95 latency (your measured numbers)
 4. Example: one follow-up question, its raw form, the condensed form, and the chunk that moved into the top 5
 5. Trade-offs: local vs hosted re-ranker, added latency, cost of the rewrite call
 6. What I would ship and why (two sentences)
@@ -180,4 +196,4 @@ rag-lab/
 
 </CommitBox>
 
-<Checklist id="m2-12-review" title="Self-review" items={["The cross-encoder model is loaded once, not per request", "Re-ranking runs in a thread so it does not block the event loop", "I fetch a wide candidate list (30+) before re-ranking", "Rewrite failures fall back to the original question instead of raising", "Multi-query lists are merged with RRF, not concatenated", "My benchmark compares all four configurations on the same labeled set", "I report p95 latency, not only the average", "Every rewritten query is logged so I can debug a bad answer", "The README states which configuration I would ship, backed by my numbers"]} />
+<Checklist id="m2-12-review" title="Self-review" items={["The cross-encoder model is loaded once, not per request", "Re-ranking runs in a thread so it does not block the event loop", "I fetch a wide candidate list (30+) before re-ranking", "Rewrite failures fall back to the original question instead of raising", "Multi-query lists are merged with RRF, not concatenated", "My benchmark compares all four configurations on the same golden set", "I report p95 latency, not only the average", "Every rewritten query is logged so I can debug a bad answer", "The README states which configuration I would ship, backed by my numbers"]} />

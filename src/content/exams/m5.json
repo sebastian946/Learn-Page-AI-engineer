@@ -1,0 +1,555 @@
+{
+  "moduleId": "m5",
+  "title": { "en": "Module 5 exam", "es": "Examen del módulo 5" },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "In an SSE endpoint built with StreamingResponse, why should validation, auth and retrieval happen before the first byte is sent?",
+        "es": "En un endpoint SSE construido con StreamingResponse, ¿por qué la validación, la autenticación y el retrieval deben ocurrir antes de enviar el primer byte?"
+      },
+      "options": {
+        "en": [
+          "Once streaming starts, the 200 status and headers are already sent, so later failures can only be reported in-band",
+          "StreamingResponse cannot call async functions after the first yield",
+          "Retrieval results cannot be serialized as SSE events",
+          "Browsers close SSE connections that take longer than one second to send data"
+        ],
+        "es": [
+          "Una vez que empieza el streaming, el status 200 y los headers ya se enviaron, así que las fallas posteriores solo se pueden reportar in-band",
+          "StreamingResponse no puede llamar funciones async después del primer yield",
+          "Los resultados del retrieval no se pueden serializar como eventos SSE",
+          "Los navegadores cierran las conexiones SSE que tardan más de un segundo en enviar datos"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "HTTP status and headers go out with the first chunk. If retrieval fails before streaming, you can still return a proper 4xx/5xx. After that, the only option is an in-band `error` event, which clients and monitoring handle less cleanly.",
+        "es": "El status HTTP y los headers salen con el primer chunk. Si el retrieval falla antes del streaming, todavía puedes devolver un 4xx/5xx correcto. Después de eso, la única opción es un evento `error` in-band, que clientes y monitoreo manejan con menos claridad."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "code",
+      "prompt": {
+        "en": "A mobile client retries this request after a network timeout, sending the same Idempotency-Key. What happens?",
+        "es": "Un cliente móvil reintenta esta petición después de un timeout de red, enviando la misma Idempotency-Key. ¿Qué pasa?"
+      },
+      "code": "@router.post(\"/v1/escalations\")\nasync def escalate(body: Escalation, idempotency_key: str = Header(...)) -> Ticket:\n    ticket = await ticketing.create(body)\n    await redis.set(\n        f\"idem:{idempotency_key}\", ticket.model_dump_json(), ex=86400\n    )\n    return ticket",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "A second ticket is created, because the key is stored but never checked before calling the ticketing API",
+          "The retry returns the first ticket from Redis",
+          "Redis raises an error because the key already exists",
+          "FastAPI rejects the duplicate header with a 409"
+        ],
+        "es": [
+          "Se crea un segundo ticket, porque la key se guarda pero nunca se verifica antes de llamar a la API de ticketing",
+          "El reintento devuelve el primer ticket desde Redis",
+          "Redis lanza un error porque la key ya existe",
+          "FastAPI rechaza el header duplicado con un 409"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Idempotency needs a check-then-reserve step before the side effect: look up the key (or `SET NX` a pending marker), and return the stored result if it exists. This code only writes the key after the side effect, so every retry creates a new ticket.",
+        "es": "La idempotencia necesita un paso de verificar y reservar antes del efecto secundario: buscar la key (o hacer `SET NX` de un marcador pendiente) y devolver el resultado guardado si existe. Este código solo escribe la key después del efecto secundario, así que cada reintento crea un ticket nuevo."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "code",
+      "prompt": {
+        "en": "What is the most serious problem in this Dockerfile?",
+        "es": "¿Cuál es el problema más grave de este Dockerfile?"
+      },
+      "code": "FROM python:3.12-slim\nWORKDIR /app\nCOPY . .\nRUN pip install uv && uv sync --frozen\nARG ANTHROPIC_API_KEY\nENV ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY\nCMD [\"uv\", \"run\", \"uvicorn\", \"app.main:app\", \"--host\", \"0.0.0.0\"]",
+      "codeLang": "dockerfile",
+      "options": {
+        "en": [
+          "The API key is baked into the image config, so anyone who can pull the image can read it",
+          "COPY . . before installing dependencies hurts layer caching",
+          "The image is not multi-stage",
+          "uvicorn should not bind to 0.0.0.0 inside a container"
+        ],
+        "es": [
+          "La API key queda horneada en la configuración de la imagen, así que cualquiera que pueda hacer pull la puede leer",
+          "COPY . . antes de instalar dependencias perjudica el caché de capas",
+          "La imagen no es multi-stage",
+          "uvicorn no debería escuchar en 0.0.0.0 dentro de un contenedor"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "`ENV` from a build `ARG` persists in the image metadata and is visible with `docker inspect` or `docker history`. Secrets must be injected at runtime (ECS task definition `secrets`, Secrets Manager). The caching and multi-stage issues are real but are performance problems, not a leak. Binding to 0.0.0.0 is required in a container.",
+        "es": "Un `ENV` a partir de un `ARG` de build persiste en la metadata de la imagen y se ve con `docker inspect` o `docker history`. Los secretos deben inyectarse en runtime (`secrets` de la task definition de ECS, Secrets Manager). Los problemas de caché y multi-stage son reales, pero son de rendimiento, no una fuga. Escuchar en 0.0.0.0 es necesario dentro de un contenedor."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "multi",
+      "prompt": {
+        "en": "Which values should be part of the exact-cache key for a RAG answer? Select all that apply.",
+        "es": "¿Qué valores deben formar parte de la key de la caché exacta para una respuesta RAG? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "Tenant id",
+          "Model id",
+          "Prompt version",
+          "Corpus or document version",
+          "Request id",
+          "Timestamp of the request"
+        ],
+        "es": [
+          "Id del tenant",
+          "Id del modelo",
+          "Versión del prompt",
+          "Versión del corpus o de los documentos",
+          "Id de la petición",
+          "Timestamp de la petición"
+        ]
+      },
+      "answer": [0, 1, 2, 3],
+      "explanation": {
+        "en": "The answer depends on who asks (tenant isolation), which model and prompt produced it, and which documents were retrieved. Request id and timestamp are unique per request, so including them makes the hit rate zero.",
+        "es": "La respuesta depende de quién pregunta (aislamiento por tenant), qué modelo y prompt la generaron y qué documentos se recuperaron. El id de petición y el timestamp son únicos por petición, así que incluirlos deja el hit rate en cero."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "single",
+      "prompt": {
+        "en": "What is the main risk of a semantic cache in a mortgage assistant?",
+        "es": "¿Cuál es el principal riesgo de una caché semántica en un asistente hipotecario?"
+      },
+      "options": {
+        "en": [
+          "Serving the answer to a similar but materially different question, such as a different loan amount or state",
+          "Embedding the question adds more latency than calling the LLM",
+          "Redis cannot store vectors",
+          "Semantic caches only work with OpenAI embeddings"
+        ],
+        "es": [
+          "Servir la respuesta de una pregunta similar pero materialmente distinta, como un monto de préstamo o un estado diferente",
+          "Generar el embedding de la pregunta agrega más latencia que llamar al LLM",
+          "Redis no puede guardar vectores",
+          "Las cachés semánticas solo funcionan con embeddings de OpenAI"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Embeddings put \"max LTV for a $400k loan in Texas\" and \"max LTV for a $900k loan in California\" close together. A hit returns a confident wrong answer. Mitigate with a strict threshold, tenant and version scoping, and skipping questions with numbers or entities.",
+        "es": "Los embeddings ponen muy cerca \"LTV máximo para un préstamo de $400k en Texas\" y \"LTV máximo para un préstamo de $900k en California\". Un hit devuelve una respuesta equivocada con total confianza. Mitígalo con un umbral estricto, aislamiento por tenant y versión, y omitiendo preguntas con números o entidades."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "Why is a per-tenant token bucket usually implemented as a Lua script in Redis?",
+        "es": "¿Por qué un token bucket por tenant normalmente se implementa como un script Lua en Redis?"
+      },
+      "options": {
+        "en": [
+          "The read-refill-decrement-write sequence must be atomic across many concurrent API tasks",
+          "Lua scripts are cached on the client, so they avoid network calls",
+          "Redis has no TTL support without Lua",
+          "Lua is required to return HTTP 429 responses"
+        ],
+        "es": [
+          "La secuencia leer-recargar-descontar-escribir debe ser atómica entre muchas tasks concurrentes de la API",
+          "Los scripts Lua se cachean en el cliente, así que evitan llamadas de red",
+          "Redis no soporta TTL sin Lua",
+          "Lua es necesario para devolver respuestas HTTP 429"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Redis runs a script atomically. Doing GET, compute, SET from Python creates race conditions where two tasks both see enough tokens and both spend them, letting a tenant exceed its limit under load.",
+        "es": "Redis ejecuta un script de forma atómica. Hacer GET, calcular y SET desde Python crea condiciones de carrera donde dos tasks ven suficientes tokens y ambas los gastan, permitiendo que un tenant exceda su límite bajo carga."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "multi",
+      "prompt": {
+        "en": "Which statements about token-based rate limiting for LLM requests are correct? Select all that apply.",
+        "es": "¿Qué afirmaciones sobre rate limiting basado en tokens para peticiones LLM son correctas? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Estimate input tokens before the call and charge the bucket up front",
+          "Reconcile with the actual usage reported by the provider after the call",
+          "Return 429 with a Retry-After header when the bucket is empty",
+          "Exact output token counts can be charged before the call",
+          "Counting requests alone is enough to control cost"
+        ],
+        "es": [
+          "Estimar los tokens de entrada antes de la llamada y cobrarlos al bucket por adelantado",
+          "Conciliar con el uso real reportado por el proveedor después de la llamada",
+          "Devolver 429 con un header Retry-After cuando el bucket está vacío",
+          "Los tokens de salida exactos se pueden cobrar antes de la llamada",
+          "Contar solo peticiones es suficiente para controlar el costo"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Output length is unknown until generation ends, so you estimate up front and reconcile afterwards using the `usage` field. Request counts do not control cost: one request with 30 pages of pasted text costs as much as hundreds of short ones.",
+        "es": "El largo de la salida no se conoce hasta que termina la generación, así que estimas por adelantado y concilias después con el campo `usage`. Contar peticiones no controla el costo: una petición con 30 páginas de texto pegado cuesta lo mismo que cientos de peticiones cortas."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "single",
+      "prompt": {
+        "en": "You create a pgvector index on an empty table, then load 2 million embeddings. Recall is terrible. Which index type most likely explains this?",
+        "es": "Creas un índice de pgvector sobre una tabla vacía y luego cargas 2 millones de embeddings. El recall es pésimo. ¿Qué tipo de índice explica esto con más probabilidad?"
+      },
+      "options": {
+        "en": [
+          "IVFFlat, because its list centroids are computed from the data present at build time",
+          "HNSW, because it needs a training step before inserts",
+          "B-tree, because it is the default for vector columns",
+          "HNSW, because ef_search defaults to zero"
+        ],
+        "es": [
+          "IVFFlat, porque los centroides de sus listas se calculan con los datos presentes al construirlo",
+          "HNSW, porque necesita un paso de entrenamiento antes de los inserts",
+          "B-tree, porque es el default para columnas vectoriales",
+          "HNSW, porque ef_search por defecto es cero"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "IVFFlat clusters existing rows into `lists`. Built on an empty table, the clusters are meaningless. Build IVFFlat after loading data, or use HNSW, which has no training step and handles incremental inserts, at the cost of more memory and slower builds.",
+        "es": "IVFFlat agrupa las filas existentes en `lists`. Si se construye sobre una tabla vacía, los clusters no significan nada. Construye IVFFlat después de cargar los datos, o usa HNSW, que no tiene paso de entrenamiento y maneja inserts incrementales, a cambio de más memoria y builds más lentos."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "single",
+      "prompt": {
+        "en": "An Alembic migration with CREATE INDEX CONCURRENTLY on the chunks table fails immediately. What is the most likely cause?",
+        "es": "Una migración de Alembic con CREATE INDEX CONCURRENTLY sobre la tabla de chunks falla de inmediato. ¿Cuál es la causa más probable?"
+      },
+      "options": {
+        "en": [
+          "It ran inside a transaction block, and CONCURRENTLY cannot run inside a transaction",
+          "pgvector does not support concurrent index builds",
+          "Alembic cannot run raw SQL",
+          "The table has too many rows for a concurrent build"
+        ],
+        "es": [
+          "Corrió dentro de un bloque de transacción, y CONCURRENTLY no puede correr dentro de una transacción",
+          "pgvector no soporta builds de índices concurrentes",
+          "Alembic no puede ejecutar SQL crudo",
+          "La tabla tiene demasiadas filas para un build concurrente"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Alembic wraps migrations in a transaction by default. Use `op.get_context().autocommit_block()` for the concurrent build. CONCURRENTLY avoids locking writes for the duration of a long vector index build.",
+        "es": "Alembic envuelve las migraciones en una transacción por defecto. Usa `op.get_context().autocommit_block()` para el build concurrente. CONCURRENTLY evita bloquear las escrituras durante un build largo de un índice vectorial."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "single",
+      "prompt": {
+        "en": "After putting PgBouncer in transaction pooling mode in front of Postgres, the asyncpg-based service starts throwing prepared statement errors. What is the usual fix?",
+        "es": "Después de poner PgBouncer en modo transaction pooling frente a Postgres, el servicio basado en asyncpg empieza a lanzar errores de prepared statements. ¿Cuál es la solución habitual?"
+      },
+      "options": {
+        "en": [
+          "Disable asyncpg's statement cache (statement_cache_size=0) or use a PgBouncer version and config that supports prepared statements",
+          "Switch PgBouncer to statement pooling mode",
+          "Increase max_connections on Postgres",
+          "Run VACUUM FULL on the chunks table"
+        ],
+        "es": [
+          "Desactivar el caché de statements de asyncpg (statement_cache_size=0) o usar una versión y configuración de PgBouncer que soporte prepared statements",
+          "Cambiar PgBouncer a modo statement pooling",
+          "Aumentar max_connections en Postgres",
+          "Ejecutar VACUUM FULL sobre la tabla de chunks"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "In transaction mode, consecutive transactions from one client can land on different server connections, so a statement prepared on one connection does not exist on the next. Disabling the client-side statement cache is the common fix.",
+        "es": "En modo transaction, transacciones consecutivas de un mismo cliente pueden caer en conexiones distintas del servidor, así que un statement preparado en una conexión no existe en la siguiente. Desactivar el caché de statements del lado del cliente es la solución común."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "code",
+      "prompt": {
+        "en": "This job fails at the configure-aws-credentials step with an error about fetching an OIDC token. Why?",
+        "es": "Este job falla en el paso configure-aws-credentials con un error al obtener un token OIDC. ¿Por qué?"
+      },
+      "code": "permissions:\n  contents: read\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: aws-actions/configure-aws-credentials@v4\n        with:\n          role-to-assume: arn:aws:iam::123456789012:role/gha-deploy\n          aws-region: us-east-1",
+      "codeLang": "yaml",
+      "options": {
+        "en": [
+          "The workflow lacks `id-token: write` permission, so it cannot request an OIDC token",
+          "OIDC requires AWS_ACCESS_KEY_ID to be set as a secret",
+          "configure-aws-credentials only works on self-hosted runners",
+          "The checkout step must come after the credentials step"
+        ],
+        "es": [
+          "Al workflow le falta el permiso `id-token: write`, así que no puede pedir un token OIDC",
+          "OIDC requiere que AWS_ACCESS_KEY_ID esté configurado como secreto",
+          "configure-aws-credentials solo funciona en runners self-hosted",
+          "El paso de checkout debe ir después del paso de credenciales"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Setting `permissions` explicitly removes everything not listed. OIDC federation needs `id-token: write` to mint the token that AWS STS exchanges for short-lived role credentials. No long-lived keys are needed.",
+        "es": "Definir `permissions` explícitamente quita todo lo que no está listado. La federación OIDC necesita `id-token: write` para emitir el token que AWS STS intercambia por credenciales temporales del rol. No se necesitan llaves de larga duración."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "order",
+      "prompt": {
+        "en": "Order the stages of a CI/CD pipeline for an LLM service.",
+        "es": "Ordena las etapas de un pipeline de CI/CD para un servicio LLM."
+      },
+      "items": {
+        "en": [
+          "Lint, type check and unit tests",
+          "Eval gate on prompt and retrieval changes",
+          "Build and push the image tagged with the git SHA",
+          "Deploy to staging",
+          "Smoke test staging",
+          "Manual approval in the production environment",
+          "Deploy to production"
+        ],
+        "es": [
+          "Lint, type check y pruebas unitarias",
+          "Eval gate en cambios de prompt y retrieval",
+          "Build y push de la imagen con el SHA de git como tag",
+          "Deploy a staging",
+          "Smoke test en staging",
+          "Aprobación manual en el environment de producción",
+          "Deploy a producción"
+        ]
+      },
+      "explanation": {
+        "en": "Cheap, fast checks run first. The eval gate runs before building so a quality regression never produces a deployable artifact. The same SHA-tagged image is promoted from staging to production after a smoke test and an approval.",
+        "es": "Los chequeos baratos y rápidos van primero. El eval gate corre antes del build para que una regresión de calidad nunca produzca un artefacto desplegable. La misma imagen con tag del SHA se promueve de staging a producción después de un smoke test y una aprobación."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "single",
+      "prompt": {
+        "en": "On ECS Fargate behind an ALB, long streamed answers are cut off at exactly 60 seconds. What is the most likely fix?",
+        "es": "En ECS Fargate detrás de un ALB, las respuestas largas con streaming se cortan exactamente a los 60 segundos. ¿Cuál es la solución más probable?"
+      },
+      "options": {
+        "en": [
+          "Raise the ALB idle timeout and send periodic SSE heartbeat comments",
+          "Increase the task's CPU allocation",
+          "Switch the target group health check to TCP",
+          "Enable sticky sessions on the target group"
+        ],
+        "es": [
+          "Aumentar el idle timeout del ALB y enviar comentarios SSE de heartbeat periódicos",
+          "Aumentar la CPU asignada a la task",
+          "Cambiar el health check del target group a TCP",
+          "Activar sticky sessions en el target group"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The ALB idle timeout defaults to 60 seconds. If no bytes flow (for example during a slow TTFT or a long pause), the connection is closed. Raise the timeout to match your request deadline and send heartbeat comments to keep the connection active.",
+        "es": "El idle timeout del ALB es de 60 segundos por defecto. Si no fluyen bytes (por ejemplo, durante un TTFT lento o una pausa larga), la conexión se cierra. Sube el timeout para que coincida con el deadline de tu petición y envía comentarios de heartbeat para mantener la conexión activa."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "code",
+      "prompt": {
+        "en": "During this k6 run, p95 of ttft_ms is 3100 and everything else is within limits. What happens?",
+        "es": "Durante esta corrida de k6, el p95 de ttft_ms es 3100 y todo lo demás está dentro de los límites. ¿Qué pasa?"
+      },
+      "code": "export const options = {\n  scenarios: {\n    chat: {\n      executor: 'ramping-arrival-rate',\n      startRate: 1,\n      timeUnit: '1s',\n      preAllocatedVUs: 50,\n      stages: [{ target: 15, duration: '5m' }],\n    },\n  },\n  thresholds: {\n    http_req_failed: ['rate<0.01'],\n    ttft_ms: ['p(95)<2500'],\n    http_req_duration: ['p(95)<9000'],\n  },\n};",
+      "codeLang": "javascript",
+      "options": {
+        "en": [
+          "The test runs to the end, marks the ttft_ms threshold as failed and k6 exits with a non-zero code",
+          "k6 aborts the test the moment the threshold is crossed",
+          "Nothing, because custom metrics cannot have thresholds",
+          "k6 lowers the arrival rate until the threshold passes"
+        ],
+        "es": [
+          "La prueba corre hasta el final, marca el threshold de ttft_ms como fallido y k6 termina con un código distinto de cero",
+          "k6 aborta la prueba en el momento en que se cruza el threshold",
+          "Nada, porque las métricas personalizadas no pueden tener thresholds",
+          "k6 baja la tasa de llegada hasta que el threshold pasa"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Thresholds are evaluated over the run and a failure makes k6 exit non-zero, which fails a CI job. Aborting early requires `abortOnFail: true` in an object-form threshold. Custom Trend metrics such as `ttft_ms` support thresholds like built-in ones.",
+        "es": "Los thresholds se evalúan durante la corrida y una falla hace que k6 termine con un código distinto de cero, lo que hace fallar un job de CI. Abortar antes requiere `abortOnFail: true` en un threshold en forma de objeto. Las métricas Trend personalizadas como `ttft_ms` soportan thresholds igual que las integradas."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "single",
+      "prompt": {
+        "en": "Why run most load tests with a mock LLM provider that simulates TTFT and tokens per second?",
+        "es": "¿Por qué correr la mayoría de las pruebas de carga con un proveedor LLM mock que simula TTFT y tokens por segundo?"
+      },
+      "options": {
+        "en": [
+          "It isolates your service's capacity from provider variance, cost and rate limits",
+          "Real providers block traffic from k6",
+          "Mocks produce more accurate answer quality metrics",
+          "Streaming cannot be load tested against a real provider"
+        ],
+        "es": [
+          "Aísla la capacidad de tu servicio de la variabilidad, el costo y los rate limits del proveedor",
+          "Los proveedores reales bloquean el tráfico de k6",
+          "Los mocks producen métricas de calidad de respuesta más precisas",
+          "El streaming no se puede probar con carga contra un proveedor real"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "You want to find your own bottlenecks (pools, CPU, Redis, Postgres) reproducibly and cheaply. A small, budgeted run against the real provider complements it to measure real TTFT and validate the cost model.",
+        "es": "Quieres encontrar tus propios cuellos de botella (pools, CPU, Redis, Postgres) de forma reproducible y barata. Una corrida pequeña y presupuestada contra el proveedor real la complementa para medir el TTFT real y validar el modelo de costos."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "single",
+      "prompt": {
+        "en": "Your service receives 20 requests per second and each request spends 6 seconds in the system. Roughly how many concurrent requests are in flight?",
+        "es": "Tu servicio recibe 20 peticiones por segundo y cada petición pasa 6 segundos en el sistema. ¿Aproximadamente cuántas peticiones concurrentes hay en curso?"
+      },
+      "options": {
+        "en": ["120", "26", "3", "20"],
+        "es": ["120", "26", "3", "20"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Little's law: concurrency = arrival rate × time in system = 20 × 6 = 120. Size connection pools and task counts for this number, plus headroom.",
+        "es": "Ley de Little: concurrencia = tasa de llegada × tiempo en el sistema = 20 × 6 = 120. Dimensiona los connection pools y la cantidad de tasks para ese número, más margen."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "single",
+      "prompt": {
+        "en": "Example prices: $3 per 1M input tokens and $15 per 1M output tokens. A request uses 4,000 input and 300 output tokens. With a 40% cache hit rate (hits cost nothing), what is the LLM cost per 1k requests?",
+        "es": "Precios de ejemplo: $3 por 1M de tokens de entrada y $15 por 1M de tokens de salida. Una petición usa 4,000 tokens de entrada y 300 de salida. Con un cache hit rate del 40% (los hits no cuestan nada), ¿cuál es el costo de LLM por 1k peticiones?"
+      },
+      "options": {
+        "en": ["$9.90", "$16.50", "$6.60", "$12.00"],
+        "es": ["$9.90", "$16.50", "$6.60", "$12.00"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Per request: 4,000 × 3 / 1M = $0.012 plus 300 × 15 / 1M = $0.0045, so $0.0165. Per 1k uncached: $16.50. Only 60% of requests reach the model: 16.50 × 0.6 = $9.90.",
+        "es": "Por petición: 4,000 × 3 / 1M = $0.012 más 300 × 15 / 1M = $0.0045, o sea $0.0165. Por 1k sin caché: $16.50. Solo el 60% de las peticiones llega al modelo: 16.50 × 0.6 = $9.90."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "multi",
+      "prompt": {
+        "en": "Which errors should count as failures for an LLM provider circuit breaker? Select all that apply.",
+        "es": "¿Qué errores deben contar como fallas para el circuit breaker de un proveedor LLM? Selecciona todos los que apliquen."
+      },
+      "options": {
+        "en": [
+          "Timeouts waiting for the first token",
+          "5xx and overloaded responses from the provider",
+          "Connection errors",
+          "400 validation errors caused by a malformed request",
+          "A content-policy refusal for one user's input"
+        ],
+        "es": [
+          "Timeouts esperando el primer token",
+          "Respuestas 5xx y overloaded del proveedor",
+          "Errores de conexión",
+          "Errores 400 de validación causados por una petición malformada",
+          "Un rechazo por política de contenido ante el input de un usuario"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "The breaker measures dependency health. Validation errors and refusals are caused by your code or the user's input. Counting them lets a burst of bad input open the circuit and degrade service for every tenant.",
+        "es": "El breaker mide la salud de la dependencia. Los errores de validación y los rechazos los causan tu código o el input del usuario. Contarlos permite que una ráfaga de input malo abra el circuito y degrade el servicio para todos los tenants."
+      }
+    },
+    {
+      "id": "q19",
+      "type": "order",
+      "prompt": {
+        "en": "Order what happens when the primary model starts timing out.",
+        "es": "Ordena lo que pasa cuando el modelo primario empieza a dar timeouts."
+      },
+      "items": {
+        "en": [
+          "The TTFT budget expires on a primary-model call",
+          "The circuit breaker records the failure",
+          "Failures reach the threshold and the circuit opens",
+          "New requests skip the primary and go to the fallback model",
+          "After the cooldown, one half-open probe calls the primary",
+          "The probe succeeds and the circuit closes"
+        ],
+        "es": [
+          "El presupuesto de TTFT expira en una llamada al modelo primario",
+          "El circuit breaker registra la falla",
+          "Las fallas llegan al umbral y el circuito se abre",
+          "Las peticiones nuevas saltan el primario y van al modelo de fallback",
+          "Tras el enfriamiento, una prueba half-open llama al primario",
+          "La prueba tiene éxito y el circuito se cierra"
+        ]
+      },
+      "explanation": {
+        "en": "Timeouts detect the problem, the breaker counts it, the open state makes requests fail fast to the fallback, and a half-open probe checks recovery before closing the circuit again.",
+        "es": "Los timeouts detectan el problema, el breaker lo cuenta, el estado abierto hace que las peticiones fallen rápido hacia el fallback, y una prueba half-open verifica la recuperación antes de volver a cerrar el circuito."
+      }
+    },
+    {
+      "id": "q20",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps to roll out a new system prompt safely with a feature flag.",
+        "es": "Ordena los pasos para desplegar un system prompt nuevo de forma segura con un feature flag."
+      },
+      "items": {
+        "en": [
+          "Add the new prompt version file in git",
+          "The eval gate passes in CI",
+          "Merge and deploy with the flag at 0%",
+          "Send a 5% canary of tenants to the new version",
+          "Compare online metrics by prompt version",
+          "Ramp to 100% or flip the kill switch"
+        ],
+        "es": [
+          "Agregar el archivo de la nueva versión del prompt en git",
+          "El eval gate pasa en CI",
+          "Hacer merge y deploy con el flag en 0%",
+          "Enviar un canary del 5% de los tenants a la nueva versión",
+          "Comparar métricas online por versión de prompt",
+          "Subir al 100% o activar el kill switch"
+        ]
+      },
+      "explanation": {
+        "en": "Prompt content is reviewed and evaluated like code. The flag only selects which reviewed version runs, which allows a gradual rollout and an instant rollback without a deploy.",
+        "es": "El contenido del prompt se revisa y evalúa como código. El flag solo elige qué versión revisada corre, lo que permite un rollout gradual y un rollback instantáneo sin deploy."
+      }
+    }
+  ]
+}

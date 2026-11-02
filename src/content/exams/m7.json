@@ -1,0 +1,499 @@
+{
+  "moduleId": "m7",
+  "title": { "en": "Module 7 exam", "es": "Examen del módulo 7" },
+  "timeLimitMinutes": 35,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "A multi-tenant RAG service uses a pooled PostgreSQL table with pgvector and full-text search, merged with RRF. The vector query has `WHERE tenant_id = $1`, but RLS is not enabled. A firm reports seeing a passage from another firm's document. What is the most likely leak path?",
+        "es": "Un servicio RAG multi-tenant usa una tabla compartida de PostgreSQL con pgvector y búsqueda full-text, combinadas con RRF. La consulta vectorial tiene `WHERE tenant_id = $1`, pero RLS no está habilitado. Un bufete reporta ver un pasaje del documento de otro bufete. ¿Cuál es el camino de fuga más probable?"
+      },
+      "options": {
+        "en": [
+          "The keyword (BM25/full-text) query was not filtered by tenant, and RRF merged its results",
+          "The embedding model memorized the other firm's documents",
+          "HNSW indexes ignore WHERE clauses entirely",
+          "The LLM's training data included the other firm's documents"
+        ],
+        "es": [
+          "La consulta de palabras clave (BM25/full-text) no se filtró por tenant y RRF combinó sus resultados",
+          "El modelo de embeddings memorizó los documentos del otro bufete",
+          "Los índices HNSW ignoran por completo las cláusulas WHERE",
+          "Los datos de entrenamiento del LLM incluían los documentos del otro bufete"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Hybrid search has two retrieval paths. If only one is tenant-filtered, the other leaks and fusion happily merges the results. RLS would have enforced the filter on both queries at the database level. Embedding models and LLMs do not learn from your inference calls, and HNSW does apply filters (post-filtering), though it can reduce recall.",
+        "es": "La búsqueda híbrida tiene dos caminos de retrieval. Si solo uno está filtrado por tenant, el otro filtra datos y la fusión combina los resultados sin problema. RLS habría aplicado el filtro a ambas consultas a nivel de base de datos. Los modelos de embeddings y los LLM no aprenden de tus llamadas de inferencia, y HNSW sí aplica filtros (post-filtrado), aunque puede reducir el recall."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "multi",
+      "prompt": {
+        "en": "In a multi-tenant RAG + agent platform, which of these must be scoped to (or carry) the tenant from the authenticated request context? Select all that apply.",
+        "es": "En una plataforma multi-tenant de RAG + agentes, ¿cuáles de estos deben tener alcance de tenant (o llevar el tenant) a partir del contexto de la petición autenticada? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "The semantic cache key",
+          "The BM25/keyword retrieval query",
+          "Trace span attributes",
+          "A `tenant_id` argument the LLM fills in when calling tools",
+          "The tokenizer used to count tokens"
+        ],
+        "es": [
+          "La clave de la caché semántica",
+          "La consulta de retrieval BM25/de palabras clave",
+          "Los atributos de los spans de trace",
+          "Un argumento `tenant_id` que el LLM completa al llamar herramientas",
+          "El tokenizador usado para contar tokens"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Cache keys, every retrieval path and trace attributes must carry the tenant. The tenant must never come from model-generated tool arguments, because the model can be prompt-injected; tools receive tenant context from the runtime. The tokenizer is tenant-independent.",
+        "es": "Las claves de caché, cada camino de retrieval y los atributos de trace deben llevar el tenant. El tenant nunca debe venir de argumentos de herramientas generados por el modelo, porque el modelo puede sufrir prompt injection; las herramientas reciben el contexto de tenant desde el runtime. El tokenizador no depende del tenant."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "code",
+      "prompt": {
+        "en": "This code runs in a FastAPI app using an asyncpg connection pool, with RLS policies based on `current_setting('app.tenant_id')`. What is the main bug?",
+        "es": "Este código corre en una app FastAPI que usa un pool de conexiones de asyncpg, con políticas RLS basadas en `current_setting('app.tenant_id')`. ¿Cuál es el bug principal?"
+      },
+      "code": "async def search(pool, tenant_id: str, qvec: list[float]):\n    async with pool.acquire() as conn:\n        await conn.execute(f\"SET app.tenant_id = '{tenant_id}'\")\n        return await conn.fetch(\n            \"SELECT id, content FROM chunks ORDER BY embedding <=> $1 LIMIT 20\",\n            qvec,\n        )",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "SET is session-scoped, so the tenant setting stays on the pooled connection and can apply to the next request; it should be SET LOCAL or set_config(..., true) inside a transaction (and parameterized)",
+          "RLS policies cannot read custom settings, so the query returns all rows",
+          "The `<=>` operator only works with L2 distance indexes",
+          "asyncpg does not allow SET statements"
+        ],
+        "es": [
+          "SET tiene alcance de sesión, así que el valor del tenant queda en la conexión del pool y puede aplicarse a la siguiente petición; debería ser SET LOCAL o set_config(..., true) dentro de una transacción (y parametrizado)",
+          "Las políticas RLS no pueden leer configuraciones personalizadas, así que la consulta devuelve todas las filas",
+          "El operador `<=>` solo funciona con índices de distancia L2",
+          "asyncpg no permite sentencias SET"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "With a connection pool, a session-level SET survives after the connection is released. If the next request forgets to set it, it runs as the previous tenant. Scope it to the transaction with SET LOCAL or set_config('app.tenant_id', $1, true), and avoid f-string SQL. `<=>` is cosine distance in pgvector.",
+        "es": "Con un pool de conexiones, un SET a nivel de sesión sobrevive después de liberar la conexión. Si la siguiente petición olvida fijarlo, corre como el tenant anterior. Limítalo a la transacción con SET LOCAL o set_config('app.tenant_id', $1, true), y evita SQL con f-strings. `<=>` es distancia coseno en pgvector."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "single",
+      "prompt": {
+        "en": "Your RAG assistant meets its quality targets, but p95 full-answer latency is 6 s against a 2.5 s target. What should you do first?",
+        "es": "Tu asistente RAG cumple sus objetivos de calidad, pero la latencia p95 de la respuesta completa es de 6 s contra un objetivo de 2.5 s. ¿Qué deberías hacer primero?"
+      },
+      "options": {
+        "en": [
+          "Break the latency down per stage from traces (retrieval, re-rank, time to first token, generation length)",
+          "Switch to the smallest available model immediately",
+          "Remove the re-ranker because it is always the slowest stage",
+          "Add more replicas of the API service"
+        ],
+        "es": [
+          "Desglosar la latencia por etapa desde los traces (retrieval, re-rank, tiempo al primer token, largo de la generación)",
+          "Cambiar de inmediato al modelo más pequeño disponible",
+          "Quitar el re-ranker porque siempre es la etapa más lenta",
+          "Agregar más réplicas del servicio de API"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Measure before changing. Generation usually dominates, but you only know from per-stage traces. Then apply levers cheapest first and check each against the golden set. More API replicas rarely help, because the API is not the bottleneck at low QPS.",
+        "es": "Mide antes de cambiar. Normalmente domina la generación, pero solo lo sabes con traces por etapa. Luego aplica las palancas de la más barata a la más cara y verifica cada una contra el golden set. Más réplicas de la API rara vez ayudan, porque la API no es el cuello de botella con un QPS bajo."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "order",
+      "prompt": {
+        "en": "Order the phases of a 45-minute AI system design interview.",
+        "es": "Ordena las fases de una entrevista de system design de IA de 45 minutos."
+      },
+      "items": {
+        "en": [
+          "Clarify functional and non-functional requirements",
+          "Capacity estimates (QPS, tokens, storage, cost)",
+          "High-level architecture (ingestion and query paths)",
+          "Deep dives (data model, retrieval, evals)",
+          "Scaling, failure modes and cost levers",
+          "Summary and next steps"
+        ],
+        "es": [
+          "Aclarar requisitos funcionales y no funcionales",
+          "Estimaciones de capacidad (QPS, tokens, almacenamiento, costo)",
+          "Arquitectura de alto nivel (caminos de ingesta y consulta)",
+          "Profundizaciones (modelo de datos, retrieval, evals)",
+          "Escalado, modos de falla y palancas de costo",
+          "Resumen y siguientes pasos"
+        ]
+      },
+      "explanation": {
+        "en": "Requirements drive estimates, estimates drive architecture choices (for example, 2M chunks fit on one pgvector instance), and deep dives only make sense once the shape is agreed. Leave time to close with a summary.",
+        "es": "Los requisitos guían las estimaciones, las estimaciones guían las decisiones de arquitectura (por ejemplo, 2M de chunks caben en una instancia de pgvector) y las profundizaciones solo tienen sentido cuando se acordó la forma general. Deja tiempo para cerrar con un resumen."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "10,000 users, 40% daily active, 10 queries per active user per day, traffic spread over 8 working hours, peak factor 4. What is the approximate peak QPS?",
+        "es": "10.000 usuarios, 40% activos al día, 10 consultas por usuario activo al día, tráfico repartido en 8 horas laborales, factor de pico 4. ¿Cuál es el QPS pico aproximado?"
+      },
+      "options": {
+        "en": ["About 0.6", "About 5.6", "About 56", "About 140"],
+        "es": ["Unos 0.6", "Unos 5.6", "Unos 56", "Unos 140"]
+      },
+      "answer": [1],
+      "explanation": {
+        "en": "10,000 x 0.4 x 10 = 40,000 queries per day. 40,000 / 28,800 s is about 1.4 QPS average, times 4 is about 5.6 QPS at peak. The conclusion: the API is not the hard part; LLM quota and cost are.",
+        "es": "10.000 x 0.4 x 10 = 40.000 consultas al día. 40.000 / 28.800 s son unos 1.4 QPS de promedio, por 4 son unos 5.6 QPS en el pico. La conclusión: la API no es la parte difícil; lo son la cuota y el costo del LLM."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "multi",
+      "prompt": {
+        "en": "Your CI pipeline runs the offline eval suite as a merge gate. Which changes should trigger it? Select all that apply.",
+        "es": "Tu pipeline de CI corre la suite de evals offline como gate de merge. ¿Qué cambios deberían dispararla? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Editing a system prompt template",
+          "Changing the chunk size or chunking strategy",
+          "Switching the embedding model",
+          "Fixing a typo in CONTRIBUTING.md",
+          "Upgrading the re-ranker model version"
+        ],
+        "es": [
+          "Editar una plantilla de system prompt",
+          "Cambiar el tamaño o la estrategia de chunking",
+          "Cambiar el modelo de embeddings",
+          "Corregir una errata en CONTRIBUTING.md",
+          "Actualizar la versión del modelo de re-ranking"
+        ]
+      },
+      "answer": [0, 1, 2, 4],
+      "explanation": {
+        "en": "Anything that can change retrieval or generation behavior can regress quality: prompts, chunking, embeddings, re-rankers, model ids. Path filters in CI can skip the expensive suite for docs-only changes.",
+        "es": "Todo lo que pueda cambiar el comportamiento de retrieval o de generación puede hacer retroceder la calidad: prompts, chunking, embeddings, re-rankers, ids de modelo. Los filtros de rutas en CI pueden saltarse la suite costosa en cambios que solo tocan documentación."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "code",
+      "prompt": {
+        "en": "This LangGraph node runs with state `{\"amount\": 80, \"limit\": 100}`. What happens?",
+        "es": "Este nodo de LangGraph corre con el estado `{\"amount\": 80, \"limit\": 100}`. ¿Qué pasa?"
+      },
+      "code": "from langgraph.types import interrupt\n\ndef approve_refund(state: dict) -> dict:\n    if state[\"amount\"] <= state[\"limit\"]:\n        return {\"approved\": True, \"approver\": \"auto\"}\n    decision = interrupt({\"question\": f\"Approve refund of {state['amount']}?\"})\n    return {\"approved\": decision == \"yes\", \"approver\": \"human\"}",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "It returns {\"approved\": True, \"approver\": \"auto\"} without pausing",
+          "It pauses the graph and waits for a human decision",
+          "It returns {\"approved\": False, \"approver\": \"human\"}",
+          "It raises a KeyError because the state has no decision"
+        ],
+        "es": [
+          "Devuelve {\"approved\": True, \"approver\": \"auto\"} sin pausar",
+          "Pausa el grafo y espera una decisión humana",
+          "Devuelve {\"approved\": False, \"approver\": \"human\"}",
+          "Lanza un KeyError porque el estado no tiene decision"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "80 is within the limit of 100, so the node returns the auto-approval update immediately. Only amounts above the limit reach `interrupt()`, which pauses the graph (with a checkpointer) until resumed with a human decision. The limit should come from tenant config, not the model.",
+        "es": "80 está dentro del límite de 100, así que el nodo devuelve de inmediato la actualización de auto-aprobación. Solo los montos por encima del límite llegan a `interrupt()`, que pausa el grafo (con un checkpointer) hasta que se reanude con una decisión humana. El límite debe venir de la configuración del tenant, no del modelo."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "single",
+      "prompt": {
+        "en": "Your support agent scores 0.9 on final-answer quality, but in production it sometimes issues refunds before checking the order status. Which evaluation would have caught this before release?",
+        "es": "Tu agente de soporte obtiene 0.9 en calidad de respuesta final, pero en producción a veces emite reembolsos antes de revisar el estado del pedido. ¿Qué evaluación lo habría detectado antes del release?"
+      },
+      "options": {
+        "en": [
+          "Trajectory evaluation that asserts the expected tool sequence and arguments",
+          "A larger final-answer golden set judged by an LLM",
+          "A k6 load test on the agent endpoint",
+          "Measuring context recall on the retriever"
+        ],
+        "es": [
+          "Evaluación de trayectoria que verifica la secuencia esperada de herramientas y sus argumentos",
+          "Un golden set de respuestas finales más grande juzgado por un LLM",
+          "Una prueba de carga k6 sobre el endpoint del agente",
+          "Medir el context recall del retriever"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Final answers can look correct even when the path was wrong (the mock refund succeeded). Trajectory evals check which tools were called, in what order, with what arguments. A tool-level precondition is a good extra guard.",
+        "es": "Las respuestas finales pueden verse correctas aunque el camino haya sido incorrecto (el reembolso simulado tuvo éxito). Los evals de trayectoria revisan qué herramientas se llamaron, en qué orden y con qué argumentos. Una precondición a nivel de herramienta es una buena protección extra."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of a research chat request in the multi-tenant capstone.",
+        "es": "Ordena los pasos de una petición de chat de investigación en el capstone multi-tenant."
+      },
+      "items": {
+        "en": [
+          "Verify the JWT and resolve the TenantContext",
+          "Check the tenant's rate limit and token budget",
+          "Choose a model tier with the router",
+          "Run tenant-scoped hybrid retrieval",
+          "Re-rank candidates to the top chunks",
+          "Generate the answer with citations and stream it",
+          "Write the usage event and close the trace"
+        ],
+        "es": [
+          "Verificar el JWT y resolver el TenantContext",
+          "Revisar el rate limit y el presupuesto de tokens del tenant",
+          "Elegir un nivel de modelo con el router",
+          "Correr el retrieval híbrido con alcance de tenant",
+          "Re-rankear los candidatos hasta los mejores chunks",
+          "Generar la respuesta con citas y transmitirla en streaming",
+          "Escribir el evento de uso y cerrar el trace"
+        ]
+      },
+      "explanation": {
+        "en": "Tenant context is resolved once at the edge and flows through everything. Cheap rejections (rate limit, budget) happen before any expensive work. Usage and traces close the request so cost is attributed per tenant.",
+        "es": "El contexto de tenant se resuelve una vez en el borde y fluye por todo. Los rechazos baratos (rate limit, presupuesto) ocurren antes de cualquier trabajo costoso. El uso y los traces cierran la petición para que el costo se atribuya por tenant."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "single",
+      "prompt": {
+        "en": "A team already runs PostgreSQL, tenant data must stay in its VPC, and the corpus is about 2 million chunks with modest QPS. Which vector store choice is easiest to defend?",
+        "es": "Un equipo ya opera PostgreSQL, los datos de los tenants deben quedarse en su VPC y el corpus es de unos 2 millones de chunks con un QPS moderado. ¿Qué elección de vector store es más fácil de defender?"
+      },
+      "options": {
+        "en": [
+          "pgvector in the existing PostgreSQL, behind a retriever interface, with a documented trigger to revisit",
+          "A distributed vector database cluster across three regions",
+          "A managed vector SaaS outside the VPC, because managed is always cheaper",
+          "Store embeddings in Redis only"
+        ],
+        "es": [
+          "pgvector en el PostgreSQL existente, detrás de una interfaz de retriever, con un disparador documentado para revisarlo",
+          "Un clúster distribuido de vector database en tres regiones",
+          "Un SaaS vectorial administrado fuera de la VPC, porque lo administrado siempre es más barato",
+          "Guardar los embeddings solo en Redis"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "2 million 1024-dim vectors are roughly 8 GB raw, around 16 GB with an HNSW index: one instance handles it. pgvector reuses existing ops, keeps data in the VPC and supports RLS. The interface and a revisit trigger keep the decision reversible.",
+        "es": "2 millones de vectores de 1024 dimensiones son unos 8 GB en crudo, unos 16 GB con un índice HNSW: una instancia lo maneja. pgvector reutiliza la operación existente, mantiene los datos en la VPC y soporta RLS. La interfaz y un disparador de revisión mantienen la decisión reversible."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "multi",
+      "prompt": {
+        "en": "Which README elements increase a technical reviewer's trust in a portfolio AI project? Select all that apply.",
+        "es": "¿Qué elementos del README aumentan la confianza de un revisor técnico en un proyecto de IA de portafolio? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "A results table with targets, dataset version and run date",
+          "A limitations section with linked issues",
+          "A run-in-5-minutes path that works with a fake LLM provider",
+          "\"Accuracy: 100%\" with no dataset or metric definition",
+          "A 4-minute embedded video instead of a short GIF"
+        ],
+        "es": [
+          "Una tabla de resultados con objetivos, versión del dataset y fecha de corrida",
+          "Una sección de limitaciones con issues enlazados",
+          "Un camino para correrlo en 5 minutos que funciona con un proveedor de LLM fake",
+          "\"Precisión: 100%\" sin dataset ni definición de la métrica",
+          "Un video incrustado de 4 minutos en lugar de un GIF corto"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Reproducible numbers with context, honest limitations and a fast way to run the project build trust. Unexplained perfect scores signal the opposite, and long videos are rarely watched; link them and embed a short GIF.",
+        "es": "Números reproducibles con contexto, limitaciones honestas y una forma rápida de correr el proyecto generan confianza. Puntajes perfectos sin explicación indican lo contrario, y los videos largos casi nunca se ven; enlázalos e incrusta un GIF corto."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "code",
+      "prompt": {
+        "en": "This cache key is used for a semantic/exact answer cache in a multi-tenant RAG service. What is the most serious problem?",
+        "es": "Esta clave de caché se usa para una caché de respuestas semántica/exacta en un servicio RAG multi-tenant. ¿Cuál es el problema más grave?"
+      },
+      "code": "from hashlib import sha256\n\ndef cache_key(prompt_version: str, query: str) -> str:\n    normalized = \" \".join(query.lower().split())\n    return f\"rag:{prompt_version}:{sha256(normalized.encode()).hexdigest()}\"",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "It has no tenant (or permission set) in the key, so one tenant's cached answer can be served to another",
+          "SHA-256 is too slow for cache keys",
+          "Including the prompt version makes the hit rate zero",
+          "Lowercasing the query breaks Unicode"
+        ],
+        "es": [
+          "La clave no incluye el tenant (ni el conjunto de permisos), así que la respuesta cacheada de un tenant puede servirse a otro",
+          "SHA-256 es demasiado lento para claves de caché",
+          "Incluir la versión de prompt hace que la tasa de aciertos sea cero",
+          "Pasar la consulta a minúsculas rompe Unicode"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Two firms asking the same question would share an answer built from one firm's documents. Include tenant id (and, for document ACLs, a hash of the user's groups). Including the prompt version is correct: it invalidates the cache on prompt changes.",
+        "es": "Dos bufetes que hacen la misma pregunta compartirían una respuesta construida con los documentos de uno de ellos. Incluye el tenant id (y, si hay ACLs por documento, un hash de los grupos del usuario). Incluir la versión de prompt es correcto: invalida la caché cuando cambia el prompt."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "single",
+      "prompt": {
+        "en": "In a pooled pgvector table with an HNSW index and an RLS tenant filter, global recall looks fine, but your smallest tenant often gets only 2-3 results for a top-20 search. What explains this?",
+        "es": "En una tabla compartida de pgvector con un índice HNSW y un filtro de tenant por RLS, el recall global se ve bien, pero tu tenant más pequeño suele recibir solo 2-3 resultados en una búsqueda top-20. ¿Qué lo explica?"
+      },
+      "options": {
+        "en": [
+          "The approximate index finds nearest neighbors across all tenants first, then the filter removes most of them; tune ef_search, use iterative scans, partition, or move the tenant to its own partition",
+          "RLS policies limit result sets to 3 rows by default",
+          "The small tenant's embeddings use a different dimension",
+          "HNSW indexes only work for the largest tenant"
+        ],
+        "es": [
+          "El índice aproximado encuentra primero los vecinos más cercanos entre todos los tenants y luego el filtro elimina la mayoría; ajusta ef_search, usa iterative scans, particiona o mueve al tenant a su propia partición",
+          "Las políticas RLS limitan por defecto los resultados a 3 filas",
+          "Los embeddings del tenant pequeño usan otra dimensión",
+          "Los índices HNSW solo funcionan para el tenant más grande"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Post-filtering an approximate search hurts tenants that own a small share of the vectors. This is why you measure recall per tenant size, not just globally.",
+        "es": "Post-filtrar una búsqueda aproximada perjudica a los tenants que poseen una pequeña parte de los vectores. Por eso se mide el recall por tamaño de tenant, no solo de forma global."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps to safely switch to a new embedding model in production.",
+        "es": "Ordena los pasos para cambiar de forma segura a un nuevo modelo de embeddings en producción."
+      },
+      "items": {
+        "en": [
+          "Create a new index or table for the new embeddings",
+          "Backfill embeddings for all tenants' chunks",
+          "Run the offline eval suite against both indexes and compare",
+          "Send a canary share of traffic to the new index and watch online metrics",
+          "Switch the alias or config to the new index",
+          "Keep the old index for rollback, then drop it after a stable period"
+        ],
+        "es": [
+          "Crear un índice o tabla nueva para los nuevos embeddings",
+          "Hacer backfill de embeddings para los chunks de todos los tenants",
+          "Correr la suite de evals offline contra ambos índices y comparar",
+          "Enviar una porción canary del tráfico al nuevo índice y vigilar las métricas online",
+          "Cambiar el alias o la configuración al nuevo índice",
+          "Mantener el índice viejo para rollback y borrarlo tras un periodo estable"
+        ]
+      },
+      "explanation": {
+        "en": "Embeddings from different models are not comparable, so you cannot mix them in one index. Build in parallel, prove quality offline, de-risk with a canary, switch atomically, and keep a rollback path.",
+        "es": "Los embeddings de modelos distintos no son comparables, así que no puedes mezclarlos en un índice. Construye en paralelo, demuestra la calidad offline, reduce el riesgo con un canary, cambia de forma atómica y conserva un camino de rollback."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "multi",
+      "prompt": {
+        "en": "An EU law firm requires that its data stays in the EU. Which of these must be in an EU region (or redacted before leaving it)? Select all that apply.",
+        "es": "Un bufete de la UE exige que sus datos se queden en la UE. ¿Cuáles de estos deben estar en una región de la UE (o redactarse antes de salir)? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Document chunks and their embeddings",
+          "LLM inference calls that include the firm's context",
+          "Traces that contain prompt and completion text",
+          "Your public marketing website"
+        ],
+        "es": [
+          "Los chunks de documentos y sus embeddings",
+          "Las llamadas de inferencia al LLM que incluyen el contexto del bufete",
+          "Los traces que contienen el texto de prompts y respuestas",
+          "Tu sitio web público de marketing"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Residency covers every place the firm's content goes: storage, embeddings, inference, observability, backups and eval runs. Traces are easy to forget because they feel like ops data, but they contain prompts. The marketing site holds no client data.",
+        "es": "La residencia cubre cada lugar al que va el contenido del bufete: almacenamiento, embeddings, inferencia, observabilidad, backups y corridas de evals. Los traces son fáciles de olvidar porque parecen datos de operación, pero contienen prompts. El sitio de marketing no tiene datos de clientes."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "code",
+      "prompt": {
+        "en": "What does this print? (Prices are example values per 1M tokens.)",
+        "es": "¿Qué imprime esto? (Los precios son valores de ejemplo por 1M de tokens.)"
+      },
+      "code": "def cost_per_1k(in_tok: int, out_tok: int, p_in: float, p_out: float, hit_rate: float) -> float:\n    per_req = (in_tok * p_in + out_tok * p_out) / 1_000_000\n    return round(per_req * (1 - hit_rate) * 1000, 2)\n\nprint(cost_per_1k(4000, 400, 3.0, 15.0, 0.25))",
+      "codeLang": "python",
+      "options": {
+        "en": ["18.0", "13.5", "4.5", "0.01"],
+        "es": ["18.0", "13.5", "4.5", "0.01"]
+      },
+      "answer": [1],
+      "explanation": {
+        "en": "Per request: (4000 x 3 + 400 x 15) / 1,000,000 = 0.018. A 25% cache hit rate leaves 75%: 0.0135. Times 1000 requests: 13.5. Note how input tokens dominate here, which is why trimming context and prompt caching matter.",
+        "es": "Por petición: (4000 x 3 + 400 x 15) / 1.000.000 = 0.018. Una tasa de aciertos de caché del 25% deja el 75%: 0.0135. Por 1000 peticiones: 13.5. Fíjate en que aquí dominan los tokens de entrada, por eso importan recortar el contexto y el prompt caching."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "single",
+      "prompt": {
+        "en": "An interviewer asks why you chose pooled isolation with RLS over a database per tenant. Which answer is strongest?",
+        "es": "Un entrevistador pregunta por qué elegiste aislamiento pool con RLS en lugar de una base de datos por tenant. ¿Cuál respuesta es la más sólida?"
+      },
+      "options": {
+        "en": [
+          "\"I chose pool with RLS because we have many small tenants and a three-person ops team. The cost is a shared blast radius and weaker small-tenant recall, mitigated by canary tests in CI and per-tenant recall monitoring. I'd move a tenant to its own cell for residency or when it passes a size threshold.\"",
+          "\"It depends on the requirements.\"",
+          "\"RLS is the industry standard, so it is always the right choice.\"",
+          "\"Database per tenant is outdated.\""
+        ],
+        "es": [
+          "\"Elegí pool con RLS porque tenemos muchos tenants pequeños y un equipo de operaciones de tres personas. El costo es un blast radius compartido y peor recall para tenants pequeños, mitigado con tests canario en CI y monitoreo de recall por tenant. Movería un tenant a su propia celda por residencia o cuando supere un umbral de tamaño.\"",
+          "\"Depende de los requisitos.\"",
+          "\"RLS es el estándar de la industria, así que siempre es la opción correcta.\"",
+          "\"Una base de datos por tenant es algo obsoleto.\""
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "It follows the three-sentence formula: choice and reasons, cost and mitigation, trigger to revisit. \"It depends\" without the factors, or absolute claims, signal a lack of judgment.",
+        "es": "Sigue la fórmula de tres frases: elección y razones, costo y mitigación, disparador para revisarla. \"Depende\" sin los factores, o las afirmaciones absolutas, indican falta de criterio."
+      }
+    }
+  ]
+}

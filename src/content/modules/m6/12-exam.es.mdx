@@ -1,0 +1,22 @@
+# Examen del módulo 6
+
+Este examen tiene el estilo de la certificación **Databricks Certified Generative AI Engineer Associate**: la mayoría de las preguntas describen un equipo, una restricción y un objetivo, y luego preguntan qué enfoque encaja mejor. Algunas evalúan habilidades de SQL y pipelines de las dos primeras lecciones, y otras cubren decisiones de fine-tuning y autoalojamiento.
+
+**Qué cubre**
+
+- SQL sobre logs de LLM: percentiles, window functions, construcción de datasets de evaluación
+- Pipelines: cargas incrementales, idempotencia, deduplicación, eliminación de PII, lineage
+- Unity Catalog, Volumes, Delta (CDF, time travel) y gobernanza
+- Vector Search: endpoints, Delta Sync vs Direct Access, modos de sincronización, embeddings administrados
+- Model Serving: pay-per-token, provisioned throughput, modelos externos, AI Gateway, `ai_query`
+- Tracing y evaluación GenAI con MLflow, jueces LLM y scorers personalizados
+- Agent Framework: models from code, resources, registro en Unity Catalog, `agents.deploy`, Review App
+- Prompting → RAG → fine-tuning, LoRA/QLoRA, vLLM
+
+**Cómo prepararte**
+
+Relee los callouts de "patrón del examen" y las secciones de errores comunes. En cada pregunta de escenario, busca la respuesta que mantiene los datos gobernados en Unity Catalog, usa la opción administrada con menos código propio y cumple la restricción indicada (frescura, SLA, costo, cumplimiento). Lee todas las opciones: varias serán plausibles, solo una cumple todas las restricciones.
+
+**Formato:** 18 preguntas, 35 minutos, puntaje mínimo **70%**. Preguntas de opción única, selección múltiple, ordenamiento y lectura de código. Puedes repetirlo.
+
+Esto es práctica, no el examen oficial. Revisa la guía oficial vigente del examen para conocer dominios y pesos antes de agendarlo.

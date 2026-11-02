@@ -1,0 +1,540 @@
+{
+  "moduleId": "m2",
+  "title": { "en": "Module 2 exam", "es": "Examen del módulo 2" },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "An underwriting rule says \"Maximum LTV is 95%\" and its exception \"...except for condos, where it is 90%\" ended up in the next chunk. Users get the wrong LTV for condos. Which change addresses the root cause?",
+        "es": "Una regla de underwriting dice \"El LTV máximo es 95%\" y su excepción \"...excepto para condominios, donde es 90%\" quedó en el siguiente chunk. Los usuarios obtienen el LTV incorrecto para condominios. ¿Qué cambio ataca la causa raíz?"
+      },
+      "options": {
+        "en": [
+          "Structure-aware chunking that keeps a section together, with some overlap",
+          "Switching to an embedding model with more dimensions",
+          "Raising the generation temperature so the model explores more options",
+          "Adding a semantic cache in front of the pipeline"
+        ],
+        "es": [
+          "Chunking consciente de la estructura que mantiene unida la sección, con algo de overlap",
+          "Cambiar a un modelo de embeddings con más dimensiones",
+          "Subir la temperatura de generación para que el modelo explore más opciones",
+          "Agregar un caché semántico antes del pipeline"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "This is a chunk-boundary failure: the rule and its exception are split. Structure-aware chunking (by section/heading) plus overlap keeps them together. A bigger embedding model, temperature or caching cannot reassemble text that chunking separated.",
+        "es": "Es una falla de límites de chunk: la regla y su excepción quedaron separadas. El chunking consciente de la estructura (por sección/encabezado) más overlap las mantiene juntas. Un modelo de embeddings más grande, la temperatura o el caché no pueden reunir texto que el chunking separó."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "During ingestion of policy PDFs, why should you store section number, page number and effective date with each chunk?",
+        "es": "Durante la ingesta de PDFs de políticas, ¿por qué deberías guardar el número de sección, el número de página y la fecha de vigencia con cada chunk?"
+      },
+      "options": {
+        "en": [
+          "They enable verifiable citations and filtering out superseded policies",
+          "They reduce the embedding dimension needed",
+          "They make BM25 scores independent of document length",
+          "They are required by pgvector to build an HNSW index"
+        ],
+        "es": [
+          "Permiten citas verificables y filtrar políticas reemplazadas",
+          "Reducen la dimensión de embedding necesaria",
+          "Hacen que los scores de BM25 no dependan de la longitud del documento",
+          "pgvector los exige para construir un índice HNSW"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Metadata is what makes citations precise (section and page) and lets retrieval exclude rules that are no longer in force. It has nothing to do with vector dimensions, BM25 normalization or index creation.",
+        "es": "La metadata es lo que hace precisas las citas (sección y página) y permite que el retrieval excluya reglas que ya no están vigentes. No tiene relación con las dimensiones del vector, la normalización de BM25 ni la creación de índices."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "single",
+      "prompt": {
+        "en": "Your team wants to switch to a different embedding model. What must happen to the existing index?",
+        "es": "Tu equipo quiere cambiar a otro modelo de embeddings. ¿Qué debe pasar con el índice existente?"
+      },
+      "options": {
+        "en": [
+          "All chunks must be re-embedded with the new model; vectors from different models cannot be compared",
+          "Only new documents need the new model; old vectors stay compatible",
+          "Nothing, as long as both models output the same number of dimensions",
+          "Only the HNSW index needs to be rebuilt; the stored vectors are reused"
+        ],
+        "es": [
+          "Hay que volver a generar los embeddings de todos los chunks con el nuevo modelo; los vectores de modelos distintos no son comparables",
+          "Solo los documentos nuevos necesitan el nuevo modelo; los vectores viejos siguen siendo compatibles",
+          "Nada, siempre que ambos modelos produzcan el mismo número de dimensiones",
+          "Solo hay que reconstruir el índice HNSW; los vectores guardados se reutilizan"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Each model defines its own vector space. Even with equal dimensions, a query vector from model B is meaningless against document vectors from model A. Re-embed everything, and include the model name in the embedding cache key.",
+        "es": "Cada modelo define su propio espacio vectorial. Aunque tengan las mismas dimensiones, un vector de consulta del modelo B no tiene sentido frente a vectores de documentos del modelo A. Vuelve a generar todos los embeddings e incluye el nombre del modelo en la clave del caché de embeddings."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "multi",
+      "prompt": {
+        "en": "You normalize all embeddings to unit length before storing them in pgvector. Which statements are true? (Select all that apply.)",
+        "es": "Normalizas todos los embeddings a longitud unitaria antes de guardarlos en pgvector. ¿Qué afirmaciones son verdaderas? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Ranking by inner product gives the same order as ranking by cosine similarity",
+          "You can use the inner-product operator with a vector_ip_ops index",
+          "Normalization removes the need for any ANN index",
+          "Normalization lets you mix vectors from two different embedding models"
+        ],
+        "es": [
+          "Rankear por producto interno da el mismo orden que rankear por similitud coseno",
+          "Puedes usar el operador de producto interno con un índice vector_ip_ops",
+          "La normalización elimina la necesidad de cualquier índice ANN",
+          "La normalización permite mezclar vectores de dos modelos de embeddings distintos"
+        ]
+      },
+      "answer": [0, 1],
+      "explanation": {
+        "en": "For unit vectors, cosine similarity equals the dot product, so inner-product search (with the matching vector_ip_ops index) ranks identically. Normalization does not replace an index, and it never makes different models' vectors comparable.",
+        "es": "Para vectores unitarios, la similitud coseno es igual al producto punto, así que la búsqueda por producto interno (con el índice vector_ip_ops correspondiente) rankea igual. La normalización no reemplaza un índice y nunca hace comparables los vectores de modelos distintos."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "code",
+      "prompt": {
+        "en": "The index was created with vector_cosine_ops. After deploying this query, latency jumps from 15 ms to 900 ms on a large table. What is the most likely cause?",
+        "es": "El índice se creó con vector_cosine_ops. Después de desplegar esta consulta, la latencia sube de 15 ms a 900 ms en una tabla grande. ¿Cuál es la causa más probable?"
+      },
+      "code": "CREATE INDEX chunks_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);\n\nSELECT chunk_id, text\nFROM chunks\nORDER BY embedding <#> %(q)s\nLIMIT 5;",
+      "codeLang": "sql",
+      "options": {
+        "en": [
+          "The query uses the inner-product operator, which does not match the cosine index, so Postgres does a sequential scan",
+          "LIMIT 5 is too small for HNSW to work",
+          "HNSW indexes cannot be used with ORDER BY",
+          "The query should use websearch_to_tsquery to activate the index"
+        ],
+        "es": [
+          "La consulta usa el operador de producto interno, que no coincide con el índice coseno, así que Postgres hace un escaneo secuencial",
+          "LIMIT 5 es demasiado pequeño para que HNSW funcione",
+          "Los índices HNSW no se pueden usar con ORDER BY",
+          "La consulta debería usar websearch_to_tsquery para activar el índice"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "pgvector uses an index only when the query's distance operator matches the index operator class. vector_cosine_ops serves <=>; the query uses <#> (negative inner product), so the planner falls back to a full scan. Check with EXPLAIN ANALYZE.",
+        "es": "pgvector usa un índice solo cuando el operador de distancia de la consulta coincide con la clase de operador del índice. vector_cosine_ops sirve a <=>; la consulta usa <#> (producto interno negativo), así que el planner cae a un escaneo completo. Verifícalo con EXPLAIN ANALYZE."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "single",
+      "prompt": {
+        "en": "Which query is most likely to benefit from adding BM25 (keyword) search to vector search?",
+        "es": "¿Qué consulta tiene más probabilidad de beneficiarse al agregar búsqueda BM25 (por palabras clave) a la búsqueda vectorial?"
+      },
+      "options": {
+        "en": [
+          "\"What does bulletin UW-2026-07 change about form 4506-C?\"",
+          "\"Can my parents help me buy a house?\"",
+          "\"Explain how mortgages work in general\"",
+          "\"Is it a good time to refinance?\""
+        ],
+        "es": [
+          "\"¿Qué cambia el boletín UW-2026-07 sobre el formulario 4506-C?\"",
+          "\"¿Mis papás me pueden ayudar a comprar una casa?\"",
+          "\"Explica cómo funcionan las hipotecas en general\"",
+          "\"¿Es buen momento para refinanciar?\""
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Exact identifiers, codes and form numbers are where dense embeddings are weakest and lexical matching is strongest. Paraphrased lay questions are where vector search shines; hybrid search covers both.",
+        "es": "Los identificadores exactos, códigos y números de formulario son donde los embeddings densos son más débiles y el matching léxico es más fuerte. Las preguntas coloquiales parafraseadas son donde brilla la búsqueda vectorial; la búsqueda híbrida cubre ambas."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "code",
+      "prompt": {
+        "en": "What does this reciprocal rank fusion code print?",
+        "es": "¿Qué imprime este código de reciprocal rank fusion?"
+      },
+      "code": "def rrf(*lists, k=60):\n    scores = {}\n    for lst in lists:\n        for rank, cid in enumerate(lst, start=1):\n            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)\n    return sorted(scores, key=scores.get, reverse=True)\n\nvector = [\"a\", \"b\", \"c\"]\nkeyword = [\"c\", \"a\", \"d\"]\nprint(rrf(vector, keyword)[:2])",
+      "codeLang": "python",
+      "options": {
+        "en": ["['a', 'c']", "['c', 'a']", "['a', 'b']", "['c', 'd']"],
+        "es": ["['a', 'c']", "['c', 'a']", "['a', 'b']", "['c', 'd']"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "a gets 1/61 + 1/62; c gets 1/63 + 1/61. Both appear in both lists, but a has the better combined ranks (1 and 2 vs 3 and 1), so a edges out c. b and d appear in only one list each and rank lower.",
+        "es": "a obtiene 1/61 + 1/62; c obtiene 1/63 + 1/61. Ambos aparecen en las dos listas, pero a tiene mejores posiciones combinadas (1 y 2 vs 3 y 1), así que a supera por poco a c. b y d aparecen en una sola lista cada uno y quedan más abajo."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "single",
+      "prompt": {
+        "en": "A bulletin effective March 1 lowered the max DTI for FHA loans. The assistant still sometimes answers with the old limit. What is the best fix?",
+        "es": "Un boletín vigente desde el 1 de marzo bajó el DTI máximo para préstamos FHA. El asistente todavía responde a veces con el límite viejo. ¿Cuál es la mejor solución?"
+      },
+      "options": {
+        "en": [
+          "Store effective_from and superseded_by metadata and filter retrieval to chunks in force on the query date",
+          "Increase top-k so both versions reach the model and let it decide",
+          "Lower the temperature to 0",
+          "Add the word \"latest\" to the system prompt"
+        ],
+        "es": [
+          "Guardar metadata effective_from y superseded_by y filtrar el retrieval a chunks vigentes en la fecha de la consulta",
+          "Subir el top-k para que ambas versiones lleguen al modelo y que él decida",
+          "Bajar la temperatura a 0",
+          "Agregar la palabra \"latest\" al system prompt"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Stale sources are a corpus and retrieval problem. Version metadata plus a filter removes superseded text before generation. Sending both versions and hoping the model picks correctly is unreliable and unauditable.",
+        "es": "Las fuentes obsoletas son un problema de corpus y retrieval. La metadata de versión más un filtro elimina el texto reemplazado antes de la generación. Enviar ambas versiones y esperar que el modelo elija bien no es confiable ni auditable."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "single",
+      "prompt": {
+        "en": "Why is a cross-encoder used as a second stage instead of for first-stage retrieval over the whole corpus?",
+        "es": "¿Por qué un cross-encoder se usa como segunda etapa en lugar de para el retrieval de primera etapa sobre todo el corpus?"
+      },
+      "options": {
+        "en": [
+          "It scores each (query, document) pair jointly, so nothing can be precomputed and cost grows with every candidate",
+          "It cannot handle more than 10 documents per query",
+          "It only works with BM25 scores as input",
+          "It produces vectors that are too large to store in pgvector"
+        ],
+        "es": [
+          "Puntúa cada par (consulta, documento) en conjunto, así que nada se puede precalcular y el costo crece con cada candidato",
+          "No puede manejar más de 10 documentos por consulta",
+          "Solo funciona con scores de BM25 como entrada",
+          "Produce vectores demasiado grandes para guardarse en pgvector"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A cross-encoder outputs a relevance score, not a reusable vector. It must run at query time for every candidate, so it is applied to a short list (for example 30–50) produced by fast bi-encoder and BM25 retrieval.",
+        "es": "Un cross-encoder produce un score de relevancia, no un vector reutilizable. Debe ejecutarse en tiempo de consulta para cada candidato, así que se aplica a una lista corta (por ejemplo 30–50) producida por el retrieval rápido de bi-encoder y BM25."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "multi",
+      "prompt": {
+        "en": "Match techniques to their purpose. Which statements are correct? (Select all that apply.)",
+        "es": "Relaciona técnicas con su propósito. ¿Qué afirmaciones son correctas? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Conversation condensation turns a follow-up like \"and for condos?\" into a standalone query",
+          "HyDE embeds a hypothetical answer so the query vector lands near real document chunks",
+          "Step-back prompting adds a more general question to retrieve the underlying rule",
+          "Multi-query replaces the need for an evaluation dataset"
+        ],
+        "es": [
+          "La condensación de conversación convierte un seguimiento como \"¿y para condominios?\" en una consulta autocontenida",
+          "HyDE genera el embedding de una respuesta hipotética para que el vector de consulta caiga cerca de chunks reales",
+          "Step-back prompting agrega una pregunta más general para recuperar la regla subyacente",
+          "Multi-query elimina la necesidad de un dataset de evaluación"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Condensation, HyDE and step-back each fix a different input problem for the retriever. No rewriting technique replaces measurement; you still need a golden dataset to know if it helped.",
+        "es": "La condensación, HyDE y step-back corrigen cada uno un problema distinto en la entrada del retriever. Ninguna técnica de reescritura reemplaza la medición; igual necesitas un golden dataset para saber si ayudó."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "single",
+      "prompt": {
+        "en": "What is the main risk of using HyDE alone, without the original query?",
+        "es": "¿Cuál es el principal riesgo de usar HyDE solo, sin la consulta original?"
+      },
+      "options": {
+        "en": [
+          "The hypothetical answer may contain hallucinated specifics that pull in the wrong chunks",
+          "HyDE cannot be used with pgvector",
+          "HyDE doubles the size of the vector index",
+          "HyDE disables metadata filtering"
+        ],
+        "es": [
+          "La respuesta hipotética puede contener detalles alucinados que atraen los chunks equivocados",
+          "HyDE no se puede usar con pgvector",
+          "HyDE duplica el tamaño del índice vectorial",
+          "HyDE desactiva el filtrado por metadata"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "If the generated paragraph states a wrong number or rule, its embedding drifts toward chunks about that wrong rule. Fuse HyDE results with results from the original query to limit the damage.",
+        "es": "Si el párrafo generado afirma un número o regla incorrectos, su embedding se desvía hacia chunks sobre esa regla incorrecta. Fusiona los resultados de HyDE con los de la consulta original para limitar el daño."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "order",
+      "prompt": {
+        "en": "Order the online steps of a production RAG request with rewriting and re-ranking.",
+        "es": "Ordena los pasos online de una solicitud RAG en producción con reescritura y re-ranking."
+      },
+      "items": {
+        "en": [
+          "Condense the follow-up into a standalone question",
+          "Run hybrid retrieval for about 40 candidates",
+          "Fuse the ranked lists with RRF",
+          "Re-rank with a cross-encoder and keep the top 5",
+          "Generate an answer with chunk-id citations",
+          "Validate citations before returning the answer"
+        ],
+        "es": [
+          "Condensar el seguimiento en una pregunta autocontenida",
+          "Ejecutar retrieval híbrido para unos 40 candidatos",
+          "Fusionar las listas rankeadas con RRF",
+          "Re-rankear con un cross-encoder y quedarse con el top 5",
+          "Generar una respuesta con citas por ID de chunk",
+          "Validar las citas antes de devolver la respuesta"
+        ]
+      },
+      "explanation": {
+        "en": "Rewrite first so retrieval sees a good query, retrieve wide, fuse, then re-rank to fix the order, generate from the best few chunks, and validate citations last because they only exist after generation.",
+        "es": "Primero se reescribe para que el retrieval vea una buena consulta, se recupera amplio, se fusiona, luego se re-rankea para corregir el orden, se genera con los mejores chunks y al final se validan las citas, porque solo existen después de la generación."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "order",
+      "prompt": {
+        "en": "Order the offline ingestion steps for the mortgage policy corpus.",
+        "es": "Ordena los pasos de ingesta offline para el corpus de políticas hipotecarias."
+      },
+      "items": {
+        "en": [
+          "Load PDFs and HTML pages",
+          "Extract and clean text and tables",
+          "Split into structure-aware chunks",
+          "Attach metadata (program, section, page, effective date)",
+          "Embed the chunks (skipping cached hashes)",
+          "Upsert into the pgvector table and indexes"
+        ],
+        "es": [
+          "Cargar PDFs y páginas HTML",
+          "Extraer y limpiar texto y tablas",
+          "Dividir en chunks conscientes de la estructura",
+          "Adjuntar metadata (programa, sección, página, fecha de vigencia)",
+          "Generar embeddings de los chunks (omitiendo hashes en caché)",
+          "Hacer upsert en la tabla e índices de pgvector"
+        ]
+      },
+      "explanation": {
+        "en": "You cannot chunk before cleaning, and metadata must be attached to each chunk before it is stored. Embedding comes after the final chunk text is fixed, and the upsert keeps ingestion idempotent.",
+        "es": "No puedes hacer chunking antes de limpiar, y la metadata debe adjuntarse a cada chunk antes de guardarlo. Los embeddings van después de fijar el texto final del chunk, y el upsert mantiene la ingesta idempotente."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "single",
+      "prompt": {
+        "en": "On your golden set, context recall is 0.92 but faithfulness is 0.58. Where should you look first?",
+        "es": "En tu golden set, el context recall es 0.92 pero la faithfulness es 0.58. ¿Dónde deberías buscar primero?"
+      },
+      "options": {
+        "en": [
+          "Generation: the right context arrives but the model ignores or embellishes it",
+          "Chunking: the chunks are too small",
+          "Retrieval: the right chunks are not being retrieved",
+          "Ingestion: the PDFs are not being parsed"
+        ],
+        "es": [
+          "Generación: llega el contexto correcto pero el modelo lo ignora o lo adorna",
+          "Chunking: los chunks son demasiado pequeños",
+          "Retrieval: no se están recuperando los chunks correctos",
+          "Ingesta: los PDFs no se están parseando"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "High context recall means retrieval delivered what the reference answer needs. Low faithfulness means the answer contains claims not supported by that context. That points to the prompt, citation requirements or too many distracting chunks.",
+        "es": "Un context recall alto significa que el retrieval entregó lo que necesita la respuesta de referencia. Una faithfulness baja significa que la respuesta contiene afirmaciones no respaldadas por ese contexto. Eso apunta al prompt, a los requisitos de citas o a demasiados chunks que distraen."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "multi",
+      "prompt": {
+        "en": "Which checks belong in a citation validator that runs after generation? (Select all that apply.)",
+        "es": "¿Qué verificaciones pertenecen a un validador de citas que corre después de la generación? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Every cited chunk id is in the set of retrieved chunks",
+          "Each quoted span appears in the cited chunk after whitespace normalization",
+          "An answer marked as not found contains no claims",
+          "The answer uses at least 300 words"
+        ],
+        "es": [
+          "Cada ID de chunk citado está en el conjunto de chunks recuperados",
+          "Cada fragmento citado aparece en el chunk citado tras normalizar espacios",
+          "Una respuesta marcada como no encontrada no contiene afirmaciones",
+          "La respuesta usa al menos 300 palabras"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Validation checks that citations are real (known ids), accurate (quotes exist) and consistent with the abstention flag. Answer length is not a grounding property.",
+        "es": "La validación verifica que las citas sean reales (IDs conocidos), precisas (las citas textuales existen) y consistentes con la marca de abstención. La longitud de la respuesta no es una propiedad de grounding."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "single",
+      "prompt": {
+        "en": "The model answers a question correctly using its general training knowledge, but the retrieved chunks do not contain that information. How does Ragas faithfulness score this answer?",
+        "es": "El modelo responde correctamente una pregunta usando su conocimiento general de entrenamiento, pero los chunks recuperados no contienen esa información. ¿Cómo puntúa la faithfulness de Ragas esta respuesta?"
+      },
+      "options": {
+        "en": [
+          "Low, because its claims are not supported by the retrieved context",
+          "High, because the answer is factually correct",
+          "It cannot be scored without a reference answer",
+          "High, as long as answer relevance is also high"
+        ],
+        "es": [
+          "Bajo, porque sus afirmaciones no están respaldadas por el contexto recuperado",
+          "Alto, porque la respuesta es factualmente correcta",
+          "No se puede puntuar sin una respuesta de referencia",
+          "Alto, siempre que la answer relevance también sea alta"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Faithfulness measures support by the context, not truth in the world. In a lender where policies differ from general rules, an ungrounded correct-sounding answer is a risk, so a low score is the desired signal. Faithfulness does not need a reference answer.",
+        "es": "La faithfulness mide el respaldo del contexto, no la verdad en el mundo. En un prestamista donde las políticas difieren de las reglas generales, una respuesta sin grounding que suena correcta es un riesgo, así que un score bajo es la señal deseada. La faithfulness no necesita respuesta de referencia."
+      }
+    },
+    {
+      "id": "q17",
+      "type": "code",
+      "prompt": {
+        "en": "What does this retrieval metric return?",
+        "es": "¿Qué devuelve esta métrica de retrieval?"
+      },
+      "code": "def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:\n    return len(set(retrieved[:k]) & relevant) / len(relevant)\n\nprint(recall_at_k([\"c1\", \"c7\", \"c3\", \"c4\"], {\"c3\", \"c4\"}, k=3))",
+      "codeLang": "python",
+      "options": {
+        "en": ["0.5", "1.0", "0.333...", "0.25"],
+        "es": ["0.5", "1.0", "0.333...", "0.25"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The top 3 are c1, c7, c3. Only c3 of the two relevant chunks is among them, so recall@3 = 1/2 = 0.5. c4 is at rank 4 and does not count.",
+        "es": "El top 3 es c1, c7, c3. Solo c3 de los dos chunks relevantes está entre ellos, así que recall@3 = 1/2 = 0.5. c4 está en la posición 4 y no cuenta."
+      }
+    },
+    {
+      "id": "q18",
+      "type": "multi",
+      "prompt": {
+        "en": "Which values should be part of the key of an exact-match RAG response cache so that you never need manual invalidation? (Select all that apply.)",
+        "es": "¿Qué valores deberían formar parte de la clave de un caché exacto de respuestas RAG para no necesitar invalidación manual? (Selecciona todas las que apliquen.)"
+      },
+      "options": {
+        "en": [
+          "Corpus version (bumped on every ingestion run)",
+          "Prompt version",
+          "Metadata filters such as loan program and state",
+          "The current timestamp in milliseconds"
+        ],
+        "es": [
+          "Versión del corpus (se incrementa en cada ingesta)",
+          "Versión del prompt",
+          "Filtros de metadata como programa de préstamo y estado",
+          "El timestamp actual en milisegundos"
+        ]
+      },
+      "answer": [0, 1, 2],
+      "explanation": {
+        "en": "Versions in the key make old entries stop matching when the corpus or prompt changes, and filters keep FHA answers from being served for conventional questions. A timestamp would make every key unique, so the cache would never hit.",
+        "es": "Las versiones en la clave hacen que las entradas viejas dejen de coincidir cuando cambia el corpus o el prompt, y los filtros evitan servir respuestas de FHA a preguntas de convencionales. Un timestamp haría única cada clave, así que el caché nunca acertaría."
+      }
+    },
+    {
+      "id": "q19",
+      "type": "single",
+      "prompt": {
+        "en": "Why is a semantic cache risky for underwriting questions?",
+        "es": "¿Por qué un caché semántico es riesgoso para preguntas de underwriting?"
+      },
+      "options": {
+        "en": [
+          "Very similar questions (FHA vs conventional DTI) can have different correct answers",
+          "Semantic caches cannot be stored in Redis",
+          "Semantic caches always increase cost",
+          "Semantic caches disable citations"
+        ],
+        "es": [
+          "Preguntas muy parecidas (DTI de FHA vs convencional) pueden tener respuestas correctas distintas",
+          "Los cachés semánticos no se pueden guardar en Redis",
+          "Los cachés semánticos siempre aumentan el costo",
+          "Los cachés semánticos desactivan las citas"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Embedding similarity does not capture small but decisive differences like loan program, state or date. A semantic hit can return a confident, cited answer to a different question. Limit it to low-risk content, include filters and use a strict, tested threshold.",
+        "es": "La similitud de embeddings no captura diferencias pequeñas pero decisivas como el programa, el estado o la fecha. Un acierto semántico puede devolver una respuesta segura y con citas a otra pregunta. Limítalo a contenido de bajo riesgo, incluye filtros y usa un umbral estricto y probado."
+      }
+    },
+    {
+      "id": "q20",
+      "type": "single",
+      "prompt": {
+        "en": "You use provider prompt caching, but logs show cache_read_input_tokens is always 0. What is the most likely cause?",
+        "es": "Usas el prompt caching del proveedor, pero los logs muestran que cache_read_input_tokens siempre es 0. ¿Cuál es la causa más probable?"
+      },
+      "options": {
+        "en": [
+          "The supposedly stable prefix changes on every request, for example a timestamp in the system prompt",
+          "The retrieved chunks are placed after the system prompt",
+          "max_tokens is set too low",
+          "The model temperature is 0"
+        ],
+        "es": [
+          "El prefijo supuestamente estable cambia en cada solicitud, por ejemplo un timestamp en el system prompt",
+          "Los chunks recuperados se colocan después del system prompt",
+          "max_tokens está configurado demasiado bajo",
+          "La temperatura del modelo es 0"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Prompt caching needs an identical prefix. Any volatile content at the top breaks it. Placing variable chunks after the stable system prompt is the correct design, not the problem.",
+        "es": "El prompt caching necesita un prefijo idéntico. Cualquier contenido volátil al inicio lo rompe. Colocar los chunks variables después del system prompt estable es el diseño correcto, no el problema."
+      }
+    }
+  ]
+}

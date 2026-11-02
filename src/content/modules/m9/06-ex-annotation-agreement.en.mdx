@@ -1,0 +1,164 @@
+## Goal
+
+In Module 3 you labeled 30 items alone and checked one judge against your own labels. Now you run a small but real human evaluation program and hold an LLM judge to the human standard:
+
+1. Write a versioned **annotation guideline** for two criteria on support-bot answers: `correct` (yes/no/cannot_judge) and `helpfulness` (anchored 1–4).
+2. Collect labels from **at least three raters** on 60 items.
+3. Measure agreement properly: Cohen's kappa per pair, quadratic-weighted kappa and Krippendorff's alpha (ordinal) for helpfulness, all with bootstrap CIs.
+4. **Adjudicate** disagreements, update the guideline to v2 with new borderline examples, and relabel a fresh batch to show whether agreement improved.
+5. Run a two-model **judge jury** and compare judge-vs-gold kappa with human-vs-human kappa, per segment.
+
+This is folder `02-annotation/` of `llm-eval-lab`.
+
+## Context
+
+Use answers from any support assistant you built (the Module 5 `support-assistant-prod` bot, or the Module 1 ticket router extended with a reply step). You need 60 items for round 1 and 30 fresh items for round 2. Include at least two segments, for example `billing` vs `technical`, or `short` vs `long` conversations. Make sure roughly a third of the answers have real problems.
+
+About raters: ask two colleagues or friends to label. If you truly cannot get two other people, use one other person plus **yourself again after at least five days**, without looking at your first labels. Report that as intra-rater reliability and say so clearly. Do not use LLMs as "raters" for the human agreement study; that defeats the purpose.
+
+Label file format, one row per (item, rater) in `labels/round1.jsonl`:
+
+```json
+{"item_id": "s-017", "rater": "r2", "guideline_version": "v1", "correct": "no", "helpfulness": 2, "seconds": 74, "note": "Refund window is 30 days in policy, answer says 14"}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `guidelines/v1.md` contains purpose, unit of work, definitions, a decision procedure, a `cannot_judge` rule and at least 2 borderline examples per criterion, with every helpfulness point anchored
+- [ ] At least 3 raters labeled all 60 round-1 items, blind to which bot version produced each answer, in randomized order
+- [ ] `agreement.py` reports pairwise Cohen's kappa for `correct`, quadratic-weighted kappa and Krippendorff's alpha (ordinal) for `helpfulness`, each with a 95% bootstrap CI that resamples items
+- [ ] Per-class agreement for `correct` is reported to expose any kappa paradox
+- [ ] `adjudicated.jsonl` holds the gold label per item, keeping all raw labels and the adjudicator's reason; no raw label was overwritten
+- [ ] `guidelines/v2.md` has a changelog that links each change to specific disagreements; round 2 (30 new items) reports agreement under v2
+- [ ] `judge.py` runs a jury of two judge models from different providers on all 90 items, cached on disk
+- [ ] The report compares judge-vs-gold kappa with mean human-vs-human kappa, overall and per segment, and lists the items where jurors disagreed
+- [ ] Median seconds per item and a projected cost for labeling 1,000 items with 2 raters plus adjudication are included (state the hourly rate you assume)
+- [ ] `REPORT.md` ends with a decision: can the jury replace one human rater for this task, and under what conditions
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 02-annotation/agreement.py
+import json
+from collections import defaultdict
+from pathlib import Path
+from typing import Literal
+
+import krippendorff
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.metrics import cohen_kappa_score
+
+SEED = 11
+
+
+class Label(BaseModel):
+    item_id: str
+    rater: str
+    guideline_version: str
+    correct: Literal["yes", "no", "cannot_judge"]
+    helpfulness: int = Field(ge=1, le=4)
+    seconds: int
+    note: str = ""
+
+
+def load(path: Path) -> list[Label]:
+    return [Label.model_validate_json(l) for l in path.read_text("utf-8").splitlines() if l.strip()]
+
+
+def matrix(labels: list[Label], field: str, items: list[str], raters: list[str]) -> np.ndarray:
+    """Returns shape (n_raters, n_items) with np.nan for missing or cannot_judge."""
+    lookup = {(l.item_id, l.rater): getattr(l, field) for l in labels}
+    codes = {"yes": 1.0, "no": 0.0}
+    out = np.full((len(raters), len(items)), np.nan)
+    for r, rater in enumerate(raters):
+        for i, item in enumerate(items):
+            v = lookup.get((item, rater))
+            if v is None or v == "cannot_judge":
+                continue
+            out[r, i] = codes.get(v, v) if isinstance(v, str) else float(v)
+    return out
+
+
+def bootstrap(stat_fn, data: np.ndarray, iters: int = 2_000) -> tuple[float, float, float]:
+    """data: (n_raters, n_items). Resample ITEMS (columns)."""
+    rng = np.random.default_rng(SEED)
+    # TODO(you): point = stat_fn(data); loop iters: idx = rng.integers(0, n_items, n_items)
+    #            vals.append(stat_fn(data[:, idx])); skip nan results
+    # TODO(you): return point, 2.5th and 97.5th percentiles
+    raise NotImplementedError
+
+
+def pairwise_cohen(m: np.ndarray, weights: str | None = None) -> dict[str, float]:
+    # TODO(you): for each rater pair, mask items where both have a value, call cohen_kappa_score
+    raise NotImplementedError
+
+
+def kripp_ordinal(m: np.ndarray) -> float:
+    return krippendorff.alpha(reliability_data=m, level_of_measurement="ordinal")
+
+
+def per_class_agreement(m: np.ndarray) -> dict[str, float]:
+    # TODO(you): for class 1 (yes) and 0 (no): of all rater pairs where at least one said the class,
+    #            what fraction had both say it? (positive/negative specific agreement)
+    raise NotImplementedError
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Write the borderline examples first, before the definitions feel "done". Pick 4–6 answers from your pool that you yourself hesitated on. For each, write the decision and one sentence of reasoning. Those examples will move your kappa more than polishing definitions.</Hint>
+  <Hint>Bootstrap agreement by resampling columns (items) of the raters-by-items matrix, never individual labels. Krippendorff's alpha can return nan on a resample with no variation; skip those and report how many you skipped.</Hint>
+  <Hint>Specific agreement makes the kappa paradox visible. Positive agreement is `2 * both_yes / (2 * both_yes + disagreements)`, and negative agreement is the same with `no`. If positive agreement is 0.95 and negative agreement is 0.50, your raters agree on easy passes and disagree on failures, which is where the risk lives.</Hint>
+  <Hint>For the judge comparison, compute human-human kappa as the mean of the three pairwise kappas, and judge-gold kappa against the adjudicated label. Then compute judge-vs-each-rater kappa too. If the jury agrees with each rater about as well as raters agree with each other, it behaves like another rater. Break all of this down by segment; a jury that is fine on billing and weak on technical answers is a conditional "yes".</Hint>
+</Hints>
+
+<CommitBox repo="llm-eval-lab">
+
+```text
+llm-eval-lab/
+  02-annotation/
+    README.md
+    guidelines/
+      v1.md
+      v2.md               # with changelog
+    data/
+      items_round1.jsonl  # 60 items, randomized order, no model names
+      items_round2.jsonl  # 30 fresh items
+    labels/
+      round1.jsonl
+      round2.jsonl
+      adjudicated.jsonl
+    agreement.py
+    judge.py
+    rubrics/
+      correct_v1.md
+      helpfulness_v1.md
+    .cache/               # gitignored
+    REPORT.md
+    tests/
+      test_agreement.py   # kappa and alpha against small hand-computed tables
+```
+
+`02-annotation/README.md` outline:
+
+- Task and why human labels matter for it
+- Raters: how many, background, how blinding and randomization were done (no personal data)
+- Guideline versions and what changed between them
+- Results: agreement table per round with CIs, judge vs human table per segment
+- Cost and throughput: median seconds per item, projection for 1,000 items
+- Decision on using the jury, with conditions
+
+Suggested commits:
+
+- `docs(annotation): guideline v1 with anchored scale and borderline examples`
+- `feat(annotation): agreement metrics with item-level bootstrap CIs`
+- `data(annotation): round 1 labels from 3 raters and adjudication`
+- `docs(annotation): guideline v2 changelog from adjudication`
+- `feat(annotation): two-provider judge jury and judge-vs-human report`
+
+</CommitBox>
+
+<Checklist id="m9-06-review" title="Self-review" items={["My guideline has anchored scale points and borderline examples for each criterion", "Raters were blind to the bot version and saw items in random order", "Agreement CIs come from resampling items, not labels", "I report per-class agreement next to kappa", "Raw labels are preserved; adjudication adds a gold label with a reason", "Guideline v2 changes trace back to specific disagreements, and round 2 measures their effect", "Judge-vs-gold kappa is compared with human-vs-human kappa, overall and per segment", "The cost projection states its assumptions", "The final decision is conditional on evidence, not a blanket yes or no"]} />

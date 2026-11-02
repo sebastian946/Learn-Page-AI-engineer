@@ -1,0 +1,194 @@
+## "Model B scored 84%, model A scored 81%. Ship B?"
+
+Not yet. On 100 items, a 3-point gap is well inside the noise. In Module 3 you added a bootstrap confidence interval to a single score in your CI gate. That was the first step. This lesson gives you the full toolkit to answer the question every model or prompt change raises: **is the difference real, how big is it, and how sure are we?**
+
+As an SDET you already think this way about flaky tests. One red run proves little. You rerun, you look at the failure rate, you check whether the flake rate changed after a commit. Statistics just puts numbers on that instinct.
+
+## Two sources of variance
+
+An eval score moves for two different reasons:
+
+1. **Sampling variance of the dataset.** Your 200 items are a sample of all possible inputs. A different 200 would give a different score. This is usually the bigger source.
+2. **Generation variance.** The same item gives different outputs across runs. Temperature 0 reduces it but does not remove it: batching, hardware and provider-side changes still cause variation. Judges add their own variance on top.
+
+Measure both before you trust a gate. The cheapest experiment is an **A/A test**: run the same configuration twice and compare. If A vs A shows a 2-point "difference", any change smaller than that is noise. This is the eval version of running your suite ten times on an unchanged commit to measure the flake rate.
+
+## Standard errors and confidence intervals
+
+For a pass/fail metric with accuracy `p` on `n` independent items, the standard error is `sqrt(p(1-p)/n)`. At `p = 0.8`, `n = 100`, that is 0.04, so the 95% interval is roughly ±7.8 points. At `n = 400` it is about ±3.9. To halve the interval, you need four times the data.
+
+Use the **Wilson interval** for proportions, not the textbook normal approximation. It behaves well near 0% and 100% and with small samples. For any other metric (mean judge score, field F1, cost per task), use the **bootstrap**: resample items with replacement many times, recompute the metric, take percentiles. It makes no distributional assumptions, and it works for metrics like F1 that are not simple averages.
+
+Always resample the **unit of analysis**. If each item has 5 runs, resample items, not runs. If each conversation has 8 turns, resample conversations. Resampling the smaller units treats correlated observations as independent and gives intervals that are too narrow. This is the most common statistical bug in eval reports.
+
+## Paired comparisons: the biggest free win
+
+When you compare two prompts or models, run them **on the same items**. Then analyze the per-item differences, not the two scores separately.
+
+Why it matters: item difficulty dominates variance. Hard items are hard for both models. Comparing two independent means carries all that difficulty variance. The paired difference cancels it. In practice, a paired analysis often gives a confidence interval two or three times narrower for the same data. That is like getting 4–9x more samples for free.
+
+Tests to use:
+
+| Metric type | Paired test | Python |
+|---|---|---|
+| Binary pass/fail | McNemar (exact for small counts) | `scipy.stats.binomtest` on discordant pairs |
+| Continuous or ordinal scores | Paired bootstrap of differences, Wilcoxon signed-rank | `numpy`, `scipy.stats.wilcoxon` |
+| Any metric, few assumptions | Paired permutation test | `scipy.stats.permutation_test(..., permutation_type="samples")` |
+| Approximately normal differences | Paired t-test | `scipy.stats.ttest_rel` |
+
+McNemar only looks at **discordant pairs**: items where exactly one model passes. If A wins 12 items and B wins 25, the question is whether 25 vs 12 is a plausibly fair coin. Items both pass or both fail carry no information about the difference.
+
+## Code: intervals and paired tests
+
+```python
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(7)
+
+def wilson_ci(k: int, n: int, conf: float = 0.95) -> tuple[float, float]:
+    ci = stats.binomtest(k, n).proportion_ci(confidence_level=conf, method="wilson")
+    return ci.low, ci.high
+
+def bootstrap_ci(x: np.ndarray, iters: int = 10_000, conf: float = 0.95) -> tuple[float, float]:
+    idx = rng.integers(0, len(x), size=(iters, len(x)))
+    boots = x[idx].mean(axis=1)
+    return tuple(np.percentile(boots, [50 * (1 - conf), 50 * (1 + conf)]))
+
+def paired_bootstrap(a: np.ndarray, b: np.ndarray, iters: int = 10_000, conf: float = 0.95):
+    """a, b: per-item scores on the SAME items. Returns mean(b - a) and its CI."""
+    diff = b - a
+    lo, hi = bootstrap_ci(diff, iters, conf)
+    return diff.mean(), lo, hi
+
+def mcnemar_exact(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
+    """a, b: 0/1 pass vectors. Exact McNemar = binomial test on discordant pairs."""
+    a_only = int(((a == 1) & (b == 0)).sum())
+    b_only = int(((a == 0) & (b == 1)).sum())
+    n_disc = a_only + b_only
+    p = stats.binomtest(b_only, n_disc, 0.5).pvalue if n_disc else 1.0
+    return {"a_only": a_only, "b_only": b_only, "p_value": p}
+
+# Demo: per-item difficulty shared by both models, B slightly better.
+n = 400
+difficulty = rng.beta(4, 1.5, n)                      # P(success) per item
+a = rng.binomial(1, difficulty)
+b = rng.binomial(1, np.clip(difficulty + 0.04, 0, 1))
+
+print("A acc", a.mean(), wilson_ci(int(a.sum()), n))
+print("B acc", b.mean(), wilson_ci(int(b.sum()), n))
+print("paired diff (B-A)", paired_bootstrap(a.astype(float), b.astype(float)))
+print("mcnemar", mcnemar_exact(a, b))
+res = stats.permutation_test(
+    (a.astype(float), b.astype(float)),
+    lambda x, y: np.mean(y - x),
+    permutation_type="samples", n_resamples=10_000, random_state=7,
+)
+print("paired permutation p", res.pvalue)
+```
+
+Report the **effect size with its interval** first ("B is +3.5 points, 95% CI +0.8 to +6.1"), and the p-value second. A p-value without an effect size tells a stakeholder nothing they can act on.
+
+## Multiple runs per item
+
+When generation variance is high, run each item `k` times. Average per item first, then do the paired analysis across items. Extra runs shrink only the within-item part of the variance. Past 3–5 runs, adding more items usually helps more than adding more runs.
+
+```python
+def per_item_means(scores: np.ndarray) -> np.ndarray:
+    """scores shape: (n_items, k_runs). Collapse runs before resampling items."""
+    return scores.mean(axis=1)
+
+def variance_split(scores: np.ndarray) -> dict[str, float]:
+    within = scores.var(axis=1, ddof=1).mean()         # generation noise
+    between = per_item_means(scores).var(ddof=1)       # item difficulty spread
+    return {"within_item": within, "between_item": between}
+
+# a_runs, b_runs: (n_items, k) arrays for the same items
+# diff, lo, hi = paired_bootstrap(per_item_means(a_runs), per_item_means(b_runs))
+```
+
+## How many items do you need?
+
+Estimate before you label. Two useful formulas:
+
+```python
+import math
+from scipy.stats import norm
+
+def n_for_margin(p: float, margin: float, conf: float = 0.95) -> int:
+    """Items needed so a single accuracy has a +/- margin CI."""
+    z = norm.ppf(1 - (1 - conf) / 2)
+    return math.ceil(z**2 * p * (1 - p) / margin**2)
+
+def n_mcnemar(p_disc: float, delta: float, alpha: float = 0.05, power: float = 0.8) -> int:
+    """Paired items to detect a true difference delta, given discordant rate p_disc."""
+    za, zb = norm.ppf(1 - alpha / 2), norm.ppf(power)
+    return math.ceil((za * math.sqrt(p_disc) + zb * math.sqrt(p_disc - delta**2)) ** 2 / delta**2)
+
+print(n_for_margin(0.80, 0.03))   # 683 items for +/- 3 points at 80% accuracy
+print(n_mcnemar(0.15, 0.05))      # 469 paired items to detect +5 points if 15% of items disagree
+```
+
+Get `p_disc` from a small pilot: run both systems on 50–100 items and count disagreements. **Power** is the probability of detecting a real difference of size `delta`. An underpowered eval will "find no difference" most of the time even when one exists. "Not significant" is not "equivalent".
+
+## Non-inferiority: the question migrations actually ask
+
+When you move to a cheaper model, you rarely need it to be *better*. You need it to be **not worse by more than a margin** you can accept. Define the margin with stakeholders before running anything, for example 2 points of field F1.
+
+Decision rule: compute the paired CI of `candidate - baseline`. If the **lower bound** is above `-margin`, the candidate is non-inferior. If the whole interval is inside `(-margin, +margin)`, the two are equivalent for practical purposes. If the interval crosses `-margin`, you do not have enough evidence: get more data or say no. You will use this exact rule in the capstone.
+
+## Multiple comparisons
+
+Compare 5 prompts on 6 metrics and you run 30 tests. At alpha 0.05 you expect about 1.5 "significant" results from pure noise. Options:
+
+- **Pre-register** one primary metric and one primary comparison. Everything else is exploratory.
+- **Holm-Bonferroni** to control the chance of any false positive. Simple and safe for a handful of tests.
+- **Benjamini-Hochberg** (`scipy.stats.false_discovery_control`) to control the false discovery rate when you screen many variants.
+
+```python
+def holm(pvals: list[float], alpha: float = 0.05) -> list[bool]:
+    order = np.argsort(pvals)
+    reject = [False] * len(pvals)
+    for rank, i in enumerate(order):
+        if pvals[i] > alpha / (len(pvals) - rank):
+            break
+        reject[i] = True
+    return reject
+```
+
+Also watch **segment fishing**. If the overall result is flat and you slice by 12 segments, one will look significant. Segment analysis is for finding risks to investigate, not for rescuing a result.
+
+## Common mistakes
+
+- **Comparing two overlapping CIs and calling it a test.** Two separate intervals can overlap while the paired difference is clearly significant. Test the difference directly.
+- **Resampling runs or turns instead of items.** Intervals come out far too narrow.
+- **Peeking.** Checking the p-value after every 20 items and stopping when it dips under 0.05 inflates false positives. Fix `n` in advance or use a sequential method on purpose.
+- **Treating temperature 0 as deterministic.** Measure the A/A noise floor.
+- **"No significant difference, so they are the same."** Without power or a non-inferiority margin, that conclusion is unsupported.
+- **Reporting p-values without effect sizes and intervals.**
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Your new prompt scores 2 points higher on a 150-item eval. How do you decide whether it is a real improvement?" level="senior">
+
+First I make it a paired comparison: both prompts on the same 150 items, ideally 3 runs each, averaged per item. I bootstrap the per-item differences by resampling items and report the mean difference with a 95% CI. For pass/fail I also run exact McNemar on the discordant pairs. I compare against the A/A noise floor from running the baseline against itself. On 150 items a 2-point gain is likely inside the interval, so I would either say "no evidence of improvement" or estimate the sample size needed from the observed discordant rate. If the goal is just "not worse", I use a non-inferiority margin agreed beforehand.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="Why is a paired test more powerful than comparing two independent accuracies?" level="mid">
+
+Because most variance in eval scores comes from item difficulty, and both systems see the same items. Hard items are hard for both. When I analyze per-item differences, that shared difficulty cancels out, and only the disagreement remains. McNemar, for example, ignores items both pass or both fail and only looks at items where exactly one system wins. The result is a much narrower confidence interval for the same number of items, which means fewer labels for the same decision.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Sound bite">
+
+"I report the effect size with a confidence interval from a paired bootstrap over items, I know my A/A noise floor, and for migrations I test non-inferiority against a margin the business agreed to before I ran anything."
+
+</Callout>
+
+## Further reading
+
+- Evan Miller, "Adding Error Bars to Evals: A Statistical Approach to Language Model Evaluations": https://arxiv.org/abs/2411.00640
+- SciPy statistics reference (binomtest, permutation_test, bootstrap, wilcoxon): https://docs.scipy.org/doc/scipy/reference/stats.html
+- Dror et al., "The Hitchhiker's Guide to Testing Statistical Significance in Natural Language Processing" (ACL 2018): https://aclanthology.org/P18-1128/

@@ -1,0 +1,221 @@
+## Cost is a feature requirement
+
+In a classic web service, the marginal cost of one request rounds to zero. In an LLM service it doesn't. One feature can quietly cost thousands of dollars a month, and a prompt change can double the bill overnight. Hiring managers know this: "cost per 1k requests" shows up in client briefs, system design interviews and job postings.
+
+You cannot optimize what you don't measure. The goal of this lesson: **every LLM call produces a cost record**, attributed to a feature, a prompt version and (if relevant) a tenant, so that you can answer "what does this feature cost, and why did it change?" with a query.
+
+## The cost formula
+
+Providers bill per token, with different prices per category, per model:
+
+```text
+cost = input_tokens        * input_price
+     + output_tokens       * output_price
+     + cache_write_tokens  * cache_write_price
+     + cache_read_tokens   * cache_read_price
+```
+
+Prices are usually quoted per **million tokens (MTok)**. Things that surprise people:
+
+- **Output is several times pricier than input.** Verbose answers are expensive answers.
+- **Reasoning ("thinking") tokens are billed as output tokens**, even when the thinking text is not shown to you. With Anthropic they are included in `usage.output_tokens`. Effort settings directly change this number.
+- **Prompt caching** has its own prices: writing to the cache costs a bit more than normal input; reading from it costs far less. Anthropic reports these as `cache_creation_input_tokens` and `cache_read_input_tokens`.
+- **Batch APIs** are discounted for non-urgent workloads.
+- **Some prices are tiered** by prompt length, and **cloud marketplaces** (Bedrock, Vertex) price separately from first-party APIs.
+
+Example first-party Anthropic prices at the time of writing (always verify on the pricing page before using numbers in a report):
+
+| Model | Input $/MTok | Output $/MTok |
+|---|---|---|
+| `claude-haiku-5-5` | 0.10 | 0.50 |
+| `claude-sonnet-5-5` | 2.00 | 10.00 |
+| `claude-opus-5-5` | 4.00 | 20.00 |
+
+For OpenAI, Bedrock and others, read prices from their pricing pages and keep them in the same config file.
+
+## Prices are config, with dates
+
+Prices change. Store them in versioned config with an effective date, never as constants scattered in code. Use `Decimal` for money.
+
+```toml
+# pricing.toml — USD per million tokens. Verify against provider pricing pages.
+[meta]
+effective_date = "2026-11-01"
+source = "provider pricing pages"
+
+[models."claude-haiku-5-5"]
+input = "0.10"
+output = "0.50"
+# no cache prices filled in: code falls back to the input price (conservative)
+
+[models."claude-sonnet-5-5"]
+input = "2.00"
+output = "10.00"
+cache_read = "0.20"
+
+[models."claude-opus-5-5"]
+input = "4.00"
+output = "20.00"
+cache_read = "0.20"
+```
+
+```python
+import tomllib
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+
+MTOK = Decimal(1_000_000)
+
+@dataclass(frozen=True)
+class Price:
+    input: Decimal
+    output: Decimal
+    cache_read: Decimal
+    cache_write: Decimal
+
+def load_prices(path: Path = Path("pricing.toml")) -> dict[str, Price]:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    prices = {}
+    for model, p in data["models"].items():
+        inp = Decimal(p["input"])
+        prices[model] = Price(
+            input=inp, output=Decimal(p["output"]),
+            cache_read=Decimal(p.get("cache_read", p["input"])),
+            cache_write=Decimal(p.get("cache_write", p["input"])),
+        )
+    return prices
+
+def cost_usd(usage: "Usage", price: Price) -> Decimal:
+    return (
+        usage.input_tokens * price.input
+        + usage.output_tokens * price.output
+        + usage.cache_read_tokens * price.cache_read
+        + usage.cache_write_tokens * price.cache_write
+    ) / MTOK
+```
+
+An unknown model must **fail loudly** (or emit an alert metric), not silently cost $0. A $0 line in a cost report is a bug that hides real spend.
+
+## One cost record per call
+
+Your client (lesson 6) already returns a normalized `Usage`. Wrap every call so it emits a structured record:
+
+```python
+import json, logging, time, uuid
+from decimal import Decimal
+
+cost_log = logging.getLogger("llm.cost")
+
+def emit_cost_record(resp: "LLMResponse", req: "LLMRequest", attempt: int,
+                     prices: dict[str, Price]) -> Decimal:
+    price = prices.get(resp.model)
+    if price is None:
+        cost_log.error("unknown_model_price", extra={"model": resp.model})
+        raise KeyError(f"no price for {resp.model}")
+    usd = cost_usd(resp.usage, price)
+    record = {
+        "ts": time.time(),
+        "request_id": req.metadata.get("request_id", str(uuid.uuid4())),
+        "feature": req.metadata.get("feature", "unknown"),
+        "prompt_id": req.metadata.get("prompt_id"),
+        "prompt_version": req.metadata.get("prompt_version"),
+        "tenant": req.metadata.get("tenant"),
+        "provider": resp.provider,
+        "model": resp.model,
+        "attempt": attempt,
+        "input_tokens": resp.usage.input_tokens,
+        "output_tokens": resp.usage.output_tokens,
+        "cache_read_tokens": resp.usage.cache_read_tokens,
+        "cache_write_tokens": resp.usage.cache_write_tokens,
+        "latency_ms": round(resp.latency_ms, 1),
+        "stop_reason": resp.stop_reason,
+        "cost_usd": str(usd),
+    }
+    cost_log.info(json.dumps(record))
+    return usd
+```
+
+Ship these records to wherever you aggregate: a JSONL file for the exercises, PostgreSQL or a data warehouse in production, or an LLM observability tool (Langfuse, LangSmith — module 3).
+
+### Attribution: which dimensions matter
+
+- **feature** – "ticket_triage", "reply_draft". The unit product managers reason about.
+- **prompt_version** – answers "did 1.4.0 cost more than 1.3.0?"
+- **model** and **provider** – shows the effect of routing and fallbacks.
+- **tenant / customer** – needed for pricing, quotas and abuse detection in B2B products.
+- **attempt** – separates first tries from retries and repairs, which are pure overhead.
+
+Pass these through `LLMRequest.metadata`. Make `feature` mandatory in your client: a request without it is rejected in tests.
+
+## From records to decisions
+
+With records, analysis is a query:
+
+```sql
+SELECT feature,
+       prompt_version,
+       model,
+       COUNT(*)                                     AS calls,
+       SUM(cost_usd::numeric)                       AS total_usd,
+       1000 * SUM(cost_usd::numeric) / COUNT(DISTINCT request_id) AS usd_per_1k_requests,
+       AVG(output_tokens)                           AS avg_out,
+       SUM(CASE WHEN attempt > 1 THEN cost_usd::numeric ELSE 0 END) AS retry_usd
+FROM llm_cost_records
+WHERE ts >= now() - interval '7 days'
+GROUP BY 1, 2, 3
+ORDER BY total_usd DESC;
+```
+
+Metrics worth tracking:
+
+- **Cost per 1k requests** per feature (the number clients and interviewers ask for).
+- **Cost per successful task**: a cheap model that needs repairs and escalations can cost more per *resolved* ticket than a stronger model.
+- **Overhead share**: retries + repairs + escalations as a percentage of spend.
+- **Tokens per request** p50/p95: a regression in prompt size shows up here first.
+
+Then add guardrails: a daily budget per feature with an alert at 80%, a hard per-request cap on `max_tokens`, and a per-tenant quota where relevant.
+
+### Quick estimation before you build
+
+For a client brief, estimate up front. Example: 1,000 tickets, about 700 input tokens and 150 output tokens each, on `claude-haiku-5-5` at the example prices above:
+
+```text
+input:  1,000 * 700 = 700,000 tokens  -> 0.7 MTok * $0.10 = $0.07
+output: 1,000 * 150 = 150,000 tokens  -> 0.15 MTok * $0.50 = $0.075
+total ~ $0.15 per 1k tickets (before retries, escalations and thinking overhead)
+```
+
+Then measure the real number with your records. The gap between estimate and reality is usually output length and escalations.
+
+## Common mistakes
+
+- Hard-coded prices in code, without dates.
+- Using floats for money and getting rounding drift in reports.
+- Logging cost only for successful calls. Failed attempts that completed generation are billed too.
+- Forgetting cache and thinking tokens, so cost looks lower than the invoice.
+- No feature attribution, so the only answer to "why did spend double?" is "LLMs are expensive".
+- Unknown models priced at $0 instead of raising an alert.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you know the cost per request of each LLM feature in production?" level="mid">
+
+Every call goes through one client that returns normalized usage: input, output, cache read and write tokens. The client computes cost from a dated price config, using Decimal, and emits a structured record with request id, feature, prompt version, tenant, provider, model, attempt number, tokens, latency and cost. Records go to a store I can query. From there I compute cost per 1k requests per feature, cost per successful task, and overhead from retries and escalations, with budgets and alerts per feature. I reconcile monthly against the provider invoice to catch missing token categories.
+
+</InterviewQuestion>
+
+<InterviewQuestion question="A cheaper model cut cost per call by 70% but finance says the feature got more expensive. How?" level="senior">
+
+Cost per call is the wrong unit. The cheaper model likely produced more validation failures, repairs and escalations to the stronger model, or more human handoffs, and longer outputs or more thinking tokens. Measure cost per successful task: total spend, including retries, repairs, escalation calls and an estimate of human review cost, divided by tickets resolved correctly. Then compare configurations on the same eval set. Often the answer is a cascade with a calibrated confidence threshold, or the stronger model at lower effort, rather than the cheapest model everywhere.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Anthropic, pricing: https://docs.anthropic.com/en/docs/about-claude/pricing
+- Anthropic, prompt caching: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- Anthropic, Message Batches API: https://docs.anthropic.com/en/docs/build-with-claude/batch-processing
+- OpenAI, pricing: https://platform.openai.com/docs/pricing
+- AWS, Amazon Bedrock pricing: https://aws.amazon.com/bedrock/pricing/
+- Langfuse, model usage and cost tracking: https://langfuse.com/docs/model-usage-and-cost

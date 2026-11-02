@@ -1,0 +1,158 @@
+## Objetivo
+
+Agrega una rama de palabras clave a tu retriever de pgvector, fusiona las dos ramas con reciprocal rank fusion, aplica los filtros de metadata en ambas ramas y demuestra con números que el híbrido supera al solo-vectorial en tu corpus hipotecario, sobre todo en preguntas con identificadores exactos.
+
+Carpeta: `rag-lab/04-hybrid/`. Se apoya en la base de datos y el indexador de `03-pgvector/` (el mismo stack de compose) y en el golden set de `02-chunking/`.
+
+### Primero extiende el golden set
+
+Tu golden set actual probablemente tiene pocos casos de los que el híbrido debe resolver. Antes de escribir código, agrega al menos 12 preguntas en tres categorías y etiqueta cada una con `category`:
+
+- `exact_term` (al menos 5): números de formulario, referencias a secciones, códigos de producto. "What does Form 4506-C authorize?", "Section 50(a)(6) cash-out limits".
+- `filtered` (al menos 4): preguntas cuya respuesta correcta depende de la jurisdicción o la fecha, con `filters` registrados en la fila dorada, por ejemplo `{"jurisdiction": "US-TX"}` o una fecha `as_of` que selecciona la versión FHA anterior.
+- `paraphrase` (al menos 3): sin palabras clave compartidas con la fuente. "Highest debt ratio we'll take on a conforming loan?"
+
+Las métricas por categoría contarán una historia mucho más clara que un solo número global.
+
+## Criterios de aceptación
+
+<AcceptanceCriteria>
+
+- [ ] Una migración `002_fulltext.sql` agrega una columna `tsvector` generada (section + content) con un índice GIN. Se verifica que tus identificadores `exact_term` sobreviven a la tokenización (un unit test llama a `to_tsvector` con cada uno y revisa los lexemas), con una corrección si alguno se rompe.
+- [ ] `keyword_search` y `vector_search` devuelven cada una los N IDs de chunk candidatos principales (por defecto 40) con los filtros aplicados **dentro** de cada rama.
+- [ ] `rrf(lists, k=60, weights)` está implementada en Python con unit tests sobre un ejemplo calculado a mano, y una consulta híbrida equivalente en un solo SQL devuelve el mismo top 10 para al menos 5 preguntas doradas (verificado en un test).
+- [ ] Filtros soportados: `jurisdictions` (lista, siempre incluyendo `US`), `doc_type`, fecha `as_of` (selecciona la versión vigente en esa fecha) y `current_only`. Un test estilo propiedades corre todas las preguntas doradas y verifica que ningún chunk devuelto viole sus filtros.
+- [ ] Extracción opcional de filtros desde la pregunta con un modelo Claude barato y un schema de Pydantic; los valores extraídos se validan contra listas permitidas, y un resultado filtrado vacío recurre a la búsqueda sin filtros con un flag en la respuesta.
+- [ ] `python -m hybrid bench` compara `vector`, `keyword`, `hybrid_rrf` y `hybrid_rrf_weighted` reportando hit@5 y MRR@10 en general y por categoría, más la latencia p50/p95 del retrieval.
+- [ ] Se corre una pequeña búsqueda en grilla sobre el `k` de RRF en (10, 30, 60, 100) y el peso vectorial en (0.3, 0.5, 0.7), y la configuración elegida se registra con la advertencia de que se ajustó sobre el mismo set en el que se reporta.
+
+</AcceptanceCriteria>
+
+## Código inicial
+
+<StarterCode>
+
+```python
+# 04-hybrid/hybrid/retrieve.py
+from dataclasses import dataclass, field
+from datetime import date
+
+import numpy as np
+from psycopg import AsyncConnection
+
+from .fusion import rrf
+
+
+@dataclass
+class Filters:
+    jurisdictions: list[str] = field(default_factory=lambda: ["US"])
+    doc_type: str | None = None
+    as_of: date | None = None
+    current_only: bool = True
+
+
+def filter_sql(f: Filters) -> tuple[str, dict]:
+    where = ["d.jurisdiction = ANY(%(jur)s)"]
+    params: dict = {"jur": sorted(set(f.jurisdictions) | {"US"})}
+    if f.doc_type:
+        where.append("d.doc_type = %(doc_type)s"); params["doc_type"] = f.doc_type
+    if f.as_of:
+        # TODO: select the version effective on as_of (latest effective_date <= as_of
+        #       per document family). current_only must be ignored in this case.
+        raise NotImplementedError
+    elif f.current_only:
+        where.append("d.is_current")
+    return " AND ".join(where), params
+
+
+async def vector_search(conn: AsyncConnection, qvec: np.ndarray, f: Filters, n: int = 40) -> list[str]:
+    where, params = filter_sql(f)
+    cur = await conn.execute(f"""
+        SELECT c.chunk_id FROM chunks c JOIN documents d USING (doc_id)
+        WHERE {where}
+        ORDER BY c.embedding <=> %(q)s LIMIT %(n)s""", {**params, "q": qvec, "n": n})
+    return [r["chunk_id"] for r in await cur.fetchall()]
+
+
+async def keyword_search(conn: AsyncConnection, text: str, f: Filters, n: int = 40) -> list[str]:
+    where, params = filter_sql(f)
+    # TODO: websearch_to_tsquery + ts_rank_cd over c.tsv, same filters
+    raise NotImplementedError
+
+
+async def hybrid_search(conn, qvec, text, f: Filters, k: int = 8,
+                        rrf_k: int = 60, w_vec: float = 0.5) -> list[str]:
+    vec_ids = await vector_search(conn, qvec, f)
+    kw_ids = await keyword_search(conn, text, f)
+    fused = rrf([vec_ids, kw_ids], k=rrf_k, weights=[w_vec, 1 - w_vec], top_n=k)
+    return [chunk_id for chunk_id, _ in fused]
+```
+
+```python
+# 04-hybrid/tests/test_fusion.py
+from hybrid.fusion import rrf
+
+def test_rrf_prefers_items_in_both_lists():
+    fused = dict(rrf([["a", "b", "c"], ["c", "d", "a"]], k=60))
+    # a: 1/61 + 1/63, c: 1/63 + 1/61 -> tie; both beat b and d
+    assert abs(fused["a"] - fused["c"]) < 1e-12
+    assert fused["a"] > fused["b"] and fused["a"] > fused["d"]
+```
+
+</StarterCode>
+
+## Pistas
+
+<Hints>
+  <Hint>Corre las dos ramas en paralelo con `asyncio.gather`, cada una en su propia conexión de un pool (`psycopg_pool.AsyncConnectionPool`). Una sola conexión no puede ejecutar dos consultas al mismo tiempo.</Hint>
+  <Hint>Revisa primero la tokenización de los identificadores en `psql`: `SELECT to_tsvector('english', 'Form 4506-C and Section 50(a)(6)');`. Si un identificador se parte en piezas que también coinciden con chunks no relacionados, agrega una segunda columna generada con la configuración `simple` sobre una copia normalizada del texto (sin guiones ni paréntesis), y combina ambas tsqueries con OR en la rama de palabras clave.</Hint>
+  <Hint>Para `as_of` necesitas una clave de familia de documento que sea estable entre versiones (por ejemplo el slug de la ruta del archivo en `01-ingestion`). Usa `DISTINCT ON (family) ... ORDER BY family, effective_date DESC` restringido a `effective_date <= as_of` en un CTE, y une los chunks con ese conjunto.</Hint>
+  <Hint>Espera que la tabla por categoría muestre a las palabras clave ganando en `exact_term`, a los vectores ganando en `paraphrase` y al híbrido cerca del mejor de ambos en cada una. Si el híbrido pierde en `paraphrase`, tu peso de palabras clave es demasiado alto o cada rama devuelve muy pocos candidatos; si pierde en `exact_term`, revisa la tokenización antes de tocar los pesos.</Hint>
+</Hints>
+
+## Haz commit
+
+<CommitBox repo="rag-lab">
+
+```text
+rag-lab/
+  04-hybrid/
+    README.md
+    pyproject.toml
+    migrations/
+      002_fulltext.sql
+    data/
+      golden_hybrid.jsonl     # extended golden set with category + filters
+    hybrid/
+      __init__.py
+      __main__.py             # search | bench | grid
+      fusion.py
+      retrieve.py
+      hybrid.sql              # single-query version
+      filters_extract.py      # optional LLM filter extraction with allow-lists
+      bench.py
+    tests/
+      test_fusion.py
+      test_tokenization.py
+      test_filters_property.py
+      test_sql_matches_python.py
+    results/
+      bench.md
+      grid.csv
+```
+
+**Esquema del README para `04-hybrid/`:** planteamiento del problema con dos fallas reales del solo-vectorial, diseño (dos ramas, filtros en cada rama, RRF), hallazgos de tokenización y su corrección, fuentes de los filtros (primero el contexto del request, luego la extracción, listas permitidas), tabla de resultados general y por categoría, resultado de la búsqueda en grilla con la advertencia de sobreajuste, impacto en latencia y cuándo cambiarías a BM25 real (ParadeDB u OpenSearch).
+
+**Commits sugeridos:**
+
+- `feat(hybrid): full-text tsvector column with GIN index and tokenization tests`
+- `feat(hybrid): keyword and vector legs with shared filter builder`
+- `feat(hybrid): reciprocal rank fusion in Python and single SQL query`
+- `feat(hybrid): as_of version filtering and property test for filter safety`
+- `feat(hybrid): per-category benchmark and RRF grid search; docs`
+
+</CommitBox>
+
+## Autoevaluación
+
+<Checklist id="m2-10-review" title="Autoevaluación" items={["Cada identificador exact_term sobrevive a la tokenización, demostrado con un test", "Los filtros se aplican dentro de ambas ramas, antes de la fusión", "Ningún chunk recuperado viola sus filtros en todo el golden set", "El RRF en Python y la consulta híbrida en SQL coinciden en el top 10", "Los resultados se reportan por categoría, no solo en general", "El k de RRF y los pesos ajustados están documentados con una advertencia de sobreajuste", "La latencia del retrieval híbrido está medida y comparada con la del solo-vectorial"]} />

@@ -1,0 +1,164 @@
+# Ejercicio: crea un índice de Vector Search sobre una tabla Delta
+
+**Escenario (estilo certificación).** El equipo de reclamos guarda documentos de pólizas de seguro como chunks. Quieren una capa de retrieval gobernada y de bajo mantenimiento que se actualice cuando cambien los documentos, que soporte filtrado por tipo de documento y que devuelva suficiente metadata para citar fuentes. Debes construirla, demostrar que recupera los chunks correctos y documentar las decisiones de configuración.
+
+Elige un camino:
+
+- **Camino A — Databricks** (Databricks Free Edition o un workspace de empresa): tabla Delta con Change Data Feed, endpoint de Vector Search, índice Delta Sync con embeddings administrados.
+- **Camino B — Local**: la misma tabla de chunks en Postgres o Parquet, indexada en **pgvector** o **Chroma**, con MLflow registrando el experimento.
+
+Ambos caminos comparten el código de evaluación a través de un pequeño protocolo `Retriever`, así tus resultados son comparables. Si tienes workspace, haz el Camino A y mantén el Camino B como alternativa para CI.
+
+**Tiempo:** 75–90 minutos.
+
+<Callout type="warning" title="Revisa las APIs actuales">
+
+Los argumentos del cliente de Vector Search y los nombres de endpoints de embeddings varían según la versión y la región. Si una llamada del código inicial falla, compárala con la documentación actual en docs.databricks.com en lugar de adivinar.
+
+</Callout>
+
+## Tareas
+
+- **Tarea 1 — Tabla fuente.** Carga 30–60 documentos tipo póliza (pólizas de seguro de ejemplo públicas, o sintéticas que generes) en una tabla de chunks con las columnas `chunk_id` (determinista, primary key), `doc_id`, `doc_type` (`policy` | `endorsement` | `faq`), `page`, `content`, `ingested_at`. En Databricks, activa Change Data Feed.
+- **Tarea 2 — Índice.** Camino A: crea un endpoint `STANDARD` y un índice Delta Sync en modo `TRIGGERED` con embeddings administrados sobre `content`. Camino B: genera los embeddings de los chunks con un modelo y haz upsert en pgvector o Chroma.
+- **Tarea 3 — Consulta.** Implementa `search(query, k, doc_type=None)` que devuelva `chunk_id`, `doc_id`, `page`, `content`. Soporta un filtro `doc_type` y (Camino A) `query_type="HYBRID"`.
+- **Tarea 4 — Evaluación.** Escribe 20 consultas etiquetadas (`query`, `relevant_chunk_ids`). Calcula recall@5 y MRR para solo-vector vs híbrido (Camino A) o solo-vector vs fusión BM25+vector (Camino B). Registra params y métricas en MLflow.
+- **Tarea 5 — Actualización incremental.** Modifica un documento, vuelve a ejecutar la ingesta, sincroniza el índice (Camino A: `index.sync()`; Camino B: vuelve a ejecutar el upsert idempotente y borra los chunks obsoletos) y muestra que el texto viejo ya no se devuelve.
+
+<AcceptanceCriteria>
+
+- [ ] Los ids de chunk son deterministas; volver a ejecutar la ingesta no cambia el número de filas
+- [ ] Camino A: la tabla fuente tiene `delta.enableChangeDataFeed = true` y una primary key; el índice es `TRIGGERED` con embeddings administrados. Camino B: vectores y chunks viven en un mismo almacén con un upsert por `chunk_id`
+- [ ] `search()` soporta `k` y un filtro `doc_type` y devuelve campos de lineage para las citas
+- [ ] `queries.jsonl` tiene 20 consultas etiquetadas, incluyendo al menos 5 con muchas palabras clave (códigos de póliza, números de formulario)
+- [ ] Los runs de MLflow registran el modelo de embeddings, tamaño de chunk, traslape, `k`, modo de búsqueda, recall@5 y MRR
+- [ ] La Tarea 5 demuestra la actualización de punta a punta (salida antes/después en el README)
+- [ ] El README tiene una sección "Decisiones de configuración": tipo de índice, modo de sincronización, modelo de embeddings, tamaño de chunk vs límite de entrada del modelo, y por qué
+- [ ] Camino A: el comando para borrar el endpoint está documentado (y ejecutado al terminar) para evitar costos continuos
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# retrieval/protocol.py — shared by both paths
+from typing import Protocol
+from pydantic import BaseModel
+
+class Hit(BaseModel):
+    chunk_id: str
+    doc_id: str
+    page: int
+    content: str
+    score: float | None = None
+
+class Retriever(Protocol):
+    def search(self, query: str, k: int = 5, doc_type: str | None = None) -> list[Hit]: ...
+```
+
+```python
+# retrieval/databricks_vs.py — Path A
+from databricks.vector_search.client import VectorSearchClient
+from retrieval.protocol import Hit
+
+COLUMNS = ["chunk_id", "doc_id", "page", "content"]
+
+class DatabricksRetriever:
+    def __init__(self, endpoint: str, index_name: str, hybrid: bool = False) -> None:
+        self.index = VectorSearchClient().get_index(endpoint_name=endpoint, index_name=index_name)
+        self.hybrid = hybrid
+
+    def search(self, query: str, k: int = 5, doc_type: str | None = None) -> list[Hit]:
+        kwargs = {"query_text": query, "columns": COLUMNS, "num_results": k}
+        if doc_type:
+            kwargs["filters"] = {"doc_type": doc_type}
+        if self.hybrid:
+            kwargs["query_type"] = "HYBRID"
+        res = self.index.similarity_search(**kwargs)
+        # data_array rows follow COLUMNS order, with the score appended last
+        return [Hit(chunk_id=r[0], doc_id=r[1], page=int(r[2]), content=r[3], score=r[-1])
+                for r in res["result"]["data_array"]]
+```
+
+```python
+# eval_retrieval.py — shared evaluation
+import json
+import mlflow
+from retrieval.protocol import Retriever
+
+def recall_at_k(hits: list[str], relevant: set[str], k: int) -> float:
+    return len(set(hits[:k]) & relevant) / len(relevant)
+
+def mrr(hits: list[str], relevant: set[str]) -> float:
+    for rank, cid in enumerate(hits, start=1):
+        if cid in relevant:
+            return 1.0 / rank
+    return 0.0
+
+def evaluate(retriever: Retriever, path: str, params: dict, k: int = 5) -> dict:
+    rows = [json.loads(line) for line in open(path)]
+    with mlflow.start_run(run_name=params.get("search_mode", "vector")):
+        mlflow.log_params(params | {"k": k, "n_queries": len(rows)})
+        r, m = [], []
+        for row in rows:
+            ids = [h.chunk_id for h in retriever.search(row["query"], k=k)]
+            rel = set(row["relevant_chunk_ids"])
+            r.append(recall_at_k(ids, rel, k))
+            m.append(mrr(ids, rel))
+        metrics = {f"recall_at_{k}": sum(r) / len(r), "mrr": sum(m) / len(m)}
+        mlflow.log_metrics(metrics)
+    return metrics
+```
+
+</StarterCode>
+
+<Hints>
+
+<Hint>Orden de configuración del Camino A: crea la tabla con `TBLPROPERTIES (delta.enableChangeDataFeed = true)` y una restricción `PRIMARY KEY`, escribe los chunks con `MERGE INTO`, luego crea el endpoint y después el índice. El endpoint y la primera sincronización tardan varios minutos; consulta el estado del índice en lugar de volver a crearlo.</Hint>
+
+<Hint>Camino B con pgvector: reutiliza tu schema del Módulo 2, agrega `doc_type` y `page`, y haz que el upsert sea `ON CONFLICT (chunk_id) DO NOTHING`. Con Chroma, usa `collection.upsert(ids=..., documents=..., metadatas=...)` y `where={"doc_type": "policy"}` para filtrar. Fija el nombre del modelo de embeddings en un archivo de configuración y regístralo en MLflow.</Hint>
+
+<Hint>Las consultas con muchas palabras clave ("¿Qué cambia el endoso HO-04-90?") son donde la búsqueda híbrida le gana a solo-vector. Si el híbrido no gana en esas, revisa que los códigos hayan sobrevivido a tus pasos de chunking y limpieza.</Hint>
+
+<Hint>En la Tarea 5 la trampa son los chunks obsoletos: el documento editado produce ids de chunk nuevos, pero los viejos siguen ahí a menos que borres los chunks cuyo `doc_id` coincide y cuyo id no está en el conjunto nuevo. En Databricks, un `MERGE` con `WHEN NOT MATCHED BY SOURCE ... THEN DELETE` limitado al `doc_id` modificado lo resuelve, y el Change Data Feed propaga el borrado al índice en la siguiente sincronización.</Hint>
+
+</Hints>
+
+<CommitBox repo="databricks-genai-lab">
+
+Estructura de carpetas:
+
+```text
+databricks-genai-lab/
+  02-vector-search/
+    README.md
+    config.yaml                  # embedding model, chunk size, overlap, index names
+    data/
+      docs/                      # source documents (or a download script)
+      queries.jsonl              # 20 labeled queries
+    notebooks/
+      01_create_chunks_table.py  # Path A (Databricks notebook source)
+      02_create_index.py
+    retrieval/
+      protocol.py
+      databricks_vs.py
+      local_pgvector.py          # or local_chroma.py
+    ingest_local.py
+    eval_retrieval.py
+    tests/
+      test_chunk_ids.py
+```
+
+Esquema del README: objetivo, camino elegido y por qué, bosquejo de arquitectura, decisiones de configuración (tipo de índice, modo de sincronización, modelo de embeddings, tamaño de chunk), tabla de resultados (vector vs híbrido: recall@5, MRR), demo de actualización incremental, notas de costo (ciclo de vida del endpoint), cómo ejecutar cada camino.
+
+Commits sugeridos:
+
+- `feat(vector-search): deterministic chunk table with CDF and primary key`
+- `feat(vector-search): delta sync index with managed embeddings`
+- `feat(vector-search): local pgvector fallback behind Retriever protocol`
+- `feat(vector-search): recall@5 and MRR evaluation logged to MLflow`
+- `docs(vector-search): configuration decisions and results`
+
+</CommitBox>
+
+<Checklist id="m6-10-review" title="Autoevaluación" items={["Ids de chunk deterministas e ingesta idempotente", "CDF y primary key configurados antes de crear el índice Delta Sync (Camino A)", "Mismo modelo de embeddings para documentos y consultas, fijado en la configuración", "El filtro por doc_type funciona y se devuelven los campos de lineage", "Vector vs híbrido comparados sobre las mismas 20 consultas, registrados en MLflow", "Chunks obsoletos eliminados después de actualizar un documento", "Endpoint borrado o costo anotado al terminar el ejercicio"]} />
