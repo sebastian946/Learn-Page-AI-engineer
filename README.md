@@ -4,7 +4,7 @@ A personal, text-first and project-first learning platform for moving from **Sen
 
 The whole course is bilingual: **English and Spanish** (toggle in the header).
 
-- 10 modules, 40 days, ~240 hours: LLM foundations → RAG → evals & observability → agents & MCP → production serving → data & Databricks → final capstone and job readiness, plus two advanced deep-dives: LLM deployment & LLMOps, and LLM evaluation. See [CURRICULUM.md](CURRICULUM.md).
+- 11 modules, 43 days, ~258 hours: LLM foundations → RAG → evals & observability → agents & MCP → production serving → data & Databricks → final capstone and job readiness, plus three advanced deep-dives: LLM deployment & LLMOps, LLM evaluation, and System One models (Jev). See [CURRICULUM.md](CURRICULUM.md).
 - Concept lessons, hands-on exercises, timed exams that gate the next module, capstones written as client briefs, an interview question bank and a glossary.
 - Progress, exam scores, checklists and repo links are saved in your browser, with JSON export/import.
 
@@ -31,9 +31,9 @@ npm run validate:content   # check every module, exam, interview bank and the gl
 ```
 src/
   content/              # all course content (edit this, not components)
-    modules/m0..m9/     # module.json + NN-slug.en.mdx / NN-slug.es.mdx
-    exams/m0..m9.json
-    interview/m0..m9.json
+    modules/m0..m10/     # module.json + NN-slug.en.mdx / NN-slug.es.mdx
+    exams/m0..m10.json
+    interview/m0..m10.json
     glossary.json
   components/           # layout, sidebar, exam runner
   components/mdx/       # Callout, CodeTabs, Checklist, Diagram, InterviewQuestion, Hints, CommitBox, ...
@@ -49,9 +49,9 @@ e2e/                    # Playwright tests
 
 Read [docs/CONTENT_GUIDE.md](docs/CONTENT_GUIDE.md). In short, to add a module:
 
-1. Create `src/content/modules/m10/module.json` (`"order": 10`, titles in `en` and `es`, the lesson list, expected repos).
+1. Create `src/content/modules/m11/module.json` (`"order": 11`, titles in `en` and `es`, the lesson list, expected repos).
 2. Write `NN-slug.en.mdx` and `NN-slug.es.mdx` for each lesson. MDX components need no imports.
-3. Add `src/content/exams/m10.json` (12–20 questions) and `src/content/interview/m10.json`. Add terms to `glossary.json`.
+3. Add `src/content/exams/m11.json` (12–20 questions) and `src/content/interview/m11.json`. Add terms to `glossary.json`.
 4. Run `npm run validate:content` and `npm run curriculum`, then `npm run dev`.
 
 Design decisions are recorded in [DECISIONS.md](DECISIONS.md).

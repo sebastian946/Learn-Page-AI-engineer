@@ -1,0 +1,30 @@
+{
+  "id": "m10",
+  "order": 10,
+  "days": 3,
+  "hours": 18,
+  "title": { "en": "System One models & Jev: fast, typed decisions", "es": "Modelos System One y Jev: decisiones rápidas y tipadas" },
+  "summary": {
+    "en": "A deep dive into TypeSafe AI's Jev, the first System One model: a non-autoregressive model that answers typed questions (Choice, Score, Noul) with probabilities instead of generating text. You learn where it fits inside LLM systems as a fast, cheap decision layer: triage, confidence-gated routing, re-ranking, citation checks, guardrails and tool-call gates, then how to evaluate its calibration and run it in production. Ends with a real-time decision layer capstone with an LLM fallback and a calibration eval suite.",
+    "es": "Una inmersión en Jev de TypeSafe AI, el primer modelo System One: un modelo no autorregresivo que responde preguntas tipadas (Choice, Score, Noul) con probabilidades en lugar de generar texto. Aprendes dónde encaja dentro de sistemas con LLM como capa de decisión rápida y barata: triage, routing con gate por confianza, re-ranking, verificación de citas, guardrails y gates de tool calls, y luego cómo evaluar su calibración y operarlo en producción. Termina con un capstone de capa de decisión en tiempo real con fallback a LLM y una suite de evals de calibración."
+  },
+  "lessons": [
+    { "slug": "01-system-one-vs-llms", "type": "concept", "minutes": 45, "title": { "en": "System One models vs LLMs: what Jev is and is not", "es": "Modelos System One vs LLMs: qué es y qué no es Jev" } },
+    { "slug": "02-primitives-choice-score-noul", "type": "concept", "minutes": 50, "title": { "en": "The three primitives: Choice, Score and Noul", "es": "Las tres primitivas: Choice, Score y Noul" } },
+    { "slug": "03-ex-first-jev-call", "type": "exercise", "minutes": 60, "title": { "en": "Exercise: your first Jev call, a ticket-triage CLI with recorded tests", "es": "Ejercicio: tu primera llamada a Jev, un CLI de triage de tickets con tests grabados" } },
+    { "slug": "04-probabilities-confidence", "type": "concept", "minutes": 45, "title": { "en": "Probabilities, confidence and thresholds that scale with risk", "es": "Probabilidades, confianza y umbrales que escalan con el riesgo" } },
+    { "slug": "05-ex-confidence-gated-routing", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: a confidence-gated classifier with a precision/coverage sweep", "es": "Ejercicio: un clasificador con gate por confianza y un barrido precisión/cobertura" } },
+    { "slug": "06-patterns", "type": "concept", "minutes": 50, "title": { "en": "Patterns: fan-out, composite scoring, routing, hierarchies, cascades", "es": "Patrones: fan-out, composite scoring, routing, jerarquías, cascadas" } },
+    { "slug": "07-jev-in-rag-and-agents", "type": "concept", "minutes": 50, "title": { "en": "Jev inside RAG and agents: re-ranking, citation checks, guardrails, tool gates", "es": "Jev dentro de RAG y agentes: re-ranking, verificación de citas, guardrails, gates de tools" } },
+    { "slug": "08-ex-rerank-and-guardrail", "type": "exercise", "minutes": 90, "title": { "en": "Exercise: a Jev re-ranker for rag-lab and a tool-call gate for the HITL agent", "es": "Ejercicio: un re-ranker con Jev para rag-lab y un gate de tool calls para el agente HITL" } },
+    { "slug": "09-evaluating-jev", "type": "concept", "minutes": 50, "title": { "en": "Evaluating a decision model: accuracy, calibration, Brier, ECE and drift", "es": "Evaluar un modelo de decisión: accuracy, calibración, Brier, ECE y drift" } },
+    { "slug": "10-ex-calibration-eval", "type": "exercise", "minutes": 75, "title": { "en": "Exercise: calibration curve, Brier, ECE and a regression test", "es": "Ejercicio: curva de calibración, Brier, ECE y un test de regresión" } },
+    { "slug": "11-production-jev", "type": "concept", "minutes": 45, "title": { "en": "Jev in production: cost, latency, batching, pinning, fallbacks and privacy", "es": "Jev en producción: costo, latencia, batching, pinning, fallbacks y privacidad" } },
+    { "slug": "12-exam", "type": "exam", "minutes": 30, "title": { "en": "Module 10 exam", "es": "Examen del módulo 10" } },
+    { "slug": "13-capstone-decision-layer", "type": "project", "minutes": 600, "title": { "en": "Capstone: a real-time decision layer for a marketplace ops team", "es": "Proyecto final: una capa de decisión en tiempo real para el equipo de operaciones de un marketplace" } }
+  ],
+  "repos": [
+    { "id": "m10-jev-lab", "name": "jev-lab", "description": { "en": "Exercises: a ticket-triage CLI with mocked HTTP tests, a confidence-gated classifier with a precision/coverage sweep, a Jev re-ranker and tool-call gate wired into rag-lab and langgraph-hitl-agent, and a calibration eval with a regression test.", "es": "Ejercicios: un CLI de triage de tickets con tests de HTTP mockeado, un clasificador con gate por confianza y barrido precisión/cobertura, un re-ranker y un gate de tool calls con Jev conectados a rag-lab y langgraph-hitl-agent, y una eval de calibración con test de regresión." } },
+    { "id": "m10-decision-layer", "name": "jev-decision-layer", "description": { "en": "Capstone: a real-time decision layer for a marketplace ops team: triage, routing, guardrails and re-ranking with Jev, an LLM fallback on the same schema, a confidence-gated human queue, a calibration eval suite and a cost/latency dashboard against the pure-LLM baseline.", "es": "Proyecto final: una capa de decisión en tiempo real para el equipo de operaciones de un marketplace: triage, routing, guardrails y re-ranking con Jev, un fallback a LLM con el mismo schema, una cola humana con gate por confianza, una suite de evals de calibración y un dashboard de costo/latencia contra el baseline puramente LLM." } }
+  ]
+}

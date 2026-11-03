@@ -1,0 +1,125 @@
+## Rápido y lento, en software
+
+Daniel Kahneman describió dos modos de pensar. El *Sistema 1* es rápido, automático e intuitivo: reconoces un email enojado en un segundo. El *Sistema 2* es lento y deliberado: redactas la respuesta, sopesas la política, revisas los números. Los modelos de lenguaje grandes son máquinas de Sistema 2. Razonan en texto, token a token, y lo hacen bien. También son lentos y caros cuando lo único que necesitabas era el juicio de un segundo.
+
+Un **modelo System One** es un modelo de IA construido para ese juicio de un segundo. Lee lenguaje natural como un LLM, pero no escribe nada de vuelta. Responde una pregunta tipada con una decisión y una distribución de probabilidad. **Jev**, de TypeSafe AI, es el primer modelo de esa clase, anunciado el 15 de septiembre de 2026 como producto de acceso anticipado. Lleva el nombre del economista W. S. Jevons; "System One" es la referencia a Kahneman.
+
+<Callout type="info" title="El acceso puede estar en lista de espera">
+
+TypeSafe pausó los registros nuevos el 22 de septiembre de 2026 por la demanda. Si todavía no puedes obtener una key desde la consola, puedes enrutar las requests a través de OpenRouter o Vercel AI Gateway, que listan a Jev. Las formas de request y response de este módulo son las de la API de TypeSafe; un gateway las envuelve pero no cambia las primitivas. Cada ejercicio del módulo está escrito para que los tests corran con respuestas grabadas, sin key.
+
+</Callout>
+
+## Qué te da "no autorregresivo"
+
+Un LLM genera su respuesta token a token. Cada token depende de los anteriores, así que una respuesta JSON de 200 tokens cuesta 200 pasadas secuenciales, y la forma de ese JSON es tan confiable como tu parser y tus retries. El módulo 1 te enseñó a defenderte con structured outputs y Pydantic. Funciona. Sigue siendo generación.
+
+Jev es **no autorregresivo**. Una request lleva un `state` (el texto u objeto JSON a juzgar) y un mapa de `questions`. El modelo ingiere el state una vez y evalúa cada pregunta **en paralelo y de forma aislada** contra él. No hay loop de decodificación. Cada respuesta es una distribución sobre las opciones que tú diste, así que la salida no puede estar malformada, no puede inventar una quinta categoría cuando ofreciste cuatro y no puede irse de paseo en prosa. Esa es la garantía real: **conformidad con el schema**. Todavía puede elegir la opción válida equivocada.
+
+De aquí se desprenden tres consecuencias, y todo el módulo se construye sobre ellas:
+
+1. **Agregar preguntas es casi gratis.** El state domina el conteo de tokens. Hacer 13 preguntas cuesta más o menos la misma latencia que hacer 1, y en precio solo los tokens extra de las preguntas. Vas a aprender a preguntar de más y dejar que el código decida qué usar.
+2. **Las preguntas no se ven entre sí.** La respuesta A nunca es contexto para la pregunta B. Si un juicio depende de una respuesta anterior, eso es una segunda request, hecha en código.
+3. **La salida es un número, no una frase.** Lo umbralizas, ordenas por él, lo registras y lo evalúas con las herramientas de calibración del módulo 9. Para un SDET, cada pregunta es un **oráculo** que puedes correr a escala.
+
+## Las tres primitivas en una request
+
+```python
+from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+
+ticket = (
+    "Checkout has been failing with a 502 for every customer since 09:40. "
+    "We are losing orders. Please escalate."
+)
+
+with TypeSafeClient(model="jev-latest") as client:  # reads TYPESAFE_API_KEY
+    response = client.system_one(
+        state=ticket,
+        questions={
+            "department": Choice(
+                instructions="Which team should handle this ticket?",
+                criteria={
+                    "billing": "Charges, invoices, refunds, subscriptions",
+                    "technical": "Bugs, outages, API or integration failures",
+                    "sales": "Pricing, plans, contract questions",
+                },
+            ),
+            "frustration": Score(
+                instructions="How frustrated does the customer appear?",
+                criteria=["Calm, states facts", "Frustrated but civil", "Angry, strong language"],
+            ),
+            "is_urgent": Noul(instructions="The message conveys urgency or time pressure."),
+        },
+    )
+
+dept = response.answers["department"]
+print(dept.choice, dept.confidence, dept.probabilities)   # technical 1.0 {...}
+print(response.answers["frustration"].score)             # e.g. 1.2 on a 0-2 scale
+print(response.answers["is_urgent"].noul)                # e.g. 0.98
+print(response.model, response.usage.input_tokens)       # jev-1.14.0 ...
+```
+
+La misma request por HTTP crudo es un `POST https://api.typesafe.ai/v1/systemone` con `Authorization: Bearer <key>`, un body JSON con `model`, `state` y `questions`, y una respuesta con `model`, `answers` y `usage`. La lección 02 recorre cada campo.
+
+## Las afirmaciones del proveedor, leídas como SDET
+
+El material de lanzamiento de TypeSafe dice que Jev es "193.6x más rápido" y "444.6x más barato" que un LLM en sus tareas de benchmark, y que "no puede alucinar". Trátalas como tratas la slide de load test de un proveedor: son sus números en su workload. Lo que sí puedes verificar tú:
+
+- **Precio (proveedor, septiembre 2026):** $0.042 por millón de tokens de entrada, tokens de salida gratis. Es barato, pero revisa la página actual antes de citarlo en un reporte de costos.
+- **Latencia (proveedor):** 70–500 ms por request. Mide p50 y p95 sobre tus propios states; un state de 30k tokens es más lento que un ticket de 300.
+- **"No puede alucinar":** cierto en el sentido estrecho de que la salida siempre es una de tus opciones. No es cierto que la opción elegida sea correcta. El modelo puede elegir `billing` con toda la confianza para un ticket técnico. La calibración (lecciones 04 y 09) es cómo descubres con qué frecuencia.
+
+El modelo se entrena con lo que TypeSafe llama **Reinforcement Learning for Calibrated Decisions (RLCD)**. La documentación es cuidadosa: la calibración se mide sobre grupos de predicciones y no garantiza ninguna respuesta individual. Vas a validarla sobre tus propios datos etiquetados, igual que el módulo 9 te enseñó a validar un juez LLM.
+
+## Lo que Jev no puede hacer
+
+El proveedor publica una página de "jaggedness" (irregularidad). Su propia lista de puntos débiles vale la pena memorizarla, porque cada uno es un lugar donde dejas la lógica en código o delegas a un LLM:
+
+| Debilidad | Por qué importa | Qué hacer en su lugar |
+|---|---|---|
+| Lectura literal | Puede perder sarcasmo y significado implícito | Da `criteria` explícitos con ejemplos; valida con tus datos |
+| Matemática y conteo | "¿Hay más de 3 líneas de pedido?" no es confiable | Cuenta en código y pon el conteo en el state |
+| Comparación de fechas | "¿El deadline es anterior a la fecha de factura?" | Parsea fechas en código; pide a Jev solo *encontrar* el texto de la fecha |
+| Indirección multi-hop | "¿La política que referencia el ticket permite X?" | Trae la política, pon ambas en el state, haz una pregunta de un salto |
+| State grande y ruidoso | La accuracy baja a medida que crece el state | Recorta el state a lo que la pregunta necesita; 64k es un techo, no una meta |
+| Contenido adversarial | Texto de injection dentro del state puede sesgar los juicios | Filtra primero con un Noul dedicado (lección 07) |
+| Sin generación de texto | Nunca va a explicar, resumir ni responder | Combínalo con un LLM para todo lo que lea un humano |
+
+## Jev vs un LLM vs código simple
+
+Usa esta escalera cuando diseñes un paso de pipeline:
+
+1. **Código simple** cuando la regla es exacta: regex, aritmética, cálculo de fechas, lookups, allow-lists. Determinista, gratis, testeable. Siempre primero.
+2. **Jev** cuando la regla es un juicio rápido que una persona entrenada hace en un segundo a partir del texto: qué categoría, qué tan severo, si esto es verdad. Salida restringida, probabilidades, unos 100–500 ms, fracciones de centavo.
+3. **Un LLM** cuando el paso necesita razonamiento en varios pasos, generación de texto que un humano va a leer, uso de tools o extracción abierta donde el espacio de respuestas no es enumerable de antemano.
+
+La frase para recordar: **Jev no es un reemplazo del LLM. Es la capa de decisión rápida, barata y tipada dentro de los sistemas con LLM.** Tu router de tickets del módulo 1 sigue necesitando un LLM para redactar la respuesta. No lo necesita para decidir el departamento.
+
+## Errores comunes
+
+- **Hacer una pregunta de Sistema 2.** "Analiza este ticket y decide qué hacer" no tiene lista de opciones y necesita razonamiento. Divídela en cinco juicios rápidos y combínalos en código.
+- **Citar el speed-up del proveedor como tu resultado.** Mide en tu propio workload y reporta tus números con fechas.
+- **Tratar `confidence: 1.0` como "correcto".** Significa que toda la probabilidad cayó en una opción. Nada más.
+- **Dejar que Jev haga aritmética o compare fechas.** Pon los hechos calculados en el state; pregunta por significado, no por matemática.
+- **Una pregunta por request.** La economía de Jev depende del batching. La lección 06 lo convierte en hábito.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="Un compañero propone reemplazar el LLM de tu router de soporte por Jev para bajar costos. ¿Qué respondes?" level="mid">
+
+En parte sí. El paso de clasificación (departamento, urgencia, tono) es un juicio rápido sobre un conjunto enumerable: Jev devuelve una respuesta restringida con probabilidades en unos cientos de milisegundos por una fracción de centavo, así que encaja bien y me da una confianza con la que puedo hacer gate. El paso de redactar la respuesta es generación de texto, que Jev no hace, así que el LLM se queda para eso. El encuadre honesto es "Jev se vuelve la capa de decisión delante del LLM", no "Jev reemplaza al LLM". Validaría la accuracy del routing y la calibración sobre nuestros tickets etiquetados antes de cambiar, y mantendría el LLM con un schema de structured output como fallback cuando Jev no esté disponible.
+
+</InterviewQuestion>
+
+<Callout type="interview" title="Prepárate para explicar 'no autorregresivo' de un tirón">
+
+"El modelo evalúa todas las preguntas contra el state en paralelo en lugar de decodificar tokens uno por uno, así que la salida es una distribución de probabilidad sobre las opciones que yo le di, nunca texto libre." Si además puedes decir por qué eso hace que agregar preguntas sea casi gratis, ya está.
+
+</Callout>
+
+## Lecturas adicionales
+
+- Docs de TypeSafe: páginas System One concept, Primitives y Confidence en https://docs.typesafe.ai
+- Kahneman, *Thinking, Fast and Slow* (2011), para el encuadre Sistema 1 / Sistema 2
+- Guo et al., "On Calibration of Modern Neural Networks" (2017), https://arxiv.org/abs/1706.04599
+- OWASP Top 10 for LLM Applications, https://owasp.org/www-project-top-10-for-large-language-model-applications/ (prompt injection como razón para filtrar el state)

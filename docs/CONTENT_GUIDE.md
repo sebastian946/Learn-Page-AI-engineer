@@ -14,7 +14,7 @@ src/content/
   glossary.json            # all glossary terms
 ```
 
-Module ids are `m0` … `m9`. Run `npm run validate:content` (or `node scripts/validate-content.mjs m3`) after every change.
+Module ids are `m0` … `m10`. Run `npm run validate:content` (or `node scripts/validate-content.mjs m3`) after every change.
 
 ## module.json
 
@@ -187,7 +187,7 @@ Folder structure, README outline, commit message suggestions (markdown).
 
 ## Adding a new module
 
-1. Create `src/content/modules/m10/module.json` with `"order": 10`.
+1. Create `src/content/modules/m11/module.json` with `"order": 11`.
 2. Add `NN-slug.en.mdx` and `NN-slug.es.mdx` for each lesson.
-3. Add `exams/m10.json` and `interview/m10.json`. Add terms to `glossary.json`.
+3. Add `exams/m11.json` and `interview/m11.json`. Add terms to `glossary.json`.
 4. Run `npm run validate:content`, then `npm run dev`. The module shows up in the sidebar, dashboard and portfolio tracker automatically.
