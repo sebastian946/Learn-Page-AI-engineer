@@ -1,0 +1,129 @@
+<ClientBrief company="Kestrel Market" industry="E-commerce / Peer-to-peer marketplace" duration="3 days" />
+
+## Company context
+
+Kestrel Market is a fictional peer-to-peer marketplace for refurbished electronics. About 40,000 listings go live each week, 9,000 support conversations start each day, and a seller-facing assistant ("Kestrel Helper") answers policy and listing questions from a help-center corpus. The operations team of 22 people reviews listings, routes tickets, and audits the assistant's answers.
+
+Today every automated decision in that flow is an LLM call with a JSON schema: listing moderation (is this listing prohibited, miscategorised, suspicious?), ticket triage (department, urgency, tone), the Helper's input and output guardrails, and the help-center re-ranker. It works, but each call takes 1.5–4 seconds, the monthly model bill is the second-largest line in the ops budget, and the schema-only outputs give the team no probability to decide what to automate. Everything either auto-runs or goes to a human by static rule.
+
+Leadership has read about System One models and wants a **real-time decision layer**: Jev for every snap judgment, the LLM kept for anything a person reads, and a human queue fed by confidence rather than by fixed rules. They want it measured against the current pure-LLM baseline before anyone changes production.
+
+## Stakeholders
+
+| Stakeholder | Role | What they care about |
+|---|---|---|
+| Amara Sow | Head of Marketplace Operations | Fewer manual reviews without more mistakes; a queue her team can trust |
+| Diego Fontana | Trust & Safety lead | Prohibited listings and prompt-injection attempts must not slip through; fail closed |
+| Hannah Weiss | Finance partner | Cost per 1,000 decisions versus the baseline, with dated prices she can audit |
+| Yusuf Demir | Staff engineer, platform | Latency budget, pinned model versions, clean fallback, no new single point of failure |
+| Priya Raman | Support team lead | Triage accuracy per department and the frustration signal for escalations |
+| Legal & privacy | Compliance | Customer text sent to a new vendor needs a DPA and minimisation; logs must not duplicate PII |
+
+## Business goal
+
+Cut the cost and latency of automated marketplace decisions by replacing LLM calls with Jev where a typed snap judgment is enough, **without** lowering accuracy on the decisions that matter, and introduce confidence-gated automation so the ops team reviews the uncertain cases instead of a fixed share of everything. Produce the evidence that lets Amara and Yusuf decide whether to roll it out.
+
+## Functional requirements
+
+1. **Decision service.** A FastAPI service exposing four decision points, each one Jev request built with speculative fan-out: `POST /decide/listing` (prohibited Noul, category Choice over the marketplace taxonomy with at least 30 options, suspicious-pricing Noul, condition Score), `POST /decide/ticket` (department Choice over 8 teams, urgency Noul, frustration Score, wants-human Noul, language Choice), `POST /guardrail/input` and `POST /guardrail/output` (the hazard battery: injection, safeguard-drop, harm request, off-topic, PII-in-output, plus a harm Score), `POST /rerank` (one Noul per (query, passage) over up to 30 help-center passages, concurrent).
+2. **Confidence-gated routing.** Every decision returns a band (`auto`, `confirm`, `human`) per action using thresholds from a versioned `thresholds.yaml`, chosen per action by the cost of a wrong action and validated on labeled data with the precision/coverage method from exercise 05.
+3. **Human queue.** Decisions in `confirm` and `human` bands land in a queue table with the full answers map; a minimal reviewer endpoint records the human label. Human labels feed the next calibration run.
+4. **LLM fallback on the same schema.** For each decision point, an adapter that answers the identical questions with a Claude structured-output schema (model id from config). Used when Jev times out or fails after retries, flagged in logs, gated with stricter thresholds. Guardrails fail closed; re-ranking fails open to BM25 order.
+5. **Labeled datasets.** At least 300 labeled listings, 300 labeled tickets, 200 labeled guardrail messages (including at least 60 adversarial ones reused from Module 3), and 40 help-center queries with gold passages. Label yourself; document the guideline.
+6. **Calibration eval suite.** For every Noul and the top probability of every Choice: accuracy or F1, reliability table, Brier, ECE (equal-mass bins), bootstrap intervals, and a regression test with a committed baseline per pinned model version (exercise 10 generalised).
+7. **Baseline comparison.** Run the pure-LLM adapters on the same datasets and report, paired: quality, calibration, p50/p95 latency and cost per 1,000 decisions, with provider prices read from config and dated.
+8. **Cost/latency dashboard.** A small page or notebook export that shows, per decision point: automation rate (share in `auto`), human-queue rate, p50/p95, cost per 1,000 for Jev versus baseline, fallback rate, and the pinned model id.
+9. **Observability.** Every decision logged with request id, decision point, versioned model, answers map, band, thresholds version, source (`jev` or `llm_adapter`), latency and input tokens; state logged as a hash only.
+
+## Non-functional requirements
+
+| Requirement | Target |
+|---|---|
+| Latency, triage and listing decisions | p95 under 800 ms end to end at 20 concurrent requests, measured with k6 against recorded responses and once live if a key is available |
+| Latency, re-rank over 30 passages | p95 under 1.2 s with concurrent fan-out |
+| Accuracy, ticket department | Macro-F1 not lower than the LLM baseline by more than 2 points (paired bootstrap, lower bound) |
+| Precision among `auto` decisions | At least 0.95 for listing moderation and guardrails, 0.90 for triage, on held-out labels |
+| Guardrail recall for adversarial messages | At least 0.95 at the production threshold; failures fail closed |
+| Calibration | ECE (equal-mass, 10 bins) under 0.08 on every gated Noul; reported with intervals |
+| Cost | Cost per 1,000 decisions for Jev decision points at least 10x below the LLM baseline, prices dated |
+| Resilience | Jev outage simulated in tests: guardrails hold, re-rank falls back, triage uses the adapter, alert fires |
+| Versioning | Versioned Jev id pinned in config; alias used only in a documented "canary" job |
+| Privacy | PII masked before the state is built; no raw state in logs; DPA checklist in the README |
+
+## Out of scope
+
+- Replacing the LLM that writes replies or answers help-center questions.
+- A production-grade reviewer UI; a JSON endpoint and a table are enough.
+- Fine-tuning any model. Jev is shaped only through state, instructions and criteria.
+- Multimodal moderation of listing photos.
+- Deploying to the cloud; Docker Compose locally with the Module 5 patterns is the target.
+
+## Deliverables
+
+1. Repo `jev-decision-layer` with the service, adapters, datasets, eval suite, dashboard and tests.
+2. `ARCHITECTURE.md` with the diagram below, the decision points, the band logic and the degradation table.
+3. `THRESHOLDS.md` explaining each gate: statistic, threshold, precision at threshold with interval, coverage, model id, date.
+4. `EVAL_REPORT.md` with quality, calibration, latency and cost for Jev and the LLM baseline, paired, with the verdict.
+5. `RUNBOOK.md`: what to do when Jev is down, when the alias moves, when the human queue grows, how to regenerate baselines.
+6. A demo GIF: a ticket and a prohibited listing flowing through the service, one landing in `auto`, one in `human`.
+
+## Acceptance criteria
+
+- The four decision points work end to end against recorded responses in tests and against live Jev (or a gateway) when a key is present.
+- Every threshold in `thresholds.yaml` traces to a row in `THRESHOLDS.md` with data behind it.
+- The calibration regression test runs in CI and fails on a degraded baseline.
+- The eval report compares Jev and the LLM baseline on the same items with paired intervals and dated prices.
+- Outage tests prove fail-closed guardrails, fail-open re-ranking and the adapter fallback for triage.
+- The dashboard shows automation rate, queue rate, latency, cost and fallback rate per decision point.
+- No raw customer text appears in logs or in the repo.
+
+## Suggested architecture
+
+<Diagram caption="Real-time decision layer with Jev, LLM fallback and a confidence-gated human queue" chart={`flowchart LR
+  A[Listing / ticket / message / query] --> B[PII masking + state builder]
+  B --> C{Decision point}
+  C --> D["Jev request (fan-out questions)"]
+  D -- timeout / 529 --> E["LLM adapter (same schema)"]
+  D --> F[Band: auto / confirm / human]
+  E --> F
+  F -- auto --> G[Downstream action]
+  F -- confirm / human --> H[(Human queue)]
+  H --> I[Reviewer label]
+  I --> J[Calibration eval suite]
+  D --> K[(Decision log: answers, model, band)]
+  E --> K
+  K --> J
+  K --> L[Cost / latency dashboard]
+  J --> M[thresholds.yaml + baseline.json]`} />
+
+## Evaluation rubric
+
+| Area | Weight | 1 (weak) | 3 (solid) | 5 (excellent) |
+|---|---|---|---|---|
+| Question design | 15% | One vague question per decision; numeric Score levels | Atomic questions with descriptive criteria; fan-out used | Criteria tuned on data with documented iterations; companion Nouls instead of `other` |
+| Confidence gating | 20% | One global threshold, chosen by eye | Per-action gates from a precision/coverage sweep | Lower-bound-driven gates, per-class overrides, workload estimate per action |
+| Calibration eval | 20% | Accuracy only | Reliability, Brier, ECE with intervals; regression test | Equal-mass bins, recalibration evaluated held-out, per-version baselines |
+| Baseline comparison | 15% | Vendor claims quoted | Paired comparison with intervals and dated prices | Trade-off analysis per decision point, including where the LLM wins |
+| Resilience and fallback | 15% | Jev failure crashes the request | Adapter fallback and fail-closed guardrails, tested | Degradation table, alerting on fallback rate, pinned versions and canary job |
+| Observability and privacy | 10% | Choices logged, no probabilities | Full answers map, model id, band, hashed state | Logs feed the eval suite directly; DPA and minimisation documented |
+| Communication | 5% | Numbers without context | Clear reports and runbook | A stakeholder could decide from the eval report alone |
+
+## Suggested timeline
+
+| Day | Focus | Output |
+|---|---|---|
+| 1 | Datasets, questions, service skeleton | Labeled sets with guideline; four decision points with fan-out questions; recorded-response tests; PII masking |
+| 2 | Gating, fallback, evals | Precision/coverage sweeps and `thresholds.yaml`; LLM adapters; outage tests; calibration suite with baselines |
+| 3 | Baseline comparison, dashboard, docs | Paired eval report with cost and latency; k6 run; dashboard; ARCHITECTURE, THRESHOLDS, RUNBOOK; demo GIF |
+
+## Definition of Done
+
+<Checklist id="m10-13-dod" title="Definition of Done" items={["Four decision points each send one Jev request with speculative fan-out, and tests assert on the request JSON", "thresholds.yaml is versioned and every gate traces to a precision/coverage row with a lower-bound interval", "Listing moderation and guardrails reach at least 0.95 precision among auto decisions on held-out labels", "Guardrail recall on adversarial messages is at least 0.95 and failures fail closed", "Every gated Noul has a reliability table, Brier and ECE with intervals, and a committed baseline per pinned model id", "The calibration regression test runs in CI and skips with a clear message on a model change", "LLM adapters answer the identical questions with a structured-output schema and are flagged in logs", "Outage tests prove hold for guardrails, BM25 fallback for re-rank, adapter for triage, and an alert on fallback rate", "The eval report compares Jev and the LLM baseline on the same items, paired, with dated prices and p50/p95", "Cost per 1,000 decisions for Jev decision points is at least 10x below baseline, or the report explains why not", "The dashboard shows automation rate, queue rate, latency, cost and fallback rate per decision point", "No raw customer text in logs or the repo; the README has the DPA and minimisation checklist", "RUNBOOK covers Jev down, alias moved, queue growing, baseline regeneration", "Demo GIF shows an auto and a human-queue decision end to end"]} />
+
+## How to present this in an interview
+
+Open with the one-sentence framing: "I replaced the snap-judgment LLM calls in a marketplace ops flow with a System One model and added confidence-gated automation, measured against the LLM baseline." Then show the dashboard: automation rate, queue rate, cost per 1,000 and p95 per decision point, Jev next to baseline.
+
+Expect four questions. **"How do you know the probabilities mean anything?"** Show the reliability curve and the ECE with intervals, explain equal-mass bins, and say what you did when a Noul was badly calibrated. **"What happens when the vendor is down?"** Walk the degradation table: fail closed, fail open, adapter, alert. **"Why not just use the LLM with a schema?"** Give the paired numbers, then be honest about where the LLM still wins: it can explain, and it handles the multi-hop and arithmetic cases Jev's own docs say it cannot. **"How did you pick the thresholds?"** Precision/coverage sweep, lower bound of the interval, per action by cost of a wrong action, pinned model id, regression test.
+
+Close with the SDET angle: each Jev question is an oracle you can run on every request, so the eval suite and the production path are the same code, and the human queue is the labeling pipeline. That is the part most candidates cannot say.

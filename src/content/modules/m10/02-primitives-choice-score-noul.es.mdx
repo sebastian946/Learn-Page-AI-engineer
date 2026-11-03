@@ -1,0 +1,179 @@
+## Una request, tres tipos de pregunta
+
+Toda request a Jev tiene los mismos tres campos de nivel superior: `model`, `state` y `questions`. El state es un string, un objeto JSON o un array de texto. Cada pregunta tiene un id que tú eliges, un `type`, `instructions`, y para dos de los tres tipos un campo `criteria` que define el espacio de respuestas. El id es para tu código; el modelo nunca lo ve, así que pon la pregunta completa en `instructions`.
+
+| Primitiva | Forma de la pregunta | `criteria` | Campos de respuesta |
+|---|---|---|---|
+| **Choice** | ¿Cuál de estas opciones? | mapa de nombre de opción a descripción, hasta 255 opciones | `choice`, `probabilities`, `confidence` |
+| **Score** | ¿Qué nivel en esta rúbrica ordenada? | lista ordenada de 2–10 descripciones de nivel | `score`, `legend`, `probabilities`, `confidence` |
+| **Noul** | ¿Esta afirmación es verdadera? | descripciones opcionales `true` / `false` | `noul` (0–1), sin `confidence` |
+
+Elige el tipo cuya respuesta tu código usa directamente. Un Choice se mapea a un `match` o a un dict de handlers. Un Score se mapea a un umbral o a una clave de ordenamiento. Un Noul se mapea a un `if`.
+
+## La request y la response crudas
+
+Conocer la forma HTTP importa: la vas a mockear en tests, la vas a registrar en producción y la vas a usar a través de un gateway si no tienes key directa.
+
+```json
+{
+  "model": "jev-latest",
+  "state": {
+    "subject": "Wrong size and charged twice",
+    "message": "The trainers I ordered arrived in a 9, I ordered a 10. I was also charged twice."
+  },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle `message`?",
+      "criteria": {
+        "returns": "Exchanges, wrong or damaged items",
+        "shipping": "Delivery status, delays, lost parcels",
+        "billing": "Charges, invoices, duplicate payments"
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the problem described in `message`?",
+      "criteria": ["Cosmetic or minor inconvenience", "Degraded, workaround exists", "Blocking, no workaround"]
+    },
+    "wants_refund": {
+      "type": "noul",
+      "instructions": "The customer explicitly asks for money back.",
+      "criteria": { "true": "Asks for a refund or reversal", "false": "Asks for an exchange, info, or nothing" }
+    }
+  }
+}
+```
+
+Los backticks alrededor de `message` apuntan al modelo a una clave dentro de un state estructurado. Úsalos siempre que el state sea un objeto.
+
+```json
+{
+  "model": "jev-1.14.0",
+  "answers": {
+    "department": {
+      "type": "choice", "choice": "returns", "confidence": 0.42,
+      "probabilities": { "returns": 0.61, "billing": 0.35, "shipping": 0.04 }
+    },
+    "severity": {
+      "type": "score", "score": 1.2, "confidence": 0.7,
+      "legend": { "0": "Cosmetic or minor inconvenience", "1": "Degraded, workaround exists", "2": "Blocking, no workaround" },
+      "probabilities": { "0": 0.0, "1": 0.8, "2": 0.2 }
+    },
+    "wants_refund": { "type": "noul", "noul": 0.31 }
+  },
+  "usage": { "input_tokens": 412, "output_tokens": 61 }
+}
+```
+
+Tres cosas para notar. El `model` de la response es el **id versionado** que respondió, aunque hayas pedido el alias `jev-latest`; regístralo. El Choice está dividido entre `returns` y `billing` porque el ticket de verdad pertenece a dos equipos, y `confidence` lo dice. Y el Noul de "pide explícitamente dinero de vuelta" es 0.31: el cliente menciona un cobro doble pero nunca pide un reembolso, así que es exactamente el tipo de valor intermedio que enrutas a una persona o a una pregunta de seguimiento.
+
+## La misma request a través de los SDKs
+
+<CodeTabs>
+```python
+from typesafe_sdk import Choice, Noul, NoulCriteria, Score, TypeSafeClient
+
+TRIAGE = {
+    "department": Choice(
+        instructions="Which team should handle `message`?",
+        criteria={
+            "returns": "Exchanges, wrong or damaged items",
+            "shipping": "Delivery status, delays, lost parcels",
+            "billing": "Charges, invoices, duplicate payments",
+        },
+    ),
+    "severity": Score(
+        instructions="How severe is the problem described in `message`?",
+        criteria=["Cosmetic or minor inconvenience", "Degraded, workaround exists", "Blocking, no workaround"],
+    ),
+    "wants_refund": Noul(
+        instructions="The customer explicitly asks for money back.",
+        criteria=NoulCriteria(true="Asks for a refund or reversal", false="Asks for an exchange, info, or nothing"),
+    ),
+}
+
+with TypeSafeClient() as client:  # model defaults to jev-latest
+    r = client.system_one(state={"subject": "...", "message": "..."}, questions=TRIAGE, model="jev-1.14.0")
+
+dept = r.answers["department"]          # ChoiceAnswer
+sev = r.answers["severity"]             # ScoreAnswer: probabilities keyed by int level
+refund = r.answers["wants_refund"]      # NoulAnswer
+print(dept.choice, dept.confidence, sev.score, refund.noul, r.model)
+```
+```typescript
+import { choice, noul, score, TypeSafeClient } from "@typesafe-ai/sdk";
+
+const client = new TypeSafeClient({ defaultModel: "jev-1.14.0" }); // reads TYPESAFE_API_KEY
+
+const response = await client.systemOne({
+  state: { subject: "...", message: "..." },
+  questions: {
+    department: choice("Which team should handle `message`?", {
+      returns: "Exchanges, wrong or damaged items",
+      shipping: "Delivery status, delays, lost parcels",
+      billing: "Charges, invoices, duplicate payments",
+    }),
+    severity: score("How severe is the problem described in `message`?", [
+      "Cosmetic or minor inconvenience",
+      "Degraded, workaround exists",
+      "Blocking, no workaround",
+    ]),
+    wants_refund: noul("The customer explicitly asks for money back."),
+  },
+});
+
+// Types are inferred: department.choice is "returns" | "shipping" | "billing"
+const { department, severity, wants_refund } = response.answers;
+console.log(department.choice, department.confidence, severity.score, wants_refund.noul, response.model);
+```
+</CodeTabs>
+
+Instala con `pip install typesafe-sdk` (Python 3.10+) o `npm install @typesafe-ai/sdk` (Node 22+). Ambos leen `TYPESAFE_API_KEY`, usan `jev-latest` por defecto y reintentan 429 y 529 con backoff exponencial sin configuración. Python también trae `AsyncTypeSafeClient` con la misma firma `system_one`.
+
+## Choice: escribir opciones que se separen
+
+- **Describe cada opción contra sus vecinas.** "returns: exchanges, wrong or damaged items" y "shipping: delivery status, delays, lost parcels" se superponen en "dañado en tránsito". Di a dónde va eso. Cuando dos opciones se siguen confundiendo, convierte la descripción en un objeto con campos `what`, `not_for` y `examples`; los nombres de los campos son tuyos.
+- **Manda la lista completa.** Hasta 255 opciones cuestan unos pocos tokens cada una. Una lista recortada fuerza respuestas equivocadas.
+- **`other` es un comodín débil.** La documentación es explícita en que una opción `none_of_the_above` suele funcionar mal. Prefiere un Noul compañero en la misma request: "¿`message` nombra alguno de nuestros productos?" y lee el Choice solo cuando dice que sí.
+- **Se permiten descripciones `null`** cuando los nombres de las opciones se explican solos (`calm`, `frustrated`, `angry`).
+
+## Score: describe situaciones, no grados
+
+Los niveles se juzgan uno por uno contra el state. El modelo no ve los números de nivel ni los vecinos, así que "peor que el nivel anterior" no significa nada, y etiquetas numéricas como `["0", "1", "2"]` producen una distribución plana. Escribe cada nivel como una situación que un ingeniero pueda reconocer: "Funcionalidad rota, existe workaround". Mantén cada Score en **una dimensión**; "puntual e inteligente y experimentado" son tres preguntas. Si la parte alta de la escala tiene un extremo raro que manejas distinto (abusivo, amenaza legal), dale su propio nivel. El `score` es la media de los números de nivel ponderada por probabilidad, así que 1.0 puede significar "todo en el nivel 1" o "mitad en 0, mitad en 2". Lee `probabilities` a su lado.
+
+## Noul: una proposición, alto significa sí
+
+- Una condición por Noul. "Enojado *y* pidiendo reembolso" son dos Nouls combinados con `and` en código.
+- Redáctalo para que un valor alto signifique sí. Las preguntas negadas ("está libre de PII") invierten el significado y alguien lo va a leer al revés.
+- Las afirmaciones funcionan igual que las preguntas. Prueba ambas con tus datos.
+- Agrega `criteria` cuando el límite es sutil: ¿qué cuenta como "contacto repetido"?
+- Un Noul mide **probabilidad de sí**, no grado. "¿El candidato es fuerte en Python?" en 0.5 es incertidumbre, no "nivel medio". Si quieres grado, usa un Score con niveles descritos.
+
+## Casos límite
+
+- **State vacío o irrelevante.** Las respuestas igual vuelven, normalmente planas. Verifica states vacíos en código antes de llamar.
+- **State más grande que el contexto.** 64k tokens para state más todas las preguntas, 32k para state más la pregunta más larga. Por encima recibes un 400 con `max_tokens_exceeded`. Recorta primero; el header de long context existe pero la documentación dice que es más lento y menos preciso.
+- **Preguntas que dependen entre sí.** Haz una segunda request. La lección 06 muestra cuándo es legítimo (jerarquías, traer más state) y cuándo es pereza.
+- **Alias de modelo.** `jev-latest` apunta hoy a `jev-1.14.0` (lanzado el 14 de octubre de 2026); `jev-1.13.0` sigue siendo invocable. Los alias se mueven. Fija el id versionado en producción una vez que hayas ajustado umbrales, y cambia de forma deliberada.
+
+## Errores comunes
+
+- Poner la pregunta en el id (`is_urgent`) y dejar `instructions` vago. El modelo nunca ve el id.
+- Niveles de Score numéricos o comparativos.
+- Un Choice con 3 opciones para una taxonomía de 40 porque "el prompt se estaba haciendo largo". No es un prompt.
+- Leer `score` sin `probabilities` y perderse una división bimodal.
+- Olvidar que `probabilities` de un Score se indexa por número de nivel como **string** en JSON crudo y como **int** en el SDK de Python.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Cuándo usarías un Score en lugar de un Noul, y qué sale mal si eliges el equivocado?" level="mid">
+
+Un Noul responde una proposición sí/no y devuelve la probabilidad de que sea verdadera. Un Score ubica el state en una rúbrica ordenada de niveles descritos y devuelve una posición ponderada más la distribución. Si necesito un grado, como la frustración del cliente de calmado a abusivo, un Noul como "¿el cliente está frustrado?" lo colapsa en una probabilidad donde 0.5 significa "no estoy seguro", no "moderadamente frustrado". Si necesito un booleano, como "¿el mensaje pide un reembolso?", un Score agrega niveles que nadie puede describir de forma distinta y la confianza cae. La prueba es si mi código va a ramificar con él (Noul), umbralizar u ordenar con él (Score) o despachar con él (Choice).
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Docs de TypeSafe: páginas de las primitivas Choice, Score y Noul, y la referencia de la API para `POST /v1/systemone`, https://docs.typesafe.ai
+- Docs de Pydantic v2 para modelar las formas de respuesta que vas a registrar, https://docs.pydantic.dev/latest/

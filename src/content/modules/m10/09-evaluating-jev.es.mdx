@@ -1,0 +1,126 @@
+## Un modelo de decisión es más fácil de evaluar que un generador
+
+Los módulos 3 y 9 dedicaron mucho esfuerzo a la parte más difícil de las evals de LLM: el oráculo. El texto libre necesita un juez, y el juez necesita calibración. Jev quita esa capa. Cada pregunta devuelve una etiqueta o una probabilidad sobre un espacio que tú definiste, así que la eval es la que ya conoces de clasificación: etiquetas gold, una matriz de confusión, precisión y recall por clase, intervalos. Lo nuevo es que también obtienes una **probabilidad**, y una probabilidad puede estar mal de una segunda manera: no solo la etiqueta equivocada, sino la cantidad equivocada de certeza. Eso es calibración, y es la propiedad que decide si el gate por confianza funciona en absoluto.
+
+## Nivel 1: accuracy por pregunta
+
+Evalúa cada pregunta por separado, porque cada una es su propio oráculo:
+
+- **Choice:** accuracy, macro-F1, matriz de confusión contra etiquetas gold. Vigila la clase rara, igual que en el módulo 9.
+- **Score:** trátalo de dos formas. Redondea `score` al nivel más cercano y calcula accuracy y la matriz de confusión; y calcula el error absoluto medio en niveles, que premia los casi aciertos. Reporta ambos; un Score que siempre está un nivel desfasado es inútil para un umbral pero sirve para ranking.
+- **Noul:** umbraliza en 0.5 (o en tu umbral de producción) para precisión, recall y F1, más las métricas probabilísticas de abajo.
+
+Intervalos bootstrap sobre ítems, como en el módulo 9. Una diferencia entre dos redacciones de una pregunta que queda dentro del intervalo no es una diferencia.
+
+## Nivel 2: calibración
+
+Un modelo está calibrado si, entre todas las veces que dice 0.8, alrededor del 80% son verdaderas. Tres herramientas:
+
+**Diagrama de fiabilidad.** Agrupa las probabilidades predichas en bins (10 bins de igual ancho es el comienzo habitual), y para cada bin grafica la probabilidad predicha media contra la frecuencia observada de la etiqueta positiva. Un modelo calibrado queda sobre la diagonal. Por encima de la diagonal es sub-confiado; por debajo es sobre-confiado.
+
+**Brier score.** El error cuadrático medio entre la probabilidad y el resultado 0/1. Menor es mejor; 0.25 es lo que saca un 0.5 constante en un set balanceado. Mezcla discriminación y calibración en un solo número, así que es buena métrica de regresión y mal diagnóstico.
+
+**Expected Calibration Error (ECE).** El promedio ponderado, sobre bins, de la brecha absoluta entre confianza media y accuracy observada. Aísla la calibración. También es sensible al binning y a bins pequeños, así que reporta el número de bins y de ítems por bin, y prefiere bins adaptativos (de igual masa) cuando las probabilidades se agrupan cerca de 0 y 1, como suelen hacer las de Jev.
+
+```python
+import numpy as np
+
+
+def brier(p: np.ndarray, y: np.ndarray) -> float:
+    return float(np.mean((p - y) ** 2))
+
+
+def reliability(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False):
+    """Returns rows of (bin_lo, bin_hi, n, mean_confidence, observed_frequency)."""
+    edges = np.quantile(p, np.linspace(0, 1, bins + 1)) if equal_mass else np.linspace(0, 1, bins + 1)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (p >= lo) & (p < hi) if hi < edges[-1] else (p >= lo) & (p <= hi)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        rows.append((float(lo), float(hi), n, float(p[mask].mean()), float(y[mask].mean())))
+    return rows
+
+
+def ece(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False) -> float:
+    rows = reliability(p, y, bins, equal_mass)
+    total = len(p)
+    return float(sum(n / total * abs(conf - freq) for _, _, n, conf, freq in rows))
+```
+
+Para un Choice, calibra la **probabilidad máxima** contra "la opción elegida fue correcta", y por separado mira `confidence` de la misma forma; ambas son con lo que haces gate. Para un Score, calibra la probabilidad de cada nivel contra "el nivel gold fue este", o colapsa al nivel máximo como un Choice.
+
+## Leer la curva como una decisión
+
+Calibración y discriminación son cosas distintas. Un modelo puede estar perfectamente calibrado y ser inútil (dice 0.3 para todo en un set que es 30% positivo). Puede discriminar perfectamente y estar mal calibrado (dice 0.6 para todos los positivos y 0.4 para todos los negativos). Reporta ambas: AUROC o la curva precisión/cobertura del ejercicio 05 para discriminación, ECE y el diagrama de fiabilidad para calibración.
+
+Cuando el ECE es alto pero la discriminación es buena, puedes **recalibrar en código**: ajusta una regresión isotónica o Platt scaling sobre un set hold-out y mapea la probabilidad de Jev a una corregida antes de umbralizar. Eso mantiene tus umbrales con el significado de "alrededor de X% de precisión". Cuando la discriminación es pobre, ninguna recalibración ayuda; reescribe la pregunta.
+
+## Comparar Jev, un juez LLM y un cross-encoder
+
+La pregunta que tu equipo va a hacer de verdad es "¿cuál debería ir en este punto del pipeline?". Pon los tres en una tabla sobre el mismo set etiquetado, de forma pareada:
+
+| Dimensión | Jev | Juez LLM (structured output) | Cross-encoder |
+|---|---|---|---|
+| Calidad | accuracy / F1 / MRR con CI | igual | igual |
+| Calibración | ECE, Brier sobre las probabilidades devueltas | ECE sobre logprob o score auto-reportado, normalmente pobre | los scores no son probabilidades; solo rank |
+| Latencia p50 / p95 | medida, cientos de ms | medida, segundos | medida, decenas de ms en GPU |
+| Costo por 1,000 | tokens de entrada × precio publicado, con fecha | tokens de entrada + salida × precio, con fecha | costo de cómputo |
+| Explicación | ninguna | sí, en texto | ninguna |
+| Modo de fallo | opción válida equivocada | opción equivocada, salida malformada, drift con el prompt | rank equivocado |
+
+Dos observaciones honestas de esta tabla. El juez LLM es el único que puede decirte **por qué**, lo que importa para debugging y para colas de revisión humana. Y el cross-encoder es más rápido que Jev para ranking puro; Jev gana cuando además quieres un umbral con probabilidad y una pregunta que codifique una regla del dominio.
+
+## El adaptador System One: mismo schema, comparación justa
+
+Para comparar un LLM con Jev de forma justa, restringe el LLM al **mismo espacio de respuestas**: un schema de structured output con exactamente las opciones del Choice, los niveles del Score o un booleano, más un campo de probabilidad auto-reportada. Entonces ambos sistemas producen el mismo registro tipado y los evalúas con el mismo código. Este "adaptador" es también tu fallback de producción (lección 11): cuando Jev no está disponible, el LLM responde las mismas preguntas con la misma forma, y tus logs siguen siendo comparables.
+
+```python
+from pydantic import BaseModel, Field
+
+
+class ChoiceLike(BaseModel):
+    """What the LLM must return to stand in for a Jev Choice."""
+    choice: str
+    probabilities: dict[str, float] = Field(description="One entry per option, summing to 1")
+
+    def confidence(self) -> float:
+        n = len(self.probabilities)
+        return (max(self.probabilities.values()) - 1 / n) / (1 - 1 / n)
+```
+
+Espera que las probabilidades auto-reportadas del LLM estén peor calibradas que las de Jev en la mayoría de las tareas; eso es un hallazgo, no una suposición, y tu reporte debe mostrar los dos diagramas de fiabilidad lado a lado.
+
+## Drift: cuando el alias se mueve
+
+`jev-latest` pasó de `jev-1.13.0` a `jev-1.14.0` el 14 de octubre de 2026, y se va a mover de nuevo. Cada response lleva el id de `model` versionado. Tres reglas:
+
+1. **Fija** el id versionado en producción una vez ajustados los umbrales. Trata el alias como "dev".
+2. **Vuelve a correr la eval de calibración** sobre la versión nueva antes de cambiar, sobre el mismo set etiquetado, de forma pareada. Los umbrales ajustados en 1.13 no tienen garantía de sostenerse en 1.14 aunque la accuracy mejore.
+3. **Conviértelo en un test de regresión** (ejercicio 10): la accuracy no debe caer más allá de un margen, el ECE debe quedar bajo un techo y los checks por clase de tus clases raras deben pasar. Córrelo en CI contra respuestas cacheadas, y contra respuestas en vivo de forma programada.
+
+Esta es la disciplina de migración de modelo del capstone del módulo 9, aplicada a un modelo mucho más barato donde volver a correr toda la eval cuesta centavos.
+
+## Errores comunes
+
+- Reportar solo accuracy para un modelo cuyo punto entero es la probabilidad.
+- ECE con 10 bins de igual ancho sobre probabilidades que están 90% en el bin superior. Usa bins de igual masa y reporta conteos.
+- Comparar Jev con un LLM al que se le permitió responder en texto libre. Usa el adaptador.
+- Calibrar sobre los mismos ítems con los que ajustas umbrales.
+- Reajustar umbrales después de que un alias se movió y llamarlo "el mismo sistema".
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="¿Cómo decidirías si confiar en las probabilidades de Jev lo suficiente para automatizar una decisión?" level="senior">
+
+Separaría discriminación de calibración. Sobre un set etiquetado de unos cientos de ítems calcularía accuracy y la curva precisión/cobertura para ver si las respuestas de alta probabilidad son de hecho más a menudo correctas, con intervalos bootstrap. Luego un diagrama de fiabilidad con bins de igual masa, Brier y ECE, para ver si 0.9 significa alrededor de 90%. Si la discriminación es buena pero la calibración está desfasada, recalibro con regresión isotónica sobre un split hold-out y umbralizo la probabilidad corregida. Si la discriminación es pobre, ningún umbral va a funcionar y reescribo la pregunta o muevo el paso a un LLM. Fijaría la versión del modelo, la registraría junto a los umbrales y convertiría todo el análisis en un test de regresión en CI para que una versión nueva no pueda cambiar en silencio la tasa de automatización.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Guo et al., "On Calibration of Modern Neural Networks" (temperature scaling, ECE), https://arxiv.org/abs/1706.04599
+- Niculescu-Mizil y Caruana, "Predicting Good Probabilities with Supervised Learning" (Platt, isotónica), ICML 2005
+- Guía de calibración de scikit-learn, https://scikit-learn.org/stable/modules/calibration.html
+- Módulo 9, lecciones 02 y 05, y el capstone de migración de modelo

@@ -175,11 +175,25 @@
     "es": "Modelo de aislamiento con infraestructura compartida pero un schema, colección o namespace separado por tenant."
   },
   {
+    "term": "Brier score",
+    "termEs": "Brier score",
+    "module": "m10",
+    "en": "The mean squared error between a predicted probability and the 0/1 outcome. Lower is better; a constant 0.5 scores 0.25 on a balanced set. Mixes calibration and discrimination, so it suits regression tests more than diagnosis.",
+    "es": "El error cuadrático medio entre una probabilidad predicha y el resultado 0/1. Menor es mejor; un 0.5 constante saca 0.25 en un set balanceado. Mezcla calibración y discriminación, así que sirve más para tests de regresión que para diagnóstico."
+  },
+  {
     "term": "C4 model",
     "termEs": "Modelo C4",
     "module": "m7",
     "en": "A way to diagram software architecture at four zoom levels: system context, containers, components and code.",
     "es": "Una forma de diagramar arquitectura de software en cuatro niveles de zoom: contexto del sistema, contenedores, componentes y código."
+  },
+  {
+    "term": "Calibration",
+    "termEs": "Calibración",
+    "module": "m10",
+    "en": "The property that predicted probabilities match observed frequencies: among answers given 0.8, about 80% are true. Measured with reliability diagrams, Brier score and ECE on labeled data; distinct from discrimination.",
+    "es": "La propiedad de que las probabilidades predichas coincidan con las frecuencias observadas: entre las respuestas con 0.8, alrededor del 80% son verdaderas. Se mide con diagramas de fiabilidad, Brier score y ECE sobre datos etiquetados; es distinta de la discriminación."
   },
   {
     "term": "Canary release",
@@ -217,6 +231,13 @@
     "es": "Una capa de persistencia de LangGraph, como MemorySaver o un saver de Postgres, que guarda el estado del grafo después de cada paso por thread_id, permitiendo hilos multi-turno, interrupciones y reanudación."
   },
   {
+    "term": "Choice (primitive)",
+    "termEs": "Choice (primitiva)",
+    "module": "m10",
+    "en": "A Jev question that picks one of up to 255 named options described in criteria. The answer contains choice, probabilities over every option and confidence.",
+    "es": "Una pregunta de Jev que elige una de hasta 255 opciones con nombre descritas en criteria. La respuesta contiene choice, probabilities sobre cada opción y confidence."
+  },
+  {
     "term": "Chunking",
     "termEs": "Chunking (fragmentación)",
     "module": "m2",
@@ -245,6 +266,20 @@
     "es": "Estadístico de acuerdo entre dos evaluadores que corrige el acuerdo esperado por azar. Se usa para verificar si un juez LLM coincide con las etiquetas humanas."
   },
   {
+    "term": "Composite scoring",
+    "termEs": "Composite scoring",
+    "module": "m10",
+    "en": "Splitting a complex judgment into one Score question per dimension, normalising each score to 0–1 and combining them with weights kept in code, so priorities can change without rewording questions.",
+    "es": "Dividir un juicio complejo en una pregunta Score por dimensión, normalizar cada score a 0–1 y combinarlos con pesos mantenidos en código, para que las prioridades puedan cambiar sin reescribir preguntas."
+  },
+  {
+    "term": "Confidence (Jev)",
+    "termEs": "Confianza (Jev)",
+    "module": "m10",
+    "en": "A summary statistic of how peaked an answer's probability distribution is, from 0 (even split) to 1 (all on one option). For a Choice with n options it is (p_max − 1/n)/(1 − 1/n). It is not the probability that the answer is correct.",
+    "es": "Un estadístico resumen de qué tan concentrada está la distribución de probabilidad de una respuesta, de 0 (reparto parejo) a 1 (todo en una opción). Para un Choice con n opciones es (p_max − 1/n)/(1 − 1/n). No es la probabilidad de que la respuesta sea correcta."
+  },
+  {
     "term": "Confidence calibration",
     "termEs": "Calibración de confianza",
     "module": "m1",
@@ -257,6 +292,13 @@
     "module": "m9",
     "en": "A range that expresses the uncertainty of an estimate, such as an accuracy or a difference between models. Eval results should be reported with one, not as bare points.",
     "es": "Un rango que expresa la incertidumbre de una estimación, como una accuracy o una diferencia entre modelos. Los resultados de evals deben reportarse con uno, no como puntos sueltos."
+  },
+  {
+    "term": "Confidence-gated routing",
+    "termEs": "Routing con gate por confianza",
+    "module": "m10",
+    "en": "Using an answer's confidence (or a Noul's distance from 0.5) as a second decision axis: act automatically above one threshold, add a safeguard in a middle band, and send low-confidence cases to a human. Thresholds are set per action by the cost of a wrong action and validated on labeled data.",
+    "es": "Usar la confianza de una respuesta (o la distancia de un Noul a 0.5) como segundo eje de decisión: actuar automáticamente por encima de un umbral, agregar una salvaguarda en una banda media y mandar los casos de baja confianza a un humano. Los umbrales se fijan por acción según el costo de una acción equivocada y se validan con datos etiquetados."
   },
   {
     "term": "Connection pooling",
@@ -511,6 +553,13 @@
     "es": "La regla de la plataforma que desbloquea el siguiente módulo solo cuando el mejor puntaje del examen del módulo actual es de al menos 70 %, con una opción manual para contenido que ya conoces."
   },
   {
+    "term": "Expected Calibration Error (ECE)",
+    "termEs": "Expected Calibration Error (ECE)",
+    "module": "m10",
+    "en": "The weighted average, over probability bins, of the gap between mean predicted probability and observed frequency. Isolates calibration. Sensitive to binning; prefer equal-mass bins and report counts when probabilities cluster near 0 and 1.",
+    "es": "El promedio ponderado, sobre bins de probabilidad, de la brecha entre la probabilidad predicha media y la frecuencia observada. Aísla la calibración. Es sensible al binning; prefiere bins de igual masa y reporta conteos cuando las probabilidades se agrupan cerca de 0 y 1."
+  },
+  {
     "term": "Exponential backoff",
     "termEs": "Backoff exponencial",
     "module": "m1",
@@ -630,6 +679,13 @@
     "es": "En un swarm, la transferencia del control de un agente a otro, normalmente mediante una handoff tool que devuelve un Command que enruta al agente destino."
   },
   {
+    "term": "Hierarchical beam search (Jev)",
+    "termEs": "Beam search jerárquico (Jev)",
+    "module": "m10",
+    "en": "Classifying through a deep taxonomy with one Choice per level, keeping the top k paths weighted by the product of their probabilities instead of committing greedily at each level.",
+    "es": "Clasificar a través de una taxonomía profunda con un Choice por nivel, manteniendo los k mejores caminos ponderados por el producto de sus probabilidades en lugar de comprometerse greedy en cada nivel."
+  },
+  {
     "term": "High-water mark",
     "termEs": "Marca de agua alta (watermark)",
     "module": "m6",
@@ -712,6 +768,13 @@
     "module": "m5",
     "en": "An inverted-file vector index that clusters existing vectors into lists and searches the nearest `probes` lists. Fast to build, but must be built after data is loaded.",
     "es": "Índice vectorial de archivo invertido que agrupa los vectores existentes en listas y busca en las `probes` listas más cercanas. Rápido de construir, pero debe crearse después de cargar los datos."
+  },
+  {
+    "term": "Jev",
+    "termEs": "Jev",
+    "module": "m10",
+    "en": "TypeSafe AI's flagship model and the first System One model (early access since September 2026, named after economist W. S. Jevons). Called through POST /v1/systemone with a state and a map of Choice, Score and Noul questions; the alias jev-latest currently points to jev-1.14.0.",
+    "es": "El modelo insignia de TypeSafe AI y el primer modelo System One (acceso anticipado desde septiembre de 2026, nombrado por el economista W. S. Jevons). Se invoca con POST /v1/systemone con un state y un mapa de preguntas Choice, Score y Noul; el alias jev-latest apunta hoy a jev-1.14.0."
   },
   {
     "term": "Jitter",
@@ -903,6 +966,13 @@
     "es": "Un nombre estable que piden las apps (como chat-default) y que el gateway mapea a modelos concretos, lo que permite cambiar modelos de forma centralizada."
   },
   {
+    "term": "Model alias (jev-latest)",
+    "termEs": "Alias de modelo (jev-latest)",
+    "module": "m10",
+    "en": "A model name that points to a versioned id and moves when a new release ships. Responses always report the versioned id that answered. Pin the versioned id in production once thresholds are tuned.",
+    "es": "Un nombre de modelo que apunta a un id versionado y se mueve cuando sale un release nuevo. Las responses siempre reportan el id versionado que respondió. Fija el id versionado en producción una vez ajustados los umbrales."
+  },
+  {
     "term": "Model cascade",
     "termEs": "Cascada de modelos",
     "module": "m1",
@@ -973,11 +1043,25 @@
     "es": "Un tenant cuyo uso intensivo degrada el rendimiento de los demás en infraestructura compartida. Se mitiga con rate limits, cuotas y topes de colas por tenant."
   },
   {
+    "term": "Non-autoregressive",
+    "termEs": "No autorregresivo",
+    "module": "m10",
+    "en": "A model that does not generate output token by token. Jev ingests the state once and evaluates every question in parallel and in isolation, so answers are always constrained to the supplied options and adding questions barely changes latency.",
+    "es": "Un modelo que no genera la salida token a token. Jev ingiere el state una vez y evalúa cada pregunta en paralelo y de forma aislada, así que las respuestas siempre quedan restringidas a las opciones dadas y agregar preguntas apenas cambia la latencia."
+  },
+  {
     "term": "Non-inferiority margin",
     "termEs": "Margen de no inferioridad",
     "module": "m9",
     "en": "The largest quality loss stakeholders accept, agreed before testing. A candidate is non-inferior if the lower bound of the CI of (candidate minus baseline) is above minus the margin.",
     "es": "La mayor pérdida de calidad que aceptan los stakeholders, acordada antes de probar. Un candidato es no inferior si el límite inferior del CI de (candidato menos baseline) está por encima de menos el margen."
+  },
+  {
+    "term": "Noul (primitive)",
+    "termEs": "Noul (primitiva)",
+    "module": "m10",
+    "en": "A Jev question that judges one yes/no proposition and returns noul, the probability (0–1) that it is true. It has no separate confidence field; |2p − 1| gives one on the Choice scale if needed.",
+    "es": "Una pregunta de Jev que juzga una proposición sí/no y devuelve noul, la probabilidad (0–1) de que sea verdadera. No tiene campo confidence separado; |2p − 1| da uno en la escala de Choice si hace falta."
   },
   {
     "term": "Novelty effect",
@@ -1097,6 +1181,13 @@
     "module": "m3",
     "en": "A judge's tendency to prefer an answer because of where it appears (first or second) in a pairwise comparison. Mitigated by swapping order.",
     "es": "La tendencia de un juez a preferir una respuesta por su posición (primera o segunda) en una comparación pairwise. Se mitiga intercambiando el orden."
+  },
+  {
+    "term": "Precision/coverage curve",
+    "termEs": "Curva precisión/cobertura",
+    "module": "m10",
+    "en": "For each confidence threshold, the fraction of items that would be auto-decided (coverage) against the fraction of those that are correct (precision). Used to choose thresholds and estimate human workload.",
+    "es": "Para cada umbral de confianza, la fracción de ítems que se decidirían automáticamente (cobertura) contra la fracción de esos que son correctos (precisión). Se usa para elegir umbrales y estimar la carga humana."
   },
   {
     "term": "Prediction-powered inference",
@@ -1260,6 +1351,13 @@
     "es": "Un archivo versionado que fija todo lo que define el comportamiento de una funcionalidad LLM: versión del prompt, snapshot del modelo, parámetros, guardrail y evidencia de evaluación."
   },
   {
+    "term": "Reliability diagram",
+    "termEs": "Diagrama de fiabilidad",
+    "module": "m10",
+    "en": "A plot of observed frequency against mean predicted probability per bin. A calibrated model lies on the diagonal; below it is over-confident, above it under-confident.",
+    "es": "Un gráfico de frecuencia observada contra probabilidad predicha media por bin. Un modelo calibrado queda sobre la diagonal; por debajo es sobre-confiado, por encima sub-confiado."
+  },
+  {
     "term": "Repair loop",
     "termEs": "Bucle de reparación",
     "module": "m1",
@@ -1286,6 +1384,13 @@
     "module": "m6",
     "en": "A Databricks chat UI created by agents.deploy where subject-matter experts test an agent, give feedback and label traces.",
     "es": "Una interfaz de chat de Databricks creada por agents.deploy donde los expertos del dominio prueban un agente, dan feedback y etiquetan traces."
+  },
+  {
+    "term": "RLCD",
+    "termEs": "RLCD",
+    "module": "m10",
+    "en": "Reinforcement Learning for Calibrated Decisions, the training method TypeSafe says it uses so Jev's probabilities reflect uncertainty. Calibration is measured across groups of predictions and is not guaranteed for any single answer or dataset.",
+    "es": "Reinforcement Learning for Calibrated Decisions, el método de entrenamiento que TypeSafe dice usar para que las probabilidades de Jev reflejen incertidumbre. La calibración se mide sobre grupos de predicciones y no está garantizada para ninguna respuesta o dataset individual."
   },
   {
     "term": "Row-level security (RLS)",
@@ -1316,11 +1421,32 @@
     "es": "Instrucciones operativas paso a paso para tareas rutinarias y de emergencia: deploy, rollback, rotar secretos, escalar, cambiar flags."
   },
   {
+    "term": "Schema conformance",
+    "termEs": "Conformidad con el schema",
+    "module": "m10",
+    "en": "The guarantee a System One model actually gives: every answer is one of the supplied options or levels, never malformed or outside the answer space. It says nothing about whether the chosen option is correct.",
+    "es": "La garantía que realmente da un modelo System One: cada respuesta es una de las opciones o niveles dados, nunca malformada ni fuera del espacio de respuestas. No dice nada sobre si la opción elegida es correcta."
+  },
+  {
+    "term": "Score (primitive)",
+    "termEs": "Score (primitiva)",
+    "module": "m10",
+    "en": "A Jev question that places the state on an ordered rubric of 2–10 described levels. The answer contains score (the probability-weighted level position), legend, per-level probabilities and confidence. Levels should describe situations, not numbers.",
+    "es": "Una pregunta de Jev que ubica el state en una rúbrica ordenada de 2–10 niveles descritos. La respuesta contiene score (la posición de nivel ponderada por probabilidad), legend, probabilities por nivel y confidence. Los niveles deben describir situaciones, no números."
+  },
+  {
     "term": "Scorer",
     "termEs": "Scorer",
     "module": "m6",
     "en": "In MLflow GenAI evaluation, a function that assesses an app's output: a built-in LLM judge, a Guidelines rule or custom code.",
     "es": "En la evaluación GenAI de MLflow, una función que evalúa la salida de una app: un juez LLM integrado, una regla Guidelines o código personalizado."
+  },
+  {
+    "term": "SDE cascade",
+    "termEs": "Cascada SDE",
+    "module": "m10",
+    "en": "Structured-data-extraction cascade: a cheap LLM extracts a record, one Jev request checks each field with narrow Nouls phrased so true means wrong, and an any-style gate escalates only flagged documents to a stronger model.",
+    "es": "Cascada de extracción de datos estructurados: un LLM barato extrae un registro, una request a Jev verifica cada campo con Nouls estrechos redactados para que true signifique incorrecto, y un gate estilo any escala solo los documentos marcados a un modelo más fuerte."
   },
   {
     "term": "Self-preference bias",
@@ -1393,11 +1519,25 @@
     "es": "Una unidad de trabajo cronometrada dentro de un trace, con nombre, inicio y fin, padre y atributos como el modelo y el uso de tokens."
   },
   {
+    "term": "Speculative fan-out",
+    "termEs": "Speculative fan-out",
+    "module": "m10",
+    "en": "Putting every question the code might need into one Jev request, including questions that only matter for some inputs, and letting the code ignore unused answers. Cheap because the state is paid once and questions run in parallel.",
+    "es": "Poner todas las preguntas que el código podría necesitar en una sola request a Jev, incluidas las que solo importan para algunos inputs, y dejar que el código ignore las respuestas no usadas. Es barato porque el state se paga una vez y las preguntas corren en paralelo."
+  },
+  {
     "term": "STAR method",
     "termEs": "Método STAR",
     "module": "m7",
     "en": "A structure for behavioral answers: Situation, Task, Action, Result, often extended with what you learned.",
     "es": "Una estructura para respuestas conductuales: Situación, Tarea, Acción, Resultado, a menudo ampliada con lo que aprendiste."
+  },
+  {
+    "term": "State (Jev)",
+    "termEs": "State (Jev)",
+    "module": "m10",
+    "en": "The content a Jev request evaluates: a string, a JSON object or an array of text. Every question in the request is judged against the same state. Keys inside a structured state are referenced from instructions with backticks.",
+    "es": "El contenido que evalúa una request a Jev: un string, un objeto JSON o un array de texto. Cada pregunta de la request se juzga contra el mismo state. Las claves dentro de un state estructurado se referencian desde las instructions con backticks."
   },
   {
     "term": "StateGraph",
@@ -1454,6 +1594,20 @@
     "module": "m4",
     "en": "A multi-agent design where a central router agent decides which specialist agent runs next, and control returns to the supervisor after each step.",
     "es": "Un diseño multi-agente en el que un agente enrutador central decide qué agente especialista corre después, y el control vuelve al supervisor tras cada paso."
+  },
+  {
+    "term": "System One adapter",
+    "termEs": "Adaptador System One",
+    "module": "m10",
+    "en": "An LLM constrained through a structured-output schema to exactly the same answer space as a Jev question, returning the same typed record. Used for fair Jev-vs-LLM comparisons and as the production fallback when Jev is unavailable.",
+    "es": "Un LLM restringido mediante un schema de structured output exactamente al mismo espacio de respuestas que una pregunta de Jev, devolviendo el mismo registro tipado. Se usa para comparaciones justas Jev-vs-LLM y como fallback de producción cuando Jev no está disponible."
+  },
+  {
+    "term": "System One model",
+    "termEs": "Modelo System One",
+    "module": "m10",
+    "en": "A class of AI model built for fast, typed decisions: it reads natural-language input like an LLM but returns a probability distribution over options you define instead of generated text. Named after Kahneman's fast, intuitive System 1.",
+    "es": "Una clase de modelo de IA construida para decisiones rápidas y tipadas: lee entrada en lenguaje natural como un LLM pero devuelve una distribución de probabilidad sobre opciones que tú defines en lugar de texto generado. Lleva el nombre del Sistema 1 rápido e intuitivo de Kahneman."
   },
   {
     "term": "System prompt",

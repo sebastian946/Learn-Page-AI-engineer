@@ -1,0 +1,170 @@
+## Think in atomic decisions
+
+An LLM invites you to write one big prompt. Jev invites the opposite: many small, typed questions whose answers you combine in code. The patterns in this lesson are the ways that combination tends to look in real systems. Every one of them follows from three facts you already have: questions in a request run in parallel against the same state, questions do not see each other, and answers are numbers.
+
+## Speculative fan-out
+
+Ask every question your code **might** need in one request, including the ones that only matter for some inputs, and let the code ignore the rest. A ticket that is not a return does not need `return_reason`, but asking it costs a few tokens and no extra latency, and saves a second round-trip when it is a return.
+
+```python
+from typesafe_sdk import Choice, Noul, Score
+
+TRIAGE = {
+    "department": Choice(instructions="Which team should handle `message`?",
+                         criteria={"returns": "...", "shipping": "...", "billing": "..."}),
+    "return_reason": Choice(instructions="If the customer wants to return something, why?",
+                            criteria={"wrong_size": "...", "damaged": "...", "changed_mind": "...", "other": "..."}),
+    "shipping_issue": Choice(instructions="If this is a shipping problem, which kind?",
+                             criteria={"not_delivered": "...", "delayed": "...", "wrong_address": "..."}),
+    "wants_human": Noul(instructions="The customer asks to speak to a person."),
+    "language": Choice(instructions="What language is `message` written in?",
+                       criteria={"en": None, "es": None, "pt": None, "fr": None, "other": None}),
+}
+
+
+def dispatch(answers) -> dict:
+    dept = answers["department"]
+    issue = {"returns": "return_reason", "shipping": "shipping_issue"}.get(dept.choice)
+    return {
+        "team": dept.choice,
+        "issue": answers[issue].choice if issue else None,   # the other answer is ignored
+        "escalate": answers["wants_human"].noul > 0.7,
+        "language": answers["language"].choice,
+    }
+```
+
+TypeSafe's own cookbook measured 13 questions in one call against 13 calls: roughly 10x faster and 12x cheaper with identical answers. The only limit is context: state plus all questions under 64k tokens, state plus the longest question under 32k.
+
+## Composite scoring
+
+A judgment that depends on several things becomes one Score per thing, normalised to 0–1 and weighted in code. The weights are visible, versioned and changeable without touching a prompt.
+
+```python
+PRIORITY_QUESTIONS = {
+    "severity": Score(instructions="How severe is the reported issue?",
+                      criteria=["Cosmetic", "Degraded, workaround exists", "Blocking, no workaround"]),
+    "frustration": Score(instructions="How frustrated is the customer?",
+                         criteria=["Calm", "Frustrated but civil", "Angry or threatening to leave"]),
+    "report_quality": Score(instructions="How much does the report give an engineer to work with?",
+                            criteria=["No detail", "Names the feature only", "Steps or environment", "Steps and environment"]),
+}
+WEIGHTS = {"severity": 0.6, "frustration": 0.3, "report_quality": 0.1}
+
+
+def priority(answers) -> float:
+    total = 0.0
+    for qid, w in WEIGHTS.items():
+        top = len(PRIORITY_QUESTIONS[qid].criteria) - 1
+        total += w * answers[qid].score / top
+    return total
+```
+
+When the ranking disagrees with what your team would do, change a weight, re-run on cached answers, compare. No API calls. That is the same loop you used for metric weights in Module 9.
+
+## Intent routing
+
+Classify first with Jev, then send each request to the cheapest handler that can serve it: deterministic code, a specialist LLM with the right context, or a human. The intent Choice and a complexity Score go in the same request; the confidence of each is a second axis.
+
+```python
+def route(answers, ticket_id: str) -> None:
+    intent, complexity = answers["intent"], answers["complexity"]
+    if intent.confidence < 0.5:
+        return human_queue(ticket_id)                      # not sure what this is
+    match intent.choice:
+        case "order_status":
+            return lookup_order(ticket_id)                 # plain code, no model
+        case "product_question":
+            return llm_answer(ticket_id, context="catalog")
+        case "complaint":
+            if complexity.score > 1 or complexity.confidence < 0.5:
+                return human_queue(ticket_id)
+            return llm_answer(ticket_id, context="complaints_playbook")
+```
+
+The expensive handler only runs for the inputs that need it. Lesson 11 turns this into a cost model.
+
+## Hierarchical classification
+
+A taxonomy with 2,000 leaves does not fit in one Choice. Walk it level by level: a Choice over the top-level categories, then a second request whose options are the children of the chosen node. Because the second request's options **depend on the first answer**, two requests are legitimate here. Do not commit greedily. Keep the top `k` candidates at each level, weight each path by the product of its probabilities, and expand the best `k` paths at the next level. That is beam search over Choice probabilities, and TypeSafe's cookbook shows it beats greedy descent on patent, product and biomedical hierarchies.
+
+```python
+def beam_classify(client, state, tree: dict, k: int = 3, depth: int = 3) -> list[tuple[list[str], float]]:
+    beams: list[tuple[list[str], float]] = [([], 1.0)]
+    for _ in range(depth):
+        expanded = []
+        for path, prob in beams:
+            node = tree_at(tree, path)
+            if not node.get("children"):
+                expanded.append((path, prob))
+                continue
+            r = client.system_one(
+                state=state,
+                questions={"next": Choice(instructions="Which category best fits `document`?",
+                                          criteria={c: node["children"][c]["desc"] for c in node["children"]})},
+            )
+            for option, p in r.answers["next"].probabilities.items():
+                expanded.append((path + [option], prob * p))
+        beams = sorted(expanded, key=lambda b: -b[1])[:k]
+    return beams
+```
+
+Each level's requests for the `k` beams are independent, so run them concurrently.
+
+## Self-consistency with Nouls
+
+Jev's answers vary a little between runs. For a checklist of Nouls over a claim, a contract, or an extraction, you can run the same request `n` times and look at the spread. Tight spread near 0.9 is a stable yes. A value that bounces across 0.5 is an item that should go to a person regardless of the mean. In practice one run with the 0.3–0.7 "uncertain" band already captures most of that; sampling buys you a variance estimate for your calibration report (lesson 10), not a different decision rule.
+
+## The SDE cascade: cheap first, escalate on failed checks
+
+Structured data extraction is an LLM job. Verifying the extraction is a Jev job. The cascade:
+
+1. A cheap LLM extracts the record with a schema (Module 1).
+2. One Jev request asks a battery of narrow Nouls, one per field and failure mode, each phrased so that **true means something is wrong**: "Does `extracted_field` violate the `type` declared in `field_spec`?", "Is `extracted_field` absent from the `source`?".
+3. A `max`-style gate: if **any** flag exceeds the threshold, escalate that document to a stronger, slower model. A mean would average one confident red flag into silence.
+4. Only the escalated documents pay for the expensive model.
+
+```python
+FIRE_T = 0.7
+
+
+def should_escalate(checks: dict[str, float]) -> tuple[bool, dict[str, float]]:
+    fired = {qid: p for qid, p in checks.items() if p > FIRE_T}
+    return bool(fired), fired
+```
+
+The cascade saves money only if the verifier costs far less than the escalation rung and the flags separate well (high on wrong fields, low on right ones). Measure both on labeled extractions before you ship it.
+
+## Keep arithmetic and dates in code
+
+The vendor is explicit that Jev is unreliable at counting, arithmetic and comparing dates. The pattern is **extract with Jev, compute in code**:
+
+- Ask a Choice "Which line of `invoice` states the due date?" with the line numbers as options, then parse the date in Python.
+- For "is the order over the free-shipping threshold?", compute the total in code and put `"total_usd": 112.40` and `"threshold_usd": 100` in the state, then ask a Noul only if the question is about meaning ("does the customer claim they qualified for free shipping?").
+- For relative dates ("next Friday"), ask Jev which anchor and which offset words appear, resolve them with a calendar library, and unit-test the resolver.
+
+<Callout type="warning" title="Two requests are the exception">
+
+The only honest reasons for a second request are that your code cannot build it until it has the first answer: it needs the answer to fetch more state, to decide what the state contains, or to choose the next options (hierarchies). If the second request could have been asked against the original state, it belongs in the first request.
+
+</Callout>
+
+## Common mistakes
+
+- Sending one question per request "to keep it simple". It is slower, dearer and no simpler.
+- Averaging flags in a cascade gate. Use `any` or `max`.
+- Greedy descent in a hierarchy. Keep a beam.
+- Letting a Score do the weighting. Normalise and weight in code where you can read it.
+- Asking Jev to count or compare numbers.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Design a document classifier for a 1,500-leaf taxonomy with Jev. Where are the API calls and why?" level="senior">
+
+Walk the hierarchy. One Choice per level with that node's children as options, descriptions included, so each call stays well under 255 options and the descriptions separate siblings. I keep a beam of the top k paths weighted by the product of probabilities rather than committing greedily, because a near-tie at level one is where greedy fails. Calls at the same level for different beams are independent, so they run concurrently; depth three with k equal to three is at most seven requests per document, each a few hundred milliseconds. Second requests are justified here because the options depend on the previous answer. I gate the final path on its product probability, send low ones to review, and evaluate accuracy per level on a labeled set, because errors at level one dominate.
+
+</InterviewQuestion>
+
+## Further reading
+
+- TypeSafe docs: Patterns (fan-out, confidence-gated routing, composite scoring, intent routing) and the cookbooks on parallel questions, hierarchical classification and the SDE cascade, https://docs.typesafe.ai
+- Module 1 structured outputs (the extraction rung of the cascade), Module 4 routing nodes in LangGraph

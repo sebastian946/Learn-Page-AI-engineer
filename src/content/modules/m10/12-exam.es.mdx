@@ -1,0 +1,23 @@
+## Sobre este examen
+
+Este examen verifica que puedas ubicar correctamente un modelo System One dentro de un sistema con LLM y razonar sobre sus probabilidades. Tiene 16 preguntas y un límite de 30 minutos. La nota de aprobación es **70%**.
+
+**Qué cubre:**
+
+- Qué es y qué no es Jev: evaluación paralela no autorregresiva, conformidad con el schema versus corrección, la propia lista de puntos débiles del proveedor, cuándo usar código simple, Jev o un LLM
+- Las tres primitivas: Choice, Score y Noul, sus campos de request y response, y cómo escribir criterios que se separen
+- Probabilidades y confianza: las fórmulas publicadas, por qué 0.5 depende del número de opciones, tres bandas escaladas por riesgo, validar umbrales con datos etiquetados
+- Patrones: speculative fan-out, composite scoring, intent routing, beam search jerárquico, la cascada SDE, mantener la aritmética y las fechas en código
+- Jev dentro de RAG y agentes: re-ranking, clasificación de pasajes, verificación de citas, baterías de guardrails, gates de tool calls
+- Evaluación y producción: curvas de calibración, Brier, ECE, drift cuando el alias se mueve, modelado de costos, retries, fallbacks con el mismo schema
+
+**Tipos de pregunta:** opción única, selección múltiple, ordenar los pasos y lectura de código (JSON de request, cálculo de confianza, lógica de umbrales, un gate de cascada).
+
+**Cómo prepararte:**
+
+1. Recalcula a mano los ejemplos de confianza de Choice y Score de la lección 04.
+2. Relee tu `thresholds.json` del ejercicio 05 y explica por qué los dos gates difieren.
+3. Sé capaz de decir qué hace tu gate de tool calls cuando Jev no está disponible, y por qué.
+4. Repasa la sección de "errores comunes" de cada lección.
+
+Las opciones se mezclan en cada intento. Lee todas las explicaciones después de enviar.

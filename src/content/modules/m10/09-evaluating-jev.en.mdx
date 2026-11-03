@@ -1,0 +1,126 @@
+## A decision model is easier to evaluate than a generator
+
+Module 3 and Module 9 spent a lot of effort on the hardest part of LLM evals: the oracle. Free text needs a judge, and the judge needs calibrating. Jev removes that layer. Each question returns a label or a probability over a space you defined, so the eval is the one you already know from classification: gold labels, a confusion matrix, per-class precision and recall, intervals. What is new is that you also get a **probability**, and a probability can be wrong in a second way: not just the wrong label, but the wrong amount of certainty. That is calibration, and it is the property that decides whether confidence gating works at all.
+
+## Level 1: accuracy per question
+
+Evaluate each question on its own, because each one is its own oracle:
+
+- **Choice:** accuracy, macro-F1, confusion matrix against gold labels. Watch the rare class, the same way as in Module 9.
+- **Score:** treat it two ways. Round `score` to the nearest level and compute accuracy and the confusion matrix; and compute mean absolute error in levels, which rewards near misses. Report both; a Score that is always one level off is useless for a threshold but fine for ranking.
+- **Noul:** threshold at 0.5 (or your production threshold) for precision, recall and F1, plus the probabilistic metrics below.
+
+Bootstrap intervals over items, as in Module 9. A difference between two question wordings that sits inside the interval is not a difference.
+
+## Level 2: calibration
+
+A model is calibrated if, among all the times it says 0.8, about 80% are true. Three tools:
+
+**Reliability diagram.** Bin the predicted probabilities (10 equal-width bins is the usual start), and for each bin plot the mean predicted probability against the observed frequency of the positive label. A calibrated model sits on the diagonal. Above the diagonal is under-confident; below is over-confident.
+
+**Brier score.** The mean squared error between the probability and the 0/1 outcome. Lower is better; 0.25 is what a constant 0.5 scores on a balanced set. It mixes discrimination and calibration into one number, so it is a good regression metric and a poor diagnostic.
+
+**Expected Calibration Error (ECE).** The weighted average, over bins, of the absolute gap between mean confidence and observed accuracy. It isolates calibration. It is also sensitive to binning and to small bins, so report the bin count and the number of items per bin, and prefer adaptive (equal-mass) bins when the probabilities cluster near 0 and 1, which Jev's often do.
+
+```python
+import numpy as np
+
+
+def brier(p: np.ndarray, y: np.ndarray) -> float:
+    return float(np.mean((p - y) ** 2))
+
+
+def reliability(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False):
+    """Returns rows of (bin_lo, bin_hi, n, mean_confidence, observed_frequency)."""
+    edges = np.quantile(p, np.linspace(0, 1, bins + 1)) if equal_mass else np.linspace(0, 1, bins + 1)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (p >= lo) & (p < hi) if hi < edges[-1] else (p >= lo) & (p <= hi)
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        rows.append((float(lo), float(hi), n, float(p[mask].mean()), float(y[mask].mean())))
+    return rows
+
+
+def ece(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False) -> float:
+    rows = reliability(p, y, bins, equal_mass)
+    total = len(p)
+    return float(sum(n / total * abs(conf - freq) for _, _, n, conf, freq in rows))
+```
+
+For a Choice, calibrate the **top probability** against "was the chosen option correct", and separately look at `confidence` the same way; both are what you gate on. For a Score, calibrate each level's probability against "was the gold level this one", or collapse to top level like a Choice.
+
+## Reading the curve into a decision
+
+Calibration and discrimination are different. A model can be perfectly calibrated and useless (it says 0.3 for everything on a set that is 30% positive). It can discriminate perfectly and be badly calibrated (it says 0.6 for all the positives and 0.4 for all the negatives). Report both: AUROC or the precision/coverage curve from exercise 05 for discrimination, ECE and the reliability diagram for calibration.
+
+When ECE is high but discrimination is good, you can **recalibrate in code**: fit isotonic regression or Platt scaling on a held-out set and map Jev's probability to a corrected one before thresholding. That keeps your thresholds meaningful as "about X% precise". When discrimination is poor, no recalibration helps; rewrite the question.
+
+## Comparing Jev, an LLM judge and a cross-encoder
+
+The question your team will actually ask is "which one should sit at this point in the pipeline?". Put the three on one table on the same labeled set, paired:
+
+| Dimension | Jev | LLM judge (structured output) | Cross-encoder |
+|---|---|---|---|
+| Quality | accuracy / F1 / MRR with CI | same | same |
+| Calibration | ECE, Brier on returned probabilities | ECE on logprob or self-reported score, usually poor | scores are not probabilities; rank only |
+| Latency p50 / p95 | measured, hundreds of ms | measured, seconds | measured, tens of ms on GPU |
+| Cost per 1,000 | input tokens × published price, dated | input + output tokens × price, dated | compute cost |
+| Explanation | none | yes, in text | none |
+| Failure mode | wrong valid option | wrong option, malformed output, drift with prompt | wrong rank |
+
+Two honest observations from this table. The LLM judge is the only one that can tell you **why**, which matters for debugging and for human review queues. And the cross-encoder is faster than Jev for pure ranking; Jev wins when you also want a threshold with a probability and a question that encodes a domain rule.
+
+## The System One adapter: same schema, fair comparison
+
+To compare an LLM with Jev fairly, constrain the LLM to **the same answer space**: a structured-output schema with exactly the Choice options, Score levels or a boolean, plus a self-reported probability field. Then both systems produce the same typed record and you evaluate them with the same code. This "adapter" is also your production fallback (lesson 11): when Jev is unavailable, the LLM answers the same questions in the same shape, and your logs stay comparable.
+
+```python
+from pydantic import BaseModel, Field
+
+
+class ChoiceLike(BaseModel):
+    """What the LLM must return to stand in for a Jev Choice."""
+    choice: str
+    probabilities: dict[str, float] = Field(description="One entry per option, summing to 1")
+
+    def confidence(self) -> float:
+        n = len(self.probabilities)
+        return (max(self.probabilities.values()) - 1 / n) / (1 - 1 / n)
+```
+
+Expect the LLM's self-reported probabilities to be worse calibrated than Jev's on most tasks; that is a finding, not an assumption, and your report should show the two reliability diagrams side by side.
+
+## Drift: when the alias moves
+
+`jev-latest` moved from `jev-1.13.0` to `jev-1.14.0` on October 14, 2026, and it will move again. Every response carries the versioned `model` id. Three rules:
+
+1. **Pin** the versioned id in production once thresholds are tuned. Treat the alias as "dev".
+2. **Re-run the calibration eval** on the new version before switching, on the same labeled set, paired. Thresholds tuned on 1.13 are not guaranteed to hold on 1.14 even if accuracy improves.
+3. **Make it a regression test** (exercise 10): accuracy must not drop beyond a margin, ECE must stay under a ceiling, and the per-class checks for your rare classes must pass. Run it in CI against cached responses, and against live responses on a schedule.
+
+This is the model-migration discipline from Module 9's capstone, applied to a much cheaper model where re-running the whole eval costs cents.
+
+## Common mistakes
+
+- Reporting only accuracy for a model whose whole point is the probability.
+- ECE with 10 equal-width bins on probabilities that are 90% in the top bin. Use equal-mass bins and report counts.
+- Comparing Jev with an LLM that was allowed to answer in free text. Use the adapter.
+- Calibrating on the same items you tune thresholds on.
+- Re-tuning thresholds after an alias moved and calling it "the same system".
+
+## How this shows up in interviews
+
+<InterviewQuestion question="How would you decide whether to trust Jev's probabilities enough to automate a decision?" level="senior">
+
+I would separate discrimination from calibration. On a labeled set of a few hundred items I would compute accuracy and the precision/coverage curve to see whether high-probability answers are in fact more often correct, with bootstrap intervals. Then a reliability diagram with equal-mass bins, Brier and ECE, to see whether 0.9 means about 90%. If discrimination is good but calibration is off, I recalibrate with isotonic regression on a held-out split and threshold the corrected probability. If discrimination is poor, no threshold will work and I rewrite the question or move the step to an LLM. I would pin the model version, record it next to the thresholds, and turn the whole analysis into a CI regression test so a new version cannot silently change the automation rate.
+
+</InterviewQuestion>
+
+## Further reading
+
+- Guo et al., "On Calibration of Modern Neural Networks" (temperature scaling, ECE), https://arxiv.org/abs/1706.04599
+- Niculescu-Mizil and Caruana, "Predicting Good Probabilities with Supervised Learning" (Platt, isotonic), ICML 2005
+- scikit-learn calibration guide, https://scikit-learn.org/stable/modules/calibration.html
+- Module 9, lessons 02 and 05, and the model-migration capstone

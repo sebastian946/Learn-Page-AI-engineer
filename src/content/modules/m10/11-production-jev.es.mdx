@@ -1,0 +1,145 @@
+## Las preguntas de producción
+
+El módulo 5 te dio el checklist de serving para una funcionalidad con LLM: modelo de costos, presupuesto de latencia, retries, caché, degradación, flags, logging. Jev necesita la misma lista, pero los números son tan distintos que algunas respuestas se invierten. Un paso que era demasiado caro para correr en cada request se vuelve barato. Un fallback que antes era "servir una respuesta cacheada" ahora puede ser "preguntarle a un LLM la misma pregunta tipada". Esta lección recorre la lista.
+
+## Costo: tokens de entrada, nada de salida
+
+El precio publicado de Jev (proveedor, septiembre 2026) es **$0.042 por millón de tokens de entrada**; los tokens de salida son gratis. Modélalo por punto de decisión:
+
+```python
+from dataclasses import dataclass
+
+JEV_PRICE_PER_MTOK = 0.042          # vendor list price, dated 2026-09; read from config in real code
+
+
+@dataclass(frozen=True)
+class DecisionPoint:
+    name: str
+    state_tokens: int               # measured mean from logs
+    question_tokens: int            # all questions in the request
+    calls_per_request: int = 1      # e.g. 30 for a re-ranker over 30 candidates
+
+
+def cost_per_1k(dp: DecisionPoint) -> float:
+    tokens = (dp.state_tokens + dp.question_tokens) * dp.calls_per_request
+    return tokens / 1e6 * JEV_PRICE_PER_MTOK * 1000
+
+
+for dp in [
+    DecisionPoint("triage", state_tokens=350, question_tokens=180),
+    DecisionPoint("input_guardrail", state_tokens=200, question_tokens=320),
+    DecisionPoint("rerank_30", state_tokens=450, question_tokens=60, calls_per_request=30),
+]:
+    print(f"{dp.name:16s} ${cost_per_1k(dp):.4f} per 1,000 requests")
+```
+
+Con esos conteos de tokens de ejemplo, el triage sale en alrededor de $0.02 por 1,000 requests y el re-ranker de 30 candidatos en alrededor de $0.64 por 1,000 queries. Compáralo con una llamada a un LLM para la misma decisión usando los precios actuales de tu proveedor (léelos de config y ponles fecha; no los hard-codees). La brecha es lo bastante grande como para que la pregunta deje de ser "¿podemos pagar por verificar esto?" y pase a ser "¿qué checks vale la pena registrar?".
+
+Dos reglas de costo se desprenden de la forma del precio. **Agrupa preguntas** en una request: el state se paga una vez por request, así que diez preguntas en una llamada cuestan un state más diez preguntas, no diez states. **Recorta el state** a lo que las preguntas necesitan: el state es la factura, y el proveedor dice que la accuracy cae con state ruidoso de todos modos.
+
+## Latencia: presupuéstala como cualquier otra dependencia
+
+La latencia citada por el proveedor es 70–500 ms. Mide p50 y p95 tú mismo, por punto de decisión, porque el tamaño del state la determina. Reglas de presupuesto:
+
+- Una llamada a Jev en el camino de la request suma su p95 a tu p95. Si el guardrail debe correr antes de que el LLM empiece, es serial. Si el re-ranking corre sobre 30 candidatos, corre las 30 requests de forma concurrente y la latencia agregada es un p95, no treinta.
+- Fija un timeout por llamada (los SDKs aceptan `timeout`) por debajo de tu presupuesto, y decide qué pasa en timeout por punto de decisión: retener (gates), saltar (el re-rank cae al orden de BM25) o caer al adaptador LLM.
+- El speculative fan-out también es una herramienta de latencia: una request con todas las preguntas que podrías necesitar le gana a dos secuenciales.
+
+## Retries, backoff e idempotencia
+
+Las requests a Jev son lecturas idempotentes, así que los retries son seguros. Los SDKs reintentan 429 y 529 con backoff exponencial por defecto y respetan `Retry-After`. Si llamas a la API HTTP tú mismo, eso es tuyo: reintenta solo 429 y 529, haz backoff exponencial con jitter, limita los intentos y trata 400, 401, 413, 415 y 422 como bugs a exponer, no como transitorios. Los rate limits son por organización en tokens y requests por segundo; un re-ranker que dispara 30 llamadas por query los va a golpear primero, así que dale un semáforo y una cola en lugar de dejar que cada request reintente a la vez.
+
+## Fija versiones, registra todo
+
+`jev-latest` se mueve. En producción:
+
+- Envía el id versionado (`jev-1.14.0`) y deja el alias para staging. Cuando el alias se mueva, corre el test de regresión de calibración del ejercicio 10 contra el id nuevo antes de cambiar la config.
+- Registra cada decisión con: id de request, punto de decisión, `model` versionado, el mapa `answers` completo (choice o score, `probabilities`, `confidence`, `noul`), la banda en la que cayó, los umbrales vigentes (una versión de config basta), latencia y `usage.input_tokens`. El mapa de respuestas es pequeño, y es el dataset de tu próxima corrida de calibración y de la cola de revisión humana.
+- No registres el state completo por defecto cuando contiene texto de clientes. Registra un hash y un puntero a dónde se puede reconstruir el state bajo tu política de retención.
+
+```python
+import json
+import time
+from uuid import uuid4
+
+
+def record_decision(log, point: str, response, band: str, thresholds_version: str, state_hash: str) -> None:
+    log.info(json.dumps({
+        "id": str(uuid4()),
+        "ts": time.time(),
+        "point": point,
+        "model": response.model,
+        "answers": {k: v.model_dump() for k, v in response.answers.items()},
+        "band": band,
+        "thresholds_version": thresholds_version,
+        "state_sha256": state_hash,
+        "input_tokens": response.usage.input_tokens,
+    }))
+```
+
+## Fallbacks: el adaptador LLM con el mismo schema
+
+Cuando Jev hace timeout, devuelve 529 tras los retries o tu gateway está caído, igual necesitas la decisión. El fallback es el adaptador System One de la lección 09: un LLM con un schema de structured output que refleja exactamente la pregunta y devuelve el mismo registro tipado. Entonces el resto del pipeline no sabe cuál respondió, y tus logs siguen siendo comparables.
+
+```python
+from anthropic import AsyncAnthropic
+from pydantic import BaseModel
+
+
+class DepartmentAnswer(BaseModel):
+    choice: str
+    probabilities: dict[str, float]
+
+
+async def department_via_llm(client: AsyncAnthropic, model: str, message: str, options: dict[str, str]) -> DepartmentAnswer:
+    schema = DepartmentAnswer.model_json_schema()
+    schema["properties"]["choice"]["enum"] = list(options)
+    r = await client.messages.create(
+        model=model,                       # from config, e.g. claude-haiku-5-5
+        max_tokens=200,
+        system="You classify support tickets. Answer only with the tool call.",
+        tools=[{"name": "answer", "description": "Typed answer", "input_schema": schema}],
+        tool_choice={"type": "tool", "name": "answer"},
+        messages=[{"role": "user", "content": f"Options: {options}\n\nTicket: {message}"}],
+    )
+    return DepartmentAnswer.model_validate(next(b.input for b in r.content if b.type == "tool_use"))
+```
+
+Marca las decisiones de fallback en el log (`"source": "llm_adapter"`), hazles gate con umbrales **más estrictos** porque las probabilidades auto-reportadas del LLM suelen estar menos calibradas, y alerta cuando la tasa de fallback suba. Más lento y más caro está bien por una hora; en silencio no.
+
+Ordena la degradación por punto de decisión, como en el módulo 5: los guardrails fallan **cerrados** (bloquear o retener), el re-ranking falla **abierto** (orden de BM25), el triage cae al adaptador y luego a la cola humana.
+
+## Rutas por gateway
+
+Si no tienes key directa, o quieres una sola factura y un solo set de credenciales para todos los modelos, OpenRouter y Vercel AI Gateway enrutan a Jev. Mantén el body de request de TypeSafe como el contrato en tu código, deja que una capa de transporte delgada agregue la base URL y los headers del gateway, y registra qué ruta respondió. Un gateway agrega latencia y sus propios rate limits; mide el p95 a través de él, no desde la página del proveedor.
+
+## Privacidad de datos
+
+El state son datos de clientes. Antes de enviarlo:
+
+- Lee los términos de manejo de datos del proveedor: la documentación dice que las requests no se usan para entrenar y que hay retención cero de datos disponible para planes enterprise. Confirma el DPA que tu empresa necesita.
+- Minimiza: quita campos que las preguntas no necesitan, enmascara números de cuenta y emails en código antes de construir el state.
+- Respeta las restricciones regionales como lo hiciste para el proveedor de LLM en el módulo 5; un gateway puede agregar un salto en otra región.
+- Trata el mapa `answers` registrado como dato personal derivado si el state era dato personal.
+
+## Errores comunes
+
+- Calcular el precio de Jev por llamada en lugar de por token, y olvidar que el fan-out multiplica las llamadas.
+- Dejar que las 30 llamadas concurrentes del re-ranker compartan la política de retries con el guardrail. Clientes separados, límites separados.
+- Un fallback que devuelve texto libre a un pipeline que espera un registro tipado.
+- Registrar `choice` pero no `probabilities`. Las probabilidades son el dataset de eval.
+- No fijar nada, y después preguntarse por qué la cola humana se duplicó un martes.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="Jev se cae durante una hora. ¿Qué le pasa a tu asistente de soporte?" level="senior">
+
+Cada punto de decisión se degrada con su propia regla. Los guardrails de entrada fallan cerrados: un timeout o un 529 tras los retries del SDK significa que el mensaje se retiene para revisión en lugar de pasar. El re-ranking falla abierto: servimos el orden de BM25 y registramos que el re-ranking se saltó. El triage cae a un adaptador LLM que responde el mismo Choice con un schema de structured output, marcado en el log como fuente de fallback y con gate de umbrales más estrictos; si el adaptador también falla, el ticket va a la cola humana. Se dispara una alerta por tasa de fallback, y el dashboard de costos muestra el pico de gasto en LLM, que es el precio de seguir arriba. Cuando Jev vuelve, nada tiene que reajustarse porque fijamos la versión del modelo y los umbrales no cambiaron.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Docs de TypeSafe: Models (precios, contexto, alias, rate limits, manejo de datos), Request rules and errors, política de retries del SDK, https://docs.typesafe.ai
+- Lecciones del módulo 5 sobre modelado de costos, degradación elegante y feature flags
+- Tool use y structured outputs de Anthropic, https://docs.anthropic.com
