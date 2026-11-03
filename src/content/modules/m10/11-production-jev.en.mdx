@@ -1,0 +1,145 @@
+## The production questions
+
+Module 5 gave you the serving checklist for an LLM feature: cost model, latency budget, retries, caching, degradation, flags, logging. Jev needs the same list, but the numbers are different enough that some answers flip. A step that was too expensive to run on every request becomes cheap. A fallback that used to be "serve a cached answer" can now be "ask an LLM the same typed question". This lesson walks the list.
+
+## Cost: tokens in, nothing out
+
+Jev's published price (vendor, September 2026) is **$0.042 per million input tokens**; output tokens are free. Model it per decision point:
+
+```python
+from dataclasses import dataclass
+
+JEV_PRICE_PER_MTOK = 0.042          # vendor list price, dated 2026-09; read from config in real code
+
+
+@dataclass(frozen=True)
+class DecisionPoint:
+    name: str
+    state_tokens: int               # measured mean from logs
+    question_tokens: int            # all questions in the request
+    calls_per_request: int = 1      # e.g. 30 for a re-ranker over 30 candidates
+
+
+def cost_per_1k(dp: DecisionPoint) -> float:
+    tokens = (dp.state_tokens + dp.question_tokens) * dp.calls_per_request
+    return tokens / 1e6 * JEV_PRICE_PER_MTOK * 1000
+
+
+for dp in [
+    DecisionPoint("triage", state_tokens=350, question_tokens=180),
+    DecisionPoint("input_guardrail", state_tokens=200, question_tokens=320),
+    DecisionPoint("rerank_30", state_tokens=450, question_tokens=60, calls_per_request=30),
+]:
+    print(f"{dp.name:16s} ${cost_per_1k(dp):.4f} per 1,000 requests")
+```
+
+With those example token counts, triage comes to about $0.02 per 1,000 requests and the 30-candidate re-ranker to about $0.64 per 1,000 queries. Compare that with an LLM call for the same decision using your provider's current prices (read them from config and date them; do not hard-code). The gap is large enough that the question stops being "can we afford to check this?" and becomes "which checks are worth logging?".
+
+Two cost rules follow from the pricing shape. **Batch questions** into one request: the state is paid once per request, so ten questions in one call cost one state plus ten questions, not ten states. **Trim the state** to what the questions need: the state is the bill, and the vendor says accuracy drops with noisy state anyway.
+
+## Latency: budget it like any other dependency
+
+Vendor-quoted latency is 70–500 ms. Measure p50 and p95 yourself, per decision point, because state size drives it. Budget rules:
+
+- A Jev call on the request path adds its p95 to your p95. If the guardrail must run before the LLM starts, it is serial. If re-ranking runs over 30 candidates, run the 30 requests concurrently and the added latency is one p95, not thirty.
+- Set a per-call timeout (the SDKs accept `timeout`) below your budget, and decide what happens on timeout per decision point: hold (gates), skip (re-rank falls back to BM25 order), or fall back to the LLM adapter.
+- Speculative fan-out is a latency tool too: one request with every question you might need beats two sequential ones.
+
+## Retries, backoff and idempotency
+
+Jev requests are idempotent reads, so retries are safe. The SDKs retry 429 and 529 with exponential backoff by default and honour `Retry-After`. If you call the HTTP API yourself, you own that: retry only 429 and 529, back off exponentially with jitter, cap the attempts, and treat 400, 401, 413, 415 and 422 as bugs to surface, not transients. Rate limits are per organisation in tokens and requests per second; a re-ranker that fans out 30 calls per query will hit them first, so give it a semaphore and a queue rather than letting every request retry at once.
+
+## Pin versions, log everything
+
+`jev-latest` moves. In production:
+
+- Send the versioned id (`jev-1.14.0`) and keep the alias for staging. When the alias moves, run the calibration regression test from exercise 10 against the new id before changing config.
+- Log every decision with: request id, decision point, versioned `model`, the full `answers` map (choice or score, `probabilities`, `confidence`, `noul`), the band it fell in, the thresholds in force (a config version is enough), latency and `usage.input_tokens`. The answers map is small, and it is the dataset for your next calibration run and for the human-review queue.
+- Do not log the full state by default when it contains customer text. Log a hash and a pointer to where the state can be reconstructed under your retention policy.
+
+```python
+import json
+import time
+from uuid import uuid4
+
+
+def record_decision(log, point: str, response, band: str, thresholds_version: str, state_hash: str) -> None:
+    log.info(json.dumps({
+        "id": str(uuid4()),
+        "ts": time.time(),
+        "point": point,
+        "model": response.model,
+        "answers": {k: v.model_dump() for k, v in response.answers.items()},
+        "band": band,
+        "thresholds_version": thresholds_version,
+        "state_sha256": state_hash,
+        "input_tokens": response.usage.input_tokens,
+    }))
+```
+
+## Fallbacks: the LLM adapter on the same schema
+
+When Jev times out, returns 529 after retries, or your gateway is down, you need the decision anyway. The fallback is the System One adapter from lesson 09: an LLM with a structured-output schema that mirrors the question exactly, returning the same typed record. Then the rest of the pipeline does not know which one answered, and your logs stay comparable.
+
+```python
+from anthropic import AsyncAnthropic
+from pydantic import BaseModel
+
+
+class DepartmentAnswer(BaseModel):
+    choice: str
+    probabilities: dict[str, float]
+
+
+async def department_via_llm(client: AsyncAnthropic, model: str, message: str, options: dict[str, str]) -> DepartmentAnswer:
+    schema = DepartmentAnswer.model_json_schema()
+    schema["properties"]["choice"]["enum"] = list(options)
+    r = await client.messages.create(
+        model=model,                       # from config, e.g. claude-haiku-5-5
+        max_tokens=200,
+        system="You classify support tickets. Answer only with the tool call.",
+        tools=[{"name": "answer", "description": "Typed answer", "input_schema": schema}],
+        tool_choice={"type": "tool", "name": "answer"},
+        messages=[{"role": "user", "content": f"Options: {options}\n\nTicket: {message}"}],
+    )
+    return DepartmentAnswer.model_validate(next(b.input for b in r.content if b.type == "tool_use"))
+```
+
+Mark fallback decisions in the log (`"source": "llm_adapter"`), gate them with **stricter** thresholds because the LLM's self-reported probabilities are usually less calibrated, and alert when the fallback rate rises. Slower and dearer is fine for an hour; silent is not.
+
+Order the degradation per decision point, as in Module 5: guardrails fail **closed** (block or hold), re-ranking fails **open** (BM25 order), triage falls to the adapter and then to the human queue.
+
+## Gateway routes
+
+If you do not have a direct key, or you want one bill and one set of credentials for all models, OpenRouter and Vercel AI Gateway both route to Jev. Keep the TypeSafe request body as the contract in your code, let a thin transport layer add the gateway's base URL and headers, and record which route answered. A gateway adds latency and its own rate limits; measure p95 through it, not from the vendor's page.
+
+## Data privacy
+
+The state is customer data. Before you send it:
+
+- Read the vendor's data handling terms: the docs state that requests are not used for training and that zero-data-retention is available for enterprise plans. Confirm the DPA your company needs.
+- Minimise: strip fields the questions do not need, mask account numbers and emails in code before building the state.
+- Respect regional constraints the way you did for the LLM provider in Module 5; a gateway may add a hop in another region.
+- Treat the logged `answers` map as derived personal data if the state was personal data.
+
+## Common mistakes
+
+- Pricing Jev per call instead of per token, and forgetting that fan-out multiplies calls.
+- Letting the re-ranker's 30 concurrent calls share a retry policy with the guardrail. Separate clients, separate limits.
+- Fallback that returns free text to a pipeline expecting a typed record.
+- Logging `choice` but not `probabilities`. The probabilities are the eval dataset.
+- Pinning nothing, then wondering why the human queue doubled on a Tuesday.
+
+## How this shows up in interviews
+
+<InterviewQuestion question="Jev goes down for an hour. What happens to your support assistant?" level="senior">
+
+Each decision point degrades on its own rule. Input guardrails fail closed: a timeout or 529 after the SDK's retries means the message is held for review rather than passed. Re-ranking fails open: we serve BM25 order and log that re-ranking was skipped. Triage falls back to an LLM adapter that answers the same Choice with a structured-output schema, flagged in the log as the fallback source and gated with stricter thresholds; if the adapter also fails, the ticket goes to the human queue. An alert fires on fallback rate, and the cost dashboard shows the LLM spend spike, which is the price of staying up. When Jev returns, nothing has to be re-tuned because we pinned the model version and the thresholds did not change.
+
+</InterviewQuestion>
+
+## Further reading
+
+- TypeSafe docs: Models (pricing, context, aliases, rate limits, data handling), Request rules and errors, SDK retry policy, https://docs.typesafe.ai
+- Module 5 lessons on cost modelling, graceful degradation and feature flags
+- Anthropic tool use and structured outputs, https://docs.anthropic.com

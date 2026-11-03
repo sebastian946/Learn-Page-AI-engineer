@@ -1,0 +1,446 @@
+{
+  "moduleId": "m10",
+  "title": { "en": "Module 10 exam", "es": "Examen del módulo 10" },
+  "timeLimitMinutes": 30,
+  "passingScore": 70,
+  "questions": [
+    {
+      "id": "q1",
+      "type": "single",
+      "prompt": {
+        "en": "What does \"non-autoregressive\" mean for how Jev answers a request with five questions?",
+        "es": "¿Qué significa \"no autorregresivo\" para la forma en que Jev responde una request con cinco preguntas?"
+      },
+      "options": {
+        "en": [
+          "It evaluates all five questions in parallel against the same state and returns a distribution over the options for each, with no token-by-token decoding",
+          "It answers the first question, feeds that answer into the second, and so on",
+          "It generates a JSON document token by token and validates it against your schema",
+          "It runs five separate model calls and merges the results"
+        ],
+        "es": [
+          "Evalúa las cinco preguntas en paralelo contra el mismo state y devuelve una distribución sobre las opciones de cada una, sin decodificación token a token",
+          "Responde la primera pregunta, alimenta esa respuesta a la segunda, y así sucesivamente",
+          "Genera un documento JSON token a token y lo valida contra tu schema",
+          "Corre cinco llamadas separadas al modelo y fusiona los resultados"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Jev ingests the state once and evaluates every question in parallel and in isolation. There is no decoding loop, so output is always a distribution over the options you supplied, and answers never see each other.",
+        "es": "Jev ingiere el state una vez y evalúa cada pregunta en paralelo y de forma aislada. No hay loop de decodificación, así que la salida siempre es una distribución sobre las opciones que diste, y las respuestas nunca se ven entre sí."
+      }
+    },
+    {
+      "id": "q2",
+      "type": "single",
+      "prompt": {
+        "en": "The vendor says Jev \"can't hallucinate\". What is the accurate engineering reading of that claim?",
+        "es": "El proveedor dice que Jev \"no puede alucinar\". ¿Cuál es la lectura de ingeniería correcta de esa afirmación?"
+      },
+      "options": {
+        "en": [
+          "The output is always one of the options you supplied (schema conformance), but it can still be the wrong valid option",
+          "Every answer with confidence above 0.9 is correct",
+          "The model refuses to answer when it is unsure",
+          "The probabilities are guaranteed to be calibrated on any dataset"
+        ],
+        "es": [
+          "La salida siempre es una de las opciones que diste (conformidad con el schema), pero igual puede ser la opción válida equivocada",
+          "Toda respuesta con confianza mayor a 0.9 es correcta",
+          "El modelo se niega a responder cuando no está seguro",
+          "Las probabilidades están garantizadas como calibradas en cualquier dataset"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The real guarantee is schema conformance: the answer space is constrained. Correctness and calibration are empirical properties you validate on your own labeled data; the docs make no calibration guarantee.",
+        "es": "La garantía real es la conformidad con el schema: el espacio de respuestas está restringido. La corrección y la calibración son propiedades empíricas que validas con tus propios datos etiquetados; la documentación no garantiza calibración."
+      }
+    },
+    {
+      "id": "q3",
+      "type": "code",
+      "prompt": {
+        "en": "Which statement about this request body is correct?",
+        "es": "¿Qué afirmación sobre este body de request es correcta?"
+      },
+      "code": "{\n  \"model\": \"jev-latest\",\n  \"state\": {\"message\": \"Charged twice for order A-104, refund one please.\"},\n  \"questions\": {\n    \"dept\": {\"type\": \"choice\", \"instructions\": \"Which team handles `message`?\",\n             \"criteria\": {\"billing\": \"Charges and refunds\", \"shipping\": \"Delivery issues\"}},\n    \"urgent\": {\"type\": \"noul\", \"instructions\": \"The customer needs a reply today.\"}\n  }\n}",
+      "codeLang": "json",
+      "options": {
+        "en": [
+          "The response will contain answers.dept with choice, probabilities and confidence, and answers.urgent with only a noul value, and the response model field will be the versioned id that answered",
+          "The response will contain a confidence field for both answers",
+          "The question ids dept and urgent are sent to the model as part of the question text",
+          "The request is invalid because a noul question requires criteria"
+        ],
+        "es": [
+          "La response tendrá answers.dept con choice, probabilities y confidence, y answers.urgent solo con un valor noul, y el campo model de la response será el id versionado que respondió",
+          "La response tendrá un campo confidence para ambas respuestas",
+          "Los ids dept y urgent se envían al modelo como parte del texto de la pregunta",
+          "La request es inválida porque una pregunta noul requiere criteria"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Choice answers carry choice, probabilities and confidence; Noul answers carry only noul. Criteria are optional for Noul. Ids are never sent to the model. The response model field reports the versioned id (for example jev-1.14.0) even when you asked for the alias.",
+        "es": "Las respuestas Choice llevan choice, probabilities y confidence; las Noul llevan solo noul. Los criteria son opcionales para Noul. Los ids nunca se envían al modelo. El campo model de la response reporta el id versionado (por ejemplo jev-1.14.0) aunque hayas pedido el alias."
+      }
+    },
+    {
+      "id": "q4",
+      "type": "code",
+      "prompt": {
+        "en": "A Choice with three options returned probabilities {a: 0.7, b: 0.2, c: 0.1}. What confidence does the published formula give?",
+        "es": "Un Choice con tres opciones devolvió probabilities {a: 0.7, b: 0.2, c: 0.1}. ¿Qué confianza da la fórmula publicada?"
+      },
+      "code": "def choice_confidence(probabilities: dict[str, float]) -> float:\n    n = len(probabilities)\n    return (max(probabilities.values()) - 1 / n) / (1 - 1 / n)",
+      "codeLang": "python",
+      "options": {
+        "en": ["0.55", "0.70", "0.40", "0.85"],
+        "es": ["0.55", "0.70", "0.40", "0.85"]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "n = 3, so 1/n = 0.333. (0.7 − 0.333) / (1 − 0.333) = 0.367 / 0.667 = 0.55. Only the top probability matters; {0.7, 0.15, 0.15} would give the same value.",
+        "es": "n = 3, así que 1/n = 0.333. (0.7 − 0.333) / (1 − 0.333) = 0.367 / 0.667 = 0.55. Solo importa la probabilidad máxima; {0.7, 0.15, 0.15} daría el mismo valor."
+      }
+    },
+    {
+      "id": "q5",
+      "type": "single",
+      "prompt": {
+        "en": "Why does a top probability of 0.5 mean something different for a 2-option Choice than for a 10-option Choice?",
+        "es": "¿Por qué una probabilidad máxima de 0.5 significa algo distinto para un Choice de 2 opciones que para uno de 10?"
+      },
+      "options": {
+        "en": [
+          "With 2 options 0.5 is an even split (confidence 0); with 10 options it is far above the 0.1 even split (confidence about 0.44)",
+          "With 10 options the model is always less accurate, so 0.5 should be ignored",
+          "The API normalises probabilities differently depending on the option count",
+          "There is no difference; 0.5 is 0.5"
+        ],
+        "es": [
+          "Con 2 opciones 0.5 es un reparto parejo (confianza 0); con 10 opciones está muy por encima del reparto parejo de 0.1 (confianza alrededor de 0.44)",
+          "Con 10 opciones el modelo siempre es menos preciso, así que 0.5 debería ignorarse",
+          "La API normaliza las probabilidades de forma distinta según el número de opciones",
+          "No hay diferencia; 0.5 es 0.5"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The Choice confidence formula rescales the top probability relative to an even split of 1/n. That is why confidence can be compared across questions with different option counts, while raw top probability cannot.",
+        "es": "La fórmula de confianza de Choice reescala la probabilidad máxima relativa al reparto parejo de 1/n. Por eso la confianza puede compararse entre preguntas con distinto número de opciones, mientras que la probabilidad máxima cruda no."
+      }
+    },
+    {
+      "id": "q6",
+      "type": "multi",
+      "prompt": {
+        "en": "Which of these are weaknesses the vendor itself lists for Jev, where you should keep the logic in code or hand off to an LLM? Select all that apply.",
+        "es": "¿Cuáles de estas son debilidades que el propio proveedor lista para Jev, donde deberías dejar la lógica en código o delegar a un LLM? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Arithmetic and counting",
+          "Comparing dates",
+          "Multi-hop indirection across parts of the state",
+          "Returning a value outside the supplied options",
+          "Generating an explanation of its answer"
+        ],
+        "es": [
+          "Aritmética y conteo",
+          "Comparar fechas",
+          "Indirección multi-hop entre partes del state",
+          "Devolver un valor fuera de las opciones dadas",
+          "Generar una explicación de su respuesta"
+        ]
+      },
+      "answer": [0, 1, 2, 4],
+      "explanation": {
+        "en": "The jaggedness list includes literal reading, math and counting, date comparison, multi-hop indirection, large noisy state, adversarial content and no text generation. Returning a value outside the options cannot happen: the output is constrained to your answer space.",
+        "es": "La lista de jaggedness incluye lectura literal, matemática y conteo, comparación de fechas, indirección multi-hop, state grande y ruidoso, contenido adversarial y ausencia de generación de texto. Devolver un valor fuera de las opciones no puede pasar: la salida está restringida a tu espacio de respuestas."
+      }
+    },
+    {
+      "id": "q7",
+      "type": "single",
+      "prompt": {
+        "en": "You want to measure how much Python experience a candidate has, from none to deep expertise. Which primitive fits and why?",
+        "es": "Quieres medir cuánta experiencia en Python tiene un candidato, desde ninguna hasta experiencia profunda. ¿Qué primitiva encaja y por qué?"
+      },
+      "options": {
+        "en": [
+          "A Score with described levels, because the answer is a position on a spectrum and a Noul value of 0.5 would mean uncertainty, not medium skill",
+          "A Noul \"is the candidate strong in Python?\", because 0.5 naturally means medium experience",
+          "A Choice with options 0, 1, 2, 3, because numbers are easiest to threshold",
+          "Two Nouls combined with an and in code"
+        ],
+        "es": [
+          "Un Score con niveles descritos, porque la respuesta es una posición en un espectro y un valor Noul de 0.5 significaría incertidumbre, no nivel medio",
+          "Un Noul \"¿el candidato es fuerte en Python?\", porque 0.5 significa naturalmente experiencia media",
+          "Un Choice con opciones 0, 1, 2, 3, porque los números son más fáciles de umbralizar",
+          "Dos Nouls combinados con un and en código"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "A Noul measures the probability that a proposition is true, not a degree. A Score judges each described level separately and returns a weighted position. Numeric-only levels give the model nothing to match and produce flat distributions.",
+        "es": "Un Noul mide la probabilidad de que una proposición sea verdadera, no un grado. Un Score juzga cada nivel descrito por separado y devuelve una posición ponderada. Los niveles solo numéricos no le dan al modelo nada que comparar y producen distribuciones planas."
+      }
+    },
+    {
+      "id": "q8",
+      "type": "code",
+      "prompt": {
+        "en": "Given these per-action gates, what band does a department Choice with confidence 0.72 fall into for assign_team, and what band for auto_close_duplicate?",
+        "es": "Dados estos gates por acción, ¿en qué banda cae un Choice de departamento con confianza 0.72 para assign_team, y en qué banda para auto_close_duplicate?"
+      },
+      "code": "GATES = {\n    \"assign_team\": {\"act\": 0.70, \"confirm\": 0.40},\n    \"auto_close_duplicate\": {\"act\": 0.95, \"confirm\": 0.60},\n}\n\ndef band(action: str, confidence: float) -> str:\n    g = GATES[action]\n    if confidence >= g[\"act\"]:\n        return \"auto\"\n    if confidence >= g[\"confirm\"]:\n        return \"confirm\"\n    return \"human\"",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "auto for assign_team, confirm for auto_close_duplicate",
+          "auto for both",
+          "confirm for assign_team, human for auto_close_duplicate",
+          "human for both"
+        ],
+        "es": [
+          "auto para assign_team, confirm para auto_close_duplicate",
+          "auto para ambos",
+          "confirm para assign_team, human para auto_close_duplicate",
+          "human para ambos"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "0.72 is at or above 0.70, so assign_team is auto. For auto_close_duplicate, 0.72 is below 0.95 but at or above 0.60, so confirm. Same confidence, different bands: thresholds scale with the cost of a wrong action.",
+        "es": "0.72 es igual o mayor a 0.70, así que assign_team es auto. Para auto_close_duplicate, 0.72 está por debajo de 0.95 pero es igual o mayor a 0.60, así que confirm. Misma confianza, bandas distintas: los umbrales escalan con el costo de una acción equivocada."
+      }
+    },
+    {
+      "id": "q9",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps to choose a confidence threshold you can defend for one action.",
+        "es": "Ordena los pasos para elegir un umbral de confianza que puedas defender para una acción."
+      },
+      "items": {
+        "en": [
+          "Label 200–500 items with the true answer",
+          "Run every item through Jev once and store choice, probabilities, confidence and model",
+          "For each candidate threshold compute coverage and precision among covered, with a bootstrap interval",
+          "Pick the lowest threshold whose lower interval bound meets the action's precision target",
+          "Record the threshold with its statistic, precision, coverage and model id in a versioned config"
+        ],
+        "es": [
+          "Etiquetar 200–500 ítems con la respuesta verdadera",
+          "Pasar cada ítem por Jev una vez y guardar choice, probabilities, confidence y model",
+          "Para cada umbral candidato calcular cobertura y precisión entre los cubiertos, con intervalo bootstrap",
+          "Elegir el umbral más bajo cuyo límite inferior del intervalo cumpla el objetivo de precisión de la acción",
+          "Registrar el umbral con su estadístico, precisión, cobertura e id de modelo en una config versionada"
+        ]
+      },
+      "explanation": {
+        "en": "Labels first, then one cached run, then the precision/coverage sweep with intervals, then the choice driven by the lower bound, then the versioned record so the threshold stays tied to the model that produced it.",
+        "es": "Primero etiquetas, luego una corrida cacheada, luego el barrido precisión/cobertura con intervalos, luego la elección guiada por el límite inferior, y por último el registro versionado para que el umbral quede atado al modelo que lo produjo."
+      }
+    },
+    {
+      "id": "q10",
+      "type": "multi",
+      "prompt": {
+        "en": "Which situations justify a second Jev request instead of adding the question to the first one? Select all that apply.",
+        "es": "¿Qué situaciones justifican una segunda request a Jev en lugar de agregar la pregunta a la primera? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "The next question's options depend on the previous answer (hierarchical classification)",
+          "Your code needs the first answer to fetch more data for the state",
+          "The second question only matters for some inputs",
+          "You want to keep each request to one question for readability",
+          "The state must be rebuilt per candidate, as in re-ranking a list of passages"
+        ],
+        "es": [
+          "Las opciones de la siguiente pregunta dependen de la respuesta anterior (clasificación jerárquica)",
+          "Tu código necesita la primera respuesta para traer más datos al state",
+          "La segunda pregunta solo importa para algunos inputs",
+          "Quieres mantener cada request en una sola pregunta por legibilidad",
+          "El state debe reconstruirse por candidato, como al hacer re-ranking de una lista de pasajes"
+        ]
+      },
+      "answer": [0, 1, 4],
+      "explanation": {
+        "en": "A second request is legitimate only when the first answer is needed to build it: to pick the next options, to fetch more state, or because the state itself differs (one request per query-passage pair). Questions that only matter sometimes belong in the first request (speculative fan-out); one question per request is simply slower and dearer.",
+        "es": "Una segunda request es legítima solo cuando la primera respuesta hace falta para construirla: para elegir las siguientes opciones, para traer más state, o porque el state en sí difiere (una request por par query-pasaje). Las preguntas que solo importan a veces van en la primera request (speculative fan-out); una pregunta por request es simplemente más lento y más caro."
+      }
+    },
+    {
+      "id": "q11",
+      "type": "code",
+      "prompt": {
+        "en": "This is the gate of an SDE cascade. Given checks = {\"name::mismatch\": 0.12, \"date::absent\": 0.91, \"amount::type\": 0.05}, what happens?",
+        "es": "Este es el gate de una cascada SDE. Dado checks = {\"name::mismatch\": 0.12, \"date::absent\": 0.91, \"amount::type\": 0.05}, ¿qué pasa?"
+      },
+      "code": "FIRE_T = 0.7\n\ndef should_escalate(checks: dict[str, float]) -> tuple[bool, dict[str, float]]:\n    fired = {qid: p for qid, p in checks.items() if p > FIRE_T}\n    return bool(fired), fired",
+      "codeLang": "python",
+      "options": {
+        "en": [
+          "The record is escalated to the stronger model because date::absent fired; the mean of the flags is irrelevant",
+          "The record is accepted because the mean flag value (0.36) is below 0.7",
+          "The record is escalated only if at least two flags fire",
+          "The function raises because flags must sum to 1"
+        ],
+        "es": [
+          "El registro se escala al modelo más fuerte porque date::absent se disparó; la media de los flags es irrelevante",
+          "El registro se acepta porque la media de los flags (0.36) está por debajo de 0.7",
+          "El registro se escala solo si al menos dos flags se disparan",
+          "La función lanza una excepción porque los flags deben sumar 1"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The cascade gate is any/max-style: one confident red flag is enough to escalate. Averaging would hide a 0.91 among low values. Each Noul is independent and does not sum with the others.",
+        "es": "El gate de la cascada es estilo any/max: una bandera roja confiada basta para escalar. Promediar escondería un 0.91 entre valores bajos. Cada Noul es independiente y no suma con los otros."
+      }
+    },
+    {
+      "id": "q12",
+      "type": "single",
+      "prompt": {
+        "en": "In a LangGraph agent with a static RISKY_TOOLS approval list, what does a Jev tool-call gate add?",
+        "es": "En un agente LangGraph con una lista estática de aprobación RISKY_TOOLS, ¿qué agrega un gate de tool calls con Jev?"
+      },
+      "options": {
+        "en": [
+          "A state-dependent ceiling: it can hold an unlisted call that is off-task or unauthorised, and let a clearly requested read-only call skip the queue, while the static list stays as the floor",
+          "It replaces the human approval step entirely",
+          "It generates an explanation of why the tool call is risky",
+          "It makes irreversible tools reversible"
+        ],
+        "es": [
+          "Un techo dependiente del state: puede retener una llamada no listada que esté fuera de tarea o sin autorización, y dejar que una lectura claramente solicitada se salte la cola, mientras la lista estática queda como piso",
+          "Reemplaza por completo el paso de aprobación humana",
+          "Genera una explicación de por qué la tool call es riesgosa",
+          "Hace reversibles las tools irreversibles"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "The gate asks reversibility, on-task and user-authorised questions about the pending call in context. The static list remains the floor for known-dangerous tools; Jev catches the unlisted off-task call and fails to hold when it is unavailable.",
+        "es": "El gate pregunta reversibilidad, si está en tarea y si el usuario autorizó la llamada pendiente en contexto. La lista estática sigue siendo el piso para tools conocidas como peligrosas; Jev atrapa la llamada no listada fuera de tarea y cae a retener cuando no está disponible."
+      }
+    },
+    {
+      "id": "q13",
+      "type": "single",
+      "prompt": {
+        "en": "A Noul is well discriminating (high-probability answers are usually right) but has ECE of 0.18. What is the right move?",
+        "es": "Un Noul discrimina bien (las respuestas de alta probabilidad suelen ser correctas) pero tiene un ECE de 0.18. ¿Cuál es la jugada correcta?"
+      },
+      "options": {
+        "en": [
+          "Recalibrate in code (isotonic regression or Platt scaling fitted on a held-out split) and threshold the corrected probability",
+          "Rewrite the question; no threshold can work",
+          "Lower all thresholds to 0.5",
+          "Switch to an LLM judge, whose self-reported probabilities are usually better calibrated"
+        ],
+        "es": [
+          "Recalibrar en código (regresión isotónica o Platt scaling ajustados sobre un split hold-out) y umbralizar la probabilidad corregida",
+          "Reescribir la pregunta; ningún umbral puede funcionar",
+          "Bajar todos los umbrales a 0.5",
+          "Cambiar a un juez LLM, cuyas probabilidades auto-reportadas suelen estar mejor calibradas"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Calibration and discrimination are different properties. Good discrimination with poor calibration is fixable with a monotonic recalibration fitted on held-out data. Poor discrimination is when you rewrite the question. LLM self-reported probabilities are usually worse calibrated, not better.",
+        "es": "Calibración y discriminación son propiedades distintas. Buena discriminación con mala calibración se arregla con una recalibración monótona ajustada sobre datos hold-out. La discriminación pobre es cuando reescribes la pregunta. Las probabilidades auto-reportadas de un LLM suelen estar peor calibradas, no mejor."
+      }
+    },
+    {
+      "id": "q14",
+      "type": "multi",
+      "prompt": {
+        "en": "Which practices belong in a production Jev integration? Select all that apply.",
+        "es": "¿Qué prácticas pertenecen a una integración de Jev en producción? Selecciona todas las que apliquen."
+      },
+      "options": {
+        "en": [
+          "Pin the versioned model id and re-run the calibration regression test before adopting a new version",
+          "Log the full answers map (probabilities, confidence, noul) with the model id and band for every decision",
+          "Retry 422 responses with exponential backoff",
+          "Fall back to an LLM answering the same questions through a structured-output schema when Jev is unavailable",
+          "Log the raw customer state alongside every decision for easier debugging"
+        ],
+        "es": [
+          "Fijar el id de modelo versionado y volver a correr el test de regresión de calibración antes de adoptar una versión nueva",
+          "Registrar el mapa de respuestas completo (probabilities, confidence, noul) con el id de modelo y la banda para cada decisión",
+          "Reintentar respuestas 422 con backoff exponencial",
+          "Caer a un LLM que responda las mismas preguntas a través de un schema de structured output cuando Jev no esté disponible",
+          "Registrar el state crudo del cliente junto a cada decisión para facilitar el debugging"
+        ]
+      },
+      "answer": [0, 1, 3],
+      "explanation": {
+        "en": "Pin versions, log the probabilities (they are your next eval dataset) and fall back on the same schema. 422 is a validation bug, not a transient; only 429 and 529 are retried. Raw customer text should not be logged; store a hash and a pointer under your retention policy.",
+        "es": "Fija versiones, registra las probabilidades (son tu próximo dataset de eval) y cae a un fallback con el mismo schema. 422 es un bug de validación, no un transitorio; solo 429 y 529 se reintentan. El texto crudo del cliente no debe registrarse; guarda un hash y un puntero bajo tu política de retención."
+      }
+    },
+    {
+      "id": "q15",
+      "type": "order",
+      "prompt": {
+        "en": "Order the steps of an SDE cascade from a cheap extraction to the final record.",
+        "es": "Ordena los pasos de una cascada SDE desde una extracción barata hasta el registro final."
+      },
+      "items": {
+        "en": [
+          "A cheap LLM extracts the record with a schema",
+          "One Jev request asks a battery of narrow Nouls, one per field and failure mode, phrased so true means something is wrong",
+          "An any-style gate fires if any flag exceeds the threshold",
+          "Only the flagged documents are re-extracted by the stronger, slower model",
+          "Accepted and escalated records are logged with their flags for the calibration eval"
+        ],
+        "es": [
+          "Un LLM barato extrae el registro con un schema",
+          "Una request a Jev pregunta una batería de Nouls estrechos, uno por campo y modo de fallo, redactados para que true signifique que algo está mal",
+          "Un gate estilo any se dispara si cualquier flag supera el umbral",
+          "Solo los documentos marcados se vuelven a extraer con el modelo más fuerte y lento",
+          "Los registros aceptados y escalados se registran con sus flags para la eval de calibración"
+        ]
+      },
+      "explanation": {
+        "en": "Cheap extraction, Jev verification battery, any-style gate, selective escalation, then logging so you can check that the flags separate right from wrong fields. The cascade only pays off if the verifier is far cheaper than the escalation rung.",
+        "es": "Extracción barata, batería de verificación con Jev, gate estilo any, escalación selectiva y luego logging para poder verificar que los flags separan campos correctos de incorrectos. La cascada solo rinde si el verificador es mucho más barato que el escalón de escalación."
+      }
+    },
+    {
+      "id": "q16",
+      "type": "single",
+      "prompt": {
+        "en": "jev-latest moved from jev-1.13.0 to jev-1.14.0. Your thresholds were tuned on 1.13. What is the correct response?",
+        "es": "jev-latest pasó de jev-1.13.0 a jev-1.14.0. Tus umbrales se ajustaron con 1.13. ¿Cuál es la respuesta correcta?"
+      },
+      "options": {
+        "en": [
+          "Keep production pinned to jev-1.13.0, run the paired calibration eval on jev-1.14.0 with the same labeled set, re-tune if needed, then switch deliberately",
+          "Nothing; the alias moving means the vendor validated it for you",
+          "Switch immediately, since newer versions are always more accurate",
+          "Lower every threshold by 0.1 to be safe"
+        ],
+        "es": [
+          "Mantener producción fijada en jev-1.13.0, correr la eval de calibración pareada sobre jev-1.14.0 con el mismo set etiquetado, reajustar si hace falta y luego cambiar de forma deliberada",
+          "Nada; que el alias se mueva significa que el proveedor lo validó por ti",
+          "Cambiar de inmediato, ya que las versiones nuevas siempre son más precisas",
+          "Bajar todos los umbrales en 0.1 para estar seguros"
+        ]
+      },
+      "answer": [0],
+      "explanation": {
+        "en": "Aliases move and answers can change without any code change. Pin the versioned id in production, evaluate the new version against the same labels, and switch only after the regression test passes. The docs recommend exactly this.",
+        "es": "Los alias se mueven y las respuestas pueden cambiar sin ningún cambio de código. Fija el id versionado en producción, evalúa la versión nueva contra las mismas etiquetas y cambia solo después de que el test de regresión pase. La documentación recomienda exactamente esto."
+      }
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+## Goal
+
+Turn the placeholder thresholds from exercise 03 into numbers you can defend. You will run a labeled ticket dataset through one Jev Choice question, sweep confidence thresholds, plot the precision/coverage trade-off, and choose separate thresholds for a low-risk action (assign team) and a high-risk action (auto-close as duplicate). The output is a `thresholds.json` your router reads, plus a short report that states precision at each threshold with a bootstrap interval.
+
+This folder, `02-gated-routing/`, builds on `01-triage/` in `jev-lab`.
+
+## Context
+
+You need at least **300 labeled tickets** with a gold `department` label over 5–8 classes. The Module 1 and Module 9 ticket sets work; if you build a new one, label it yourself and keep one rare class (under 8%). The rare class is where a single global threshold fails: Jev may be confidently wrong on it.
+
+Row format for `data/labeled.jsonl`:
+
+```json
+{"id": "t-0042", "message": "Second time I'm writing. Two charges for order 88123, refund one.", "label": "billing"}
+```
+
+Prediction cache for `runs/jev-<model>.jsonl` (one row per ticket, produced once and committed):
+
+```json
+{"id": "t-0042", "choice": "billing", "confidence": 0.82, "probabilities": {"billing": 0.88, "account": 0.07, "technical": 0.05}, "model": "jev-1.14.0", "input_tokens": 231, "latency_ms": 140}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `run_jev.py` sends every ticket through one Choice question with the full class list, caches results keyed by `(model, question hash, id)`, and never re-calls the API for a cached row
+- [ ] `sweep.py` computes, for thresholds 0.0 to 1.0 in steps of 0.05: coverage, precision among covered, and a 95% bootstrap interval on that precision (1,000 resamples, fixed seed)
+- [ ] The sweep is run for three statistics: `confidence`, `p_max`, and `p_max / p_second`, and the report says which one separates best on this data
+- [ ] Per-class precision at the chosen thresholds is reported, including the rare class
+- [ ] `thresholds.json` contains two gates with `act` and `confirm` levels: `assign_team` (target precision at least 0.90 among auto-decided) and `auto_close_duplicate` (target at least 0.98), each with the statistic used, the achieved precision, its interval, the coverage, and the `model` id
+- [ ] `plot.py` writes `precision_coverage.png` with one curve per statistic and the two chosen operating points marked
+- [ ] `route.py` reads `thresholds.json` and maps a cached row to `auto`, `confirm` or `human` for each action; `tests/test_route.py` covers the band boundaries
+- [ ] `REPORT.md` states the estimated human workload (1 minus coverage) for each action and names the classes where confidence is least informative
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 02-gated-routing/sweep.py
+import json
+from pathlib import Path
+
+import numpy as np
+
+SEED = 11
+THRESHOLDS = np.round(np.arange(0.0, 1.0001, 0.05), 2)
+
+
+def load(path: str) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    gold = {json.loads(l)["id"]: json.loads(l)["label"] for l in Path("data/labeled.jsonl").read_text("utf-8").splitlines()}
+    rows = [json.loads(l) for l in Path(path).read_text("utf-8").splitlines()]
+    correct = np.array([r["choice"] == gold[r["id"]] for r in rows], dtype=bool)
+    stats = {
+        "confidence": np.array([r["confidence"] for r in rows]),
+        "p_max": np.array([max(r["probabilities"].values()) for r in rows]),
+        "ratio": np.array([top_to_second(r["probabilities"]) for r in rows]),
+    }
+    return correct, np.array([gold[r["id"]] for r in rows]), stats
+
+
+def top_to_second(probabilities: dict[str, float]) -> float:
+    ps = sorted(probabilities.values(), reverse=True)
+    second = ps[1] if len(ps) > 1 else 0.0
+    return ps[0] / max(second, 1e-6)
+
+
+def bootstrap_precision(correct: np.ndarray, iters: int = 1000) -> tuple[float, float]:
+    rng = np.random.default_rng(SEED)
+    n = len(correct)
+    if n == 0:
+        return float("nan"), float("nan")
+    draws = [correct[rng.integers(0, n, n)].mean() for _ in range(iters)]
+    return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
+def sweep(stat: np.ndarray, correct: np.ndarray, thresholds=THRESHOLDS) -> list[dict]:
+    rows = []
+    for t in thresholds:
+        covered = stat >= t
+        lo, hi = bootstrap_precision(correct[covered])
+        rows.append({
+            "t": float(t),
+            "coverage": float(covered.mean()),
+            "precision": float(correct[covered].mean()) if covered.any() else float("nan"),
+            "ci": [lo, hi],
+            "n": int(covered.sum()),
+        })
+    return rows
+
+
+def choose(rows: list[dict], target: float) -> dict | None:
+    """Lowest threshold whose LOWER CI bound meets the target. None if never met."""
+    # TODO(you): iterate rows in threshold order and return the first that satisfies rows["ci"][0] >= target
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    correct, labels, stats = load("runs/jev-1.14.0.jsonl")
+    # TODO(you): sweep each statistic, choose gates for assign_team (0.90) and auto_close_duplicate (0.98)
+    # TODO(you): write thresholds.json and results.json; print per-class precision at the chosen gates
+```
+
+```python
+# 02-gated-routing/route.py
+import json
+from pathlib import Path
+
+THRESHOLDS = json.loads(Path("thresholds.json").read_text("utf-8"))
+
+
+def band(action: str, row: dict) -> str:
+    gate = THRESHOLDS[action]
+    stat = {"confidence": row["confidence"], "p_max": max(row["probabilities"].values())}[gate["statistic"]]
+    if stat >= gate["act"]:
+        return "auto"
+    if stat >= gate["confirm"]:
+        return "confirm"
+    return "human"
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Keep API calls and analysis in separate files. `run_jev.py` is the only file that talks to Jev (SDK or your `JevClient` from folder 01). `sweep.py`, `plot.py` and `route.py` read cached rows only, so you can iterate on statistics for free and your tests never need a key.</Hint>
+  <Hint>Use the lower bound of the interval, not the point estimate, when choosing a threshold. A precision of 0.99 on 12 covered items has a lower bound near 0.75. If no threshold meets 0.98 with a defensible lower bound, the honest output is "auto-close cannot be automated at this dataset size", and that goes in the report.</Hint>
+  <Hint>Per-class precision will expose the rare class. If `legal_threat` is only 60% precise even at confidence 0.9, add a per-class override to `thresholds.json` (for example, never auto-act on `legal_threat`) rather than raising the global threshold and losing coverage everywhere.</Hint>
+  <Hint>For the plot, x is coverage (1.0 on the left, decreasing), y is precision, one line per statistic, and a marker with a label at each chosen operating point. If the `confidence` and `p_max` lines overlap almost exactly, that is expected when every question has the same number of options; the ratio line is the one that usually differs.</Hint>
+</Hints>
+
+<CommitBox repo="jev-lab">
+
+```text
+jev-lab/
+  02-gated-routing/
+    README.md
+    data/
+      labeled.jsonl
+    runs/
+      jev-1.14.0.jsonl        # cached predictions, committed
+    run_jev.py
+    sweep.py
+    plot.py
+    route.py
+    thresholds.json
+    results.json
+    precision_coverage.png
+    REPORT.md
+    tests/
+      test_sweep.py           # choose() and bootstrap on hand-built arrays
+      test_route.py           # band boundaries for both actions
+```
+
+`02-gated-routing/README.md` outline:
+
+- The question, the class list, and the dataset (size, class distribution, rare class)
+- How to run: `python run_jev.py`, `python sweep.py`, `python plot.py`
+- The precision/coverage figure and the two chosen operating points
+- Why the lower CI bound drives the choice
+- Per-class notes and overrides
+
+Suggested commits:
+
+- `feat(gated): cached Jev run over 300 labeled tickets`
+- `feat(gated): precision/coverage sweep with bootstrap intervals`
+- `feat(gated): thresholds.json with per-action gates and router`
+- `docs(gated): report with workload estimate and per-class caveats`
+
+</CommitBox>
+
+<Checklist id="m10-05-review" title="Self-review" items={["Every ticket was classified once with the full class list, and the model id is stored per row", "Thresholds were chosen from the lower CI bound, not the point estimate", "The high-risk action has a stricter gate than the low-risk one, and the report explains why", "Per-class precision is reported and the rare class has an override if it needs one", "Three statistics were compared and the report says which one wins on this data", "route.py reads thresholds.json; no numbers are hard-coded in code", "The human workload estimate per action is in the report", "Rerunning sweep.py reproduces the same numbers"]} />

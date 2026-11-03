@@ -1,0 +1,23 @@
+## About this exam
+
+This exam checks that you can place a System One model correctly inside an LLM system and reason about its probabilities. It has 16 questions and a 30-minute time limit. The passing score is **70%**.
+
+**What it covers:**
+
+- What Jev is and is not: non-autoregressive parallel evaluation, schema conformance versus correctness, the vendor's own list of weak spots, when to use plain code, Jev, or an LLM
+- The three primitives: Choice, Score and Noul, their request and response fields, and how to write criteria that separate
+- Probabilities and confidence: the published formulas, why 0.5 depends on the number of options, three bands scaled by risk, validating thresholds on labeled data
+- Patterns: speculative fan-out, composite scoring, intent routing, hierarchical beam search, the SDE cascade, keeping arithmetic and dates in code
+- Jev inside RAG and agents: re-ranking, passage classification, citation checks, guardrail batteries, tool-call gates
+- Evaluation and production: calibration curves, Brier, ECE, drift when the alias moves, cost modelling, retries, fallbacks on the same schema
+
+**Question types:** single choice, multi-select, order-the-steps and code reading (request JSON, confidence math, threshold logic, a cascade gate).
+
+**How to prepare:**
+
+1. Recompute by hand the Choice and Score confidence examples from lesson 04.
+2. Re-read your `thresholds.json` from exercise 05 and explain why the two gates differ.
+3. Be able to say what your tool-call gate does when Jev is unavailable, and why.
+4. Review the "common mistakes" section of every lesson.
+
+Options are shuffled on each attempt. Read every explanation after you submit.

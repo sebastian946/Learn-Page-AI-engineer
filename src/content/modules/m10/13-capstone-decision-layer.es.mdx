@@ -1,0 +1,129 @@
+<ClientBrief company="Kestrel Market" industry="E-commerce / Marketplace peer-to-peer" duration="3 días" />
+
+## Contexto de la empresa
+
+Kestrel Market es un marketplace ficticio peer-to-peer de electrónica reacondicionada. Unas 40,000 publicaciones salen al aire cada semana, 9,000 conversaciones de soporte empiezan cada día, y un asistente para vendedores ("Kestrel Helper") responde preguntas de políticas y publicaciones desde un corpus de help center. El equipo de operaciones de 22 personas revisa publicaciones, enruta tickets y audita las respuestas del asistente.
+
+Hoy cada decisión automatizada de ese flujo es una llamada a un LLM con un schema JSON: moderación de publicaciones (¿esta publicación está prohibida, mal categorizada, es sospechosa?), triage de tickets (departamento, urgencia, tono), los guardrails de entrada y salida del Helper, y el re-ranker del help center. Funciona, pero cada llamada tarda 1.5–4 segundos, la factura mensual de modelos es la segunda línea más grande del presupuesto de ops, y las salidas de solo-schema no le dan al equipo ninguna probabilidad para decidir qué automatizar. Todo o corre automático o va a un humano por regla estática.
+
+La dirección leyó sobre modelos System One y quiere una **capa de decisión en tiempo real**: Jev para cada juicio rápido, el LLM reservado para todo lo que una persona lea, y una cola humana alimentada por confianza en lugar de reglas fijas. Quieren medirla contra el baseline actual puramente LLM antes de que alguien cambie producción.
+
+## Stakeholders
+
+| Stakeholder | Rol | Qué le importa |
+|---|---|---|
+| Amara Sow | Head of Marketplace Operations | Menos revisiones manuales sin más errores; una cola en la que su equipo pueda confiar |
+| Diego Fontana | Lead de Trust & Safety | Las publicaciones prohibidas y los intentos de prompt injection no deben colarse; fallar cerrado |
+| Hannah Weiss | Partner de Finanzas | Costo por 1,000 decisiones contra el baseline, con precios fechados que pueda auditar |
+| Yusuf Demir | Staff engineer, plataforma | Presupuesto de latencia, versiones de modelo fijadas, fallback limpio, ningún nuevo punto único de fallo |
+| Priya Raman | Lead del equipo de soporte | Accuracy del triage por departamento y la señal de frustración para escalaciones |
+| Legal y privacidad | Compliance | El texto de clientes enviado a un proveedor nuevo necesita un DPA y minimización; los logs no deben duplicar PII |
+
+## Objetivo de negocio
+
+Reducir el costo y la latencia de las decisiones automatizadas del marketplace reemplazando llamadas a LLM por Jev donde un juicio rápido tipado alcanza, **sin** bajar la accuracy en las decisiones que importan, e introducir automatización con gate por confianza para que el equipo de ops revise los casos inciertos en lugar de una fracción fija de todo. Producir la evidencia que le permita a Amara y a Yusuf decidir si desplegarla.
+
+## Requisitos funcionales
+
+1. **Servicio de decisiones.** Un servicio FastAPI que expone cuatro puntos de decisión, cada uno una request a Jev construida con speculative fan-out: `POST /decide/listing` (Noul de prohibida, Choice de categoría sobre la taxonomía del marketplace con al menos 30 opciones, Noul de precio sospechoso, Score de condición), `POST /decide/ticket` (Choice de departamento sobre 8 equipos, Noul de urgencia, Score de frustración, Noul de quiere-humano, Choice de idioma), `POST /guardrail/input` y `POST /guardrail/output` (la batería de peligros: injection, quitar salvaguardas, pedido de daño, fuera de tema, PII-en-salida, más un Score de daño), `POST /rerank` (un Noul por (query, pasaje) sobre hasta 30 pasajes del help center, concurrente).
+2. **Routing con gate por confianza.** Cada decisión devuelve una banda (`auto`, `confirm`, `human`) por acción usando umbrales de un `thresholds.yaml` versionado, elegidos por acción según el costo de una acción equivocada y validados sobre datos etiquetados con el método precisión/cobertura del ejercicio 05.
+3. **Cola humana.** Las decisiones en las bandas `confirm` y `human` caen en una tabla de cola con el mapa de respuestas completo; un endpoint mínimo de revisor registra la etiqueta humana. Las etiquetas humanas alimentan la siguiente corrida de calibración.
+4. **Fallback a LLM con el mismo schema.** Para cada punto de decisión, un adaptador que responde las preguntas idénticas con un schema de structured output de Claude (id de modelo desde config). Se usa cuando Jev hace timeout o falla tras los retries, marcado en los logs, con gate de umbrales más estrictos. Los guardrails fallan cerrados; el re-ranking falla abierto al orden de BM25.
+5. **Datasets etiquetados.** Al menos 300 publicaciones etiquetadas, 300 tickets etiquetados, 200 mensajes de guardrail etiquetados (incluyendo al menos 60 adversariales reutilizados del módulo 3) y 40 queries del help center con pasajes gold. Etiqueta tú mismo; documenta la guía.
+6. **Suite de evals de calibración.** Para cada Noul y la probabilidad máxima de cada Choice: accuracy o F1, tabla de fiabilidad, Brier, ECE (bins de igual masa), intervalos bootstrap y un test de regresión con un baseline commiteado por versión de modelo fijada (ejercicio 10 generalizado).
+7. **Comparación con baseline.** Corre los adaptadores puramente LLM sobre los mismos datasets y reporta, de forma pareada: calidad, calibración, latencia p50/p95 y costo por 1,000 decisiones, con precios del proveedor leídos de config y fechados.
+8. **Dashboard de costo/latencia.** Una página pequeña o export de notebook que muestre, por punto de decisión: tasa de automatización (fracción en `auto`), tasa de cola humana, p50/p95, costo por 1,000 de Jev versus baseline, tasa de fallback y el id de modelo fijado.
+9. **Observabilidad.** Cada decisión registrada con id de request, punto de decisión, modelo versionado, mapa de respuestas, banda, versión de umbrales, fuente (`jev` o `llm_adapter`), latencia y tokens de entrada; el state registrado solo como hash.
+
+## Requisitos no funcionales
+
+| Requisito | Objetivo |
+|---|---|
+| Latencia, decisiones de triage y publicaciones | p95 por debajo de 800 ms de extremo a extremo con 20 requests concurrentes, medida con k6 contra respuestas grabadas y una vez en vivo si hay key disponible |
+| Latencia, re-rank sobre 30 pasajes | p95 por debajo de 1.2 s con fan-out concurrente |
+| Accuracy, departamento del ticket | Macro-F1 no menor que el baseline LLM por más de 2 puntos (bootstrap pareado, límite inferior) |
+| Precisión entre decisiones `auto` | Al menos 0.95 para moderación de publicaciones y guardrails, 0.90 para triage, sobre etiquetas hold-out |
+| Recall de guardrails en mensajes adversariales | Al menos 0.95 en el umbral de producción; los fallos fallan cerrados |
+| Calibración | ECE (igual masa, 10 bins) por debajo de 0.08 en cada Noul con gate; reportado con intervalos |
+| Costo | Costo por 1,000 decisiones de los puntos de decisión con Jev al menos 10x por debajo del baseline LLM, precios fechados |
+| Resiliencia | Caída de Jev simulada en tests: los guardrails retienen, el re-rank cae a fallback, el triage usa el adaptador, se dispara una alerta |
+| Versionado | Id versionado de Jev fijado en config; el alias se usa solo en un job "canary" documentado |
+| Privacidad | PII enmascarada antes de construir el state; sin state crudo en logs; checklist de DPA en el README |
+
+## Fuera de alcance
+
+- Reemplazar el LLM que redacta respuestas o contesta preguntas del help center.
+- Una UI de revisor de nivel producción; un endpoint JSON y una tabla alcanzan.
+- Hacer fine-tuning de cualquier modelo. Jev se moldea solo a través de state, instructions y criteria.
+- Moderación multimodal de fotos de publicaciones.
+- Desplegar a la nube; Docker Compose local con los patrones del módulo 5 es el objetivo.
+
+## Entregables
+
+1. Repo `jev-decision-layer` con el servicio, los adaptadores, los datasets, la suite de evals, el dashboard y los tests.
+2. `ARCHITECTURE.md` con el diagrama de abajo, los puntos de decisión, la lógica de bandas y la tabla de degradación.
+3. `THRESHOLDS.md` explicando cada gate: estadístico, umbral, precisión en el umbral con intervalo, cobertura, id de modelo, fecha.
+4. `EVAL_REPORT.md` con calidad, calibración, latencia y costo para Jev y el baseline LLM, pareados, con el veredicto.
+5. `RUNBOOK.md`: qué hacer cuando Jev está caído, cuando el alias se mueve, cuando la cola humana crece, cómo regenerar baselines.
+6. Un GIF de demo: un ticket y una publicación prohibida fluyendo por el servicio, uno cayendo en `auto` y otro en `human`.
+
+## Criterios de aceptación
+
+- Los cuatro puntos de decisión funcionan de extremo a extremo contra respuestas grabadas en tests y contra Jev en vivo (o un gateway) cuando hay key.
+- Cada umbral de `thresholds.yaml` se rastrea a una fila de `THRESHOLDS.md` con datos detrás.
+- El test de regresión de calibración corre en CI y falla ante un baseline degradado.
+- El reporte de eval compara Jev y el baseline LLM sobre los mismos ítems con intervalos pareados y precios fechados.
+- Los tests de caída prueban guardrails que fallan cerrados, re-ranking que falla abierto y el fallback al adaptador para triage.
+- El dashboard muestra tasa de automatización, tasa de cola, latencia, costo y tasa de fallback por punto de decisión.
+- No aparece texto crudo de clientes en logs ni en el repo.
+
+## Arquitectura sugerida
+
+<Diagram caption="Capa de decisión en tiempo real con Jev, fallback a LLM y una cola humana con gate por confianza" chart={`flowchart LR
+  A[Listing / ticket / message / query] --> B[PII masking + state builder]
+  B --> C{Decision point}
+  C --> D["Jev request (fan-out questions)"]
+  D -- timeout / 529 --> E["LLM adapter (same schema)"]
+  D --> F[Band: auto / confirm / human]
+  E --> F
+  F -- auto --> G[Downstream action]
+  F -- confirm / human --> H[(Human queue)]
+  H --> I[Reviewer label]
+  I --> J[Calibration eval suite]
+  D --> K[(Decision log: answers, model, band)]
+  E --> K
+  K --> J
+  K --> L[Cost / latency dashboard]
+  J --> M[thresholds.yaml + baseline.json]`} />
+
+## Rúbrica de evaluación
+
+| Área | Peso | 1 (débil) | 3 (sólido) | 5 (excelente) |
+|---|---|---|---|---|
+| Diseño de preguntas | 15% | Una pregunta vaga por decisión; niveles de Score numéricos | Preguntas atómicas con criterios descriptivos; se usa fan-out | Criterios ajustados con datos e iteraciones documentadas; Nouls compañeros en lugar de `other` |
+| Gate por confianza | 20% | Un umbral global, elegido a ojo | Gates por acción desde un barrido precisión/cobertura | Gates guiados por el límite inferior, overrides por clase, estimación de carga por acción |
+| Eval de calibración | 20% | Solo accuracy | Fiabilidad, Brier, ECE con intervalos; test de regresión | Bins de igual masa, recalibración evaluada hold-out, baselines por versión |
+| Comparación con baseline | 15% | Se citan afirmaciones del proveedor | Comparación pareada con intervalos y precios fechados | Análisis de trade-offs por punto de decisión, incluyendo dónde gana el LLM |
+| Resiliencia y fallback | 15% | Un fallo de Jev rompe la request | Fallback al adaptador y guardrails que fallan cerrados, probados | Tabla de degradación, alertas por tasa de fallback, versiones fijadas y job canary |
+| Observabilidad y privacidad | 10% | Se registran choices, sin probabilidades | Mapa de respuestas completo, id de modelo, banda, state hasheado | Los logs alimentan directamente la suite de evals; DPA y minimización documentados |
+| Comunicación | 5% | Números sin contexto | Reportes y runbook claros | Un stakeholder podría decidir solo con el reporte de eval |
+
+## Cronograma sugerido
+
+| Día | Foco | Salida |
+|---|---|---|
+| 1 | Datasets, preguntas, esqueleto del servicio | Sets etiquetados con guía; cuatro puntos de decisión con preguntas en fan-out; tests con respuestas grabadas; enmascarado de PII |
+| 2 | Gating, fallback, evals | Barridos precisión/cobertura y `thresholds.yaml`; adaptadores LLM; tests de caída; suite de calibración con baselines |
+| 3 | Comparación con baseline, dashboard, docs | Reporte de eval pareado con costo y latencia; corrida de k6; dashboard; ARCHITECTURE, THRESHOLDS, RUNBOOK; GIF de demo |
+
+## Definition of Done
+
+<Checklist id="m10-13-dod" title="Definition of Done" items={["Los cuatro puntos de decisión envían cada uno una request a Jev con speculative fan-out, y los tests hacen assert sobre el JSON de la request", "thresholds.yaml está versionado y cada gate se rastrea a una fila de precisión/cobertura con intervalo de límite inferior", "La moderación de publicaciones y los guardrails alcanzan al menos 0.95 de precisión entre decisiones auto sobre etiquetas hold-out", "El recall de guardrails en mensajes adversariales es al menos 0.95 y los fallos fallan cerrados", "Cada Noul con gate tiene tabla de fiabilidad, Brier y ECE con intervalos, y un baseline commiteado por id de modelo fijado", "El test de regresión de calibración corre en CI y se salta con un mensaje claro ante un cambio de modelo", "Los adaptadores LLM responden las preguntas idénticas con un schema de structured output y están marcados en los logs", "Los tests de caída prueban retención en guardrails, fallback a BM25 en re-rank, adaptador en triage y una alerta por tasa de fallback", "El reporte de eval compara Jev y el baseline LLM sobre los mismos ítems, pareados, con precios fechados y p50/p95", "El costo por 1,000 decisiones de los puntos con Jev es al menos 10x menor que el baseline, o el reporte explica por qué no", "El dashboard muestra tasa de automatización, tasa de cola, latencia, costo y tasa de fallback por punto de decisión", "No hay texto crudo de clientes en logs ni en el repo; el README tiene el checklist de DPA y minimización", "El RUNBOOK cubre Jev caído, alias movido, cola creciendo, regeneración de baseline", "El GIF de demo muestra una decisión auto y una de cola humana de extremo a extremo"]} />
+
+## Cómo presentar esto en una entrevista
+
+Abre con el encuadre de una frase: "Reemplacé las llamadas a LLM de juicio rápido en un flujo de operaciones de marketplace por un modelo System One y agregué automatización con gate por confianza, medida contra el baseline LLM." Luego muestra el dashboard: tasa de automatización, tasa de cola, costo por 1,000 y p95 por punto de decisión, Jev junto al baseline.
+
+Espera cuatro preguntas. **"¿Cómo sabes que las probabilidades significan algo?"** Muestra la curva de fiabilidad y el ECE con intervalos, explica los bins de igual masa y di qué hiciste cuando un Noul estaba mal calibrado. **"¿Qué pasa cuando el proveedor está caído?"** Recorre la tabla de degradación: fallar cerrado, fallar abierto, adaptador, alerta. **"¿Por qué no usar simplemente el LLM con un schema?"** Da los números pareados, y luego sé honesto sobre dónde el LLM sigue ganando: puede explicar, y maneja los casos multi-hop y de aritmética que la propia documentación de Jev dice que no puede. **"¿Cómo elegiste los umbrales?"** Barrido precisión/cobertura, límite inferior del intervalo, por acción según el costo de una acción equivocada, id de modelo fijado, test de regresión.
+
+Cierra con el ángulo SDET: cada pregunta a Jev es un oráculo que puedes correr en cada request, así que la suite de evals y el camino de producción son el mismo código, y la cola humana es el pipeline de etiquetado. Esa es la parte que la mayoría de los candidatos no puede decir.

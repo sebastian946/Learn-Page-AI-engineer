@@ -1,0 +1,158 @@
+[
+  {
+    "id": "m10-iv-01",
+    "level": "mid",
+    "tags": ["system-one", "jev", "architecture"],
+    "question": {
+      "en": "What is a System One model, and how is Jev different from an LLM with structured outputs?",
+      "es": "¿Qué es un modelo System One y en qué se diferencia Jev de un LLM con structured outputs?"
+    },
+    "answer": {
+      "en": "A System One model makes fast, typed decisions over natural-language input. It reads text like an LLM but returns a probability distribution over options you define, not generated text. Jev, from TypeSafe AI, is the first one.\n\nAn LLM with a JSON schema still generates token by token: the shape is enforced by the decoder and your parser, each call takes seconds, and you get at most a self-reported confidence. Jev is non-autoregressive: it ingests the state once, evaluates every question in parallel and in isolation, and returns `choice`, `probabilities` and `confidence` (or a `noul` probability) in a few hundred milliseconds for fractions of a cent. The output cannot be malformed, which is the real guarantee; it can still be the wrong valid option, so you validate accuracy and calibration on your own data. I use Jev as the decision layer inside an LLM system, not as a replacement for the parts that write text.",
+      "es": "Un modelo System One toma decisiones rápidas y tipadas sobre entrada en lenguaje natural. Lee texto como un LLM pero devuelve una distribución de probabilidad sobre opciones que tú defines, no texto generado. Jev, de TypeSafe AI, es el primero.\n\nUn LLM con un schema JSON sigue generando token a token: la forma la impone el decoder y tu parser, cada llamada tarda segundos y como mucho obtienes una confianza auto-reportada. Jev es no autorregresivo: ingiere el state una vez, evalúa cada pregunta en paralelo y de forma aislada, y devuelve `choice`, `probabilities` y `confidence` (o una probabilidad `noul`) en unos cientos de milisegundos por fracciones de centavo. La salida no puede estar malformada, que es la garantía real; igual puede ser la opción válida equivocada, así que validas accuracy y calibración con tus propios datos. Uso Jev como la capa de decisión dentro de un sistema con LLM, no como reemplazo de las partes que escriben texto."
+    }
+  },
+  {
+    "id": "m10-iv-02",
+    "level": "mid",
+    "tags": ["primitives", "choice", "score", "noul"],
+    "question": {
+      "en": "Explain the three Jev primitives and give a rule for choosing between them.",
+      "es": "Explica las tres primitivas de Jev y da una regla para elegir entre ellas."
+    },
+    "answer": {
+      "en": "Choice picks one of up to 255 named options and returns the choice, the full probability map and a confidence. Score places the state on an ordered rubric of 2 to 10 described levels and returns a weighted position, the per-level probabilities, a legend and a confidence. Noul judges one yes/no proposition and returns the probability that it is true, with no separate confidence.\n\nMy rule is to pick the type whose answer my code acts on directly. If the code dispatches on it, Choice. If it thresholds or sorts on a degree, Score with levels written as situations, not numbers. If it branches on a boolean, Noul phrased so high means yes. The classic mistake is using a Noul for a degree: 0.5 means uncertain, not medium.",
+      "es": "Choice elige una de hasta 255 opciones con nombre y devuelve la elección, el mapa completo de probabilidades y una confianza. Score ubica el state en una rúbrica ordenada de 2 a 10 niveles descritos y devuelve una posición ponderada, las probabilidades por nivel, una leyenda y una confianza. Noul juzga una proposición sí/no y devuelve la probabilidad de que sea verdadera, sin confianza separada.\n\nMi regla es elegir el tipo cuya respuesta mi código usa directamente. Si el código despacha con ella, Choice. Si umbraliza u ordena por un grado, Score con niveles escritos como situaciones, no números. Si ramifica con un booleano, Noul redactado para que alto signifique sí. El error clásico es usar un Noul para un grado: 0.5 significa incierto, no medio."
+    }
+  },
+  {
+    "id": "m10-iv-03",
+    "level": "mid",
+    "tags": ["confidence", "probabilities"],
+    "question": {
+      "en": "What is Jev's confidence value, and what is it not?",
+      "es": "¿Qué es el valor de confianza de Jev, y qué no es?"
+    },
+    "answer": {
+      "en": "Confidence is a summary statistic of the probability distribution the answer already contains. For a Choice with n options it is (p_max minus 1/n) divided by (1 minus 1/n): zero at an even split, one when all probability is on one option. For a Score it also accounts for how far the spread sits from the most likely level, so splitting between neighbours costs less confidence than splitting between the ends. Nouls have none; the probability itself carries the uncertainty, and |2p minus 1| puts it on the same scale.\n\nIt is not the probability that the answer is correct. A model can put 100% on the wrong option. Whether high confidence tends to go with correct answers is calibration, which I measure on labeled data with reliability curves and ECE, and which the vendor explicitly does not guarantee.",
+      "es": "La confianza es un estadístico resumen de la distribución de probabilidad que la respuesta ya contiene. Para un Choice con n opciones es (p_max menos 1/n) dividido por (1 menos 1/n): cero en un reparto parejo, uno cuando toda la probabilidad está en una opción. Para un Score también considera qué tan lejos del nivel más probable queda la dispersión, así que dividirse entre vecinos cuesta menos confianza que dividirse entre los extremos. Los Nouls no tienen; la probabilidad en sí carga la incertidumbre, y |2p menos 1| la pone en la misma escala.\n\nNo es la probabilidad de que la respuesta sea correcta. Un modelo puede poner 100% en la opción equivocada. Que la confianza alta tienda a ir con respuestas correctas es calibración, que mido sobre datos etiquetados con curvas de fiabilidad y ECE, y que el proveedor explícitamente no garantiza."
+    }
+  },
+  {
+    "id": "m10-iv-04",
+    "level": "senior",
+    "tags": ["confidence-gated-routing", "thresholds", "evals"],
+    "question": {
+      "en": "How do you set confidence thresholds for automated actions, and why would two actions in the same system have different thresholds?",
+      "es": "¿Cómo fijas umbrales de confianza para acciones automatizadas, y por qué dos acciones del mismo sistema tendrían umbrales distintos?"
+    },
+    "answer": {
+      "en": "From data, per action. I label a few hundred items, run them once through Jev and cache the answers, then sweep thresholds and compute coverage and precision among covered items with bootstrap intervals. I choose the lowest threshold whose lower interval bound meets the precision target for that action, read the coverage to estimate the human workload, and store the threshold with the statistic, the achieved precision, the coverage and the model id in versioned config.\n\nActions differ because the cost of a wrong action differs. Showing the wrong screen is recoverable, so it can run at confidence 0.5. Approving a transfer or auto-closing a ticket costs money or trust, so it needs 0.95 with confirmation in between. Three bands, act, confirm, human, with boundaries that scale with risk. It is the same decision an SDET makes about which checks block a merge and which only warn.",
+      "es": "A partir de datos, por acción. Etiqueto unos cientos de ítems, los paso una vez por Jev y cacheo las respuestas, luego barro umbrales y calculo cobertura y precisión entre los ítems cubiertos con intervalos bootstrap. Elijo el umbral más bajo cuyo límite inferior del intervalo cumpla el objetivo de precisión de esa acción, leo la cobertura para estimar la carga humana, y guardo el umbral con el estadístico, la precisión alcanzada, la cobertura y el id de modelo en config versionada.\n\nLas acciones difieren porque el costo de una acción equivocada difiere. Mostrar la pantalla equivocada es recuperable, así que puede correr con confianza 0.5. Aprobar una transferencia o auto-cerrar un ticket cuesta dinero o confianza, así que necesita 0.95 con confirmación en el medio. Tres bandas, act, confirm, human, con límites que escalan con el riesgo. Es la misma decisión que un SDET toma sobre qué checks bloquean un merge y cuáles solo avisan."
+    }
+  },
+  {
+    "id": "m10-iv-05",
+    "level": "mid",
+    "tags": ["speculative-fan-out", "patterns", "cost"],
+    "question": {
+      "en": "What is speculative fan-out and why does it make economic sense with Jev?",
+      "es": "¿Qué es el speculative fan-out y por qué tiene sentido económico con Jev?"
+    },
+    "answer": {
+      "en": "Speculative fan-out means putting every question your code might need into one request, including questions that only matter for some inputs, and letting the code ignore the answers it does not use. A ticket that is not a return still gets asked for a return reason.\n\nIt works because Jev evaluates all questions in parallel against a state it ingests once. The state dominates the token count, so extra questions add a few tokens each and almost no latency, while a second request would pay for the state again plus a full round-trip. The vendor's own cookbook measured 13 questions in one call at roughly ten times faster and twelve times cheaper than 13 calls, with identical answers. The only limits are the context windows: 64k tokens for state plus all questions, 32k for state plus the longest question.",
+      "es": "Speculative fan-out significa poner en una sola request todas las preguntas que tu código podría necesitar, incluidas las que solo importan para algunos inputs, y dejar que el código ignore las respuestas que no usa. A un ticket que no es una devolución igual se le pregunta la razón de devolución.\n\nFunciona porque Jev evalúa todas las preguntas en paralelo contra un state que ingiere una sola vez. El state domina el conteo de tokens, así que las preguntas extra agregan unos pocos tokens cada una y casi nada de latencia, mientras que una segunda request pagaría el state otra vez más un round-trip completo. El propio cookbook del proveedor midió 13 preguntas en una llamada alrededor de diez veces más rápido y doce veces más barato que 13 llamadas, con respuestas idénticas. Los únicos límites son las ventanas de contexto: 64k tokens para state más todas las preguntas, 32k para state más la pregunta más larga."
+    }
+  },
+  {
+    "id": "m10-iv-06",
+    "level": "senior",
+    "tags": ["sde-cascade", "extraction", "patterns"],
+    "question": {
+      "en": "Describe the SDE cascade pattern and the conditions under which it saves money.",
+      "es": "Describe el patrón de cascada SDE y las condiciones bajo las cuales ahorra dinero."
+    },
+    "answer": {
+      "en": "A cheap LLM extracts a structured record. One Jev request then verifies it with a battery of narrow Nouls, one per field and failure mode, each phrased so that true means something is wrong: type violated, value absent from the source, description mismatch. The gate is any-style: if any flag exceeds the threshold, the document is escalated to a stronger, slower model; otherwise the cheap result is accepted. Only escalated documents pay the expensive price.\n\nIt saves money when two conditions hold. The verifier must cost far less than the escalation rung, which Jev does at a fraction of a cent per request. And the flags must separate: high on genuinely wrong fields, low on correct ones, which I check on labeled extractions before shipping. I never average the flags, because a mean hides one confident red flag among many zeros.",
+      "es": "Un LLM barato extrae un registro estructurado. Una request a Jev lo verifica luego con una batería de Nouls estrechos, uno por campo y modo de fallo, cada uno redactado para que true signifique que algo está mal: tipo violado, valor ausente de la fuente, descripción que no coincide. El gate es estilo any: si cualquier flag supera el umbral, el documento se escala a un modelo más fuerte y lento; si no, se acepta el resultado barato. Solo los documentos escalados pagan el precio caro.\n\nAhorra dinero cuando se cumplen dos condiciones. El verificador debe costar mucho menos que el escalón de escalación, cosa que Jev hace a una fracción de centavo por request. Y los flags deben separar: altos en campos genuinamente incorrectos, bajos en los correctos, lo que verifico con extracciones etiquetadas antes de enviarlo. Nunca promedio los flags, porque una media esconde una bandera roja confiada entre muchos ceros."
+    }
+  },
+  {
+    "id": "m10-iv-07",
+    "level": "senior",
+    "tags": ["rag", "re-ranking", "citations"],
+    "question": {
+      "en": "Where would you put Jev inside a RAG pipeline, and how would you prove it helps?",
+      "es": "¿Dónde pondrías Jev dentro de un pipeline de RAG, y cómo probarías que ayuda?"
+    },
+    "answer": {
+      "en": "Three places. Re-ranking: one Noul per (query, passage) pair asking whether the passage directly answers the query, fired concurrently over the BM25 shortlist and sorted by probability. Passage classification: four Nouls per pair, relevance, answer evidence, contradicts the premise, prompt injection, with the include/exclude decision in code as thresholds. Citation verification after generation: a three-way Choice, supports, contradicts, says nothing, per (claim, cited passage), run on every answer because it is cheap enough.\n\nTo prove it, I benchmark on the same golden queries as the existing cross-encoder: hit@5 and MRR with paired bootstrap intervals, plus p50/p95 latency and dated cost per 1,000 queries. If the difference sits inside the interval I say so. For citations I calibrate the Choice on human-labeled pairs and report precision at the confidence threshold I gate on.",
+      "es": "En tres lugares. Re-ranking: un Noul por par (query, pasaje) preguntando si el pasaje responde directamente la query, disparado de forma concurrente sobre la lista corta de BM25 y ordenado por probabilidad. Clasificación de pasajes: cuatro Nouls por par, relevancia, evidencia de respuesta, contradice la premisa, prompt injection, con la decisión de incluir/excluir en código como umbrales. Verificación de citas después de la generación: un Choice de tres vías, supports, contradicts, says nothing, por (afirmación, pasaje citado), corrido sobre cada respuesta porque es lo bastante barato.\n\nPara probarlo, hago benchmark sobre las mismas queries golden que el cross-encoder existente: hit@5 y MRR con intervalos bootstrap pareados, más latencia p50/p95 y costo fechado por 1,000 queries. Si la diferencia queda dentro del intervalo lo digo. Para las citas calibro el Choice sobre pares etiquetados por humanos y reporto la precisión en el umbral de confianza con el que hago gate."
+    }
+  },
+  {
+    "id": "m10-iv-08",
+    "level": "senior",
+    "tags": ["guardrails", "agents", "tool-gating", "hitl"],
+    "question": {
+      "en": "How would you use Jev to gate tool calls in a LangGraph agent that already has human-in-the-loop approval?",
+      "es": "¿Cómo usarías Jev para hacer gate de tool calls en un agente LangGraph que ya tiene aprobación human-in-the-loop?"
+    },
+    "answer": {
+      "en": "I keep the static risky-tools list as the floor and add a Jev gate between the model's proposed call and the approval node. The state is the user's goal, the last few turns and the pending call with its arguments. Three questions in one request: a Choice on reversibility (reversible, costly, irreversible), a Noul on whether the call is on task toward the goal, and a Noul on whether the user explicitly authorised it.\n\nThe decision is code: off-task below 0.3 is rejected without bothering a human; a listed risky tool always holds; a reversible call with high confidence and high on-task probability executes directly; everything else holds for the existing interrupt. If Jev times out or fails after retries, the gate fails closed to hold. I write the three answers into agent state so trajectory evals can score the gate, and I test it at graph level with recorded answer maps and a scripted model, no network.",
+      "es": "Mantengo la lista estática de tools riesgosas como piso y agrego un gate con Jev entre la llamada propuesta por el modelo y el nodo de aprobación. El state es el objetivo del usuario, los últimos turnos y la llamada pendiente con sus argumentos. Tres preguntas en una request: un Choice de reversibilidad (reversible, costosa, irreversible), un Noul sobre si la llamada está en tarea hacia el objetivo y un Noul sobre si el usuario la autorizó explícitamente.\n\nLa decisión es código: fuera de tarea por debajo de 0.3 se rechaza sin molestar a un humano; una tool riesgosa listada siempre se retiene; una llamada reversible con alta confianza y alta probabilidad de estar en tarea se ejecuta directo; todo lo demás se retiene para el interrupt existente. Si Jev hace timeout o falla tras los retries, el gate falla cerrado a retener. Escribo las tres respuestas en el state del agente para que las evals de trayectoria puedan puntuar el gate, y lo pruebo a nivel de grafo con mapas de respuestas grabados y un modelo scripted, sin red."
+    }
+  },
+  {
+    "id": "m10-iv-09",
+    "level": "senior",
+    "tags": ["calibration", "brier", "ece", "evals"],
+    "question": {
+      "en": "How do you evaluate whether Jev's probabilities are calibrated, and what do you do if they are not?",
+      "es": "¿Cómo evalúas si las probabilidades de Jev están calibradas, y qué haces si no lo están?"
+    },
+    "answer": {
+      "en": "On a labeled set of a few hundred items I bin the predicted probabilities and compare mean confidence with observed frequency per bin, which is the reliability diagram. I summarise it with Brier score, which mixes calibration and discrimination, and ECE, which isolates calibration. Because Jev's probabilities cluster near 0 and 1, I use equal-mass bins and report counts per bin, with bootstrap intervals. I evaluate the top probability of Choices the same way, against whether the chosen option was correct.\n\nIf discrimination is good but calibration is off, I fit isotonic regression on a held-out split and threshold the corrected probability. If discrimination is poor, no recalibration helps and I rewrite the question or move the step to an LLM. Either way I commit a baseline per pinned model version and a regression test that fails if accuracy or ECE degrade, so a new version cannot silently change the automation rate.",
+      "es": "Sobre un set etiquetado de unos cientos de ítems agrupo las probabilidades predichas en bins y comparo la confianza media con la frecuencia observada por bin, que es el diagrama de fiabilidad. Lo resumo con el Brier score, que mezcla calibración y discriminación, y el ECE, que aísla la calibración. Como las probabilidades de Jev se agrupan cerca de 0 y 1, uso bins de igual masa y reporto conteos por bin, con intervalos bootstrap. Evalúo la probabilidad máxima de los Choices de la misma forma, contra si la opción elegida fue correcta.\n\nSi la discriminación es buena pero la calibración está desfasada, ajusto una regresión isotónica sobre un split hold-out y umbralizo la probabilidad corregida. Si la discriminación es pobre, ninguna recalibración ayuda y reescribo la pregunta o muevo el paso a un LLM. En cualquier caso commiteo un baseline por versión de modelo fijada y un test de regresión que falla si la accuracy o el ECE se degradan, para que una versión nueva no pueda cambiar en silencio la tasa de automatización."
+    }
+  },
+  {
+    "id": "m10-iv-10",
+    "level": "mid",
+    "tags": ["production", "errors", "retries", "versions"],
+    "question": {
+      "en": "Which Jev API errors do you retry, which do you not, and how do you handle model versioning in production?",
+      "es": "¿Qué errores de la API de Jev reintentas, cuáles no, y cómo manejas el versionado del modelo en producción?"
+    },
+    "answer": {
+      "en": "I retry only 429 (rate limited) and 529 (overloaded), with exponential backoff and jitter, honouring Retry-After, and a capped number of attempts; the official SDKs do this by default. I do not retry 400 (request rule broken or context exceeded), 401 (bad key), 413 (body over 32 MiB), 415 (bad compression) or 422 (validation failed): those are bugs to surface with the detail from the response body.\n\nFor versioning, `jev-latest` is an alias that moves between releases, currently pointing at `jev-1.14.0`. Every response carries the versioned `model` id, so I log it with each decision. Production sends the versioned id, not the alias; the alias runs only in a canary job. When the alias moves, I run the paired calibration regression against the new version and switch deliberately after it passes.",
+      "es": "Reintento solo 429 (rate limit) y 529 (sobrecargado), con backoff exponencial y jitter, respetando Retry-After y con un número limitado de intentos; los SDKs oficiales lo hacen por defecto. No reintento 400 (regla de request rota o contexto excedido), 401 (key inválida), 413 (body de más de 32 MiB), 415 (compresión inválida) ni 422 (validación fallida): esos son bugs a exponer con el detalle del body de la respuesta.\n\nPara el versionado, `jev-latest` es un alias que se mueve entre releases, hoy apuntando a `jev-1.14.0`. Cada response lleva el id de `model` versionado, así que lo registro con cada decisión. Producción envía el id versionado, no el alias; el alias corre solo en un job canary. Cuando el alias se mueve, corro la regresión de calibración pareada contra la versión nueva y cambio de forma deliberada después de que pasa."
+    }
+  },
+  {
+    "id": "m10-iv-11",
+    "level": "senior",
+    "tags": ["fallback", "resilience", "system-one-adapter"],
+    "question": {
+      "en": "What is the System One adapter, and how does it serve as both an eval tool and a production fallback?",
+      "es": "¿Qué es el adaptador System One, y cómo sirve a la vez como herramienta de eval y como fallback de producción?"
+    },
+    "answer": {
+      "en": "The adapter is an LLM constrained to exactly the same answer space as a Jev question: a structured-output schema with the Choice options as an enum, the Score levels, or a boolean, plus a probability field, with the same instructions and criteria text in the prompt. It returns the same typed record Jev would.\n\nAs an eval tool it makes the comparison fair: both systems are scored by the same code on the same labeled items, paired, including calibration of their probabilities, which is where the LLM usually loses. As a fallback it keeps the pipeline typed when Jev times out or returns 529 after retries: the rest of the system does not know which one answered. I flag adapter decisions in the log, gate them with stricter thresholds, order degradation per decision point, guardrails fail closed, re-ranking falls open to BM25, and alert on the fallback rate.",
+      "es": "El adaptador es un LLM restringido exactamente al mismo espacio de respuestas que una pregunta de Jev: un schema de structured output con las opciones del Choice como enum, los niveles del Score o un booleano, más un campo de probabilidad, con el mismo texto de instructions y criteria en el prompt. Devuelve el mismo registro tipado que devolvería Jev.\n\nComo herramienta de eval hace justa la comparación: ambos sistemas se puntúan con el mismo código sobre los mismos ítems etiquetados, de forma pareada, incluida la calibración de sus probabilidades, que es donde el LLM suele perder. Como fallback mantiene tipado el pipeline cuando Jev hace timeout o devuelve 529 tras los retries: el resto del sistema no sabe cuál respondió. Marco las decisiones del adaptador en el log, les hago gate con umbrales más estrictos, ordeno la degradación por punto de decisión, los guardrails fallan cerrados, el re-ranking cae abierto a BM25, y alerto por la tasa de fallback."
+    }
+  },
+  {
+    "id": "m10-iv-12",
+    "level": "mid",
+    "tags": ["cost", "latency", "vendor-claims"],
+    "question": {
+      "en": "A product manager quotes the vendor's \"444x cheaper\" claim in a planning doc. How do you turn that into a number you can stand behind?",
+      "es": "Un product manager cita la afirmación del proveedor de \"444x más barato\" en un documento de planificación. ¿Cómo lo conviertes en un número que puedas respaldar?"
+    },
+    "answer": {
+      "en": "I treat the vendor's multiplier as their benchmark on their workload and build our own model per decision point. Jev charges per input token, output free, at the published rate, so cost per 1,000 decisions is mean state tokens plus question tokens, times calls per request for fan-out patterns like re-ranking, times the price. I take token counts from our logs and date the price.\n\nThen I compute the same figure for the LLM call it replaces, input and output tokens times our provider's current prices, read from config and dated, and report the ratio with both numbers visible. I add measured p50 and p95 latency for each, because the speed claim depends on state size. The ratio is usually large, but it is our ratio, on our data, with a date, which is what a finance partner can audit.",
+      "es": "Trato el multiplicador del proveedor como su benchmark sobre su workload y construyo nuestro propio modelo por punto de decisión. Jev cobra por token de entrada, salida gratis, a la tarifa publicada, así que el costo por 1,000 decisiones es tokens medios de state más tokens de preguntas, por llamadas por request en patrones de fan-out como el re-ranking, por el precio. Tomo los conteos de tokens de nuestros logs y fecho el precio.\n\nLuego calculo la misma cifra para la llamada al LLM que reemplaza, tokens de entrada y salida por los precios actuales de nuestro proveedor, leídos de config y fechados, y reporto la razón con ambos números visibles. Agrego latencia p50 y p95 medidas para cada uno, porque la afirmación de velocidad depende del tamaño del state. La razón suele ser grande, pero es nuestra razón, sobre nuestros datos, con fecha, que es lo que un partner de finanzas puede auditar."
+    }
+  }
+]

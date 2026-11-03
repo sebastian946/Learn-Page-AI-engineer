@@ -1,0 +1,201 @@
+## Objetivo
+
+Dos integraciones, cada una medida contra lo que ya tienes:
+
+1. **Re-ranker.** Agrega un re-ranker con Noul de Jev a `rag-lab` como una carpeta nueva `08-jev-rerank/`, córrelo sobre el mismo `golden_rerank.jsonl` que usaste en `05-reranking/` del módulo 2, y compara hit@5 y MRR contra el cross-encoder, con latencia y costo por query.
+2. **Gate de tool calls.** Agrega un nodo `jev_gate` a `langgraph-hitl-agent` que corra antes del nodo de aprobación y retenga llamadas irreversibles o fuera de tarea, y pruébalo con tests a nivel de grafo usando un modelo scripted y respuestas de Jev grabadas.
+
+Ambas piezas van a sus repos originales. En `jev-lab`, la carpeta `03-integrations/` guarda solo el reporte de comparación y los links.
+
+## Contexto
+
+Para el re-ranker necesitas los artefactos del módulo 2: un retriever BM25 o híbrido que devuelva 30 candidatos por query, el archivo golden con el id del chunk relevante por query y los números del `bench.py` del cross-encoder. Si tu archivo golden tiene menos de 40 queries, extiéndelo a 40 primero; el MRR sobre 15 queries es ruido.
+
+Para el gate necesitas el agente del módulo 4 con su fake `ScriptedModel` y el nodo de aprobación con `RISKY_TOOLS`. El gate no reemplaza ese nodo; decide si la llamada llega a él, lo salta o se rechaza.
+
+<AcceptanceCriteria>
+
+- [ ] `rag-lab/08-jev-rerank/reranker.py` expone `JevReranker(client, max_workers=8).rerank(query, candidates, top_k) -> list[Candidate]`, una request Noul por (query, pasaje), concurrente, con el `noul` guardado en cada candidato
+- [ ] Las respuestas de Jev se cachean en `cache/<model>/<sha256(query+chunk_id)>.json`; una segunda corrida hace cero llamadas a la API y los tests leen solo el caché
+- [ ] `bench.py` reporta hit@1, hit@5, MRR@10, latencia p50 y p95 por query y costo estimado por 1,000 queries para: solo BM25, cross-encoder (de `05-reranking`), re-rank con Jev, todos sobre las mismas 40+ queries, con intervalos bootstrap al 95% sobre hit@5 y MRR
+- [ ] El reporte dice si la diferencia entre Jev y el cross-encoder está dentro del intervalo, y cuál debería usar el retriever por defecto y por qué
+- [ ] `langgraph-hitl-agent/src/hitl_agent/jev_gate.py` construye el state (objetivo, últimos 6 mensajes, tool call pendiente) y devuelve `execute`, `hold` o `reject` usando umbrales de `config/gate.yaml`
+- [ ] El router llama al gate antes del nodo de aprobación; `reject` termina el turno con un mensaje al usuario, `hold` va al interrupt existente, `execute` corre la tool directamente solo cuando la tool no está en `RISKY_TOOLS`
+- [ ] `tests/test_jev_gate.py` cubre: un `update_address` fuera de tarea se rechaza; `issue_refund` con autorización explícita del usuario igual se retiene (piso estático); un `get_order` claramente solicitado se ejecuta; Jev no disponible (529 tras los retries) cae a `hold`
+- [ ] Todos los tests del gate usan un cliente Jev fake que devuelve mapas de respuestas grabados; sin red
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# rag-lab/08-jev-rerank/reranker.py
+from __future__ import annotations
+
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from typesafe_sdk import Noul, NoulCriteria, TypeSafeClient
+
+RELEVANT = Noul(
+    instructions="Does `passage` contain information that directly answers `query`?",
+    criteria=NoulCriteria(
+        true="The passage states the fact, policy, figure or procedure the query asks for.",
+        false="The passage is about a related topic but does not answer the query.",
+    ),
+)
+
+
+@dataclass
+class Candidate:
+    chunk_id: str
+    title: str
+    text: str
+    bm25_score: float
+    noul: float | None = None
+    meta: dict = field(default_factory=dict)
+
+
+class JevReranker:
+    def __init__(self, client: TypeSafeClient, model: str = "jev-1.14.0", cache_dir: str = "cache", max_workers: int = 8):
+        self.client, self.model, self.max_workers = client, model, max_workers
+        self.cache = Path(cache_dir) / model
+        self.cache.mkdir(parents=True, exist_ok=True)
+
+    def _key(self, query: str, chunk_id: str) -> Path:
+        return self.cache / (hashlib.sha256(f"{query}\n{chunk_id}".encode()).hexdigest() + ".json")
+
+    def _score(self, query: str, c: Candidate) -> float:
+        path = self._key(query, c.chunk_id)
+        if path.exists():
+            return json.loads(path.read_text("utf-8"))["noul"]
+        r = self.client.system_one(
+            state={"query": query, "passage": {"title": c.title, "text": c.text}},
+            questions={"relevant": RELEVANT},
+            model=self.model,
+        )
+        noul = r.answers["relevant"].noul
+        path.write_text(json.dumps({"noul": noul, "model": r.model, "input_tokens": r.usage.input_tokens}), "utf-8")
+        return noul
+
+    def rerank(self, query: str, candidates: list[Candidate], top_k: int = 5) -> list[Candidate]:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            scores = list(pool.map(lambda c: self._score(query, c), candidates))
+        for c, s in zip(candidates, scores):
+            c.noul = s
+        # TODO(you): sort by noul desc, tie-break by bm25_score, return top_k
+        raise NotImplementedError
+```
+
+```python
+# langgraph-hitl-agent/src/hitl_agent/jev_gate.py
+from __future__ import annotations
+
+from typing import Literal, Protocol
+
+from typesafe_sdk import Choice, Noul
+
+Decision = Literal["execute", "hold", "reject"]
+
+GATE_QUESTIONS = {
+    "reversible": Choice(
+        instructions="If `tool_call` is executed, can its effect be undone without cost?",
+        criteria={
+            "reversible": "Read-only, or trivially undone by the system",
+            "costly": "Undoing needs a person, a refund or a customer contact",
+            "irreversible": "Cannot be undone (money sent, message delivered, data deleted)",
+        },
+    ),
+    "on_task": Noul(instructions="Is `tool_call` a reasonable next step toward `goal` given `history`?"),
+    "user_authorised": Noul(instructions="In `history`, did the user explicitly ask for the action in `tool_call`?"),
+}
+
+
+class JevLike(Protocol):
+    def system_one(self, *, state, questions, model: str): ...
+
+
+def build_state(agent_state: dict) -> dict:
+    call = agent_state["pending_tool_call"]
+    return {
+        "goal": agent_state["goal"],
+        "history": [m.content for m in agent_state["messages"][-6:]],
+        "tool_call": {"name": call["name"], "args": call["args"]},
+    }
+
+
+def decide(answers: dict, cfg: dict, tool_name: str, risky_tools: set[str]) -> Decision:
+    rev = answers["reversible"]
+    on_task = answers["on_task"].noul
+    authorised = answers["user_authorised"].noul
+    if on_task < cfg["reject_if_on_task_below"]:
+        return "reject"
+    if tool_name in risky_tools:
+        return "hold"                                    # static floor from Module 4
+    # TODO(you): execute only if reversible with confidence >= cfg["execute_min_confidence"]
+    #            and on_task >= cfg["execute_min_on_task"]; otherwise hold
+    raise NotImplementedError
+
+
+def jev_gate(agent_state: dict, client: JevLike, cfg: dict, risky_tools: set[str]) -> Decision:
+    try:
+        r = client.system_one(state=build_state(agent_state), questions=GATE_QUESTIONS, model=cfg["model"])
+    except Exception:                                    # 529 after retries, timeout, network
+        return "hold"                                    # fail closed
+    return decide(r.answers, cfg, agent_state["pending_tool_call"]["name"], risky_tools)
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Reutiliza las funciones de métricas del `bench.py` del módulo 2. Hit@k es 1 si el id del chunk gold está en el top k, MRR es 1 sobre el rank del primer chunk gold (0 si no aparece en el top 10). Haz bootstrap sobre queries, no sobre candidatos, y usa los mismos índices remuestreados para los tres sistemas para que la comparación sea pareada.</Hint>
+  <Hint>El costo por 1,000 queries para Jev es `sum(input_tokens) / 1e6 * 0.042 * 1000 / n_queries`; toma los conteos de tokens de los archivos de caché y declara el precio y su fecha en el reporte. Para el cross-encoder, reporta segundos de GPU o CPU en lugar de dólares y dilo.</Hint>
+  <Hint>Para los tests del gate, escribe un `FakeJev` cuyo `system_one` devuelva un mapa de respuestas preparado indexado por el nombre de la tool pendiente, y un `FailingJev` que lance excepción. Construye los objetos de respuesta con las clases de respuesta del SDK si son importables en tu versión, o con dataclasses pequeñas que expongan `.choice`, `.confidence`, `.noul`.</Hint>
+  <Hint>El cambio del router en `graph.py` es un edge condicional: después de que el modelo propone una tool call, rutea a `jev_gate_node`, y luego con `reject` a un nodo `respond_rejected` que termina el turno, con `hold` al nodo `approval` existente, con `execute` a `tools`. Mantén `jev_gate_node` delgado: llama a `jev_gate` y escribe la decisión y las tres respuestas crudas en el state para que el log de trayectoria las lleve.</Hint>
+</Hints>
+
+<CommitBox repo="jev-lab">
+
+```text
+rag-lab/
+  08-jev-rerank/
+    README.md
+    reranker.py
+    bench.py
+    cache/jev-1.14.0/          # committed, small JSON files
+    results.json
+    REPORT.md
+
+langgraph-hitl-agent/
+  config/gate.yaml             # model, thresholds
+  src/hitl_agent/jev_gate.py
+  src/hitl_agent/graph.py      # jev_gate_node + conditional edge
+  tests/fakes.py               # FakeJev, FailingJev
+  tests/test_jev_gate.py
+
+jev-lab/
+  03-integrations/
+    README.md                  # links to both PRs, the comparison table, and the gate test matrix
+```
+
+Esquema de `08-jev-rerank/README.md`:
+
+- La pregunta Noul y por qué el state es por (query, pasaje)
+- Tabla de resultados: BM25, cross-encoder, Jev con hit@1, hit@5, MRR@10, p50/p95, costo por 1,000 queries (precios con fecha)
+- Intervalos bootstrap pareados y la decisión
+- Caché y cómo volver a correr en vivo
+
+Commits sugeridos:
+
+- `feat(rerank): Jev noul re-ranker with per-pair cache`
+- `feat(rerank): bench BM25 vs cross-encoder vs Jev with paired bootstrap`
+- `feat(gate): Jev tool-call gate before HITL approval, fail closed`
+- `test(gate): off-task reject, static floor hold, requested read executes, Jev down holds`
+- `docs(integrations): comparison report and gate decision matrix`
+
+</CommitBox>
+
+<Checklist id="m10-08-review" title="Autoevaluación" items={["El re-ranker envía una request por (query, pasaje) y las corre de forma concurrente", "Los tres sistemas se miden sobre las mismas queries con intervalos bootstrap pareados", "El reporte dice si Jev le gana al cross-encoder más allá del ruido, y da un costo por 1,000 queries con fecha", "Una segunda corrida del bench hace cero llamadas a la API", "El gate mantiene el piso estático de RISKY_TOOLS y agrega los caminos reject y execute", "Los fallos de Jev hacen que el gate retenga, nunca ejecute", "Los tests del gate corren sin red usando mapas de respuestas grabados", "Las tres respuestas del gate se escriben en el state del agente para las evals de trayectoria"]} />

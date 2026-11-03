@@ -1,0 +1,155 @@
+## La distribución es la respuesta
+
+Una respuesta Choice o Score no es la opción ganadora. Es el mapa completo de `probabilities`, y `choice` o `score` es un resumen de él. `confidence` es un segundo resumen: un único número de 0 a 1 que describe qué tan **concentrada** está la distribución. Es 1 cuando toda la probabilidad está en un resultado y 0 cuando se reparte de forma pareja.
+
+Lee esa definición dos veces, porque el error más común del módulo se esconde adentro. **La confianza es un estadístico de la forma de la distribución. No es la probabilidad de que la respuesta sea correcta.** Un modelo puede poner 100% en `billing` para un ticket técnico. Su confianza es 1.0 y está equivocado. Que la confianza alta tienda a ir con respuestas correctas es una propiedad empírica llamada calibración, y la mides sobre tus propios datos etiquetados (lecciones 09 y 10). TypeSafe entrena para ella y no da ninguna garantía al respecto.
+
+## Las tres fórmulas
+
+TypeSafe publica las fórmulas exactas, así que puedes recalcular `confidence` a partir de `probabilities` y, cuando te convenga, reemplazarla por otro estadístico.
+
+**Noul.** No hay campo `confidence`. El valor `p` ya carga la incertidumbre: cerca de 0.5 significa inseguro. Si quieres un número estilo confianza en la misma escala que un Choice, usa la distancia al punto medio:
+
+`confidence = |2p − 1|`
+
+**Choice** con `n` opciones, donde `p_max` es la probabilidad de la opción elegida:
+
+`confidence = (p_max − 1/n) / (1 − 1/n)`
+
+Es "qué tan por encima de un reparto parejo está la ganadora", reescalado para que el reparto parejo sea 0 y la certeza sea 1. Solo cuenta la probabilidad máxima: `(0.6, 0.3, 0.1)` y `(0.6, 0.2, 0.2)` dan 0.4 las dos.
+
+**Score** con `n` niveles ordenados, `m` el nivel más probable y `p_i` la probabilidad del nivel `i`:
+
+`confidence = max(0, 1 − Σ p_i·|i − m| / MAD_unif)` donde `MAD_unif = (1/n) Σ |i − (n−1)/2|`
+
+El numerador es la distancia promedio, en niveles, desde el pico. El denominador es esa misma distancia para un reparto parejo. La probabilidad en un nivel vecino cuesta menos confianza que la probabilidad lejos: con tres niveles, `(0, 0.5, 0.5)` da 0.25 y `(0.5, 0, 0.5)` da 0.
+
+```python
+def noul_confidence(p: float) -> float:
+    return abs(2 * p - 1)
+
+
+def choice_confidence(probabilities: dict[str, float]) -> float:
+    n = len(probabilities)
+    return (max(probabilities.values()) - 1 / n) / (1 - 1 / n)
+
+
+def score_confidence(probabilities: dict[int, float]) -> float:
+    levels = sorted(probabilities)
+    n = len(levels)
+    m = max(levels, key=lambda i: probabilities[i])
+    spread = sum(probabilities[i] * abs(i - m) for i in levels)
+    even_spread = sum(abs(i - (n - 1) / 2) for i in levels) / n
+    return max(0.0, 1 - spread / even_spread)
+
+
+assert round(choice_confidence({"a": 0.61, "b": 0.35, "c": 0.04}), 2) == 0.42
+assert round(score_confidence({0: 0.0, 1: 0.57, 2: 0.43}), 2) == 0.35
+```
+
+Esos dos asserts reproducen los números de los ejemplos de response de la lección 02. Guarda este archivo en `jev-lab`; es un test unitario de tu entendimiento y del contrato de la API.
+
+## Por qué 0.5 significa cosas distintas
+
+Una probabilidad máxima de 0.5 es un cara o cruz entre dos opciones y una señal fuerte entre diez. La fórmula de Choice lo absorbe: `p_max = 0.5` da confianza 0 con `n = 2` y 0.44 con `n = 10`. Ese es el sentido del reescalado, y es por lo que un único umbral de confianza puede reutilizarse entre preguntas con distinto número de opciones. También es por lo que no debes comparar `p_max` crudo entre preguntas sin pensar en `n`.
+
+Dos estadísticos alternativos que la documentación sugiere, ambos calculados del mismo mapa:
+
+- **Probabilidad máxima** `p_max`: se lee directamente como "qué tan probable es la opción elegida". Fija su umbral por pregunta, por el efecto de `n`.
+- **Razón top-a-segundo** `p_max / p_second`: qué tan claramente la ganadora le gana a la segunda, ignorando la cola. Buena para routing donde solo importan las dos primeras.
+
+Pruébalos lado a lado sobre tu set etiquetado; quédate con el que mejor separe respuestas correctas de incorrectas.
+
+## Tres bandas, escaladas por riesgo
+
+El patrón que recomienda la documentación, y el que vas a construir en el próximo ejercicio, divide la confianza en tres rangos:
+
+| Banda | Comportamiento del sistema | Ejemplo |
+|---|---|---|
+| Alta | Actuar automáticamente | Asignar el ticket, mostrar el saldo |
+| Media | Actuar con una salvaguarda | Pedir confirmación al usuario, marcar para revisión, traer más state |
+| Baja | No actuar | Cola humana, aclaración, fallback a un LLM |
+
+Los límites no son un solo número. **Escalan con el costo de equivocarse**, por acción, dentro del mismo sistema:
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Gate:
+    act: float      # confidence at or above this: act automatically
+    confirm: float  # between confirm and act: safeguard; below confirm: human
+
+
+GATES = {
+    "show_balance": Gate(act=0.5, confirm=0.3),        # wrong screen is recoverable
+    "assign_team": Gate(act=0.7, confirm=0.4),         # misroute costs minutes
+    "approve_transfer": Gate(act=0.95, confirm=0.6),   # wrong approval costs money
+}
+
+
+def band(action: str, confidence: float) -> str:
+    g = GATES[action]
+    if confidence >= g.act:
+        return "auto"
+    if confidence >= g.confirm:
+        return "confirm"
+    return "human"
+```
+
+Para los Nouls la misma forma aparece como dos umbrales sobre `p`: sí por encima de 0.7, no por debajo de 0.3, el medio a una persona. Sube el umbral de sí cuando actuar sobre un falso sí es caro (paging, reembolsos). Bájalo cuando perder un sí verdadero es caro (flags de seguridad).
+
+<Callout type="tip" title="Mirada SDET: un umbral es una decisión de estrategia de pruebas">
+
+Ya decides qué checks bloquean un merge, cuáles solo avisan y cuáles despiertan a alguien a las 3 a.m. El gate por confianza es la misma decisión. "Auto" es un assert bloqueante. "Confirm" es un warning con un humano en el loop. "Human" es "no confiamos en el oráculo aquí". Escribe los umbrales con su razón, como harías con una política de tests flaky.
+
+</Callout>
+
+## Validar umbrales con tus propios datos
+
+Un umbral que elegiste a partir de tres ejemplos en el Playground es una adivinanza. Valídalo como el módulo 9 validó un juez LLM: sobre un set etiquetado, con intervalos.
+
+1. Etiqueta 200–500 ítems con la respuesta verdadera. Reutiliza tickets del módulo 1 o del módulo 9.
+2. Pasa cada ítem por Jev una vez. Guarda `choice`, `probabilities`, `confidence`, `model`.
+3. Para cada umbral candidato `t`, calcula la **cobertura** (fracción con confianza igual o mayor a `t`) y la **precisión entre los cubiertos** (fracción de esos que son correctos).
+4. Grafica precisión contra cobertura. La curva te dice qué accuracy compras en cada nivel de automatización. Elige el umbral que cumpla el objetivo de accuracy para esa acción, y después lee la cobertura en la curva para estimar la carga humana.
+5. Pon un intervalo bootstrap sobre la precisión en el umbral elegido (módulo 9, lección 02). Con 300 ítems y 60% de cobertura tienes 180 ítems cubiertos; el intervalo es ancho, y debes decirlo.
+
+```python
+import numpy as np
+
+
+def precision_coverage(conf: np.ndarray, correct: np.ndarray, thresholds: np.ndarray):
+    rows = []
+    for t in thresholds:
+        covered = conf >= t
+        n = int(covered.sum())
+        precision = float(correct[covered].mean()) if n else float("nan")
+        rows.append({"t": float(t), "coverage": n / len(conf), "precision": precision, "n": n})
+    return rows
+```
+
+Si la curva es plana, la confianza no carga información para esta pregunta con estos datos. Pasa: la pregunta puede estar mal planteada o los niveles pueden superponerse. Reescribe la pregunta antes de ajustar el número.
+
+## Errores comunes
+
+- **Leer la confianza como accuracy.** Di "la distribución está concentrada", no "el modelo está 90% seguro de tener razón".
+- **Un umbral global.** Usa uno por acción, escalado por el costo de una acción equivocada.
+- **Comparar `p_max` entre preguntas con distinto `n`.** Usa `confidence` o umbrales por pregunta.
+- **Ajustar con los mismos diez ejemplos con los que probaste.** Separa un hold-out, o al menos haz bootstrap.
+- **Ajustar con `jev-latest` y luego dejar que el alias se mueva.** Registra el `model` versionado junto a cada umbral.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="Jev devolvió confianza 0.9 para un Choice. ¿Qué puedes concluir y qué no?" level="senior">
+
+Puedo concluir que la distribución de probabilidad sobre las opciones está fuertemente concentrada: con la fórmula publicada, la opción ganadora está muy por encima de un reparto parejo. Para tres opciones eso significa que `p_max` es alrededor de 0.93. No puedo concluir que la opción elegida sea correcta. La confianza es una propiedad de la distribución de salida, no una tasa de error. Que una confianza de 0.9 corresponda a más o menos 90% de precisión es calibración, que mido sobre datos etiquetados con una curva de fiabilidad, y puede diferir por pregunta, por dominio y por versión del modelo. Así que mi respuesta en un design review es: haz gate con ella, pero publica el número de precisión en el umbral salido de nuestros propios datos junto al umbral, con un intervalo de confianza.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Docs de TypeSafe, página Confidence (fórmulas, tres caminos, umbrales que escalan con el riesgo), https://docs.typesafe.ai
+- Guo et al., "On Calibration of Modern Neural Networks", https://arxiv.org/abs/1706.04599
+- Módulo 9, lección 02 (intervalos bootstrap) y lección 05 (calibrar un juez contra etiquetas humanas)

@@ -1,0 +1,242 @@
+## Goal
+
+Build a small ticket-triage CLI on top of Jev and test it the way you would test any HTTP client: with recorded responses and no network. Given a ticket, the CLI asks three questions in **one** request (department Choice, frustration Score, urgency Noul), prints a typed decision, and behaves correctly when the API returns 422 or 429.
+
+You write a thin client over `httpx` rather than the SDK on purpose. It keeps the request JSON visible, it is trivial to mock with `httpx.MockTransport`, and it works through a gateway if you do not have a direct TypeSafe key yet. The SDK is fine for the later exercises; here you need to see the wire.
+
+This is the first folder of `jev-lab`, the repo that collects all Module 10 exercises.
+
+## Context
+
+Reuse 20–30 tickets from your Module 1 `support-ticket-router` dataset, or write them. Put them in `data/tickets.jsonl`:
+
+```json
+{"id": "t-001", "subject": "Charged twice", "message": "I see two charges of $49 for order A-104. Please refund one today."}
+```
+
+Record **real** responses once if you have a key (`python triage.py record`), or hand-write three fixture responses that follow the response schema from lesson 02 exactly. Tests read fixtures only.
+
+<AcceptanceCriteria>
+
+- [ ] `jev_client.py` exposes `JevClient(api_key, base_url, transport=None, model="jev-latest")` with a `system_one(state, questions) -> SystemOneResponse` method that POSTs to `/v1/systemone` with `Authorization: Bearer`
+- [ ] `SystemOneResponse`, `ChoiceAnswer`, `ScoreAnswer` and `NoulAnswer` are Pydantic v2 models; parsing a fixture with an unknown answer type raises a validation error
+- [ ] The three triage questions are defined once as a module-level dict and sent in a single request
+- [ ] A 422 response raises `JevValidationError` carrying the `detail` list from the body; the CLI prints the offending field path and exits with code 2
+- [ ] A 429 or 529 response is retried with exponential backoff (base 0.5 s, max 4 attempts), honouring `Retry-After` when present; a 5th failure raises `JevRateLimited`
+- [ ] 400 and 401 are not retried
+- [ ] `python triage.py run data/tickets.jsonl` prints one line per ticket: id, department, confidence, frustration score, urgency noul, and a decision (`auto`, `confirm`, `human`) using thresholds from `config.py`
+- [ ] Tests use `httpx.MockTransport` and fixtures in `tests/fixtures/`; no test needs `TYPESAFE_API_KEY`; `pytest` passes in under 2 seconds
+- [ ] Every logged decision includes the response `model` field and `usage.input_tokens`
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 01-triage/jev_client.py
+from __future__ import annotations
+
+import time
+from typing import Any, Literal
+
+import httpx
+from pydantic import BaseModel, Field
+
+BASE_URL = "https://api.typesafe.ai"
+
+
+class ChoiceAnswer(BaseModel):
+    type: Literal["choice"]
+    choice: str
+    confidence: float
+    probabilities: dict[str, float]
+
+
+class ScoreAnswer(BaseModel):
+    type: Literal["score"]
+    score: float
+    confidence: float
+    legend: dict[str, Any]
+    probabilities: dict[str, float]
+
+
+class NoulAnswer(BaseModel):
+    type: Literal["noul"]
+    noul: float
+
+
+Answer = ChoiceAnswer | ScoreAnswer | NoulAnswer
+
+
+class Usage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+
+
+class SystemOneResponse(BaseModel):
+    model: str
+    answers: dict[str, Answer] = Field(discriminator="type")
+    usage: Usage
+
+
+class JevError(Exception): ...
+
+
+class JevValidationError(JevError):
+    def __init__(self, detail: list[dict[str, Any]]):
+        super().__init__(f"422: {detail}")
+        self.detail = detail
+
+
+class JevRateLimited(JevError): ...
+
+
+class JevClient:
+    def __init__(self, api_key: str, base_url: str = BASE_URL, transport: httpx.BaseTransport | None = None,
+                 model: str = "jev-latest", max_attempts: int = 4, base_delay: float = 0.5):
+        self._http = httpx.Client(base_url=base_url, transport=transport, timeout=30.0,
+                                  headers={"Authorization": f"Bearer {api_key}"})
+        self.model, self.max_attempts, self.base_delay = model, max_attempts, base_delay
+
+    def system_one(self, state: str | dict | list, questions: dict[str, dict]) -> SystemOneResponse:
+        body = {"model": self.model, "state": state, "questions": questions}
+        for attempt in range(self.max_attempts):
+            resp = self._http.post("/v1/systemone", json=body)
+            if resp.status_code == 200:
+                return SystemOneResponse.model_validate(resp.json())
+            if resp.status_code == 422:
+                raise JevValidationError(resp.json().get("detail", []))
+            if resp.status_code in (429, 529):
+                # TODO(you): sleep base_delay * 2**attempt, or Retry-After if present, then continue
+                raise NotImplementedError
+            resp.raise_for_status()  # 400, 401, 413, 415: do not retry
+        raise JevRateLimited(f"gave up after {self.max_attempts} attempts")
+```
+
+```python
+# 01-triage/questions.py
+TRIAGE_QUESTIONS: dict[str, dict] = {
+    "department": {
+        "type": "choice",
+        "instructions": "Which team should handle `message`?",
+        "criteria": {
+            "billing": "Charges, invoices, refunds, subscriptions",
+            "technical": "Bugs, outages, API or integration failures",
+            "shipping": "Delivery status, delays, lost or damaged parcels",
+            "account": "Login, password, profile, data requests",
+        },
+    },
+    "frustration": {
+        "type": "score",
+        "instructions": "How frustrated does the customer appear in `message`?",
+        "criteria": ["Calm, states facts", "Frustrated but civil", "Angry, strong language or threatens to leave"],
+    },
+    "is_urgent": {
+        "type": "noul",
+        "instructions": "The customer needs a response today or is blocked right now.",
+    },
+}
+```
+
+```python
+# 01-triage/tests/test_client.py
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from jev_client import JevClient, JevValidationError, SystemOneResponse
+from questions import TRIAGE_QUESTIONS
+
+FIX = Path(__file__).parent / "fixtures"
+
+
+def make_client(handler) -> JevClient:
+    return JevClient(api_key="test", transport=httpx.MockTransport(handler), base_delay=0.0)
+
+
+def test_sends_bearer_and_all_three_questions():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers["authorization"]
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=json.loads((FIX / "ok_billing.json").read_text("utf-8")))
+
+    r = make_client(handler).system_one("I was charged twice", TRIAGE_QUESTIONS)
+    assert seen["auth"] == "Bearer test"
+    assert set(seen["body"]["questions"]) == {"department", "frustration", "is_urgent"}
+    assert isinstance(r, SystemOneResponse) and r.answers["department"].choice == "billing"
+
+
+def test_422_raises_with_detail():
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": [{"loc": ["body", "state"], "msg": "Field required", "type": "missing"}]})
+
+    with pytest.raises(JevValidationError) as e:
+        make_client(handler).system_one("x", TRIAGE_QUESTIONS)
+    assert e.value.detail[0]["loc"] == ["body", "state"]
+
+
+def test_429_then_200_is_retried():
+    calls = {"n": 0}
+    # TODO(you): return 429 on the first call and the ok fixture on the second; assert calls["n"] == 2
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>`httpx.MockTransport(handler)` receives the real `httpx.Request`. Decode `request.content` to assert on the body; that is your contract test for the request JSON. Keep one fixture per scenario and name them by what they prove: `ok_billing.json`, `split_department.json`, `empty_state_flat.json`.</Hint>
+  <Hint>For the retry loop, read `resp.headers.get("Retry-After")` and fall back to `self.base_delay * 2 ** attempt`. Inject `sleep` as a constructor argument (`sleep=time.sleep`) so tests pass a no-op and never actually wait.</Hint>
+  <Hint>The Pydantic union needs `Field(discriminator="type")` on the `answers` dict so an unknown `type` fails loudly instead of landing in the wrong model. Write one test that feeds `{"type": "box", ...}` and expects a `ValidationError`.</Hint>
+  <Hint>For the decision column, start with: `auto` if department confidence is at least 0.7 and urgency is not between 0.3 and 0.7; `human` if confidence is under 0.4; otherwise `confirm`. Put the numbers in `config.py`. Lesson 05 replaces these guesses with numbers from data.</Hint>
+</Hints>
+
+<CommitBox repo="jev-lab">
+
+```text
+jev-lab/
+  README.md
+  pyproject.toml            # httpx, pydantic>=2, pytest, typesafe-sdk (optional, later folders)
+  .env.example              # TYPESAFE_API_KEY=, JEV_BASE_URL=https://api.typesafe.ai
+  01-triage/
+    README.md
+    jev_client.py
+    questions.py
+    config.py               # thresholds
+    triage.py               # CLI: record | run
+    data/
+      tickets.jsonl
+    tests/
+      fixtures/
+        ok_billing.json
+        split_department.json
+        validation_422.json
+      test_client.py
+      test_decisions.py
+```
+
+README outline (repo root):
+
+- What this lab is: Module 10 exercises with Jev, one folder per exercise
+- Access: direct key, or OpenRouter / Vercel AI Gateway base URL via `JEV_BASE_URL`
+- How tests run without a key (fixtures) and how to re-record (`triage.py record`)
+
+`01-triage/README.md` outline:
+
+- The three questions and why they are one request
+- Request/response JSON example (copied from a fixture)
+- Error handling table: 400, 401, 422, 429, 529
+- Decision thresholds and the note that they are placeholders until lesson 05
+
+Suggested commits:
+
+- `feat(triage): httpx Jev client with typed response models`
+- `feat(triage): single-request triage questions and CLI`
+- `feat(triage): backoff on 429/529, typed 422 errors`
+- `test(triage): mocked transport contract tests and fixtures`
+
+</CommitBox>
+
+<Checklist id="m10-03-review" title="Self-review" items={["All three questions go out in one POST, and a test asserts on the request body", "The 422 path surfaces the field path from the API body, not a generic message", "429 and 529 back off and retry; 400 and 401 do not", "No test touches the network or needs an API key", "Parsing a fixture with an unknown answer type fails loudly", "The CLI logs the versioned model id and input tokens for every ticket", "Thresholds live in config.py and the README says they are placeholders"]} />

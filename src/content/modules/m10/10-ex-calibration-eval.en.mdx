@@ -1,0 +1,168 @@
+## Goal
+
+Measure whether Jev's Noul probabilities mean what they say on your data, then lock the result in with a regression test that fails when calibration degrades. You will compute a reliability curve, Brier score and ECE for one Noul question over a labeled set, compare them with an LLM adapter answering the same question in the same shape, and write a `pytest` test that reads cached responses and asserts against a committed baseline.
+
+Folder `04-calibration/` in `jev-lab`. It reuses the metric functions from lesson 09.
+
+## Context
+
+Pick one Noul that matters in your pipeline. Good candidates with labels you already have: `wants_refund` over Module 1 tickets, `is_relevant` over Module 2 (query, passage) pairs from `golden_rerank.jsonl`, or `contains_prompt_injection` over a mixed set of benign and adversarial messages from Module 3's red-teaming exercise. You need **at least 300 labeled items with both classes represented** (at least 60 positives).
+
+Row format for `data/labeled.jsonl`:
+
+```json
+{"id": "p-0107", "state": {"query": "How long do refresh tokens last?", "passage": "Refresh tokens expire after 30 days..."}, "label": true}
+```
+
+Cached responses go to `runs/jev-<model>.jsonl` and `runs/llm-<model>.jsonl` with the same shape: `{"id", "p", "model", "latency_ms", "input_tokens", "output_tokens"}`.
+
+<AcceptanceCriteria>
+
+- [ ] `run_jev.py` and `run_llm.py` produce one `p` per item for the same question; the LLM uses a structured-output schema with a single `probability_true` field and the same `true` / `false` criteria text in its system prompt (the System One adapter); both cache and never re-call for cached ids
+- [ ] `calibrate.py` computes, for each system: accuracy at 0.5, precision/recall/F1 at the production threshold from `config.py`, Brier, ECE with 10 equal-width bins and ECE with 10 equal-mass bins, and a reliability table with counts per bin
+- [ ] Bootstrap 95% intervals (1,000 resamples, fixed seed) on Brier and ECE for each system, and on the paired difference in Brier
+- [ ] `plot.py` writes `reliability.png` with both systems' curves on one diagonal plot, point size proportional to bin count
+- [ ] `recalibrate.py` fits isotonic regression on a 50% split and reports ECE before and after on the other half, for Jev only
+- [ ] `baseline.json` is committed with the Jev metrics, the `model` id, the dataset hash and the date
+- [ ] `tests/test_calibration_regression.py` recomputes the metrics from `runs/jev-<model>.jsonl` and fails if: accuracy drops more than 2 points below baseline, ECE (equal-mass) exceeds baseline by more than 0.03 or exceeds an absolute ceiling of 0.10, or recall for positives at the production threshold falls below the baseline minus 3 points
+- [ ] The test skips with a clear message if the run file's `model` differs from the baseline's, unless `JEV_ALLOW_MODEL_CHANGE=1` is set, in which case it runs and prints both ids
+- [ ] `REPORT.md` shows both reliability curves, the metric table with intervals, and a one-paragraph verdict on whether the production threshold can be read as "about X% precise"
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 04-calibration/metrics.py
+import numpy as np
+
+SEED = 23
+
+
+def brier(p: np.ndarray, y: np.ndarray) -> float:
+    return float(np.mean((p - y) ** 2))
+
+
+def reliability(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False) -> list[dict]:
+    edges = np.quantile(p, np.linspace(0, 1, bins + 1)) if equal_mass else np.linspace(0, 1, bins + 1)
+    edges = np.unique(edges)
+    rows = []
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        last = i == len(edges) - 2
+        mask = (p >= lo) & ((p <= hi) if last else (p < hi))
+        n = int(mask.sum())
+        if n:
+            rows.append({"lo": float(lo), "hi": float(hi), "n": n, "conf": float(p[mask].mean()), "freq": float(y[mask].mean())})
+    return rows
+
+
+def ece(p: np.ndarray, y: np.ndarray, bins: int = 10, equal_mass: bool = False) -> float:
+    rows = reliability(p, y, bins, equal_mass)
+    return float(sum(r["n"] / len(p) * abs(r["conf"] - r["freq"]) for r in rows))
+
+
+def bootstrap(metric, p: np.ndarray, y: np.ndarray, iters: int = 1000) -> tuple[float, float]:
+    rng = np.random.default_rng(SEED)
+    n = len(p)
+    draws = []
+    for _ in range(iters):
+        idx = rng.integers(0, n, n)
+        draws.append(metric(p[idx], y[idx]))
+    return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
+def paired_bootstrap_diff(metric, p_a, p_b, y, iters: int = 1000) -> tuple[float, float, float]:
+    # TODO(you): same idx for both systems per iteration; return observed diff, lo, hi
+    raise NotImplementedError
+```
+
+```python
+# 04-calibration/tests/test_calibration_regression.py
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from metrics import ece
+
+HERE = Path(__file__).resolve().parent.parent
+BASELINE = json.loads((HERE / "baseline.json").read_text("utf-8"))
+THRESHOLD = 0.7  # TODO(you): import from config.py
+
+
+def load_run(path: Path):
+    rows = [json.loads(l) for l in path.read_text("utf-8").splitlines()]
+    gold = {json.loads(l)["id"]: json.loads(l)["label"] for l in (HERE / "data/labeled.jsonl").read_text("utf-8").splitlines()}
+    p = np.array([r["p"] for r in rows])
+    y = np.array([gold[r["id"]] for r in rows], dtype=float)
+    return p, y, rows[0]["model"]
+
+
+def test_jev_calibration_has_not_degraded():
+    p, y, model = load_run(HERE / f"runs/jev-{BASELINE['model']}.jsonl")
+    if model != BASELINE["model"] and not os.environ.get("JEV_ALLOW_MODEL_CHANGE"):
+        pytest.skip(f"run model {model} differs from baseline {BASELINE['model']}; set JEV_ALLOW_MODEL_CHANGE=1 to compare")
+    acc = float(((p >= 0.5) == (y == 1)).mean())
+    e = ece(p, y, bins=10, equal_mass=True)
+    # TODO(you): recall at THRESHOLD; assert the three rules from the acceptance criteria with clear messages
+    assert acc >= BASELINE["accuracy"] - 0.02, f"accuracy {acc:.3f} vs baseline {BASELINE['accuracy']:.3f}"
+    assert e <= min(BASELINE["ece_equal_mass"] + 0.03, 0.10), f"ECE {e:.3f} vs baseline {BASELINE['ece_equal_mass']:.3f}"
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Keep the LLM adapter honest: the system prompt contains the Noul `instructions` and the `true` / `false` criteria verbatim, and the schema has one field `probability_true` between 0 and 1. Do not pass sampling parameters to Claude models. Expect clustering at round numbers like 0.9 and 0.1; that is exactly what the reliability curve will show.</Hint>
+  <Hint>Jev's probabilities pile up near 0 and 1, so equal-width bins leave the middle bins with a handful of items and a noisy ECE. Compute both, report both, and use the equal-mass version in the regression test. Print the bin table in the report so a reader can see the counts.</Hint>
+  <Hint>For isotonic regression use `sklearn.isotonic.IsotonicRegression(out_of_bounds="clip")`, fit on half the items, evaluate ECE on the other half, and never report ECE on the fitting half. If the ECE after recalibration is not clearly lower with the interval, say that calibration was already adequate.</Hint>
+  <Hint>Put the dataset SHA-256 in `baseline.json` and assert it in the test. A regression test that silently compares against a different labeled set is worse than no test. Add a `make baseline` target that regenerates `baseline.json` only when a human runs it on purpose.</Hint>
+</Hints>
+
+<CommitBox repo="jev-lab">
+
+```text
+jev-lab/
+  04-calibration/
+    README.md
+    config.py                   # question, criteria, production threshold
+    data/
+      labeled.jsonl
+    runs/
+      jev-1.14.0.jsonl
+      llm-<model>.jsonl
+    run_jev.py
+    run_llm.py                  # System One adapter via structured output
+    metrics.py
+    calibrate.py
+    recalibrate.py
+    plot.py
+    baseline.json
+    reliability.png
+    REPORT.md
+    tests/
+      test_metrics.py           # brier/ece on hand-built arrays
+      test_calibration_regression.py
+```
+
+`04-calibration/README.md` outline:
+
+- The Noul question, the criteria, and where the labels come from
+- Metric table: both systems, with intervals
+- The reliability figure and how to read it
+- Regression rules and how to regenerate the baseline on purpose
+- Model version policy: pinned id, what to do when the alias moves
+
+Suggested commits:
+
+- `feat(calib): cached Jev and LLM-adapter runs over 300 labeled items`
+- `feat(calib): reliability, Brier, ECE with bootstrap intervals`
+- `feat(calib): isotonic recalibration on held-out split`
+- `test(calib): regression test against committed baseline`
+- `docs(calib): report with both reliability curves and verdict`
+
+</CommitBox>
+
+<Checklist id="m10-10-review" title="Self-review" items={["The LLM adapter answers the exact same question with the same criteria, in a single-field schema", "ECE is reported with both binning schemes and with counts per bin", "Intervals are on Brier and ECE, and the Jev-vs-LLM Brier difference is paired", "Recalibration was evaluated on a held-out half, never on the fitting half", "baseline.json carries the model id, dataset hash and date", "The regression test skips on a model change unless explicitly allowed", "The report says whether the production threshold can be read as about X% precise", "Rerunning calibrate.py reproduces the committed numbers"]} />

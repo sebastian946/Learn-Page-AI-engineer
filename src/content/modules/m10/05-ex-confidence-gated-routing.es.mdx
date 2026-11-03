@@ -1,0 +1,170 @@
+## Objetivo
+
+Convierte los umbrales placeholder del ejercicio 03 en números que puedas defender. Vas a pasar un dataset de tickets etiquetados por una pregunta Choice de Jev, barrer umbrales de confianza, graficar el trade-off precisión/cobertura y elegir umbrales separados para una acción de bajo riesgo (asignar equipo) y una de alto riesgo (auto-cerrar como duplicado). La salida es un `thresholds.json` que tu router lee, más un reporte corto que declara la precisión en cada umbral con un intervalo bootstrap.
+
+Esta carpeta, `02-gated-routing/`, se construye sobre `01-triage/` en `jev-lab`.
+
+## Contexto
+
+Necesitas al menos **300 tickets etiquetados** con una etiqueta gold de `department` sobre 5–8 clases. Los sets de tickets de los módulos 1 y 9 sirven; si construyes uno nuevo, etiquétalo tú mismo y mantén una clase rara (menos del 8%). La clase rara es donde un único umbral global falla: Jev puede estar confiadamente equivocado en ella.
+
+Formato de fila para `data/labeled.jsonl`:
+
+```json
+{"id": "t-0042", "message": "Second time I'm writing. Two charges for order 88123, refund one.", "label": "billing"}
+```
+
+Caché de predicciones en `runs/jev-<model>.jsonl` (una fila por ticket, producida una vez y commiteada):
+
+```json
+{"id": "t-0042", "choice": "billing", "confidence": 0.82, "probabilities": {"billing": 0.88, "account": 0.07, "technical": 0.05}, "model": "jev-1.14.0", "input_tokens": 231, "latency_ms": 140}
+```
+
+<AcceptanceCriteria>
+
+- [ ] `run_jev.py` envía cada ticket por una pregunta Choice con la lista completa de clases, cachea los resultados con clave `(model, hash de la pregunta, id)` y nunca vuelve a llamar a la API para una fila cacheada
+- [ ] `sweep.py` calcula, para umbrales de 0.0 a 1.0 en pasos de 0.05: cobertura, precisión entre los cubiertos y un intervalo bootstrap al 95% sobre esa precisión (1,000 remuestreos, semilla fija)
+- [ ] El barrido se corre para tres estadísticos: `confidence`, `p_max` y `p_max / p_second`, y el reporte dice cuál separa mejor en estos datos
+- [ ] Se reporta la precisión por clase en los umbrales elegidos, incluida la clase rara
+- [ ] `thresholds.json` contiene dos gates con niveles `act` y `confirm`: `assign_team` (precisión objetivo de al menos 0.90 entre los auto-decididos) y `auto_close_duplicate` (objetivo de al menos 0.98), cada uno con el estadístico usado, la precisión alcanzada, su intervalo, la cobertura y el id del `model`
+- [ ] `plot.py` escribe `precision_coverage.png` con una curva por estadístico y los dos puntos de operación elegidos marcados
+- [ ] `route.py` lee `thresholds.json` y mapea una fila cacheada a `auto`, `confirm` o `human` para cada acción; `tests/test_route.py` cubre los límites de las bandas
+- [ ] `REPORT.md` declara la carga humana estimada (1 menos cobertura) para cada acción y nombra las clases donde la confianza es menos informativa
+
+</AcceptanceCriteria>
+
+<StarterCode>
+
+```python
+# 02-gated-routing/sweep.py
+import json
+from pathlib import Path
+
+import numpy as np
+
+SEED = 11
+THRESHOLDS = np.round(np.arange(0.0, 1.0001, 0.05), 2)
+
+
+def load(path: str) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    gold = {json.loads(l)["id"]: json.loads(l)["label"] for l in Path("data/labeled.jsonl").read_text("utf-8").splitlines()}
+    rows = [json.loads(l) for l in Path(path).read_text("utf-8").splitlines()]
+    correct = np.array([r["choice"] == gold[r["id"]] for r in rows], dtype=bool)
+    stats = {
+        "confidence": np.array([r["confidence"] for r in rows]),
+        "p_max": np.array([max(r["probabilities"].values()) for r in rows]),
+        "ratio": np.array([top_to_second(r["probabilities"]) for r in rows]),
+    }
+    return correct, np.array([gold[r["id"]] for r in rows]), stats
+
+
+def top_to_second(probabilities: dict[str, float]) -> float:
+    ps = sorted(probabilities.values(), reverse=True)
+    second = ps[1] if len(ps) > 1 else 0.0
+    return ps[0] / max(second, 1e-6)
+
+
+def bootstrap_precision(correct: np.ndarray, iters: int = 1000) -> tuple[float, float]:
+    rng = np.random.default_rng(SEED)
+    n = len(correct)
+    if n == 0:
+        return float("nan"), float("nan")
+    draws = [correct[rng.integers(0, n, n)].mean() for _ in range(iters)]
+    return float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+
+
+def sweep(stat: np.ndarray, correct: np.ndarray, thresholds=THRESHOLDS) -> list[dict]:
+    rows = []
+    for t in thresholds:
+        covered = stat >= t
+        lo, hi = bootstrap_precision(correct[covered])
+        rows.append({
+            "t": float(t),
+            "coverage": float(covered.mean()),
+            "precision": float(correct[covered].mean()) if covered.any() else float("nan"),
+            "ci": [lo, hi],
+            "n": int(covered.sum()),
+        })
+    return rows
+
+
+def choose(rows: list[dict], target: float) -> dict | None:
+    """Lowest threshold whose LOWER CI bound meets the target. None if never met."""
+    # TODO(you): iterate rows in threshold order and return the first that satisfies rows["ci"][0] >= target
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    correct, labels, stats = load("runs/jev-1.14.0.jsonl")
+    # TODO(you): sweep each statistic, choose gates for assign_team (0.90) and auto_close_duplicate (0.98)
+    # TODO(you): write thresholds.json and results.json; print per-class precision at the chosen gates
+```
+
+```python
+# 02-gated-routing/route.py
+import json
+from pathlib import Path
+
+THRESHOLDS = json.loads(Path("thresholds.json").read_text("utf-8"))
+
+
+def band(action: str, row: dict) -> str:
+    gate = THRESHOLDS[action]
+    stat = {"confidence": row["confidence"], "p_max": max(row["probabilities"].values())}[gate["statistic"]]
+    if stat >= gate["act"]:
+        return "auto"
+    if stat >= gate["confirm"]:
+        return "confirm"
+    return "human"
+```
+
+</StarterCode>
+
+<Hints>
+  <Hint>Mantén las llamadas a la API y el análisis en archivos separados. `run_jev.py` es el único archivo que habla con Jev (SDK o tu `JevClient` de la carpeta 01). `sweep.py`, `plot.py` y `route.py` leen solo filas cacheadas, así que puedes iterar sobre estadísticos gratis y tus tests nunca necesitan key.</Hint>
+  <Hint>Usa el límite inferior del intervalo, no la estimación puntual, al elegir un umbral. Una precisión de 0.99 sobre 12 ítems cubiertos tiene un límite inferior cerca de 0.75. Si ningún umbral alcanza 0.98 con un límite inferior defendible, la salida honesta es "el auto-cierre no se puede automatizar con este tamaño de dataset", y eso va al reporte.</Hint>
+  <Hint>La precisión por clase va a exponer la clase rara. Si `legal_threat` tiene solo 60% de precisión incluso con confianza 0.9, agrega un override por clase a `thresholds.json` (por ejemplo, nunca auto-actuar sobre `legal_threat`) en lugar de subir el umbral global y perder cobertura en todas partes.</Hint>
+  <Hint>Para el gráfico, x es cobertura (1.0 a la izquierda, decreciente), y es precisión, una línea por estadístico y un marcador con etiqueta en cada punto de operación elegido. Si las líneas de `confidence` y `p_max` se superponen casi exactamente, es lo esperado cuando todas las preguntas tienen el mismo número de opciones; la línea de la razón es la que suele diferir.</Hint>
+</Hints>
+
+<CommitBox repo="jev-lab">
+
+```text
+jev-lab/
+  02-gated-routing/
+    README.md
+    data/
+      labeled.jsonl
+    runs/
+      jev-1.14.0.jsonl        # cached predictions, committed
+    run_jev.py
+    sweep.py
+    plot.py
+    route.py
+    thresholds.json
+    results.json
+    precision_coverage.png
+    REPORT.md
+    tests/
+      test_sweep.py           # choose() and bootstrap on hand-built arrays
+      test_route.py           # band boundaries for both actions
+```
+
+Esquema de `02-gated-routing/README.md`:
+
+- La pregunta, la lista de clases y el dataset (tamaño, distribución de clases, clase rara)
+- Cómo correr: `python run_jev.py`, `python sweep.py`, `python plot.py`
+- La figura precisión/cobertura y los dos puntos de operación elegidos
+- Por qué el límite inferior del CI guía la elección
+- Notas por clase y overrides
+
+Commits sugeridos:
+
+- `feat(gated): cached Jev run over 300 labeled tickets`
+- `feat(gated): precision/coverage sweep with bootstrap intervals`
+- `feat(gated): thresholds.json with per-action gates and router`
+- `docs(gated): report with workload estimate and per-class caveats`
+
+</CommitBox>
+
+<Checklist id="m10-05-review" title="Autoevaluación" items={["Cada ticket se clasificó una vez con la lista completa de clases, y el id del modelo se guarda por fila", "Los umbrales se eligieron con el límite inferior del CI, no con la estimación puntual", "La acción de alto riesgo tiene un gate más estricto que la de bajo riesgo, y el reporte explica por qué", "Se reporta la precisión por clase y la clase rara tiene un override si lo necesita", "Se compararon tres estadísticos y el reporte dice cuál gana en estos datos", "route.py lee thresholds.json; no hay números hard-coded en el código", "La estimación de carga humana por acción está en el reporte", "Volver a correr sweep.py reproduce los mismos números"]} />

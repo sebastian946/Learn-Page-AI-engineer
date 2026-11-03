@@ -1,0 +1,170 @@
+## Pensar en decisiones atómicas
+
+Un LLM te invita a escribir un prompt grande. Jev invita a lo contrario: muchas preguntas pequeñas y tipadas cuyas respuestas combinas en código. Los patrones de esta lección son las formas que esa combinación suele tomar en sistemas reales. Cada uno se desprende de tres hechos que ya tienes: las preguntas de una request corren en paralelo contra el mismo state, las preguntas no se ven entre sí y las respuestas son números.
+
+## Speculative fan-out
+
+Haz todas las preguntas que tu código **podría** necesitar en una request, incluidas las que solo importan para algunos inputs, y deja que el código ignore el resto. Un ticket que no es una devolución no necesita `return_reason`, pero preguntarlo cuesta unos pocos tokens y nada de latencia extra, y ahorra un segundo round-trip cuando sí es una devolución.
+
+```python
+from typesafe_sdk import Choice, Noul, Score
+
+TRIAGE = {
+    "department": Choice(instructions="Which team should handle `message`?",
+                         criteria={"returns": "...", "shipping": "...", "billing": "..."}),
+    "return_reason": Choice(instructions="If the customer wants to return something, why?",
+                            criteria={"wrong_size": "...", "damaged": "...", "changed_mind": "...", "other": "..."}),
+    "shipping_issue": Choice(instructions="If this is a shipping problem, which kind?",
+                             criteria={"not_delivered": "...", "delayed": "...", "wrong_address": "..."}),
+    "wants_human": Noul(instructions="The customer asks to speak to a person."),
+    "language": Choice(instructions="What language is `message` written in?",
+                       criteria={"en": None, "es": None, "pt": None, "fr": None, "other": None}),
+}
+
+
+def dispatch(answers) -> dict:
+    dept = answers["department"]
+    issue = {"returns": "return_reason", "shipping": "shipping_issue"}.get(dept.choice)
+    return {
+        "team": dept.choice,
+        "issue": answers[issue].choice if issue else None,   # the other answer is ignored
+        "escalate": answers["wants_human"].noul > 0.7,
+        "language": answers["language"].choice,
+    }
+```
+
+El propio cookbook de TypeSafe midió 13 preguntas en una llamada contra 13 llamadas: alrededor de 10x más rápido y 12x más barato con respuestas idénticas. El único límite es el contexto: state más todas las preguntas por debajo de 64k tokens, state más la pregunta más larga por debajo de 32k.
+
+## Composite scoring
+
+Un juicio que depende de varias cosas se vuelve un Score por cosa, normalizado a 0–1 y ponderado en código. Los pesos son visibles, versionados y cambiables sin tocar un prompt.
+
+```python
+PRIORITY_QUESTIONS = {
+    "severity": Score(instructions="How severe is the reported issue?",
+                      criteria=["Cosmetic", "Degraded, workaround exists", "Blocking, no workaround"]),
+    "frustration": Score(instructions="How frustrated is the customer?",
+                         criteria=["Calm", "Frustrated but civil", "Angry or threatening to leave"]),
+    "report_quality": Score(instructions="How much does the report give an engineer to work with?",
+                            criteria=["No detail", "Names the feature only", "Steps or environment", "Steps and environment"]),
+}
+WEIGHTS = {"severity": 0.6, "frustration": 0.3, "report_quality": 0.1}
+
+
+def priority(answers) -> float:
+    total = 0.0
+    for qid, w in WEIGHTS.items():
+        top = len(PRIORITY_QUESTIONS[qid].criteria) - 1
+        total += w * answers[qid].score / top
+    return total
+```
+
+Cuando el ranking no coincide con lo que tu equipo haría, cambia un peso, vuelve a correr sobre respuestas cacheadas, compara. Sin llamadas a la API. Es el mismo loop que usaste para los pesos de métricas en el módulo 9.
+
+## Intent routing
+
+Clasifica primero con Jev y luego manda cada request al handler más barato que pueda atenderla: código determinista, un LLM especialista con el contexto correcto, o un humano. El Choice de intent y un Score de complejidad van en la misma request; la confianza de cada uno es un segundo eje.
+
+```python
+def route(answers, ticket_id: str) -> None:
+    intent, complexity = answers["intent"], answers["complexity"]
+    if intent.confidence < 0.5:
+        return human_queue(ticket_id)                      # not sure what this is
+    match intent.choice:
+        case "order_status":
+            return lookup_order(ticket_id)                 # plain code, no model
+        case "product_question":
+            return llm_answer(ticket_id, context="catalog")
+        case "complaint":
+            if complexity.score > 1 or complexity.confidence < 0.5:
+                return human_queue(ticket_id)
+            return llm_answer(ticket_id, context="complaints_playbook")
+```
+
+El handler caro solo corre para los inputs que lo necesitan. La lección 11 convierte esto en un modelo de costos.
+
+## Clasificación jerárquica
+
+Una taxonomía con 2,000 hojas no cabe en un Choice. Recórrela nivel por nivel: un Choice sobre las categorías de nivel superior, luego una segunda request cuyas opciones son los hijos del nodo elegido. Como las opciones de la segunda request **dependen de la primera respuesta**, dos requests son legítimas aquí. No te comprometas de forma greedy. Mantén los `k` mejores candidatos en cada nivel, pondera cada camino por el producto de sus probabilidades y expande los mejores `k` caminos en el siguiente nivel. Eso es beam search sobre probabilidades de Choice, y el cookbook de TypeSafe muestra que le gana al descenso greedy en jerarquías de patentes, productos y biomedicina.
+
+```python
+def beam_classify(client, state, tree: dict, k: int = 3, depth: int = 3) -> list[tuple[list[str], float]]:
+    beams: list[tuple[list[str], float]] = [([], 1.0)]
+    for _ in range(depth):
+        expanded = []
+        for path, prob in beams:
+            node = tree_at(tree, path)
+            if not node.get("children"):
+                expanded.append((path, prob))
+                continue
+            r = client.system_one(
+                state=state,
+                questions={"next": Choice(instructions="Which category best fits `document`?",
+                                          criteria={c: node["children"][c]["desc"] for c in node["children"]})},
+            )
+            for option, p in r.answers["next"].probabilities.items():
+                expanded.append((path + [option], prob * p))
+        beams = sorted(expanded, key=lambda b: -b[1])[:k]
+    return beams
+```
+
+Las requests de un mismo nivel para los `k` beams son independientes, así que córrelas de forma concurrente.
+
+## Self-consistency con Nouls
+
+Las respuestas de Jev varían un poco entre corridas. Para un checklist de Nouls sobre un reclamo, un contrato o una extracción, puedes correr la misma request `n` veces y mirar la dispersión. Una dispersión apretada cerca de 0.9 es un sí estable. Un valor que rebota alrededor de 0.5 es un ítem que debe ir a una persona sin importar la media. En la práctica una sola corrida con la banda "incierta" de 0.3–0.7 ya captura la mayor parte de eso; muestrear te compra una estimación de varianza para tu reporte de calibración (lección 10), no una regla de decisión distinta.
+
+## La cascada SDE: barato primero, escalar cuando fallan los checks
+
+La extracción de datos estructurados es trabajo de LLM. Verificar la extracción es trabajo de Jev. La cascada:
+
+1. Un LLM barato extrae el registro con un schema (módulo 1).
+2. Una request a Jev pregunta una batería de Nouls estrechos, uno por campo y modo de fallo, cada uno redactado para que **true signifique que algo está mal**: "¿`extracted_field` viola el `type` declarado en `field_spec`?", "¿`extracted_field` está ausente del `source`?".
+3. Un gate estilo `max`: si **cualquier** flag supera el umbral, escala ese documento a un modelo más fuerte y lento. Una media promediaría una bandera roja confiada hasta el silencio.
+4. Solo los documentos escalados pagan por el modelo caro.
+
+```python
+FIRE_T = 0.7
+
+
+def should_escalate(checks: dict[str, float]) -> tuple[bool, dict[str, float]]:
+    fired = {qid: p for qid, p in checks.items() if p > FIRE_T}
+    return bool(fired), fired
+```
+
+La cascada ahorra dinero solo si el verificador cuesta mucho menos que el escalón de escalación y los flags separan bien (altos en campos incorrectos, bajos en los correctos). Mide ambas cosas con extracciones etiquetadas antes de enviarla a producción.
+
+## Mantén la aritmética y las fechas en código
+
+El proveedor es explícito en que Jev no es confiable contando, haciendo aritmética ni comparando fechas. El patrón es **extraer con Jev, calcular en código**:
+
+- Pregunta con un Choice "¿Qué línea de `invoice` indica la fecha de vencimiento?" con los números de línea como opciones, y luego parsea la fecha en Python.
+- Para "¿el pedido supera el umbral de envío gratis?", calcula el total en código y pon `"total_usd": 112.40` y `"threshold_usd": 100` en el state, y pregunta con un Noul solo si la pregunta es de significado ("¿el cliente afirma que calificaba para envío gratis?").
+- Para fechas relativas ("el próximo viernes"), pide a Jev qué ancla y qué palabras de desplazamiento aparecen, resuélvelas con una librería de calendario y haz tests unitarios del resolver.
+
+<Callout type="warning" title="Dos requests son la excepción">
+
+Las únicas razones honestas para una segunda request son que tu código no puede construirla hasta tener la primera respuesta: necesita la respuesta para traer más state, para decidir qué contiene el state o para elegir las siguientes opciones (jerarquías). Si la segunda request podría haberse hecho contra el state original, pertenece a la primera request.
+
+</Callout>
+
+## Errores comunes
+
+- Mandar una pregunta por request "para mantenerlo simple". Es más lento, más caro y no es más simple.
+- Promediar flags en el gate de una cascada. Usa `any` o `max`.
+- Descenso greedy en una jerarquía. Mantén un beam.
+- Dejar que un Score haga la ponderación. Normaliza y pondera en código donde puedas leerlo.
+- Pedirle a Jev que cuente o compare números.
+
+## Cómo aparece en entrevistas
+
+<InterviewQuestion question="Diseña un clasificador de documentos para una taxonomía de 1,500 hojas con Jev. ¿Dónde están las llamadas a la API y por qué?" level="senior">
+
+Recorro la jerarquía. Un Choice por nivel con los hijos de ese nodo como opciones, con descripciones, para que cada llamada quede muy por debajo de 255 opciones y las descripciones separen hermanos. Mantengo un beam de los k mejores caminos ponderados por el producto de probabilidades en lugar de comprometerme greedy, porque un casi empate en el nivel uno es donde greedy falla. Las llamadas del mismo nivel para distintos beams son independientes, así que corren en paralelo; profundidad tres con k igual a tres son como máximo siete requests por documento, cada una de unos cientos de milisegundos. Las segundas requests se justifican aquí porque las opciones dependen de la respuesta anterior. Hago gate del camino final con su probabilidad producto, mando los bajos a revisión y evalúo la accuracy por nivel en un set etiquetado, porque los errores del nivel uno dominan.
+
+</InterviewQuestion>
+
+## Lecturas adicionales
+
+- Docs de TypeSafe: Patterns (fan-out, confidence-gated routing, composite scoring, intent routing) y los cookbooks de parallel questions, hierarchical classification y la cascada SDE, https://docs.typesafe.ai
+- Structured outputs del módulo 1 (el escalón de extracción de la cascada), nodos de routing en LangGraph del módulo 4
